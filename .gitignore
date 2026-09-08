@@ -1,0 +1,15 @@
+# The database. Contains real accounts and password hashes — this must
+# never reach a repo, and never sit anywhere a web server can serve it.
+elusion.db
+*.db
+*.db-journal
+
+# Virtual environment — recreate with:
+#   python -m venv venv && venv\Scripts\pip install -r requirements.txt
+venv/
+
+__pycache__/
+*.pyc
+
+# Local overrides
+.env
