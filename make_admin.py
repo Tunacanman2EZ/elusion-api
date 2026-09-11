@@ -1,7 +1,7 @@
 """
 Grant or revoke admin on an account.
 
-Admin is a server-side column — nothing the game client sends can change it.
+Admin is a server-side column - nothing the game client sends can change it.
 This script is the only intended way to set it.
 
     python make_admin.py Tunacan          grant
