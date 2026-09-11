@@ -27,7 +27,7 @@ swagger = Swagger(app)
 DB_PATH = os.environ.get("ELUSION_DB", os.path.join(os.path.dirname(__file__), "elusion.db"))
 
 # how long a login token stays valid. games shouldn't log people out
-# constantly, so this is generous — 30 days in seconds.
+# constantly, so this is generous - 30 days in seconds.
 TOKEN_TTL = 60 * 60 * 24 * 30
 
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,20}$")
@@ -45,7 +45,7 @@ def get_db():
     if "db" not in g:
         g.db = sqlite3.connect(DB_PATH)
         g.db.row_factory = sqlite3.Row
-        # enforce foreign keys — off by default in sqlite
+        # enforce foreign keys - off by default in sqlite
         g.db.execute("PRAGMA foreign_keys = ON")
     return g.db
 
@@ -78,6 +78,45 @@ def init_db():
         );
 
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+        -- one row per character slot. the primary key is (user_id, slot)
+        -- rather than an autoincrement id, so writing a slot twice is an
+        -- upsert instead of a duplicate row. slots are 0..3.
+        CREATE TABLE IF NOT EXISTS saves (
+            user_id     INTEGER NOT NULL,
+            slot        INTEGER NOT NULL,
+            class_id    TEXT    NOT NULL,
+            name        TEXT    NOT NULL,
+            level       INTEGER NOT NULL DEFAULT 1,
+            area        TEXT    NOT NULL DEFAULT 'elusion',
+            hp          INTEGER NOT NULL DEFAULT 10,
+            max_hp      INTEGER NOT NULL DEFAULT 10,
+            mana        INTEGER NOT NULL DEFAULT 10,
+            max_mana    INTEGER NOT NULL DEFAULT 10,
+            stamina     INTEGER NOT NULL DEFAULT 10,
+            max_stamina INTEGER NOT NULL DEFAULT 10,
+            gold        INTEGER NOT NULL DEFAULT 0,
+            xp          INTEGER NOT NULL DEFAULT 0,
+            xp_to_next  INTEGER NOT NULL DEFAULT 100,
+            bank_gold   INTEGER NOT NULL DEFAULT 0,
+            updated_at  INTEGER NOT NULL,
+            PRIMARY KEY (user_id, slot),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        -- the anti-duplication design is the composite primary key. one row
+        -- per item per slot means a deposit can only ever UPDATE a quantity,
+        -- never insert a second row for the same item. the database refuses
+        -- to represent the duplicated state, so no application bug can
+        -- create it.
+        CREATE TABLE IF NOT EXISTS bank_items (
+            user_id  INTEGER NOT NULL,
+            slot     INTEGER NOT NULL,
+            item_id  TEXT    NOT NULL,
+            quantity INTEGER NOT NULL CHECK (quantity > 0),
+            PRIMARY KEY (user_id, slot, item_id),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
         """
     )
     db.commit()
@@ -94,7 +133,7 @@ init_db()
 def validate_credentials(payload):
     """
     Check an incoming register/login body.
-    Returns (is_valid, errors_list) — same shape as spells_api.
+    Returns (is_valid, errors_list) - same shape as spells_api.
     """
     errors = []
 
@@ -164,7 +203,7 @@ def user_for_token(token):
         return None
 
     if row["expires_at"] < int(time.time()):
-        # expired — clean it up rather than leaving dead rows around
+        # expired - clean it up rather than leaving dead rows around
         db.execute("DELETE FROM sessions WHERE token = ?", (token,))
         db.commit()
         return None
@@ -351,7 +390,7 @@ def login():
         (data["username"],),
     ).fetchone()
 
-    # same response whether the user is missing or the password is wrong —
+    # same response whether the user is missing or the password is wrong -
     # otherwise this endpoint tells an attacker which usernames exist.
     if row is None or not check_password_hash(row["password_hash"], data["password"]):
         return {
@@ -433,6 +472,396 @@ def logout():
     db.execute("DELETE FROM sessions WHERE token = ?", (bearer_token(),))
     db.commit()
     return "", 204
+
+
+# =============================================================================
+# SAVES  -  GET/PUT /api/save
+# =============================================================================
+
+MAX_SLOT = 3
+BANK_CAPACITY = 40
+VALID_CLASSES = {"warrior", "mage", "tank", "healer"}
+
+
+def parse_slot(raw):
+    """
+    Validate a slot number coming from a query string or a JSON body.
+
+    Note the bool check: in Python `True == 1` and `isinstance(True, int)` is
+    True, so without it `{"slot": true}` would quietly be accepted as slot 1.
+    """
+    if isinstance(raw, bool):
+        return None
+    try:
+        slot = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if slot < 0 or slot > MAX_SLOT:
+        return None
+    return slot
+
+
+def bad_request(message):
+    return {"error": "Bad Request", "message": message}, 400
+
+
+def save_row_to_dict(row):
+    return {
+        "slot": row["slot"],
+        "class_id": row["class_id"],
+        "name": row["name"],
+        "level": row["level"],
+        "area": row["area"],
+        "updated_at": row["updated_at"],
+    }
+
+
+@app.get("/api/save")
+@require_auth
+def list_saves():
+    """
+    List the account's character slots
+    ---
+    tags:
+      - Save
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+    responses:
+      200:
+        description: Occupied slots only; an empty account returns an empty list
+      401:
+        description: Missing, invalid or expired token
+    """
+    rows = get_db().execute(
+        "SELECT * FROM saves WHERE user_id = ? ORDER BY slot",
+        (g.user["id"],),
+    ).fetchall()
+
+    return {
+        "username": g.user["username"],
+        "slots": [save_row_to_dict(r) for r in rows],
+    }, 200
+
+
+@app.put("/api/save")
+@require_auth
+def write_save():
+    """
+    Create or overwrite one character slot
+    ---
+    tags:
+      - Save
+    consumes:
+      - application/json
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [slot, class_id, name]
+          properties:
+            slot:     {type: integer, example: 0}
+            class_id: {type: string,  example: warrior}
+            name:     {type: string,  example: Tunacan}
+            level:    {type: integer, example: 12}
+            area:     {type: string,  example: elusion}
+    responses:
+      200:
+        description: Slot written
+      400:
+        description: Invalid slot, class or name
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+
+    slot = parse_slot(payload.get("slot"))
+    if slot is None:
+        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+
+    class_id = str(payload.get("class_id", "")).strip().lower()
+    if class_id not in VALID_CLASSES:
+        return bad_request("class_id must be one of: %s" % ", ".join(sorted(VALID_CLASSES)))
+
+    name = str(payload.get("name", "")).strip()
+    if not name or len(name) > 20:
+        return bad_request("name must be 1-20 characters")
+
+    level = max(1, int(payload.get("level", 1) or 1))
+    area = str(payload.get("area", "elusion")).strip() or "elusion"
+    now = int(time.time())
+
+    db = get_db()
+    # ON CONFLICT rather than DELETE-then-INSERT: an upsert is one statement,
+    # so there is no window where the slot exists in neither state.
+    db.execute(
+        """
+        INSERT INTO saves (user_id, slot, class_id, name, level, area, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, slot) DO UPDATE SET
+            class_id   = excluded.class_id,
+            name       = excluded.name,
+            level      = excluded.level,
+            area       = excluded.area,
+            updated_at = excluded.updated_at
+        """,
+        (g.user["id"], slot, class_id, name, level, area, now),
+    )
+    db.commit()
+
+    return {"slot": slot, "updated_at": now}, 200
+
+
+# =============================================================================
+# PLAYER STATUS  -  GET /api/player/status
+# =============================================================================
+
+@app.get("/api/player/status")
+@require_auth
+def player_status():
+    """
+    Live stat values for the HUD
+    ---
+    tags:
+      - Player
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: query
+        name: slot
+        type: integer
+        required: true
+        description: Character slot, 0-3
+    responses:
+      200:
+        description: Current stats for that slot
+      400:
+        description: Missing or out-of-range slot
+      404:
+        description: That slot is empty
+      401:
+        description: Missing, invalid or expired token
+    """
+    slot = parse_slot(request.args.get("slot"))
+    if slot is None:
+        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+
+    row = get_db().execute(
+        "SELECT * FROM saves WHERE user_id = ? AND slot = ?",
+        (g.user["id"], slot),
+    ).fetchone()
+
+    # 404 is the right answer for an empty slot: the request was valid, the
+    # resource does not exist. The client distinguishes this from a transport
+    # failure and shows "no character here" instead of "server is down".
+    if row is None:
+        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
+
+    return {
+        "slot": row["slot"],
+        "level": row["level"],
+        "hp": row["hp"], "max_hp": row["max_hp"],
+        "mana": row["mana"], "max_mana": row["max_mana"],
+        "stamina": row["stamina"], "max_stamina": row["max_stamina"],
+        "gold": row["gold"],
+        "xp": row["xp"], "xp_to_next": row["xp_to_next"],
+    }, 200
+
+
+# =============================================================================
+# BANK  -  GET/POST /api/bank
+# =============================================================================
+
+def bank_payload(user_id, slot):
+    """
+    The WHOLE bank, always. Every bank response returns full state rather than
+    a delta, so the client never has to reconstruct what the server did to it.
+    Reconstructing is how bank duplication bugs get written.
+    """
+    db = get_db()
+
+    save = db.execute(
+        "SELECT bank_gold FROM saves WHERE user_id = ? AND slot = ?",
+        (user_id, slot),
+    ).fetchone()
+
+    rows = db.execute(
+        "SELECT item_id, quantity FROM bank_items WHERE user_id = ? AND slot = ? ORDER BY item_id",
+        (user_id, slot),
+    ).fetchall()
+
+    return {
+        "slot": slot,
+        "gold": save["bank_gold"] if save else 0,
+        "capacity": BANK_CAPACITY,
+        "items": [{"item_id": r["item_id"], "quantity": r["quantity"]} for r in rows],
+    }
+
+
+@app.get("/api/bank")
+@require_auth
+def read_bank():
+    """
+    Read the bank for one character slot
+    ---
+    tags:
+      - Bank
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: query
+        name: slot
+        type: integer
+        required: true
+        description: Character slot, 0-3
+    responses:
+      200:
+        description: Full bank contents
+      400:
+        description: Missing or out-of-range slot
+      401:
+        description: Missing, invalid or expired token
+    """
+    slot = parse_slot(request.args.get("slot"))
+    if slot is None:
+        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+
+    return bank_payload(g.user["id"], slot), 200
+
+
+@app.post("/api/bank")
+@require_auth
+def modify_bank():
+    """
+    Deposit or withdraw one item stack
+    ---
+    tags:
+      - Bank
+    consumes:
+      - application/json
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [slot, op, item_id, quantity]
+          properties:
+            slot:     {type: integer, example: 0}
+            op:       {type: string,  enum: [deposit, withdraw]}
+            item_id:  {type: string,  example: healthpotion}
+            quantity: {type: integer, example: 5}
+    responses:
+      200:
+        description: The full bank after the operation
+      400:
+        description: Bad slot, op, item_id, quantity, or withdrawing more than stored
+      409:
+        description: Deposit would exceed bank capacity
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+    user_id = g.user["id"]
+
+    slot = parse_slot(payload.get("slot"))
+    if slot is None:
+        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+
+    op = str(payload.get("op", "")).strip().lower()
+    if op not in ("deposit", "withdraw"):
+        return bad_request("op must be 'deposit' or 'withdraw'")
+
+    item_id = str(payload.get("item_id", "")).strip()
+    if not item_id or len(item_id) > 64:
+        return bad_request("item_id must be 1-64 characters")
+
+    raw_quantity = payload.get("quantity")
+    if isinstance(raw_quantity, bool):
+        return bad_request("quantity must be a positive integer")
+    try:
+        quantity = int(raw_quantity)
+    except (TypeError, ValueError):
+        return bad_request("quantity must be a positive integer")
+    if quantity <= 0:
+        return bad_request("quantity must be a positive integer")
+
+    db = get_db()
+
+    existing = db.execute(
+        "SELECT quantity FROM bank_items WHERE user_id = ? AND slot = ? AND item_id = ?",
+        (user_id, slot, item_id),
+    ).fetchone()
+    held = existing["quantity"] if existing else 0
+
+    if op == "deposit":
+        # Capacity counts DISTINCT stacks, not total items - so topping up a
+        # stack you already hold is always allowed even at a full bank.
+        if existing is None:
+            stacks = db.execute(
+                "SELECT COUNT(*) AS n FROM bank_items WHERE user_id = ? AND slot = ?",
+                (user_id, slot),
+            ).fetchone()["n"]
+            if stacks >= BANK_CAPACITY:
+                return {
+                    "error": "Conflict",
+                    "message": "Bank is full (%d stacks)." % BANK_CAPACITY,
+                }, 409
+
+        db.execute(
+            """
+            INSERT INTO bank_items (user_id, slot, item_id, quantity)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, slot, item_id) DO UPDATE SET
+                quantity = quantity + excluded.quantity
+            """,
+            (user_id, slot, item_id, quantity),
+        )
+    else:
+        # Refuse rather than clamp. Clamping a withdrawal of 10 from a stack
+        # of 3 silently destroys the player's request and leaves them unsure
+        # what they now hold; an error leaves the bank exactly as it was.
+        if quantity > held:
+            return bad_request(
+                "Cannot withdraw %d of '%s' - only %d stored." % (quantity, item_id, held)
+            )
+
+        if quantity == held:
+            # The CHECK constraint forbids quantity 0, so an emptied stack is
+            # deleted rather than zeroed. One representation of "none".
+            db.execute(
+                "DELETE FROM bank_items WHERE user_id = ? AND slot = ? AND item_id = ?",
+                (user_id, slot, item_id),
+            )
+        else:
+            db.execute(
+                "UPDATE bank_items SET quantity = quantity - ? WHERE user_id = ? AND slot = ? AND item_id = ?",
+                (quantity, user_id, slot, item_id),
+            )
+
+    db.commit()
+    return bank_payload(user_id, slot), 200
 
 
 if __name__ == "__main__":
