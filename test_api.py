@@ -140,6 +140,59 @@ status("write with no token", client.put("/api/save",
        json={"slot": 1, "class_id": "mage", "name": "X"}), 401)
 
 
+# --- active_pet_id ----------------------------------------------------------
+# A pet is a 1-in-216 drop, so "which pet is out" is the single most expensive
+# field in this table to lose. These checks exist because the obvious
+# implementation - treat a missing key as an empty value - would silently
+# unequip it on the next save from any caller that doesn't send it.
+
+check("a fresh slot has no pet", body["slots"][0]["active_pet_id"] == "",
+      body["slots"][0])
+
+status("equip a pet", client.put("/api/save", headers=H,
+       json={"slot": 0, "class_id": "warrior", "name": "Checker", "level": 13,
+             "active_pet_id": "petpoisonslimesmall"}), 200)
+body = status("read back the equipped pet", client.get("/api/save", headers=H), 200)
+check("the pet was stored",
+      body["slots"][0]["active_pet_id"] == "petpoisonslimesmall", body["slots"][0])
+
+status("save WITHOUT active_pet_id", client.put("/api/save", headers=H,
+       json={"slot": 0, "class_id": "warrior", "name": "Checker", "level": 14}), 200)
+body = status("read back after a pet-less save", client.get("/api/save", headers=H), 200)
+check("omitting the key LEAVES the pet equipped",
+      body["slots"][0]["active_pet_id"] == "petpoisonslimesmall", body["slots"][0])
+check("the rest of that save still applied",
+      body["slots"][0]["level"] == 14, body["slots"][0])
+
+status("swap pets", client.put("/api/save", headers=H,
+       json={"slot": 0, "class_id": "warrior", "name": "Checker", "level": 14,
+             "active_pet_id": "petpoisonslimelarge"}), 200)
+body = status("read back after a swap", client.get("/api/save", headers=H), 200)
+check("swapping replaces rather than accumulating",
+      body["slots"][0]["active_pet_id"] == "petpoisonslimelarge", body["slots"][0])
+
+status("clear the pet with an empty string", client.put("/api/save", headers=H,
+       json={"slot": 0, "class_id": "warrior", "name": "Checker", "level": 14,
+             "active_pet_id": ""}), 200)
+body = status("read back after clearing", client.get("/api/save", headers=H), 200)
+check("an explicit empty string DOES unequip",
+      body["slots"][0]["active_pet_id"] == "", body["slots"][0])
+
+status("pet id over 64 characters", client.put("/api/save", headers=H,
+       json={"slot": 0, "class_id": "warrior", "name": "Checker",
+             "active_pet_id": "p" * 65}), 400)
+status("pet id that isn't a string", client.put("/api/save", headers=H,
+       json={"slot": 0, "class_id": "warrior", "name": "Checker",
+             "active_pet_id": {"nope": 1}}), 400)
+
+# The server has no item registry, so an unknown pet id is accepted on purpose
+# - see the schema comment. This check pins that decision down rather than
+# leaving it to be "fixed" later by someone who assumes it was an oversight.
+status("unknown pet id is accepted by design", client.put("/api/save", headers=H,
+       json={"slot": 0, "class_id": "warrior", "name": "Checker",
+             "active_pet_id": "petfromafutureupdate"}), 200)
+
+
 # =============================================================================
 # PLAYER STATUS
 # =============================================================================

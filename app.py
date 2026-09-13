@@ -99,6 +99,13 @@ def init_db():
             xp          INTEGER NOT NULL DEFAULT 0,
             xp_to_next  INTEGER NOT NULL DEFAULT 100,
             bank_gold   INTEGER NOT NULL DEFAULT 0,
+            -- which pet this character currently has out, as the client's
+            -- item_id (e.g. 'petpoisonslimesmall'). Empty string means none.
+            -- Deliberately NOT validated against a list of known pets: the
+            -- server has no item registry and inventing one here would mean
+            -- every new pet the game adds needs a matching server deploy
+            -- before it could be equipped. Same reasoning as bank item_ids.
+            active_pet_id TEXT NOT NULL DEFAULT '',
             updated_at  INTEGER NOT NULL,
             PRIMARY KEY (user_id, slot),
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -119,8 +126,32 @@ def init_db():
         );
         """
     )
+
+    _migrate_add_column(db, "saves", "active_pet_id", "TEXT NOT NULL DEFAULT ''")
+
     db.commit()
     db.close()
+
+
+def _migrate_add_column(db, table, column, definition):
+    """
+    Add a column to an existing table, once.
+
+    CREATE TABLE IF NOT EXISTS does nothing to a table that already exists, so
+    a new column in the schema above reaches a FRESH database and no other.
+    elusion.db already holds real accounts and characters, and dropping it to
+    pick up a column would delete them - so existing databases get the column
+    added here instead.
+
+    PRAGMA table_info is the check rather than catching the "duplicate column"
+    error, because a bare try/except around ALTER would also swallow a genuine
+    failure (locked database, bad definition) and leave the column silently
+    missing until the first query against it.
+    """
+    existing = {row[1] for row in db.execute("PRAGMA table_info(%s)" % table)}
+    if column in existing:
+        return
+    db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, column, definition))
 
 
 init_db()
@@ -505,6 +536,27 @@ def bad_request(message):
     return {"error": "Bad Request", "message": message}, 400
 
 
+def parse_pet_id(raw):
+    """
+    Validate an active_pet_id from a request body.
+
+    Same shape as a bank item_id - any string the client's item registry knows,
+    capped at 64 characters. Empty string is valid and means "no pet out".
+    Returns None if the value can't be one, so the caller can 400 rather than
+    store something meaningless.
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, bool):
+        return None
+    if not isinstance(raw, (str, int, float)):
+        return None
+    text = str(raw).strip()
+    if len(text) > 64:
+        return None
+    return text
+
+
 def save_row_to_dict(row):
     return {
         "slot": row["slot"],
@@ -512,6 +564,7 @@ def save_row_to_dict(row):
         "name": row["name"],
         "level": row["level"],
         "area": row["area"],
+        "active_pet_id": row["active_pet_id"],
         "updated_at": row["updated_at"],
     }
 
@@ -575,11 +628,15 @@ def write_save():
             name:     {type: string,  example: Tunacan}
             level:    {type: integer, example: 12}
             area:     {type: string,  example: elusion}
+            active_pet_id:
+              type: string
+              example: petpoisonslimesmall
+              description: "Pet currently out, as the client's item_id. Empty string means none. Omitted leaves the stored value unchanged."
     responses:
       200:
         description: Slot written
       400:
-        description: Invalid slot, class or name
+        description: Invalid slot, class, name or active_pet_id
       401:
         description: Missing, invalid or expired token
     """
@@ -599,27 +656,54 @@ def write_save():
 
     level = max(1, int(payload.get("level", 1) or 1))
     area = str(payload.get("area", "elusion")).strip() or "elusion"
+
+    # OMITTED means "leave it alone", not "clear it".
+    #
+    # The client writes this slot on character creation and again on every save,
+    # and not every one of those callers knows or cares which pet is out. If a
+    # missing key cleared the field, one save from a caller that doesn't send it
+    # would silently unequip the player's pet - and a pet is a 1-in-216 drop, so
+    # that is the last thing in the game that should vanish by omission.
+    #
+    # Sending "" explicitly is how you clear it. That's a deliberate act.
+    pet_key_sent = "active_pet_id" in payload
+    active_pet_id = parse_pet_id(payload.get("active_pet_id")) if pet_key_sent else ""
+    if pet_key_sent and active_pet_id is None:
+        return bad_request("active_pet_id must be a string of at most 64 characters")
+
     now = int(time.time())
 
     db = get_db()
     # ON CONFLICT rather than DELETE-then-INSERT: an upsert is one statement,
     # so there is no window where the slot exists in neither state.
+    #
+    # active_pet_id uses excluded.* only when the caller actually sent the key;
+    # otherwise it keeps whatever the row already holds. On a fresh INSERT there
+    # is nothing to keep, so it lands as the '' default.
     db.execute(
         """
-        INSERT INTO saves (user_id, slot, class_id, name, level, area, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO saves (user_id, slot, class_id, name, level, area, active_pet_id, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id, slot) DO UPDATE SET
-            class_id   = excluded.class_id,
-            name       = excluded.name,
-            level      = excluded.level,
-            area       = excluded.area,
-            updated_at = excluded.updated_at
+            class_id      = excluded.class_id,
+            name          = excluded.name,
+            level         = excluded.level,
+            area          = excluded.area,
+            active_pet_id = CASE WHEN ? THEN excluded.active_pet_id
+                                 ELSE saves.active_pet_id END,
+            updated_at    = excluded.updated_at
         """,
-        (g.user["id"], slot, class_id, name, level, area, now),
+        (g.user["id"], slot, class_id, name, level, area, active_pet_id, now,
+         1 if pet_key_sent else 0),
     )
     db.commit()
 
-    return {"slot": slot, "updated_at": now}, 200
+    # active_pet_id is echoed back only when the caller actually set it, so a
+    # client can tell "you stored this" apart from "we left yours alone".
+    result = {"slot": slot, "updated_at": now}
+    if pet_key_sent:
+        result["active_pet_id"] = active_pet_id
+    return result, 200
 
 
 # =============================================================================
@@ -694,7 +778,7 @@ def bank_payload(user_id, slot):
     db = get_db()
 
     save = db.execute(
-        "SELECT bank_gold FROM saves WHERE user_id = ? AND slot = ?",
+        "SELECT gold, bank_gold FROM saves WHERE user_id = ? AND slot = ?",
         (user_id, slot),
     ).fetchone()
 
@@ -706,6 +790,10 @@ def bank_payload(user_id, slot):
     return {
         "slot": slot,
         "gold": save["bank_gold"] if save else 0,
+        # what the character is CARRYING. the gold endpoint moves value between
+        # these two numbers, so a client that only knew one of them could never
+        # show the player whether a withdrawal was even possible.
+        "carried_gold": save["gold"] if save else 0,
         "capacity": BANK_CAPACITY,
         "items": [{"item_id": r["item_id"], "quantity": r["quantity"]} for r in rows],
     }
@@ -861,6 +949,264 @@ def modify_bank():
             )
 
     db.commit()
+    return bank_payload(user_id, slot), 200
+
+
+# =============================================================================
+# PLAYER STATUS - WRITE
+# =============================================================================
+
+# Every stat the client is allowed to push, and the ceiling each one is
+# checked against. The client proposes; the server decides. A value that
+# cannot legally exist is refused rather than clamped, because clamping
+# hides the bug that produced it.
+STATUS_FIELDS = {
+    "level":       None,        # no paired maximum
+    "hp":          "max_hp",
+    "mana":        "max_mana",
+    "stamina":     "max_stamina",
+    "gold":        None,
+    "xp":          None,
+    "xp_to_next":  None,
+    "max_hp":      None,
+    "max_mana":    None,
+    "max_stamina": None,
+}
+
+# nothing in this game legitimately exceeds these. a number past one of them
+# means a corrupted save, an overflow, or someone editing packets - all three
+# are worth refusing rather than storing.
+STAT_CEILING = 1_000_000_000
+
+
+def parse_stat(raw):
+    """Return a non-negative int, or None if the value isn't one."""
+    if isinstance(raw, bool):
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if value < 0 or value > STAT_CEILING:
+        return None
+    return value
+
+
+@app.put("/api/player/status")
+@require_auth
+def write_player_status():
+    """
+    Push current stat values for one character slot
+    ---
+    tags:
+      - Player
+    consumes:
+      - application/json
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [slot]
+          properties:
+            slot:        {type: integer, example: 0}
+            level:       {type: integer, example: 12}
+            hp:          {type: integer, example: 88}
+            max_hp:      {type: integer, example: 120}
+            mana:        {type: integer, example: 30}
+            max_mana:    {type: integer, example: 60}
+            stamina:     {type: integer, example: 45}
+            max_stamina: {type: integer, example: 50}
+            gold:        {type: integer, example: 1450}
+            xp:          {type: integer, example: 15320}
+            xp_to_next:  {type: integer, example: 2100}
+    responses:
+      200:
+        description: The full status after the write
+      400:
+        description: A field was not a non-negative integer, or hp exceeded max_hp
+      404:
+        description: That slot is empty
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+    user_id = g.user["id"]
+
+    slot = parse_slot(payload.get("slot"))
+    if slot is None:
+        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+
+    row = get_db().execute(
+        "SELECT * FROM saves WHERE user_id = ? AND slot = ?",
+        (user_id, slot),
+    ).fetchone()
+    if row is None:
+        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
+
+    # PARTIAL UPDATE: only fields actually present are touched. A client that
+    # knows nothing about stamina can still push hp without silently zeroing
+    # everything it didn't mention.
+    updates = {}
+    for field in STATUS_FIELDS:
+        if field not in payload:
+            continue
+        value = parse_stat(payload[field])
+        if value is None:
+            return bad_request(
+                "%s must be a non-negative integer no greater than %d" % (field, STAT_CEILING)
+            )
+        updates[field] = value
+
+    if not updates:
+        return bad_request("no writable fields supplied")
+
+    # Validate against the state AFTER the merge, not against what was sent.
+    # Pushing hp=120 alone is illegal if stored max_hp is 100, but legal in the
+    # same request that raises max_hp to 120 - and order of keys in JSON must
+    # not decide which.
+    merged = {field: row[field] for field in STATUS_FIELDS}
+    merged.update(updates)
+
+    for field, cap_field in STATUS_FIELDS.items():
+        if cap_field is None:
+            continue
+        if merged[field] > merged[cap_field]:
+            return bad_request(
+                "%s (%d) cannot exceed %s (%d)" % (field, merged[field], cap_field, merged[cap_field])
+            )
+
+    assignments = ", ".join("%s = ?" % f for f in updates)
+    values = list(updates.values()) + [int(time.time()), user_id, slot]
+
+    db = get_db()
+    db.execute(
+        "UPDATE saves SET %s, updated_at = ? WHERE user_id = ? AND slot = ?" % assignments,
+        values,
+    )
+    db.commit()
+
+    return status_payload(user_id, slot), 200
+
+
+def status_payload(user_id, slot):
+    row = get_db().execute(
+        "SELECT * FROM saves WHERE user_id = ? AND slot = ?",
+        (user_id, slot),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "slot": row["slot"],
+        "level": row["level"],
+        "hp": row["hp"], "max_hp": row["max_hp"],
+        "mana": row["mana"], "max_mana": row["max_mana"],
+        "stamina": row["stamina"], "max_stamina": row["max_stamina"],
+        "gold": row["gold"],
+        "xp": row["xp"], "xp_to_next": row["xp_to_next"],
+    }
+
+
+# =============================================================================
+# BANK - GOLD
+# =============================================================================
+
+@app.post("/api/bank/gold")
+@require_auth
+def move_bank_gold():
+    """
+    Move gold between the character and the bank
+    ---
+    tags:
+      - Bank
+    consumes:
+      - application/json
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [slot, op, amount]
+          properties:
+            slot:   {type: integer, example: 0}
+            op:     {type: string,  enum: [deposit, withdraw]}
+            amount: {type: integer, example: 500}
+    responses:
+      200:
+        description: The full bank after the transfer, including carried gold
+      400:
+        description: Bad slot, op or amount, or not enough gold on the relevant side
+      404:
+        description: That slot is empty
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+    user_id = g.user["id"]
+
+    slot = parse_slot(payload.get("slot"))
+    if slot is None:
+        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+
+    op = str(payload.get("op", "")).strip().lower()
+    if op not in ("deposit", "withdraw"):
+        return bad_request("op must be 'deposit' or 'withdraw'")
+
+    amount = parse_stat(payload.get("amount"))
+    if amount is None or amount <= 0:
+        return bad_request("amount must be a positive integer")
+
+    db = get_db()
+    row = db.execute(
+        "SELECT gold, bank_gold FROM saves WHERE user_id = ? AND slot = ?",
+        (user_id, slot),
+    ).fetchone()
+    if row is None:
+        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
+
+    carried = row["gold"]
+    banked = row["bank_gold"]
+
+    # GOLD IS A TRANSFER, NOT A DEPOSIT. This is the one thing the server can
+    # verify that it cannot verify for items: it holds BOTH balances, so it
+    # can enforce that the total is conserved. For items it only ever sees the
+    # bank side - the client's inventory is not the server's to check, which is
+    # exactly why items and gold are different endpoints rather than one.
+    if op == "deposit":
+        if amount > carried:
+            return bad_request(
+                "Cannot deposit %d - only %d carried." % (amount, carried)
+            )
+        carried -= amount
+        banked += amount
+    else:
+        if amount > banked:
+            return bad_request(
+                "Cannot withdraw %d - only %d banked." % (amount, banked)
+            )
+        banked -= amount
+        carried += amount
+
+    # One UPDATE, so both sides move together or neither does. Two statements
+    # would leave a window where the gold exists in neither place.
+    db.execute(
+        "UPDATE saves SET gold = ?, bank_gold = ?, updated_at = ? WHERE user_id = ? AND slot = ?",
+        (carried, banked, int(time.time()), user_id, slot),
+    )
+    db.commit()
+
     return bank_payload(user_id, slot), 200
 
 
