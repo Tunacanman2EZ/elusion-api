@@ -162,6 +162,34 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
 
+        -- A loot bag the server rolled and still owns. The client renders a
+        -- copy; taking anything out of it is a request, checked against these
+        -- rows. That is what takes `gold` off the list of things a client can
+        -- simply declare.
+        CREATE TABLE IF NOT EXISTS loot_bags (
+            bag_id     TEXT    PRIMARY KEY,
+            user_id    INTEGER NOT NULL,
+            slot       INTEGER NOT NULL,
+            enemy_id   TEXT    NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_loot_bags_created ON loot_bags(created_at);
+
+        -- Position-keyed like every other container here. "Take slot 2" is a
+        -- request the server can answer exactly once; "take a healthpotion" is
+        -- ambiguous when the bag holds two stacks, and a client sending it twice
+        -- would be asking for a duplication bug.
+        CREATE TABLE IF NOT EXISTS loot_bag_items (
+            bag_id   TEXT    NOT NULL,
+            position INTEGER NOT NULL,
+            item_id  TEXT    NOT NULL,
+            quantity INTEGER NOT NULL CHECK (quantity > 0),
+            PRIMARY KEY (bag_id, position),
+            FOREIGN KEY (bag_id) REFERENCES loot_bags(bag_id) ON DELETE CASCADE
+        );
+
         CREATE TABLE IF NOT EXISTS skills (
             user_id  INTEGER NOT NULL,
             slot     INTEGER NOT NULL,
@@ -182,6 +210,10 @@ def init_db():
     # rate limit in /api/combat/kill. 0 means "never", which is correctly in the
     # past for every comparison.
     _migrate_add_column(db, "saves", "last_kill_at", "INTEGER NOT NULL DEFAULT 0")
+
+    # Kill-rate tokens. Defaults to the full bucket so an existing character is
+    # not penalised for having played before this column existed.
+    _migrate_add_column(db, "saves", "kill_tokens", "REAL NOT NULL DEFAULT 20.0")
 
     db.commit()
     db.close()
@@ -789,7 +821,11 @@ def write_save():
     if not name or len(name) > 20:
         return bad_request("name must be 1-20 characters")
 
-    level = max(1, int(payload.get("level", 1) or 1))
+    # NOT from the payload. level is server-owned (see SERVER_OWNED_STATS): a
+    # new character starts at 1, and an existing one keeps whatever the server
+    # has. Taking it from the client here would have left an open door beside
+    # the one /api/player/status just closed.
+    level = 1
     area = str(payload.get("area", "elusion")).strip() or "elusion"
 
     # OMITTED means "leave it alone", not "clear it".
@@ -809,6 +845,14 @@ def write_save():
     now = int(time.time())
 
     db = get_db()
+
+    # Checked BEFORE the upsert, because afterwards there is no way to tell a
+    # character that was just created from one that already existed - and they
+    # need different treatment below.
+    is_new = db.execute(
+        "SELECT 1 FROM saves WHERE user_id = ? AND slot = ?", (g.user["id"], slot)
+    ).fetchone() is None
+
     # ON CONFLICT rather than DELETE-then-INSERT: an upsert is one statement,
     # so there is no window where the slot exists in neither state.
     #
@@ -822,7 +866,10 @@ def write_save():
         ON CONFLICT(user_id, slot) DO UPDATE SET
             class_id      = excluded.class_id,
             name          = excluded.name,
-            level         = excluded.level,
+            -- level is NOT taken from excluded. The row keeps the level the
+            -- server granted through /api/combat/kill; the 1 in VALUES only
+            -- ever applies to a brand new character.
+            level         = saves.level,
             area          = excluded.area,
             active_pet_id = CASE WHEN ? THEN excluded.active_pet_id
                                  ELSE saves.active_pet_id END,
@@ -832,6 +879,44 @@ def write_save():
          1 if pet_key_sent else 0),
     )
     db.commit()
+
+    # DERIVED STATS BELONG ON A NEW CHARACTER TOO, not only on the next status
+    # write. Without this a freshly created warrior sat at the table's DEFAULT 10
+    # hp until something happened to push a status - and if the client had been
+    # trusted for max_hp, nobody would ever have noticed, because it would have
+    # overwritten the 10 on its first save.
+    #
+    # Recomputed on every save rather than only on creation: max_hp is a pure
+    # function of class and level, so there is no state where storing anything
+    # else is correct.
+    stored_level = db.execute(
+        "SELECT level FROM saves WHERE user_id = ? AND slot = ?", (g.user["id"], slot)
+    ).fetchone()["level"]
+    derived = gamedata.max_stats_for(class_id, stored_level)
+
+    if derived is not None:
+        if is_new:
+            # A new character starts with full pools. Only on creation - doing it
+            # on every save would refill the player's health for free.
+            db.execute(
+                """
+                UPDATE saves
+                   SET max_hp = ?, hp = ?, max_mana = ?, mana = ?,
+                       max_stamina = ?, stamina = ?
+                 WHERE user_id = ? AND slot = ?
+                """,
+                (derived["max_hp"], derived["max_hp"],
+                 derived["max_mana"], derived["max_mana"],
+                 derived["max_stamina"], derived["max_stamina"],
+                 g.user["id"], slot),
+            )
+        else:
+            db.execute(
+                "UPDATE saves SET max_hp = ?, max_mana = ?, max_stamina = ? WHERE user_id = ? AND slot = ?",
+                (derived["max_hp"], derived["max_mana"], derived["max_stamina"],
+                 g.user["id"], slot),
+            )
+        db.commit()
 
     # active_pet_id is echoed back only when the caller actually set it, so a
     # client can tell "you stored this" apart from "we left yours alone".
@@ -926,6 +1011,52 @@ STATUS_FIELDS = {
 # are worth refusing rather than storing.
 STAT_CEILING = 1_000_000_000
 
+# FIELDS THE SERVER OWNS. A client may send them; the server ignores the values
+# and keeps its own.
+#
+# These three are granted by /api/combat/kill, which applies the level-up loop
+# itself and commits the result. The server therefore already knows what they
+# should be, and an assertion from the client is not evidence of anything.
+#
+# THIS IS THE HALF THAT MAKES THE OTHER HALF MEAN SOMETHING. Moving the loot
+# roll to the server closed the "give myself a pet" hole, but while
+# /api/player/status accepted a level, a modified client could simply declare
+# itself level 60 and skip the game entirely. It could not do that until there
+# was a server-side record to contradict it - which is why this change had to
+# come second, not first.
+#
+# NOT IN THIS LIST, and honestly so:
+#
+#   gold          arrives by picking up a loot bag, and the pickup is still
+#                 client-side. The server rolled what was IN the bag but does
+#                 not know the player walked over it. Closing that needs the
+#                 bag itself to be server-owned - a bag id, and an endpoint
+#                 that transfers from it. That is the next piece.
+#   hp/mana/      the result of combat and regen the server does not simulate.
+#   stamina       Clamped against their maxima below, which is all the server
+#                 can honestly say about them.
+#   hp/mana/      the result of combat and regen the server does not simulate.
+#   stamina       Clamped against their maxima below, which is all the server
+#                 can honestly say about them.
+# The two item ids that resolve into carried gold rather than a backpack cell.
+# Read from gamedata so the authored source stays baseenemy.gd's constants.
+CONSTANTS_GOLD_SMALL = gamedata.CONSTANTS.get("gold_small_id", "smallamountofgold")
+CONSTANTS_GOLD_LARGE = gamedata.CONSTANTS.get("gold_large_id", "largeamountofgold")
+
+SERVER_OWNED_STATS = ("level", "xp", "xp_to_next")
+
+# DERIVED, not merely owned. These are not stored from a request at all - they
+# are recomputed from the character's class and level every time the status is
+# written, using the same curve the client runs:
+#
+#     max_hp = hp_base + (level - 1) * hp_per_lvl
+#
+# That curve used to be four literals inside warrior.gd's _set_stat_curve(), so
+# the server knew your level AND your class and still could not work out your
+# maximum health. ClassData moved it into data/classes/*.tres and the exporter
+# carries it here - the same route EnemyData took.
+DERIVED_STATS = ("max_hp", "max_mana", "max_stamina")
+
 
 def parse_stat(raw):
     """Return a non-negative int, or None if the value isn't one."""
@@ -1001,10 +1132,33 @@ def write_player_status():
     # PARTIAL UPDATE: only fields actually present are touched. A client that
     # knows nothing about stamina can still push hp without silently zeroing
     # everything it didn't mention.
+    # RECOMPUTED BEFORE ANYTHING IS VALIDATED, so that hp is checked against the
+    # maximum the server believes in rather than the one the client sent. A
+    # client declaring max_hp = 999999 alongside hp = 999999 would otherwise pass
+    # the paired check below on its own say-so.
+    derived = gamedata.max_stats_for(row["class_id"], row["level"])
+
     updates = {}
+    ignored = []
     for field in STATUS_FIELDS:
         if field not in payload:
             continue
+
+        # Derived fields are dropped from the request for the same reason as
+        # owned ones, but they are then written back from the curve - see below.
+        if derived is not None and field in DERIVED_STATS:
+            ignored.append(field)
+            continue
+
+        # IGNORED, NOT REFUSED. A 400 here would break every honest save: the
+        # client sends its whole status block and has no way to know which
+        # fields the server has taken ownership of. Dropping them silently and
+        # reporting which ones were dropped lets an honest client carry on and
+        # gives a dishonest one nothing.
+        if field in SERVER_OWNED_STATS:
+            ignored.append(field)
+            continue
+
         value = parse_stat(payload[field])
         if value is None:
             return bad_request(
@@ -1012,7 +1166,7 @@ def write_player_status():
             )
         updates[field] = value
 
-    if not updates:
+    if not updates and not ignored:
         return bad_request("no writable fields supplied")
 
     # Validate against the state AFTER the merge, not against what was sent.
@@ -1022,25 +1176,49 @@ def write_player_status():
     merged = {field: row[field] for field in STATUS_FIELDS}
     merged.update(updates)
 
+    if derived is not None:
+        # The server's own numbers go in AFTER the client's, so they win, and
+        # they are added to `updates` so they are actually written - a character
+        # that levelled up needs its new maximum stored, not just enforced.
+        merged.update(derived)
+        updates.update(derived)
+
     for field, cap_field in STATUS_FIELDS.items():
         if cap_field is None:
             continue
         if merged[field] > merged[cap_field]:
+            # CLAMPED, not refused, when the ceiling is one the server derived.
+            #
+            # A character at full health who levels DOWN - or whose class curve
+            # is retuned downward between releases - legitimately arrives with
+            # hp above the new max_hp. Refusing would make that character
+            # unsaveable. Clamping is the honest reading: you have as much health
+            # as the curve allows.
+            if cap_field in DERIVED_STATS and derived is not None:
+                merged[field] = merged[cap_field]
+                updates[field] = merged[cap_field]
+                continue
             return bad_request(
                 "%s (%d) cannot exceed %s (%d)" % (field, merged[field], cap_field, merged[cap_field])
             )
 
-    assignments = ", ".join("%s = ?" % f for f in updates)
-    values = list(updates.values()) + [int(time.time()), user_id, slot]
-
     db = get_db()
-    db.execute(
-        "UPDATE saves SET %s, updated_at = ? WHERE user_id = ? AND slot = ?" % assignments,
-        values,
-    )
-    db.commit()
+    if updates:
+        assignments = ", ".join("%s = ?" % f for f in updates)
+        values = list(updates.values()) + [int(time.time()), user_id, slot]
+        db.execute(
+            "UPDATE saves SET %s, updated_at = ? WHERE user_id = ? AND slot = ?" % assignments,
+            values,
+        )
+        db.commit()
 
-    return status_payload(user_id, slot), 200
+    result = status_payload(user_id, slot)
+    if ignored:
+        # The server's own values are already in `result`; this just names what
+        # was disregarded, so a client can see it is being corrected rather than
+        # wondering why its level did not stick.
+        result["ignored"] = ignored
+    return result, 200
 
 
 def status_payload(user_id, slot):
@@ -1399,19 +1577,42 @@ def move_bank_gold():
 # often than it should.
 # -----------------------------------------------------------------------------
 
-# Minimum seconds between two kills on the same character.
+# A TOKEN BUCKET, NOT A MINIMUM GAP.
 #
-# A rate limit, not a simulation. The server has no idea where anything is or
-# how long a fight should take, so this cannot prove a kill was real - it only
-# caps how fast a script could farm one. 0.35s is comfortably under any honest
-# kill (your fastest enemy has a 1.2s attack cooldown and 35 hp at the very
-# least) while turning "unlimited XP in a loop" into "XP at roughly three per
-# second", which is slow enough to be visible in the numbers.
+# This was "one kill per 0.35 seconds", and it refused legitimate kills within
+# an hour of shipping:
 #
-# The real answer is the server knowing which enemies exist and having handed
-# this client that one. That needs the server to own spawning, which is phase
-# two. This is the honest placeholder until then.
-KILL_COOLDOWN_SECONDS = 0.35
+#     [KILL] bushmage refused — Kills are limited to one per 0.35s.
+#     [KILL] poisonslimesmall refused — Kills are limited to one per 0.35s.
+#
+# A large poison slime splits into four smalls. An area attack kills several
+# enemies in the same frame. Real combat is BURSTY, and no minimum gap can ever
+# allow a burst - that is what a minimum gap is for. The player lost those
+# rewards, which is the worst possible failure for a limit that cannot prove
+# anything in the first place.
+#
+# A bucket separates the two shapes. Twenty tokens covers any burst a player can
+# actually produce: a slime split, an aura wipe, a slashwave through a group.
+# One token per second refills it, so sustained farming is capped at sixty kills
+# a minute - roughly double the fastest honest rate observed - while a script
+# asking for ten thousand kills now needs about three hours and shows up plainly
+# in the data.
+#
+# WHAT THIS IS NOT: proof. The server cannot tell a real kill from a claimed
+# one; it has no idea where anything is. This caps the rate and nothing more.
+# The real answer is the server owning which enemies exist and having handed
+# this client that one.
+# SIZED FOR A GAME THAT THROWS CROWDS AT YOU. Darza's Dominion - one of this
+# project's stated inspirations - puts dozens of enemies on screen and expects
+# you to clear them without pausing, and Elusion is aiming at the same feel. A
+# bucket that a good fight can empty is a bucket that punishes playing well.
+#
+# Fifty covers any burst a screen can hold. Five a second sustained is three
+# hundred kills a minute, comfortably above the fastest honest rate and still
+# bounded: a script wanting ten thousand kills needs half an hour rather than a
+# few seconds, which is the difference between an exploit and a chore.
+KILL_BUCKET_CAPACITY = 50.0
+KILL_TOKENS_PER_SECOND = 5.0
 
 
 @app.post("/api/combat/kill")
@@ -1480,22 +1681,33 @@ def combat_kill():
 
     db = get_db()
     row = db.execute(
-        "SELECT level, xp, xp_to_next, last_kill_at FROM saves WHERE user_id = ? AND slot = ?",
+        "SELECT class_id, level, xp, xp_to_next, last_kill_at, kill_tokens FROM saves WHERE user_id = ? AND slot = ?",
         (user_id, slot),
     ).fetchone()
     if row is None:
         return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
 
     now_ms = int(time.time() * 1000)
-    since_last = now_ms - int(row["last_kill_at"])
-    if since_last < KILL_COOLDOWN_SECONDS * 1000:
+
+    # Refill first, then spend. last_kill_at of 0 means this character has never
+    # reported a kill, and the elapsed time since 1970 would overfill the bucket
+    # - min() against the capacity handles that without a special case.
+    elapsed_seconds = max(now_ms - int(row["last_kill_at"]), 0) / 1000.0
+    tokens = min(
+        KILL_BUCKET_CAPACITY,
+        float(row["kill_tokens"]) + elapsed_seconds * KILL_TOKENS_PER_SECOND,
+    )
+
+    if tokens < 1.0:
         # 429 rather than 400: nothing about the request is malformed, it simply
-        # arrived too soon. An honest client that hit this because of a lag
-        # spike can read that and retry; a 400 would tell it to give up.
+        # arrived faster than the bucket allows. An honest client can read that
+        # and retry; a 400 would tell it to give up.
         return {
             "error": "Too Many Requests",
-            "message": "Kills are limited to one per %.2fs." % KILL_COOLDOWN_SECONDS,
+            "message": "Kills are arriving faster than %g per second." % KILL_TOKENS_PER_SECOND,
         }, 429
+
+    tokens -= 1.0
 
     # ---- everything above this line is validation; everything below commits --
 
@@ -1505,26 +1717,63 @@ def combat_kill():
         int(row["level"]), int(row["xp"]), int(row["xp_to_next"]), rewards["xp"]
     )
 
+    # A LEVEL-UP MOVES THE MAXIMA WITH IT.
+    #
+    # Without this the level changed here and max_hp did not, so a character who
+    # levelled from a kill carried the previous level's maximum until something
+    # happened to write a status - and /api/player/status GET returns the stored
+    # row, so the player would simply see the wrong number.
+    #
+    # Found by a test asserting max_hp against the curve rather than against a
+    # hardcoded 180: the moment a kill-burst test started levelling the
+    # character up, the stale value stopped matching.
+    derived = gamedata.max_stats_for(row["class_id"], level) if levels_gained else None
+
     # ONE UPDATE. The XP, the level and the cooldown stamp move together or not
     # at all - the same reasoning as the bank gold transfer. Two statements
     # would leave a window where a crash could bank the XP and lose the level,
     # or stamp the cooldown for a kill that was never paid.
-    db.execute(
-        """
-        UPDATE saves
-           SET level = ?, xp = ?, xp_to_next = ?, last_kill_at = ?, updated_at = ?
-         WHERE user_id = ? AND slot = ?
-        """,
-        (level, xp, xp_to_next, now_ms, int(time.time()), user_id, slot),
-    )
+    if derived is None:
+        db.execute(
+            """
+            UPDATE saves
+               SET level = ?, xp = ?, xp_to_next = ?,
+                   last_kill_at = ?, kill_tokens = ?, updated_at = ?
+             WHERE user_id = ? AND slot = ?
+            """,
+            (level, xp, xp_to_next, now_ms, tokens, int(time.time()), user_id, slot),
+        )
+    else:
+        # One statement, so the level and the maxima it implies can never be
+        # stored apart from each other.
+        db.execute(
+            """
+            UPDATE saves
+               SET level = ?, xp = ?, xp_to_next = ?,
+                   max_hp = ?, max_mana = ?, max_stamina = ?,
+                   last_kill_at = ?, kill_tokens = ?, updated_at = ?
+             WHERE user_id = ? AND slot = ?
+            """,
+            (level, xp, xp_to_next,
+             derived["max_hp"], derived["max_mana"], derived["max_stamina"],
+             now_ms, tokens, int(time.time()), user_id, slot),
+        )
     db.commit()
 
-    # The loot is RETURNED, not stored. The client spawns the bag from this and
-    # the player still has to walk over and take it - which is the part that
-    # remains client-side for now, and the part the second half of this change
-    # has to close. What the server has fixed is that the contents below were
-    # decided here, with entropy the client never sees.
+    # THE BAG IS STORED, and its id goes back with the contents. The client
+    # spawns a node to render it, but the node is a picture: taking anything out
+    # of it goes through /api/loot/take, against these rows.
+    #
+    # An empty bag_id means nothing dropped, and the client spawns nothing.
+    #
+    # `stored` is the roll with a position stamped on every entry - which is
+    # what the client renders into its grid and what it sends back to take
+    # anything out. The roll itself is never returned: position is not a detail
+    # the two sides should be inferring separately.
+    bag_id, stored = _create_loot_bag(user_id, slot, enemy_id, rewards["contents"])
+
     return {
+        "bag_id": bag_id,
         "enemy_id": enemy_id,
         "xp_gained": rewards["xp"],
         "attack_xp_gained": rewards["attack_xp"],
@@ -1533,7 +1782,7 @@ def combat_kill():
         "xp": xp,
         "xp_to_next": xp_to_next,
         "pet_won": rewards["pet_won"],
-        "contents": rewards["contents"],
+        "contents": stored,
     }, 200
 
 
@@ -1939,6 +2188,445 @@ def write_skills():
     db.commit()
 
     return {"slot": slot, "skills": skills_payload(user_id, slot)}, 200
+
+
+# =============================================================================
+# LOOT BAGS
+# =============================================================================
+#
+# THE LAST THING THE CLIENT GETS TO ASSERT.
+#
+# /api/combat/kill already decides what drops. But the bag then existed only in
+# the client's world: it spawned a node, the player walked over it, items landed
+# in the local inventory, and the next save simply TOLD the server what was now
+# being carried. The server rolled a potion and had no idea whether you picked it
+# up, dropped it, or invented forty more.
+#
+# That is why `gold` is still on the client-asserted list next to
+# SERVER_OWNED_STATS. Closing it means the bag has to exist HERE:
+#
+#   1. A kill that drops something creates a bag with an unguessable id.
+#   2. The client renders it, but the contents it renders are a copy.
+#   3. Taking an item is a REQUEST. The server checks the bag is yours, that it
+#      still holds that item, and moves it into your backpack or your purse.
+#
+# After this, gold and carried items only change through an endpoint that
+# verified where they came from.
+#
+# WHY POSITION-KEYED, LIKE EVERY OTHER CONTAINER HERE
+# ---------------------------------------------------
+# Same reason as carry_items and bank_items: "take the item in slot 2" is a
+# request the server can answer exactly once, whereas "take a smallhealthpotion"
+# is ambiguous when the bag holds two stacks of them, and a client that sends it
+# twice would be asking for a duplication bug.
+
+# How long the server will honour a bag after it is created.
+#
+# Deliberately far longer than the client's LOOT_BAG_DESPAWN_SECONDS (20). The
+# client despawning the node is a display decision; if the two disagree the
+# player should lose the bag to the ANIMATION, never to a 410 from a server that
+# expired it a moment early. This exists to stop bags accumulating forever, not
+# to enforce the despawn.
+LOOT_BAG_TTL_SECONDS = 600
+
+# Matches BANK_CAPACITY's role for the backpack. The client's grid is 20 cells.
+CARRY_CAPACITY = INVENTORY_CAPACITY
+
+# The loot panel's grid, in cells. lootbaginventory.gd's LOOT_SIZE.
+#
+# The position IS the grid cell on both sides - that is what lets the client
+# send "take cell 2" and mean the thing the player is looking at. A bag rolled
+# with more entries than the panel can show would put loot behind a cell that
+# does not exist, and the player would never be able to ask for it. Rolls are
+# currently capped at five (one gold pile, three item slots, one pet), so this
+# is a guard against a future enemy config, not a live condition.
+LOOT_BAG_CAPACITY = 6
+
+# The item_id the client uses for the lusion pile - lootbaginventory.gd's
+# LUSION_ITEM_ID. There is no constant for it in gamedata.json because the game
+# has never needed to name it; the server does, because it is what a duplicate
+# pet turns into.
+LUSIONS_ITEM_ID = "lusions"
+
+
+def _create_loot_bag(user_id, slot, enemy_id, contents):
+    """
+    Store a rolled bag and return (bag_id, stored_contents).
+
+    stored_contents carries the POSITION of every entry, because that position
+    is the only thing /api/loot/take accepts. Returning the roll unstamped and
+    letting the client infer position from array order would work right up until
+    something reordered or dropped an entry between here and there - and the
+    failure would be the client asking for the wrong item, silently.
+
+    bag_id is secrets.token_urlsafe, not a row counter: a sequential id would
+    let a client ask for bag 4,102 and find out what someone else killed.
+    """
+    if not contents:
+        return "", []
+
+    if len(contents) > LOOT_BAG_CAPACITY:
+        # Logged rather than raised. A player mid-fight should not lose a kill
+        # because an enemy was configured to drop seven things; they lose the
+        # overflow, and the log says why.
+        app.logger.warning(
+            "loot: %s rolled %d entries, truncating to the panel's %d cells",
+            enemy_id, len(contents), LOOT_BAG_CAPACITY,
+        )
+        contents = contents[:LOOT_BAG_CAPACITY]
+
+    stored = [
+        {"position": position, "item_id": entry["item_id"], "quantity": int(entry["quantity"])}
+        for position, entry in enumerate(contents)
+    ]
+
+    bag_id = secrets.token_urlsafe(16)
+    now = int(time.time())
+
+    db = get_db()
+    db.execute(
+        "INSERT INTO loot_bags (bag_id, user_id, slot, enemy_id, created_at) VALUES (?, ?, ?, ?, ?)",
+        (bag_id, user_id, slot, enemy_id, now),
+    )
+    db.executemany(
+        "INSERT INTO loot_bag_items (bag_id, position, item_id, quantity) VALUES (?, ?, ?, ?)",
+        [(bag_id, e["position"], e["item_id"], e["quantity"]) for e in stored],
+    )
+
+    # Opportunistic cleanup. Bags are small and expire on their own terms, so
+    # this runs here rather than on a schedule - a player who is killing things
+    # is exactly the player generating rows worth clearing.
+    db.execute(
+        "DELETE FROM loot_bags WHERE created_at < ?", (now - LOOT_BAG_TTL_SECONDS,)
+    )
+
+    db.commit()
+    return bag_id, stored
+
+
+def _owns_item(user_id, slot, item_id):
+    """
+    True when this account already holds item_id in the backpack or the bank.
+
+    Only pets ask. The bank is account-scoped and the backpack is per-character,
+    which is deliberate: a pet is a collectible, and having caught one on your
+    warrior should stop it dropping again for your mage - which is exactly what
+    the bank half covers, since that is where a collection ends up.
+    """
+    if get_db().execute(
+        "SELECT 1 FROM carry_items WHERE user_id = ? AND slot = ? AND item_id = ? LIMIT 1",
+        (user_id, slot, item_id),
+    ).fetchone():
+        return True
+    return get_db().execute(
+        "SELECT 1 FROM bank_items WHERE user_id = ? AND item_id = ? LIMIT 1",
+        (user_id, item_id),
+    ).fetchone() is not None
+
+
+def _add_to_backpack(user_id, slot, item_id, quantity):
+    """
+    Put quantity of item_id into the backpack the way the CLIENT would, and
+    return the cells touched - or None when it does not fit.
+
+    TOPS UP EXISTING STACKS FIRST, then fills empty cells. That is not a nicety:
+    the response hands `inventory` back as the authoritative layout, and the
+    client applies it. If this dropped every pickup into the lowest free cell
+    while InventoryContainer.add_stack_partial() merged onto a part-used stack,
+    the two would lay the same bag out differently and the player would watch
+    their potions split across cells on every loot.
+
+    Writes nothing unless the whole quantity fits. A half-completed pickup is
+    the shape of bug that ends with an item in neither the bag nor the bag.
+    """
+    definition = gamedata.ITEMS.get(item_id, {})
+    stackable = bool(definition.get("stackable", False))
+    max_stack = int(definition.get("max_stack", 1)) if stackable else 1
+    if max_stack < 1:
+        max_stack = 1
+
+    rows = get_db().execute(
+        "SELECT position, item_id, quantity FROM carry_items WHERE user_id = ? AND slot = ? ORDER BY position",
+        (user_id, slot),
+    ).fetchall()
+
+    occupied = {int(r["position"]): (r["item_id"], int(r["quantity"])) for r in rows}
+
+    remaining = int(quantity)
+    writes = []  # (position, item_id, new_quantity)
+
+    if stackable:
+        for position in sorted(occupied):
+            if remaining <= 0:
+                break
+            held_id, held_qty = occupied[position]
+            if held_id != item_id or held_qty >= max_stack:
+                continue
+            room = max_stack - held_qty
+            moved = min(room, remaining)
+            writes.append((position, item_id, held_qty + moved))
+            remaining -= moved
+
+    for position in range(CARRY_CAPACITY):
+        if remaining <= 0:
+            break
+        if position in occupied:
+            continue
+        moved = min(max_stack, remaining)
+        writes.append((position, item_id, moved))
+        occupied[position] = (item_id, moved)
+        remaining -= moved
+
+    if remaining > 0:
+        return None
+
+    db = get_db()
+    for position, written_id, written_qty in writes:
+        db.execute(
+            """
+            INSERT INTO carry_items (user_id, slot, position, item_id, quantity)
+                 VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, slot, position)
+              DO UPDATE SET item_id = excluded.item_id, quantity = excluded.quantity
+            """,
+            (user_id, slot, position, written_id, written_qty),
+        )
+
+    return [position for position, _, _ in writes]
+
+
+@app.post("/api/loot/take")
+@require_auth
+def take_loot():
+    """
+    Take one item out of a loot bag
+    ---
+    tags:
+      - Loot
+    consumes:
+      - application/json
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [bag_id, position]
+          properties:
+            bag_id:   {type: string,  example: k3Jx9_QpZ2mNvRt1}
+            position: {type: integer, example: 0}
+    responses:
+      200:
+        description: What was taken, and the state it landed in
+      400:
+        description: Bad bag_id or position
+      404:
+        description: No such bag, not yours, or that cell is already empty
+      409:
+        description: Backpack full - the item stays in the bag
+      410:
+        description: The bag has expired
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+    user_id = g.user["id"]
+
+    bag_id = str(payload.get("bag_id", "")).strip()
+    if not bag_id or len(bag_id) > 64:
+        return bad_request("bag_id must be 1-64 characters")
+
+    # Bounded by the BAG's capacity, not the backpack's. They were the same
+    # number by accident, and a cell index from a 6-cell grid validated against
+    # a 20-cell one is a check that reads as if it is doing something.
+    position = parse_stat(payload.get("position"))
+    if position is None or position >= LOOT_BAG_CAPACITY:
+        return bad_request("position must be an integer 0-%d" % (LOOT_BAG_CAPACITY - 1))
+
+    db = get_db()
+
+    # SCOPED TO user_id IN THE QUERY ITSELF, not checked afterwards. A bag that
+    # belongs to someone else and a bag that does not exist return exactly the
+    # same 404 - there is nothing to learn from asking.
+    bag = db.execute(
+        "SELECT slot, created_at FROM loot_bags WHERE bag_id = ? AND user_id = ?",
+        (bag_id, user_id),
+    ).fetchone()
+    if bag is None:
+        return {"error": "Not Found", "message": "No such loot bag."}, 404
+
+    if int(bag["created_at"]) < int(time.time()) - LOOT_BAG_TTL_SECONDS:
+        db.execute("DELETE FROM loot_bags WHERE bag_id = ?", (bag_id,))
+        db.commit()
+        return {"error": "Gone", "message": "That loot bag has expired."}, 410
+
+    item = db.execute(
+        "SELECT item_id, quantity FROM loot_bag_items WHERE bag_id = ? AND position = ?",
+        (bag_id, position),
+    ).fetchone()
+    if item is None:
+        # Already taken, or never there. Same answer either way, and it is the
+        # answer that makes a duplicate request harmless: the second one finds
+        # nothing and changes nothing.
+        return {"error": "Not Found", "message": "Nothing in that slot of the bag."}, 404
+
+    slot = int(bag["slot"])
+    item_id = item["item_id"]
+    quantity = int(item["quantity"])
+    definition = gamedata.ITEMS.get(item_id, {})
+    kind = definition.get("type_name", "")
+
+    # WHAT WAS IN THE BAG vs WHAT THE PLAYER ACTUALLY GETS. Those are the same
+    # thing for everything except a pet you already own, and the client needs
+    # both: item_id/quantity to know which cell to clear, granted_* to know what
+    # to say in the notice.
+    result = {"bag_id": bag_id, "position": position, "item_id": item_id, "quantity": quantity}
+    granted_id = item_id
+    granted_qty = quantity
+
+    # A DUPLICATE PET BECOMES LUSIONS, AND THAT DECISION MOVED HERE.
+    #
+    # lootbaginventory.gd used to make it, in _load_contents(), by checking the
+    # local inventory and the local bank. Both of those are now views of rows
+    # this process owns, so the client was checking a copy to decide what a pet
+    # was worth - and a client that decides what it is owed is the thing this
+    # whole endpoint exists to stop.
+    #
+    # The panel still DISPLAYS the substitution so the player sees lusions in
+    # the bag rather than a pet that turns into lusions. That is cosmetic. This
+    # is the grant.
+    if kind == "PET" and _owns_item(user_id, slot, item_id):
+        kind = "CURRENCY"
+        granted_id = LUSIONS_ITEM_ID
+        granted_qty = int(gamedata.CONSTANTS.get("dupe_pet_lusions", 20))
+        result["duplicate_pet"] = True
+
+    if kind == "CURRENCY":
+        # CURRENCY RESOLVES INTO A BALANCE RATHER THAN A BACKPACK CELL. This is
+        # the whole point of the exercise: gold entering the game now goes
+        # through a statement the server wrote, against a bag the server rolled.
+        if granted_id in (CONSTANTS_GOLD_SMALL, CONSTANTS_GOLD_LARGE):
+            db.execute(
+                "UPDATE saves SET gold = gold + ?, updated_at = ? WHERE user_id = ? AND slot = ?",
+                (granted_qty, int(time.time()), user_id, slot),
+            )
+            result["credited"] = "gold"
+        else:
+            # Lusions, and anything else account-scoped that shows up later.
+            _ensure_account(user_id)
+            db.execute(
+                "UPDATE accounts SET lusions = lusions + ? WHERE user_id = ?",
+                (granted_qty, user_id),
+            )
+            result["credited"] = "lusions"
+    else:
+        written = _add_to_backpack(user_id, slot, granted_id, granted_qty)
+        if written is None:
+            # 409, and the item stays where it is. Refusing beats dropping it on
+            # the floor: the player can make room and ask again. Nothing was
+            # written - _add_to_backpack is all-or-nothing.
+            return {
+                "error": "Conflict",
+                "message": "Your backpack is full (%d slots)." % CARRY_CAPACITY,
+            }, 409
+
+        result["credited"] = "inventory"
+        result["carry_positions"] = written
+
+    result["granted_item_id"] = granted_id
+    result["granted_quantity"] = granted_qty
+
+    # Removed only after it has landed somewhere. If the insert above had failed
+    # the transaction carries the delete with it, so an item cannot evaporate
+    # between the two.
+    db.execute(
+        "DELETE FROM loot_bag_items WHERE bag_id = ? AND position = ?", (bag_id, position)
+    )
+
+    remaining = db.execute(
+        "SELECT COUNT(*) FROM loot_bag_items WHERE bag_id = ?", (bag_id,)
+    ).fetchone()[0]
+    if remaining == 0:
+        db.execute("DELETE FROM loot_bags WHERE bag_id = ?", (bag_id,))
+
+    db.commit()
+
+    result["bag_empty"] = remaining == 0
+
+    # THE BALANCES GO BACK AS TOTALS, NOT AS THE DELTA THAT WAS JUST APPLIED.
+    #
+    # The client still pushes `gold` on every save, so a client that added the
+    # delta to its own figure and got it wrong once would overwrite this row
+    # with the wrong number on the very next save - and the loss would look like
+    # nothing at all. Handing back the balance it landed on means a client that
+    # misses a response is corrected by the next one it does get.
+    result["status"] = status_payload(user_id, slot)
+    result["inventory"] = inventory_payload(user_id, slot)
+    result["lusions"] = int(_ensure_account(user_id)["lusions"])
+    return result, 200
+
+
+@app.get("/api/loot/bag")
+@require_auth
+def read_loot_bag():
+    """
+    What is still in a loot bag
+    ---
+    tags:
+      - Loot
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: query
+        name: bag_id
+        type: string
+        required: true
+    responses:
+      200:
+        description: The bag's remaining contents
+      404:
+        description: No such bag, or not yours
+      401:
+        description: Missing, invalid or expired token
+    """
+    # Exists so a client that reconnects, or one that is unsure whether a take
+    # landed, can ask rather than guess. A bag the server has already emptied is
+    # a 404, which is the same answer as never having existed - and the right
+    # one, because in both cases there is nothing to collect.
+    bag_id = str(request.args.get("bag_id", "")).strip()
+    if not bag_id:
+        return bad_request("bag_id is required")
+
+    user_id = g.user["id"]
+    bag = get_db().execute(
+        "SELECT slot, enemy_id, created_at FROM loot_bags WHERE bag_id = ? AND user_id = ?",
+        (bag_id, user_id),
+    ).fetchone()
+    if bag is None:
+        return {"error": "Not Found", "message": "No such loot bag."}, 404
+
+    rows = get_db().execute(
+        "SELECT position, item_id, quantity FROM loot_bag_items WHERE bag_id = ? ORDER BY position",
+        (bag_id,),
+    ).fetchall()
+
+    return {
+        "bag_id": bag_id,
+        "slot": int(bag["slot"]),
+        "enemy_id": bag["enemy_id"],
+        "contents": [
+            {"position": int(r["position"]), "item_id": r["item_id"], "quantity": int(r["quantity"])}
+            for r in rows
+        ],
+    }, 200
 
 
 # =============================================================================

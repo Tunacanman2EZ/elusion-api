@@ -80,19 +80,55 @@ def _load():
 
     items = {row["item_id"]: row for row in raw.get("items", [])}
     enemies = {row["enemy_id"]: row for row in raw.get("enemies", [])}
+    classes = {row["class_id"]: row for row in raw.get("classes", [])}
 
     if not items:
         raise GameDataError("gamedata.json contains no items.")
     if not enemies:
         raise GameDataError("gamedata.json contains no enemies.")
 
-    return raw.get("constants", {}), items, enemies
+    # Classes may be absent in a gamedata.json produced before they were
+    # exported. Not fatal: max_stats_for() falls back to trusting the client,
+    # which is where the server already was. An empty roster with no warning
+    # would be worse - it would look like the check was running.
+    if not classes:
+        print("gamedata: no classes in %s - max_hp/max_mana/max_stamina cannot "
+              "be verified. Re-run exportgamedata.gd." % GAMEDATA_PATH)
+
+    return raw.get("constants", {}), items, enemies, classes
 
 
 # Loaded once at import. Failing here takes the whole server down on start,
 # which is correct: a server that cannot roll loot should not accept kills and
 # quietly grant nothing.
-CONSTANTS, ITEMS, ENEMIES = _load()
+CONSTANTS, ITEMS, ENEMIES, CLASSES = _load()
+
+
+def max_stats_for(class_id, level):
+    """
+    What a character of this class SHOULD have at this level.
+
+    Port of Player._recompute_max_stats():
+
+        max_hp = hp_base + (level - 1) * hp_per_lvl
+
+    Level 1 gets exactly the base, which is what the -1 is for. Both
+    implementations must agree on that or every character is one level out.
+
+    Returns None for an unknown class, meaning "no opinion" - the caller then
+    leaves the client's values alone rather than zeroing a character it cannot
+    describe.
+    """
+    curve = CLASSES.get(class_id)
+    if curve is None:
+        return None
+
+    steps = max(int(level) - 1, 0)
+    return {
+        "max_hp": int(curve["hp_base"]) + steps * int(curve["hp_per_lvl"]),
+        "max_mana": int(curve["mana_base"]) + steps * int(curve["mana_per_lvl"]),
+        "max_stamina": int(curve["stam_base"]) + steps * int(curve["stam_per_lvl"]),
+    }
 
 
 def has_item(item_id):
