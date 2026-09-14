@@ -241,38 +241,73 @@ check("is_admin was never writable via status", "is_admin" not in body, body)
 
 
 # =============================================================================
-# BANK - ITEMS
+# ACCOUNT - BANK (SHARED ACROSS CHARACTERS)
 # =============================================================================
 
-section("BANK - ITEMS")
+section("ACCOUNT - BANK")
 
-body = status("empty bank", client.get("/api/bank?slot=0", headers=H), 200)
-check("empty bank has no items", body["items"] == [], body)
+body = status("empty account", client.get("/api/account", headers=H), 200)
+check("bank starts empty", all(c is None for c in body["bank_inventory"]), body["bank_inventory"][:3])
+check("lusions start at 0", body["lusions"] == 0, body)
+check("bank gold starts at 0", body["bank_gold"] == 0, body)
+CAPACITY = body["capacity"]
 
-status("deposit 5 potions", client.post("/api/bank", headers=H,
-       json={"slot": 0, "op": "deposit", "item_id": "healthpotion", "quantity": 5}), 200)
-body = status("deposit 7 more of the same", client.post("/api/bank", headers=H,
-              json={"slot": 0, "op": "deposit", "item_id": "healthpotion", "quantity": 7}), 200)
-check("same item merged into ONE row", len(body["items"]) == 1, body["items"])
-check("quantities summed to 12", body["items"][0]["quantity"] == 12, body["items"])
+body = status("write a positional bank", client.put("/api/account/bank", headers=H,
+              json={"bank_inventory": [
+                  {"item_id": "ironsword", "quantity": 1},
+                  None,
+                  {"item_id": "smallhealthpotion", "quantity": 12},
+              ]}), 200)
+bank = body["bank_inventory"]
+check("comes back at full capacity", len(bank) == CAPACITY, len(bank))
+check("empty cells stay empty", bank[1] is None, bank[:3])
+check("an item stays in the cell it was put in",
+      bank[2] is not None and bank[2]["quantity"] == 12, bank[2])
 
-status("withdraw more than stored", client.post("/api/bank", headers=H,
-       json={"slot": 0, "op": "withdraw", "item_id": "healthpotion", "quantity": 99}), 400)
-body = status("bank unchanged after refusal", client.get("/api/bank?slot=0", headers=H), 200)
-check("still 12 after the refused withdrawal", body["items"][0]["quantity"] == 12, body["items"])
+# The bank used to be keyed on (user_id, slot, item_id), which merged stacks
+# and hid a warrior's deposits from a mage. Both halves of that are tested here.
+body = status("two stacks of one item", client.put("/api/account/bank", headers=H,
+              json={"bank_inventory": [
+                  {"item_id": "smallhealthpotion", "quantity": 4},
+                  {"item_id": "smallhealthpotion", "quantity": 6},
+              ]}), 200)
+bank = body["bank_inventory"]
+check("are NOT merged", bank[0]["quantity"] == 4 and bank[1]["quantity"] == 6, bank[:2])
 
-body = status("withdraw the exact stack", client.post("/api/bank", headers=H,
-              json={"slot": 0, "op": "withdraw", "item_id": "healthpotion", "quantity": 12}), 200)
-check("emptied stack is deleted, not left at zero", body["items"] == [], body["items"])
+status("more entries than capacity", client.put("/api/account/bank", headers=H,
+       json={"bank_inventory": [None] * (CAPACITY + 1)}), 400)
+status("quantity zero", client.put("/api/account/bank", headers=H,
+       json={"bank_inventory": [{"item_id": "ironsword", "quantity": 0}]}), 400)
+status("quantity boolean", client.put("/api/account/bank", headers=H,
+       json={"bank_inventory": [{"item_id": "ironsword", "quantity": True}]}), 400)
+status("empty item_id", client.put("/api/account/bank", headers=H,
+       json={"bank_inventory": [{"item_id": "", "quantity": 1}]}), 400)
 
-status("quantity zero", client.post("/api/bank", headers=H,
-       json={"slot": 0, "op": "deposit", "item_id": "x", "quantity": 0}), 400)
-status("quantity boolean", client.post("/api/bank", headers=H,
-       json={"slot": 0, "op": "deposit", "item_id": "x", "quantity": True}), 400)
-status("unknown op", client.post("/api/bank", headers=H,
-       json={"slot": 0, "op": "steal", "item_id": "x", "quantity": 1}), 400)
-status("empty item_id", client.post("/api/bank", headers=H,
-       json={"slot": 0, "op": "deposit", "item_id": "", "quantity": 1}), 400)
+body = status("bank is unchanged by every refusal", client.get("/api/account", headers=H), 200)
+check("still the two unmerged stacks",
+      body["bank_inventory"][0]["quantity"] == 4, body["bank_inventory"][:2])
+
+# THE POINT OF THE REWRITE: the bank is reached without naming a character, so
+# there is no slot for it to be trapped in.
+body = status("a SECOND character", client.put("/api/save", headers=H,
+              json={"slot": 1, "class_id": "mage", "name": "Second", "level": 1}), 200)
+body = status("reads the same bank", client.get("/api/account", headers=H), 200)
+check("what one character banked, another can see",
+      body["bank_inventory"][0]["quantity"] == 4, body["bank_inventory"][:2])
+
+
+# =============================================================================
+# ACCOUNT - LUSIONS
+# =============================================================================
+
+section("ACCOUNT - LUSIONS")
+
+body = status("set lusions", client.put("/api/account/lusions", headers=H, json={"lusions": 40}), 200)
+check("stored", body["lusions"] == 40, body)
+status("negative lusions", client.put("/api/account/lusions", headers=H, json={"lusions": -1}), 400)
+status("lusions as a string", client.put("/api/account/lusions", headers=H, json={"lusions": "lots"}), 400)
+body = status("unchanged after refusals", client.get("/api/account", headers=H), 200)
+check("still 40", body["lusions"] == 40, body)
 
 
 # =============================================================================
@@ -281,36 +316,138 @@ status("empty item_id", client.post("/api/bank", headers=H,
 
 section("BANK - GOLD")
 
-body = status("bank reports both sides", client.get("/api/bank?slot=0", headers=H), 200)
-TOTAL = body["gold"] + body["carried_gold"]
-check("carried gold matches the status endpoint", body["carried_gold"] == 500, body)
+body = status("account and carried gold", client.get("/api/player/status?slot=0", headers=H), 200)
+CARRIED = body["gold"]
+check("carried gold matches the status endpoint", CARRIED == 500, body)
+TOTAL = CARRIED + status("account", client.get("/api/account", headers=H), 200)["bank_gold"]
 
 status("deposit more than carried", client.post("/api/bank/gold", headers=H,
        json={"slot": 0, "op": "deposit", "amount": 900}), 400)
-body = status("bank unchanged after refusal", client.get("/api/bank?slot=0", headers=H), 200)
-check("total conserved after refusal", body["gold"] + body["carried_gold"] == TOTAL, body)
+body = status("unchanged after refusal", client.get("/api/account", headers=H), 200)
+check("total conserved after refusal",
+      body["bank_gold"] + client.get("/api/player/status?slot=0", headers=H).get_json()["gold"] == TOTAL, body)
 
 body = status("deposit 300", client.post("/api/bank/gold", headers=H,
               json={"slot": 0, "op": "deposit", "amount": 300}), 200)
-check("banked 300", body["gold"] == 300, body)
+check("banked 300", body["bank_gold"] == 300, body)
 check("carried dropped to 200", body["carried_gold"] == 200, body)
-check("total conserved across deposit", body["gold"] + body["carried_gold"] == TOTAL, body)
+check("total conserved across deposit", body["bank_gold"] + body["carried_gold"] == TOTAL, body)
 
 status("withdraw more than banked", client.post("/api/bank/gold", headers=H,
        json={"slot": 0, "op": "withdraw", "amount": 999}), 400)
 body = status("withdraw 100", client.post("/api/bank/gold", headers=H,
               json={"slot": 0, "op": "withdraw", "amount": 100}), 200)
-check("total conserved across withdrawal", body["gold"] + body["carried_gold"] == TOTAL, body)
+check("total conserved across withdrawal", body["bank_gold"] + body["carried_gold"] == TOTAL, body)
 
-body = status("status endpoint agrees with bank", client.get("/api/player/status?slot=0", headers=H), 200)
-check("status gold == bank carried_gold", body["gold"] == 300, body)
+# Gold banked by one character is spendable by another - the same property the
+# item bank has, and the reason bank_gold moved off the saves row.
+body = status("the second character's pocket", client.post("/api/bank/gold", headers=H,
+              json={"slot": 1, "op": "withdraw", "amount": 200}), 200)
+check("one character can withdraw what another banked",
+      body["carried_gold"] == 200 and body["bank_gold"] == 0, body)
+
+body = status("status endpoint agrees", client.get("/api/player/status?slot=0", headers=H), 200)
+check("status gold == what the transfer reported", body["gold"] == 300, body)
 
 status("amount zero", client.post("/api/bank/gold", headers=H,
        json={"slot": 0, "op": "deposit", "amount": 0}), 400)
 status("amount negative", client.post("/api/bank/gold", headers=H,
        json={"slot": 0, "op": "deposit", "amount": -50}), 400)
+status("unknown op", client.post("/api/bank/gold", headers=H,
+       json={"slot": 0, "op": "steal", "amount": 1}), 400)
 status("gold move on empty slot", client.post("/api/bank/gold", headers=H,
        json={"slot": 2, "op": "deposit", "amount": 1}), 404)
+
+
+# =============================================================================
+# CHARACTER - BACKPACK
+# =============================================================================
+
+section("CHARACTER - BACKPACK")
+
+body = status("write a positional inventory", client.put("/api/character/inventory", headers=H,
+              json={"slot": 0, "inventory": [
+                  {"item_id": "ironsword", "quantity": 1},
+                  None,
+                  None,
+                  {"item_id": "smallhealthpotion", "quantity": 7},
+              ]}), 200)
+inv = body["inventory"]
+check("comes back as 20 positional cells", len(inv) == 20, len(inv))
+check("empty cells stay empty", inv[1] is None and inv[2] is None, inv[:4])
+check("an item stays in the cell it was put in",
+      inv[3] is not None and inv[3]["item_id"] == "smallhealthpotion", inv[3])
+
+# The reason carry_items is keyed on position rather than item_id. Keying on
+# item_id would merge these two stacks and reshuffle the bag on every login.
+body = status("the same item in two cells", client.put("/api/character/inventory", headers=H,
+              json={"slot": 0, "inventory": [
+                  {"item_id": "smallhealthpotion", "quantity": 2},
+                  {"item_id": "smallhealthpotion", "quantity": 3},
+              ]}), 200)
+inv = body["inventory"]
+check("two stacks of one item are NOT merged",
+      inv[0]["quantity"] == 2 and inv[1]["quantity"] == 3, inv[:2])
+
+body = status("an empty array", client.put("/api/character/inventory", headers=H,
+              json={"slot": 0, "inventory": []}), 200)
+check("clears the bag rather than leaving it", all(c is None for c in body["inventory"]))
+
+status("more entries than capacity", client.put("/api/character/inventory", headers=H,
+       json={"slot": 0, "inventory": [None] * 21}), 400)
+status("quantity 0", client.put("/api/character/inventory", headers=H,
+       json={"slot": 0, "inventory": [{"item_id": "ironsword", "quantity": 0}]}), 400)
+status("a cell that is not an object", client.put("/api/character/inventory", headers=H,
+       json={"slot": 0, "inventory": ["ironsword"]}), 400)
+
+# The whole array is validated before any of it is written. A bad entry at the
+# end must not leave the good entries before it stored - a half-saved bag with
+# no error is worse than a refused write.
+client.put("/api/character/inventory", headers=H,
+           json={"slot": 0, "inventory": [{"item_id": "ironsword", "quantity": 1}]})
+status("a write with a bad entry LATE in the array", client.put("/api/character/inventory", headers=H,
+       json={"slot": 0, "inventory": [
+           {"item_id": "bushamulet", "quantity": 1},
+           {"item_id": "", "quantity": 1},
+       ]}), 400)
+body = status("read it back", client.get("/api/character?slot=0", headers=H), 200)
+check("a rejected write changed NOTHING",
+      body["inventory"][0]["item_id"] == "ironsword", body["inventory"][0])
+
+
+# =============================================================================
+# CHARACTER - SKILLS
+# =============================================================================
+
+section("CHARACTER - SKILLS")
+
+body = status("write skills", client.put("/api/character/skills", headers=H,
+              json={"slot": 0, "skills": {
+                  "attack": {"level": 12, "xp": 340},
+                  "magic":  {"level": 3,  "xp": 9},
+              }}), 200)
+check("skills round-trip", body["skills"]["attack"]["level"] == 12, body["skills"])
+
+status("an unknown skill", client.put("/api/character/skills", headers=H,
+       json={"slot": 0, "skills": {"swimming": {"level": 1, "xp": 0}}}), 400)
+status("skill level 0", client.put("/api/character/skills", headers=H,
+       json={"slot": 0, "skills": {"attack": {"level": 0, "xp": 0}}}), 400)
+status("skills that are not an object", client.put("/api/character/skills", headers=H,
+       json={"slot": 0, "skills": []}), 400)
+
+
+# =============================================================================
+# CHARACTER - ONE-CALL READ
+# =============================================================================
+
+section("CHARACTER - ONE-CALL READ")
+
+body = status("GET /api/character", client.get("/api/character?slot=0", headers=H), 200)
+check("carries identity, status, backpack and skills together",
+      all(k in body for k in ("class_id", "name", "status", "inventory", "skills")),
+      sorted(body))
+status("an empty slot", client.get("/api/character?slot=2", headers=H), 404)
+status("no token", client.get("/api/character?slot=0"), 401)
 
 
 # =============================================================================
@@ -326,13 +463,24 @@ H2 = {"Authorization": "Bearer " + other["token"]}
 body = status("stranger sees no saves", client.get("/api/save", headers=H2), 200)
 check("stranger's save list is empty", body["slots"] == [], body)
 
-body = status("stranger sees an empty bank", client.get("/api/bank?slot=0", headers=H2), 200)
-check("stranger sees no items", body["items"] == [], body)
-check("stranger sees no gold", body["gold"] == 0 and body["carried_gold"] == 0, body)
+body = status("stranger sees an empty account", client.get("/api/account", headers=H2), 200)
+check("stranger sees no bank items", all(c is None for c in body["bank_inventory"]), body["bank_inventory"][:3])
+check("stranger sees no bank gold", body["bank_gold"] == 0, body)
+check("stranger sees no lusions", body["lusions"] == 0, body)
+status("stranger cannot write our bank", client.put("/api/account/bank", headers=H2,
+       json={"bank_inventory": [{"item_id": "ironsword", "quantity": 99}]}), 200)
+body = status("our bank is untouched", client.get("/api/account", headers=H), 200)
+check("the stranger wrote to THEIR bank, not ours",
+      body["bank_inventory"][0]["quantity"] == 4, body["bank_inventory"][:2])
 
 status("stranger cannot read our status", client.get("/api/player/status?slot=0", headers=H2), 404)
 status("stranger cannot write our status", client.put("/api/player/status", headers=H2,
        json={"slot": 0, "gold": 999999}), 404)
+status("stranger cannot read our character", client.get("/api/character?slot=0", headers=H2), 404)
+status("stranger cannot write our backpack", client.put("/api/character/inventory", headers=H2,
+       json={"slot": 0, "inventory": [{"item_id": "ironsword", "quantity": 99}]}), 404)
+status("stranger cannot write our skills", client.put("/api/character/skills", headers=H2,
+       json={"slot": 0, "skills": {"attack": {"level": 99, "xp": 0}}}), 404)
 
 body = status("our gold is untouched", client.get("/api/player/status?slot=0", headers=H), 200)
 check("still 300 after the stranger's attempts", body["gold"] == 300, body)
@@ -347,6 +495,101 @@ section("LOGOUT")
 status("logout", client.post("/api/auth/logout", headers=H2), 204)
 status("token is dead afterwards", client.get("/api/auth/session", headers=H2), 401)
 status("logging out twice", client.post("/api/auth/logout", headers=H2), 401)
+
+
+# =============================================================================
+# MIGRATION - AN EXISTING DATABASE
+# =============================================================================
+#
+# THE SECTION THAT WAS MISSING, AND THE BUG IT WOULD HAVE CAUGHT.
+#
+# Everything above runs against a database created from scratch, where every
+# CREATE TABLE statement actually fires. A real elusion.db is not that. When
+# bank_items was re-keyed from (user_id, slot, item_id) to (user_id, position),
+# CREATE TABLE IF NOT EXISTS did nothing to the table already sitting there, and
+# every bank request failed with "no such column: position" - while this suite
+# reported 151 passed.
+#
+# So this builds a database in the OLD shape, boots the app against it, and
+# checks the migration actually ran.
+
+section("MIGRATION - AN EXISTING DATABASE")
+
+LEGACY_DB = os.path.join(tempfile.gettempdir(), "elusion_legacy_test.db")
+if os.path.exists(LEGACY_DB):
+    os.remove(LEGACY_DB)
+
+import sqlite3 as _sqlite3
+
+_legacy = _sqlite3.connect(LEGACY_DB)
+_legacy.executescript(
+    """
+    CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                        password_hash TEXT NOT NULL, is_admin INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+    CREATE TABLE sessions (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+    CREATE TABLE saves (user_id INTEGER NOT NULL, slot INTEGER NOT NULL, class_id TEXT NOT NULL, name TEXT NOT NULL,
+                        level INTEGER NOT NULL DEFAULT 1, area TEXT NOT NULL DEFAULT 'elusion',
+                        hp INTEGER NOT NULL DEFAULT 10, max_hp INTEGER NOT NULL DEFAULT 10,
+                        mana INTEGER NOT NULL DEFAULT 10, max_mana INTEGER NOT NULL DEFAULT 10,
+                        stamina INTEGER NOT NULL DEFAULT 10, max_stamina INTEGER NOT NULL DEFAULT 10,
+                        gold INTEGER NOT NULL DEFAULT 0, xp INTEGER NOT NULL DEFAULT 0,
+                        xp_to_next INTEGER NOT NULL DEFAULT 100, bank_gold INTEGER NOT NULL DEFAULT 0,
+                        updated_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user_id, slot));
+    CREATE TABLE bank_items (user_id INTEGER NOT NULL, slot INTEGER NOT NULL, item_id TEXT NOT NULL,
+                             quantity INTEGER NOT NULL CHECK (quantity > 0), PRIMARY KEY (user_id, slot, item_id));
+    """
+)
+_legacy.execute("INSERT INTO users VALUES (1,'legacyuser','x',0,0)")
+_legacy.execute("INSERT INTO saves (user_id,slot,class_id,name,bank_gold) VALUES (1,0,'warrior','Warrior',400)")
+_legacy.execute("INSERT INTO saves (user_id,slot,class_id,name,bank_gold) VALUES (1,1,'mage','Mage',150)")
+# The same item banked by two characters - two rows under the old key, one
+# stack under the new one.
+_legacy.execute("INSERT INTO bank_items VALUES (1,0,'smallhealthpotion',6)")
+_legacy.execute("INSERT INTO bank_items VALUES (1,1,'smallhealthpotion',4)")
+_legacy.execute("INSERT INTO bank_items VALUES (1,0,'ironsword',1)")
+_legacy.commit()
+_legacy.close()
+
+os.environ["ELUSION_DB"] = LEGACY_DB
+_spec = importlib.util.spec_from_file_location("elusion_legacy", os.path.join(HERE, "app.py"))
+_migrated = importlib.util.module_from_spec(_spec)
+try:
+    _spec.loader.exec_module(_migrated)
+    check("an existing database boots without error", True)
+except Exception as exc:
+    check("an existing database boots without error", False, repr(exc))
+
+_db = _sqlite3.connect(LEGACY_DB)
+_columns = [row[1] for row in _db.execute("PRAGMA table_info(bank_items)")]
+check("bank_items was re-keyed on position", "position" in _columns and "slot" not in _columns, _columns)
+
+_rows = _db.execute("SELECT position, item_id, quantity FROM bank_items ORDER BY position").fetchall()
+check("two characters' stacks of one item merged", len(_rows) == 2, _rows)
+_potion = [r for r in _rows if r[1] == "smallhealthpotion"]
+check("nothing was lost in the merge (6 + 4 = 10)",
+      _potion and _potion[0][2] == 10, _rows)
+
+_account = _db.execute("SELECT lusions, bank_gold FROM accounts WHERE user_id = 1").fetchone()
+check("banked gold pooled onto the account (400 + 150)", _account and _account[1] == 550, _account)
+check("the old per-character column was zeroed",
+      _db.execute("SELECT SUM(bank_gold) FROM saves").fetchone()[0] == 0)
+check("the legacy table was dropped",
+      not _db.execute("SELECT 1 FROM sqlite_master WHERE name='bank_items_legacy'").fetchall())
+_db.close()
+
+# Booting twice must not double the gold or duplicate the rows - every server
+# restart runs init_db() again.
+_spec2 = importlib.util.spec_from_file_location("elusion_legacy2", os.path.join(HERE, "app.py"))
+_again = importlib.util.module_from_spec(_spec2)
+_spec2.loader.exec_module(_again)
+_db = _sqlite3.connect(LEGACY_DB)
+check("migrating twice does not double the gold",
+      _db.execute("SELECT bank_gold FROM accounts").fetchone()[0] == 550)
+check("migrating twice does not duplicate rows",
+      _db.execute("SELECT COUNT(*) FROM bank_items").fetchone()[0] == 2)
+_db.close()
+
+os.environ["ELUSION_DB"] = DB_PATH
 
 
 # =============================================================================
