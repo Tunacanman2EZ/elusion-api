@@ -36,6 +36,25 @@ MIN_PASSWORD_LENGTH = 8
 
 REQUIRED_FIELDS = ["username", "password"]
 
+# The account that owns this server, named in the environment rather than
+# stored in the database.
+#
+# That is the whole point. If "owner" were the top value of a role column, then
+# whatever endpoint sets roles could set it, and the first bug in that endpoint
+# would be a total compromise. It would also survive a stolen database backup.
+# An environment variable cannot be written by any request, does not appear in
+# elusion.db, and makes "everyone except me" a comparison that no code path can
+# make false.
+#
+# Set it before starting the server:
+#     PowerShell   $env:ELUSION_OWNER = "yourname"
+#     cmd          set ELUSION_OWNER=yourname
+#     bash         export ELUSION_OWNER=yourname
+#
+# Unset means no owner, and every owner check fails closed - a server with no
+# configured owner has no owner, rather than everyone being one.
+OWNER_USERNAME = os.environ.get("ELUSION_OWNER", "").strip()
+
 
 # =============================================================================
 # DATABASE
@@ -61,15 +80,65 @@ def close_db(exception):
 def init_db():
     """Create tables if they don't exist. Safe to call on every boot."""
     db = sqlite3.connect(DB_PATH)
+
+    # Before the schema block, not after - see the docstring.
+    _migrate_rename_admin_actions(db)
+
     db.executescript(
         """
+        -- `role` is the rank system. It replaced a boolean called is_admin,
+        -- which _migrate_role_column() carries across and
+        -- _migrate_drop_is_admin() then removes. There is no admin rank and
+        -- there never was one; that column was a yes/no flag from before
+        -- ranks existed.
+        --
+        -- 'owner' is NOT a legal value here. The CHECK says so, but the CHECK
+        -- only reaches databases created from this statement - a database
+        -- migrated by _migrate_role_column() gets the column via ALTER
+        -- and therefore no constraint at all.
+        --
+        -- So the CHECK is defence in depth, not the mechanism. role_for() is
+        -- the mechanism: it reads anything outside ROLES, and anything equal
+        -- to 'owner', as DEFAULT_ROLE. A column holding 'owner' grants
+        -- nothing on either shape of database.
         CREATE TABLE IF NOT EXISTS users (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             username      TEXT    NOT NULL UNIQUE COLLATE NOCASE,
             password_hash TEXT    NOT NULL,
-            is_admin      INTEGER NOT NULL DEFAULT 0,
+            role          TEXT    NOT NULL DEFAULT 'player'
+                          CHECK (role IN ('player', 'mod', 'dev')),
+            is_banned      INTEGER NOT NULL DEFAULT 0,
+            -- NULL with is_banned = 1 means permanent. See the migration.
+            ban_expires_at INTEGER,
+            ban_reason     TEXT    NOT NULL DEFAULT '',
+            banned_by      TEXT    NOT NULL DEFAULT '',
+            banned_at      INTEGER NOT NULL DEFAULT 0,
             created_at    INTEGER NOT NULL
         );
+
+        -- Every moderation action, forever. Names are stored ALONGSIDE ids
+        -- because the log has to still make sense after an account is gone -
+        -- an audit trail of orphaned integers answers nothing.
+        --
+        -- This exists from the first day rather than after the first argument.
+        -- Once there are mods it is how THEIR decisions get reviewed, which is
+        -- what makes delegating safe rather than merely convenient.
+        -- "staff" is not a rank. It is the set of ranks above player -
+        -- mod, dev and owner - because all three can act here and the table
+        -- needs one word for them.
+        CREATE TABLE IF NOT EXISTS staff_actions (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_id    INTEGER,
+            actor_name  TEXT    NOT NULL,
+            action      TEXT    NOT NULL,
+            target_id   INTEGER,
+            target_name TEXT    NOT NULL,
+            detail      TEXT    NOT NULL DEFAULT '',
+            created_at  INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_staff_actions_target
+            ON staff_actions(target_name);
 
         CREATE TABLE IF NOT EXISTS sessions (
             token      TEXT    PRIMARY KEY,
@@ -118,7 +187,7 @@ def init_db():
         -- to represent the duplicated state, so no application bug can
         -- create it.
         -- Account-shared game state. Separate from `users`, which is auth:
-        -- a password hash and an admin flag have nothing to do with a lusion
+        -- a password hash and a rank have nothing to do with a lusion
         -- balance, and keeping them apart means the auth table stays the thing
         -- you can reason about when something goes wrong with logging in.
         CREATE TABLE IF NOT EXISTS accounts (
@@ -215,6 +284,31 @@ def init_db():
     # not penalised for having played before this column existed.
     _migrate_add_column(db, "saves", "kill_tokens", "REAL NOT NULL DEFAULT 20.0")
 
+    _migrate_role_column(db)
+
+    # AFTER the line above, never before. That migration reads is_admin to
+    # decide who becomes a dev; dropping the column first would silently demote
+    # every one of them on a database that had not migrated yet.
+    _migrate_drop_is_admin(db)
+
+    # BAN STATE. Three columns rather than one, because a single nullable
+    # timestamp cannot say both "not banned" and "banned forever" - NULL would
+    # have to mean both.
+    #
+    #   is_banned = 0                       not banned
+    #   is_banned = 1, ban_expires_at NULL  permanent
+    #   is_banned = 1, ban_expires_at set   until that moment
+    #
+    # Permanent is a real state, queryable and displayable, rather than a very
+    # large number. A ban of 9999 days shows the player a date decades away,
+    # cannot be told apart from a long timeout, and stops being distinguishable
+    # at all the moment someone types a bigger one.
+    _migrate_add_column(db, "users", "is_banned", "INTEGER NOT NULL DEFAULT 0")
+    _migrate_add_column(db, "users", "ban_expires_at", "INTEGER")
+    _migrate_add_column(db, "users", "ban_reason", "TEXT NOT NULL DEFAULT ''")
+    _migrate_add_column(db, "users", "banned_by", "TEXT NOT NULL DEFAULT ''")
+    _migrate_add_column(db, "users", "banned_at", "INTEGER NOT NULL DEFAULT 0")
+
     db.commit()
     db.close()
 
@@ -298,6 +392,88 @@ def _migrate_bank_to_account(db):
                 (total, user_id),
             )
             db.execute("UPDATE saves SET bank_gold = 0 WHERE user_id = ?", (user_id,))
+
+
+def _migrate_role_column(db):
+    """
+    Carry the old is_admin boolean across to the `role` column, once.
+
+    The ranks are player < mod < dev < owner. There is no 'admin' rank; the
+    column this replaced was called is_admin, which is the only reason that
+    word appears here at all.
+
+    A boolean cannot express three ranks. The moment a mod exists, "can this
+    person do X" stops being one bit and becomes an expression repeated in
+    every endpoint - so the rank became an ordered column before there was any
+    endpoint reading it, which is the cheap moment to change it.
+
+    RUNS EXACTLY ONCE, and the guard is that the column did not exist a moment
+    ago - not that the values in it look untouched.
+
+    The first version guarded on `role = 'player'`, which reads as "only fill
+    in rows nobody has set". It is not: an admin who was DEMOTED is a row with
+    role 'player' and is_admin still 1, so every restart promoted them again.
+    init_db() runs on every boot, so a migration guarded by anything other than
+    "this has not happened yet" is a migration that happens forever.
+    """
+    existing = {row[1] for row in db.execute("PRAGMA table_info(users)")}
+    if "role" in existing:
+        return
+
+    db.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'player'")
+
+    # An old is_admin=1 account becomes a dev - the highest rank that is
+    # storable, since owner comes from the environment.
+    if "is_admin" in existing:
+        db.execute("UPDATE users SET role = 'dev' WHERE is_admin = 1")
+
+
+def _migrate_drop_is_admin(db):
+    """
+    Remove users.is_admin once `role` has taken over from it.
+
+    MUST RUN AFTER _migrate_role_column(). See the call site.
+
+    Dropping a column from the one database holding real accounts is not
+    something to do casually, and the earlier version of this deliberately did
+    not: it left the column in place on the grounds that nothing read it. That
+    was the right call while the client still received an is_admin key. The
+    client does not any more, and a column nobody reads but everybody sees is
+    how "there is no admin rank" keeps needing to be explained.
+
+    ALTER TABLE DROP COLUMN needs SQLite 3.35 (March 2021). An older build
+    keeps the column, which costs nothing - no query names it.
+    """
+    existing = {row[1] for row in db.execute("PRAGMA table_info(users)")}
+    if "is_admin" not in existing:
+        return
+    if "role" not in existing:
+        # Never drop the source before the destination exists.
+        return
+
+    try:
+        db.execute("ALTER TABLE users DROP COLUMN is_admin")
+    except sqlite3.OperationalError as exc:
+        print(f"[migrate] users.is_admin left in place ({exc}); nothing reads it")
+
+
+def _migrate_rename_admin_actions(db):
+    """
+    Rename the audit table off the word 'admin'.
+
+    RUNS BEFORE THE SCHEMA BLOCK, which is the whole point. init_db() creates
+    staff_actions with CREATE TABLE IF NOT EXISTS; if that ran first it would
+    make an empty staff_actions, this rename would find the name taken and skip,
+    and every moderation action ever recorded would be stranded in a table
+    nothing queries. An audit trail that silently stops being the audit trail is
+    worse than no audit trail.
+    """
+    names = {row[0] for row in db.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+    )}
+    if "admin_actions" not in names or "staff_actions" in names:
+        return
+    db.execute("ALTER TABLE admin_actions RENAME TO staff_actions")
 
 
 def _migrate_add_column(db, table, column, definition):
@@ -389,7 +565,9 @@ def user_for_token(token):
     db = get_db()
     row = db.execute(
         """
-        SELECT u.id, u.username, u.is_admin, s.expires_at
+        SELECT u.id, u.username, u.role,
+               u.is_banned, u.ban_expires_at, u.ban_reason, u.banned_by, u.banned_at,
+               s.expires_at
         FROM sessions s
         JOIN users u ON u.id = s.user_id
         WHERE s.token = ?
@@ -406,6 +584,17 @@ def user_for_token(token):
         db.commit()
         return None
 
+    # THE BAN IS CHECKED HERE, not only at login, because login is not the only
+    # door. Banning deletes the user's sessions in the same transaction, so a
+    # live token should not exist - but "should not exist" is not a security
+    # control, and require_auth wraps every authenticated route at once.
+    #
+    # The session goes with them rather than being left to expire.
+    if ban_state(row) is not None:
+        db.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+        db.commit()
+        return None
+
     return row
 
 
@@ -415,6 +604,207 @@ def bearer_token():
     if not header.startswith("Bearer "):
         return None
     return header[7:].strip()
+
+
+def is_owner(username):
+    """
+    True only for the account named by ELUSION_OWNER.
+
+    Case-insensitive, because `users.username` is COLLATE NOCASE - Tunacan and
+    tunacan are the same account, so an owner check that disagreed with the
+    database about that would lock the owner out of their own server.
+
+    Fails closed: no configured owner means nobody is the owner.
+    """
+    if not OWNER_USERNAME or not username:
+        return False
+    return str(username).casefold() == OWNER_USERNAME.casefold()
+
+
+# The ranks, in order. Index is the comparison - "mod or above" is one
+# integer test rather than an expression repeated in every endpoint, which is
+# what a pile of booleans turns into the moment there is more than one of them.
+#
+# 'owner' is last and is NOT storable. users.role has a CHECK that refuses it,
+# and role_for() supplies it from the environment instead. That is what makes
+# the top rank ungrantable: there is no write that produces it.
+ROLES = ("player", "mod", "dev", "owner")
+
+# What a fresh account is, and what an unrecognised value is read as. A row
+# holding something this server has never heard of - written by an older build,
+# or by hand - must read as the LEAST privilege, never the most.
+DEFAULT_ROLE = "player"
+
+# The ranks a moderation endpoint may assign. 'owner' is absent and always will
+# be - it comes from ELUSION_OWNER, so no request can grant it. Mirrors
+# SETTABLE_ROLES in set_role.py.
+SETTABLE_ROLES = tuple(r for r in ROLES if r != "owner")
+
+
+def role_for(user):
+    """
+    The effective rank of a user row.
+
+    The owner is decided before the column is consulted, so revoking their row
+    cannot lock them out of their own server, and a column set to 'owner' by
+    hand cannot grant it.
+    """
+    if is_owner(user["username"]):
+        return "owner"
+
+    stored = user["role"] if "role" in user.keys() else DEFAULT_ROLE
+    return stored if stored in ROLES and stored != "owner" else DEFAULT_ROLE
+
+
+def role_at_least(user, minimum):
+    """
+    True when this user's rank is `minimum` or higher.
+
+    An unrecognised `minimum` denies rather than raising. It should never
+    happen - the argument comes from this codebase, not from a request - but
+    ROLES.index() on a name that is not there throws ValueError, and a route
+    asking "may I" deserves a "no" rather than a 500 with a traceback in it.
+
+    That is not theoretical: removing the 'admin' rank turned every surviving
+    role_at_least(..., "admin") call into a crash.
+    """
+    if minimum not in ROLES:
+        return False
+    return ROLES.index(role_for(user)) >= ROLES.index(minimum)
+
+
+def can_act_on(actor, target):
+    """
+    True when `actor` may moderate `target`.
+
+    STRICTLY ABOVE, not at-or-above. One comparison produces every rule that
+    was wanted:
+
+        a mod cannot ban another mod      equal ranks, refused
+        a dev can ban a mod               dev is above mod
+        a dev cannot ban another dev      equal ranks, refused
+        the owner can ban anyone          nothing is at or above the owner
+        nobody can ban the owner          the owner is the top of ROLES
+        a player cannot ban anyone        there is nothing below player
+
+    It also refuses acting on yourself, since your own rank is never strictly
+    below your own - which saves a separate guard against banning yourself.
+
+    role_for() is used on both sides rather than the raw column, so the owner
+    outranks everyone whatever their row says, and an unrecognised rank is
+    treated as `player` on both sides of the comparison.
+    """
+    return ROLES.index(role_for(actor)) > ROLES.index(role_for(target))
+
+
+def ban_state(user):
+    """
+    The live ban on a user row, or None when there is not one.
+
+    Reads EXPIRY AGAINST NOW rather than trusting is_banned alone, so a served
+    sentence stops mattering the moment it is up - nothing has to run on a
+    schedule to release people, and a server that was switched off for a week
+    does not keep anyone an extra week.
+    """
+    if not user["is_banned"]:
+        return None
+
+    expires = user["ban_expires_at"]
+    if expires is not None and int(expires) <= int(time.time()):
+        return None
+
+    return {
+        "permanent": expires is None,
+        "expires_at": None if expires is None else int(expires),
+        "reason": user["ban_reason"] or "",
+        "banned_by": user["banned_by"] or "",
+        "banned_at": int(user["banned_at"] or 0),
+    }
+
+
+def log_staff_action(actor, action, target_name, target_id=None, detail=""):
+    """
+    Record one moderation action. Called inside the same transaction as the
+    thing it describes, so an action cannot happen without a line about it.
+    """
+    get_db().execute(
+        """
+        INSERT INTO staff_actions
+               (actor_id, actor_name, action, target_id, target_name, detail, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (actor["id"], actor["username"], action, target_id, target_name,
+         detail, int(time.time())),
+    )
+
+
+def _user_by_name(username):
+    return get_db().execute(
+        "SELECT * FROM users WHERE username = ?", (username,)
+    ).fetchone()
+
+
+def _moderation_target(payload):
+    """
+    Resolve and authorise the target of a moderation action.
+
+    Returns (row, None) or (None, response). Every refusal is the SAME 404,
+    whether the account does not exist or is simply out of your reach - a
+    distinguishable answer would let a mod map out who outranks them.
+    """
+    username = str(payload.get("username", "")).strip()
+    if not username:
+        return None, bad_request("username is required")
+
+    target = _user_by_name(username)
+    not_found = ({"error": "Not Found", "message": "No such account."}, 404)
+
+    if target is None:
+        return None, not_found
+    if not can_act_on(g.user, target):
+        return None, not_found
+
+    return target, None
+
+
+def require_role(minimum):
+    """
+    Decorator for a route that needs a rank. Sits inside @require_auth, which
+    is what puts the user row on g.
+
+        @app.post("/api/staff/whatever")
+        @require_auth
+        @require_role("mod")
+        def whatever(): ...
+    """
+    def decorator(view):
+        @wraps(view)
+        def wrapped(*args, **kwargs):
+            if not role_at_least(g.user, minimum):
+                # 404 rather than 403, same as require_owner. A 403 confirms
+                # the route exists and that you are not allowed to use it,
+                # which tells someone exactly where to push.
+                return {"error": "Not Found", "message": "Not found."}, 404
+            return view(*args, **kwargs)
+        return wrapped
+    return decorator
+
+
+def require_owner(view):
+    """
+    Decorator for the handful of things only the server's owner may do.
+
+    Deliberately NOT a check against a database column. See OWNER_USERNAME.
+    """
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not is_owner(g.user["username"]):
+            # 404, not 403. A 403 confirms the route exists and that you are
+            # not allowed to use it, which tells an attacker where to aim.
+            return {"error": "Not Found", "message": "Not found."}, 404
+        return view(*args, **kwargs)
+
+    return wrapped
 
 
 def require_auth(view):
@@ -507,7 +897,7 @@ def register():
     db = get_db()
     try:
         cursor = db.execute(
-            "INSERT INTO users (username, password_hash, is_admin, created_at) VALUES (?, ?, 0, ?)",
+            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
             (username, password_hash, int(time.time())),
         )
         db.commit()
@@ -520,9 +910,19 @@ def register():
     user_id = cursor.lastrowid
     token, expires_at = issue_token(user_id)
 
+    # THE SAME SHAPE AS LOGIN AND SESSION. This used to omit keys that those
+    # two returned, so a client that read the response after registering got a
+    # different object than the one it got after logging in - and the
+    # difference was a missing key rather than a false value, which is the kind
+    # that surfaces as a crash somewhere else entirely.
+    #
+    # A new account is always a player, but it can be the owner: registering
+    # the account named by ELUSION_OWNER is exactly how a fresh server gets one.
     return {
         "user_id": user_id,
         "username": username,
+        "role": "owner" if is_owner(username) else DEFAULT_ROLE,
+        "is_owner": is_owner(username),
         "token": token,
         "expires_at": expires_at,
     }, 201
@@ -558,8 +958,8 @@ def login():
               type: integer
             username:
               type: string
-            is_admin:
-              type: boolean
+            role:
+              type: string
             token:
               type: string
             expires_at:
@@ -584,7 +984,11 @@ def login():
 
     db = get_db()
     row = db.execute(
-        "SELECT id, username, password_hash, is_admin FROM users WHERE username = ?",
+        # SELECT * rather than a column list: ban_state() and role_for() both read
+        # from this row, and a list here is a list that gets forgotten the next
+        # time a column is added - which is exactly what happened when the ban
+        # columns arrived.
+        "SELECT * FROM users WHERE username = ?",
         (data["username"],),
     ).fetchone()
 
@@ -596,12 +1000,33 @@ def login():
             "message": "Incorrect username or password.",
         }, 401
 
+    # AFTER the password check, deliberately. Telling someone their account is
+    # banned before they have proved it is theirs would make this endpoint a
+    # way to find out who is banned.
+    #
+    # 403 rather than 401, and the reason IS included - unlike the routes that
+    # hide behind a 404, a banned player has every right to know they are
+    # banned and why. Silence there reads as the game being broken.
+    ban = ban_state(row)
+    if ban is not None:
+        return {
+            "error": "Forbidden",
+            "message": "This account is banned." if ban["permanent"]
+                       else "This account is banned until further notice.",
+            "ban": ban,
+        }, 403
+
     token, expires_at = issue_token(row["id"])
 
     return {
         "user_id": row["id"],
         "username": row["username"],
-        "is_admin": bool(row["is_admin"]),
+        # THE OWNER IS ALWAYS THE OWNER, whatever the column says. A stored
+        # rank is a row someone could revoke; the owner is configuration.
+        # Locking the owner out of their own server with an UPDATE should not
+        # be possible, so role_for() answers from ELUSION_OWNER first.
+        "role": role_for(row),
+        "is_owner": is_owner(row["username"]),
         "token": token,
         "expires_at": expires_at,
     }, 200
@@ -631,8 +1056,8 @@ def session_info():
               type: integer
             username:
               type: string
-            is_admin:
-              type: boolean
+            role:
+              type: string
             expires_at:
               type: integer
       401:
@@ -641,7 +1066,8 @@ def session_info():
     return {
         "user_id": g.user["id"],
         "username": g.user["username"],
-        "is_admin": bool(g.user["is_admin"]),
+        "role": role_for(g.user),
+        "is_owner": is_owner(g.user["username"]),
         "expires_at": g.user["expires_at"],
     }, 200
 
@@ -677,7 +1103,6 @@ def logout():
 # =============================================================================
 
 MAX_SLOT = 3
-BANK_CAPACITY = 40
 VALID_CLASSES = {"warrior", "mage", "tank", "healer"}
 
 
@@ -1277,6 +1702,12 @@ def status_payload(user_id, slot):
 # Must match BANK_MAX_SLOTS in characterdata.gd. Exported into gamedata.json so
 # there is one authored source; the fallback here only applies to an older
 # gamedata that predates the key.
+#
+# THE ONLY DEFINITION. There used to be a second one, BANK_CAPACITY = 40, six
+# hundred lines above this. Python took the later assignment, so the bank really
+# held 50 and everything worked - right up until someone tidied away the
+# "unused" one and the bank silently shrank by ten cells, at which point every
+# save with an item in cells 40-49 starts failing validation.
 BANK_CAPACITY = int(gamedata.CONSTANTS.get("bank_capacity", 50))
 
 
@@ -1786,6 +2217,298 @@ def combat_kill():
     }, 200
 
 
+# =============================================================================
+# MODERATION
+# =============================================================================
+#
+# Every route here is @require_role("mod") at the door and can_act_on() inside,
+# and the two do different jobs: the decorator says whether you are staff at
+# all, can_act_on() says whether this particular person is within your reach.
+#
+# Refusals are 404, and the same 404 whether the account does not exist or
+# simply outranks you. A mod who could tell those apart could map out who is
+# above them by guessing names.
+
+# How long a mod may mute someone for. Anything longer, and anything permanent,
+# needs a dev or the owner.
+#
+# The point is not that thirty days is special. It is that a permanent removal
+# and a timeout are different decisions, and the person having a bad night at
+# 2am should only be able to make the reversible one.
+MAX_MOD_BAN_DAYS = 30
+
+
+@app.post("/api/staff/ban")
+@require_auth
+@require_role("mod")
+def ban_account():
+    """
+    Ban an account
+    ---
+    tags:
+      - Moderation
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [username, reason]
+          properties:
+            username: {type: string}
+            reason:   {type: string}
+            days:     {type: integer, description: "Omit for a permanent ban."}
+    responses:
+      200:
+        description: The ban as stored
+      400:
+        description: Missing reason, or a days value out of range
+      403:
+        description: A mod attempting a permanent or over-long ban
+      404:
+        description: No such account, or one you may not act on
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+
+    target, error = _moderation_target(payload)
+    if error is not None:
+        return error
+
+    reason = str(payload.get("reason", "")).strip()
+    if not reason or len(reason) > 500:
+        # REQUIRED, not optional. A ban with no reason is one nobody can review
+        # later, including the person who issued it.
+        return bad_request("reason must be 1-500 characters")
+
+    raw_days = payload.get("days")
+    permanent = raw_days is None
+
+    expires_at = None
+    if not permanent:
+        days = parse_stat(raw_days)
+        if days is None or days < 1 or days > 3650:
+            return bad_request("days must be an integer 1-3650, or omitted for a permanent ban")
+        expires_at = int(time.time()) + days * 86400
+
+    # A PERMANENT BAN IS A HIGHER PERMISSION THAN A TEMPORARY ONE.
+    if not role_at_least(g.user, "dev"):
+        if permanent:
+            return {
+                "error": "Forbidden",
+                "message": "Only a dev or the owner can ban permanently.",
+            }, 403
+        if parse_stat(raw_days) > MAX_MOD_BAN_DAYS:
+            return {
+                "error": "Forbidden",
+                "message": "A mod may ban for at most %d days." % MAX_MOD_BAN_DAYS,
+            }, 403
+
+    db = get_db()
+    now = int(time.time())
+
+    db.execute(
+        """
+        UPDATE users
+           SET is_banned = 1, ban_expires_at = ?, ban_reason = ?,
+               banned_by = ?, banned_at = ?
+         WHERE id = ?
+        """,
+        (expires_at, reason, g.user["username"], now, target["id"]),
+    )
+
+    # IN THE SAME TRANSACTION. Crossing the name off the list does nothing
+    # about the person already inside - a banned player holding a live token
+    # keeps playing until it expires, which on this server is thirty days.
+    db.execute("DELETE FROM sessions WHERE user_id = ?", (target["id"],))
+
+    log_staff_action(
+        g.user, "ban", target["username"], target["id"],
+        "permanent: %s" % reason if permanent else "%d days: %s" % (parse_stat(raw_days), reason),
+    )
+    db.commit()
+
+    return {
+        "username": target["username"],
+        "banned": True,
+        "permanent": permanent,
+        "expires_at": expires_at,
+        "reason": reason,
+        "banned_by": g.user["username"],
+    }, 200
+
+
+@app.post("/api/staff/unban")
+@require_auth
+@require_role("mod")
+def unban_account():
+    """
+    Lift a ban
+    ---
+    tags:
+      - Moderation
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [username]
+          properties:
+            username: {type: string}
+    responses:
+      200:
+        description: The account is no longer banned
+      404:
+        description: No such account, or one you may not act on
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+
+    target, error = _moderation_target(payload)
+    if error is not None:
+        return error
+
+    db = get_db()
+    db.execute(
+        """
+        UPDATE users
+           SET is_banned = 0, ban_expires_at = NULL, ban_reason = '',
+               banned_by = '', banned_at = 0
+         WHERE id = ?
+        """,
+        (target["id"],),
+    )
+    log_staff_action(g.user, "unban", target["username"], target["id"])
+    db.commit()
+
+    # Idempotent on purpose: unbanning someone who is not banned is a 200 that
+    # changed nothing. The caller wanted them not-banned, and they are not.
+    return {"username": target["username"], "banned": False}, 200
+
+
+@app.put("/api/staff/role")
+@require_auth
+@require_role("mod")
+def set_account_role():
+    """
+    Change an account's rank
+    ---
+    tags:
+      - Moderation
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [username, role]
+          properties:
+            username: {type: string}
+            role:     {type: string, description: "player, mod or dev"}
+    responses:
+      200:
+        description: The rank as stored
+      400:
+        description: Not a settable rank
+      403:
+        description: Granting a rank at or above your own
+      404:
+        description: No such account, or one you may not act on
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+
+    target, error = _moderation_target(payload)
+    if error is not None:
+        return error
+
+    new_role = str(payload.get("role", "")).strip().lower()
+    if new_role not in SETTABLE_ROLES:
+        return bad_request(
+            "role must be one of: %s. 'owner' comes from the environment."
+            % ", ".join(SETTABLE_ROLES)
+        )
+
+    # YOU CANNOT GRANT A RANK AT OR ABOVE YOUR OWN.
+    #
+    # Without this, one dev promotes another dev, or promotes a player to dev,
+    # and a single compromised staff account spreads sideways for as long as
+    # nobody is looking. Only the owner makes a dev.
+    if ROLES.index(new_role) >= ROLES.index(role_for(g.user)):
+        return {
+            "error": "Forbidden",
+            "message": "You cannot grant a rank at or above your own.",
+        }, 403
+
+    was = target["role"]
+
+    db = get_db()
+    db.execute("UPDATE users SET role = ? WHERE id = ?", (new_role, target["id"]))
+    log_staff_action(
+        g.user, "role", target["username"], target["id"], "%s -> %s" % (was, new_role)
+    )
+    db.commit()
+
+    return {"username": target["username"], "role": new_role, "was": was}, 200
+
+
+@app.get("/api/staff/users")
+@require_auth
+@require_role("mod")
+def list_accounts():
+    """
+    Every account, with rank and ban state
+    ---
+    tags:
+      - Moderation
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+    responses:
+      200:
+        description: The account list
+      401:
+        description: Missing, invalid or expired token
+    """
+    rows = get_db().execute(
+        "SELECT * FROM users ORDER BY id"
+    ).fetchall()
+
+    accounts = []
+    for row in rows:
+        ban = ban_state(row)
+        accounts.append({
+            "id": row["id"],
+            "username": row["username"],
+            "role": role_for(row),
+            "banned": ban is not None,
+            "ban": ban,
+            # Whether YOU can act on this person, so a client can grey out the
+            # buttons rather than offering them and being refused.
+            "actionable": can_act_on(g.user, row),
+        })
+
+    return {"accounts": accounts}, 200
+
+
 @app.get("/api/status")
 def server_status():
     """
@@ -1876,6 +2599,24 @@ VALID_SKILLS = {"attack", "magic", "agility", "defense", "fishing", "cooking"}
 # is called, which is exactly the NameError this replaced.
 
 
+# The most of anything a single cell may hold when the server does not
+# recognise the item. Known items are capped at their own max_stack instead.
+#
+# 9999 matches the largest real stack in the game (a gold pile). It is not a
+# guess at what is reasonable, it is the biggest thing the game itself makes.
+QUANTITY_CEILING = 9999
+
+
+def _stack_limit(item_id):
+    """How many of item_id may sit in one cell."""
+    definition = gamedata.ITEMS.get(item_id)
+    if definition is None:
+        return QUANTITY_CEILING
+    if not definition.get("stackable", False):
+        return 1
+    return max(1, min(int(definition.get("max_stack", 1)), QUANTITY_CEILING))
+
+
 def _parse_positional_items(cells, field):
     """
     Validate a positional item array - the backpack and the bank are the same
@@ -1906,6 +2647,22 @@ def _parse_positional_items(cells, field):
             return None, bad_request("%s[%d].quantity must be a positive integer" % (field, index))
         if quantity <= 0:
             return None, bad_request("%s[%d].quantity must be a positive integer" % (field, index))
+
+        # The ceiling, which "positive integer" alone does not give you. Without
+        # it a client could declare a cell holding a billion potions and this
+        # would store it: the table only checks quantity > 0.
+        #
+        # A known item is capped at its own max_stack, which is the rule the
+        # game already plays by. An unknown one falls back to QUANTITY_CEILING,
+        # because item ids are deliberately NOT validated against a list here -
+        # that is what lets the game add an item without a matching server
+        # deploy, and it is worth keeping.
+        limit = _stack_limit(item_id)
+        if quantity > limit:
+            return None, bad_request(
+                "%s[%d].quantity is %d, the most %s stacks to is %d"
+                % (field, index, quantity, item_id, limit)
+            )
 
         parsed.append((index, item_id, quantity))
 
@@ -2065,31 +2822,19 @@ def write_inventory():
     if len(cells) > INVENTORY_CAPACITY:
         return bad_request("inventory has %d entries, capacity is %d" % (len(cells), INVENTORY_CAPACITY))
 
-    # VALIDATE THE WHOLE ARRAY BEFORE WRITING ANY OF IT. A bad entry at index 17
-    # must not leave the first seventeen written and the rest not - the player
-    # would see a half-saved bag with no error explaining it.
-    parsed = []
-    for index, cell in enumerate(cells):
-        if cell is None:
-            continue
-        if not isinstance(cell, dict):
-            return bad_request("inventory[%d] must be an object or null" % index)
+    # THE SHARED VALIDATOR, not a second copy of it. This loop used to be
+    # written out here as well as in _parse_positional_items(), twenty identical
+    # lines in two places - so a rule added to one of them (the stack ceiling
+    # was exactly that) would silently not apply to the other.
+    #
+    # It validates the whole array before the caller writes any of it: a bad
+    # entry at index 17 must not leave the first seventeen stored.
+    items, error = _parse_positional_items(cells, "inventory")
+    if error is not None:
+        return error
 
-        item_id = str(cell.get("item_id", "")).strip()
-        if not item_id or len(item_id) > 64:
-            return bad_request("inventory[%d].item_id must be 1-64 characters" % index)
-
-        raw_quantity = cell.get("quantity", 1)
-        if isinstance(raw_quantity, bool):
-            return bad_request("inventory[%d].quantity must be a positive integer" % index)
-        try:
-            quantity = int(raw_quantity)
-        except (TypeError, ValueError):
-            return bad_request("inventory[%d].quantity must be a positive integer" % index)
-        if quantity <= 0:
-            return bad_request("inventory[%d].quantity must be a positive integer" % index)
-
-        parsed.append((user_id, slot, index, item_id, quantity))
+    parsed = [(user_id, slot, index, item_id, quantity)
+              for index, item_id, quantity in items]
 
     db = get_db()
     # DELETE then INSERT, in one transaction. A replace has no upsert form: cells

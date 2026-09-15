@@ -34,6 +34,12 @@ os.environ["ELUSION_DB"] = DB_PATH
 if os.path.exists(DB_PATH):
     os.remove(DB_PATH)
 
+# Also BEFORE the import: OWNER_USERNAME is read at import time, the same way
+# DB_PATH is. Deliberately a different case from the account registered below
+# ("checker"), because users.username is COLLATE NOCASE and an owner check that
+# disagreed with the database about case would lock the owner out.
+os.environ["ELUSION_OWNER"] = "CHECKER"
+
 sys.path.insert(0, HERE)
 spec = importlib.util.spec_from_file_location("elusion_app", os.path.join(HERE, "app.py"))
 app_module = importlib.util.module_from_spec(spec)
@@ -111,6 +117,225 @@ status("session with junk token", client.get("/api/auth/session",
        headers={"Authorization": "Bearer nonsense"}), 401)
 status("session with token but no Bearer prefix", client.get("/api/auth/session",
        headers={"Authorization": TOKEN}), 401)
+
+
+# =============================================================================
+# THE OWNER
+# =============================================================================
+#
+# The owner is named by an environment variable, not stored in the database. If
+# it were a column, whatever endpoint sets that column could set it, and the
+# first bug in that endpoint would be a total compromise. It would also travel
+# in a stolen backup.
+
+section("THE OWNER")
+
+import sqlite3 as _owner_sq
+
+body = status("the owner's session", client.get("/api/auth/session", headers=H), 200)
+check("the configured owner is flagged", body.get("is_owner") is True, body)
+check("and their rank reads as owner", body.get("role") == "owner", body)
+
+# The point of the previous check: they are the owner WITHOUT a stored rank.
+# No UPDATE to this table can lock the owner out of their own server.
+stored = _owner_sq.connect(DB_PATH).execute(
+    "SELECT role FROM users WHERE username = 'checker'").fetchone()[0]
+check("while users.role still says player", stored == "player", stored)
+
+# THE KEY IS GONE, NOT FALSE. is_admin was a compatibility alias the Godot
+# client used to read; there is no admin rank and now no key pretending there
+# might be. A client reading body["is_admin"] should fail loudly rather than
+# get False forever.
+check("no is_admin key survives in a session", "is_admin" not in body, body)
+
+body = status("someone else registers", client.post("/api/auth/register",
+              json={"username": "notowner", "password": "password123"}), 201)
+check("they are not the owner", body.get("is_owner") is False, body)
+check("and register does not leak an is_admin key either",
+      "is_admin" not in body, body)
+
+# CASE-INSENSITIVE both ways. ELUSION_OWNER is "CHECKER", the account is
+# "checker", and COLLATE NOCASE says those are one account.
+check("owner match ignores case", app_module.is_owner("checker") is True, "checker")
+check("and in the other direction", app_module.is_owner("CHECKER") is True, "CHECKER")
+check("a different name is not the owner", app_module.is_owner("notowner") is False, "notowner")
+
+# FAILS CLOSED. A server with no configured owner has no owner, rather than
+# everyone being one - which is the failure that would actually matter.
+_saved_owner = app_module.OWNER_USERNAME
+app_module.OWNER_USERNAME = ""
+check("no configured owner means nobody is the owner",
+      app_module.is_owner("checker") is False, "unset")
+check("and empty input matches nothing either",
+      app_module.is_owner("") is False and app_module.is_owner(None) is False, "empty")
+app_module.OWNER_USERNAME = _saved_owner
+check("owner restored for the rest of the suite",
+      app_module.is_owner("checker") is True, app_module.OWNER_USERNAME)
+
+
+# =============================================================================
+# RANKS
+# =============================================================================
+#
+# player < mod < dev < owner, as an ordered column rather than a pile of
+# booleans. Two booleans is four states; four is sixteen, and most of those are
+# nonsense - someone who is a mod but not a player, a dev who is somehow not
+# a mod.
+#
+# 'owner' is deliberately NOT storable. The CHECK on users.role refuses it and
+# role_for() supplies it from the environment, so there is no write that
+# produces the top rank.
+
+section("RANKS")
+
+body = status("a new account's rank", client.post("/api/auth/register",
+              json={"username": "ranktest", "password": "password123"}), 201)
+check("a fresh account is a player", body.get("role") == "player", body)
+RANK_H = {"Authorization": "Bearer " + body["token"]}
+
+check("the ordering is player < mod < dev < owner",
+      app_module.ROLES == ("player", "mod", "dev", "owner"), app_module.ROLES)
+
+def _set_rank(username, role):
+    conn = _owner_sq.connect(DB_PATH)
+    conn.execute("UPDATE users SET role = ? WHERE username = ?", (role, username))
+    conn.commit(); conn.close()
+
+_set_rank("ranktest", "mod")
+body = status("after promotion to mod", client.get("/api/auth/session", headers=RANK_H), 200)
+check("the session reports mod", body.get("role") == "mod", body)
+check("and not the owner", body.get("is_owner") is False, body)
+
+_set_rank("ranktest", "dev")
+body = status("after promotion to dev", client.get("/api/auth/session", headers=RANK_H), 200)
+check("the session reports dev", body.get("role") == "dev", body)
+
+# DEMOTION HAS TO WORK, which is the thing a boolean made awkward.
+_set_rank("ranktest", "player")
+body = status("after demotion", client.get("/api/auth/session", headers=RANK_H), 200)
+check("rank dropped back to player", body.get("role") == "player", body)
+
+# THE TOP RANK IS NOT STORABLE. The CHECK refuses it outright.
+_rank_conn = _owner_sq.connect(DB_PATH)
+try:
+    _rank_conn.execute("UPDATE users SET role = 'owner' WHERE username = 'ranktest'")
+    _rank_conn.commit()
+    _refused = False
+except Exception:
+    _refused = True
+_rank_conn.close()
+check("the database refuses role = 'owner'", _refused is True, "CHECK constraint")
+
+# An unrecognised value reads as the LEAST privilege, not the most. A row
+# written by an older build, or by hand, must not fail open.
+_set_rank("ranktest", "player")
+_fake = {"username": "ranktest", "role": "superuser"}
+check("an unknown rank reads as player",
+      app_module.role_for(_fake) == "player", app_module.role_for(_fake))
+
+# The owner outranks whatever the column says, in both directions.
+check("the owner is owner regardless of the column",
+      app_module.role_for({"username": "checker", "role": "player"}) == "owner",
+      "checker is ELUSION_OWNER")
+check("owner is at least dev",
+      app_module.role_at_least({"username": "checker", "role": "player"}, "dev") is True, "")
+check("an unknown minimum denies rather than raising",
+      app_module.role_at_least({"username": "checker", "role": "player"}, "admin") is False,
+      "removing a rank must not turn every surviving call into a 500")
+check("a mod is at least mod",
+      app_module.role_at_least({"username": "ranktest", "role": "mod"}, "mod") is True, "")
+check("a mod is not at least admin",
+      app_module.role_at_least({"username": "ranktest", "role": "mod"}, "admin") is False, "")
+check("a player is not at least mod",
+      app_module.role_at_least({"username": "ranktest", "role": "player"}, "mod") is False, "")
+
+# The chain of command is owner -> dev -> mod -> player.
+#
+# THE WORD "admin" APPEARS BELOW ON PURPOSE AND SHOULD STAY. These are the
+# checks that keep it from coming back: a rank nobody defined must read as the
+# LOWEST privilege, and a requirement nobody defined must DENY rather than
+# raise. When the admin rank was removed, every surviving role_at_least(...,
+# "admin") call became a 500 until role_at_least was made to fail closed.
+check("a dev outranks a mod",
+      app_module.role_at_least({"username": "ranktest", "role": "dev"}, "mod") is True, "")
+check("a mod does not outrank a dev",
+      app_module.role_at_least({"username": "ranktest", "role": "mod"}, "dev") is False, "")
+check("'admin' is not a rank and reads as player",
+      app_module.role_for({"username": "ranktest", "role": "admin"}) == "player",
+      app_module.role_for({"username": "ranktest", "role": "admin"}))
+check("a dev is not the owner",
+      app_module.role_for({"username": "ranktest", "role": "dev"}) == "dev", "")
+
+_set_rank("ranktest", "dev")
+body = status("a dev's session", client.get("/api/auth/session", headers=RANK_H), 200)
+check("the session reports dev", body.get("role") == "dev", body)
+check("and still no is_admin key at any rank", "is_admin" not in body, body)
+_set_rank("ranktest", "player")
+
+# THE CHECK CONSTRAINT IS NOT THE GUARANTEE, and this is the part that would
+# otherwise be a fresh-database-only truth. A migrated users table gets its
+# role column via ALTER and therefore carries no constraint, so 'owner' IS
+# storable there. role_for() is what actually refuses it, on both shapes.
+check("a column reading 'owner' still grants nothing",
+      app_module.role_for({"username": "ranktest", "role": "owner"}) == "player",
+      app_module.role_for({"username": "ranktest", "role": "owner"}))
+check("and does not sneak past role_at_least either",
+      app_module.role_at_least({"username": "ranktest", "role": "owner"}, "mod") is False, "")
+
+
+# =============================================================================
+# WHO MAY ACT ON WHOM
+# =============================================================================
+#
+# One comparison - strictly above, not at-or-above - is the whole moderation
+# hierarchy. Every case below is a consequence of it rather than a separate
+# rule, which is the reason it is one comparison.
+#
+# The ban endpoint does not exist yet. The predicate does, and it is tested
+# here so that whatever calls it later inherits a rule that was already right.
+
+section("WHO MAY ACT ON WHOM")
+
+def _u(name, role):
+    return {"username": name, "role": role}
+
+OWNER  = _u("checker", "player")   # checker is ELUSION_OWNER; the column is ignored
+DEV    = _u("adev", "dev")
+DEV2   = _u("anotherdev", "dev")
+MOD    = _u("amod", "mod")
+MOD2   = _u("anothermod", "mod")
+PLAYER = _u("someone", "player")
+
+act = app_module.can_act_on
+
+check("a mod may not ban another mod", act(MOD, MOD2) is False, "equal ranks")
+check("a mod may ban a player", act(MOD, PLAYER) is True, "")
+check("a mod may not ban a dev", act(MOD, DEV) is False, "")
+check("a mod may not ban the owner", act(MOD, OWNER) is False, "")
+
+check("a dev may ban a mod", act(DEV, MOD) is True, "")
+check("a dev may ban a player", act(DEV, PLAYER) is True, "")
+check("a dev may not ban another dev", act(DEV, DEV2) is False, "equal ranks")
+check("a dev may not ban the owner", act(DEV, OWNER) is False, "")
+
+check("the owner may ban a dev", act(OWNER, DEV) is True, "")
+check("the owner may ban a mod", act(OWNER, MOD) is True, "")
+check("the owner may ban a player", act(OWNER, PLAYER) is True, "")
+
+check("a player may not ban anyone", act(PLAYER, PLAYER) is False, "")
+check("nor a mod", act(PLAYER, MOD) is False, "")
+
+# Falls out of the same comparison rather than needing its own guard.
+check("nobody may act on themselves", act(MOD, MOD) is False, "own rank is never below itself")
+check("not even the owner", act(OWNER, OWNER) is False, "")
+
+# The owner is decided before the column is read, in BOTH directions - so a
+# row claiming a rank cannot be used to shield someone from the owner, or to
+# reach past one.
+check("the owner outranks a column claiming 'owner'",
+      act(OWNER, _u("liar", "owner")) is True, "role_for reads it as player")
+check("and a column claiming 'owner' reaches nobody",
+      act(_u("liar", "owner"), MOD) is False, "")
 
 
 # =============================================================================
@@ -248,13 +473,14 @@ status("boolean instead of int", client.put("/api/player/status", headers=H,
 status("value past the ceiling", client.put("/api/player/status", headers=H,
        json={"slot": 0, "gold": 10 ** 12}), 400)
 status("only unknown fields", client.put("/api/player/status", headers=H,
-       json={"slot": 0, "is_admin": 1}), 400)
+       json={"slot": 0, "wingspan": 1}), 400)
 status("write to empty slot", client.put("/api/player/status", headers=H,
        json={"slot": 2, "gold": 1}), 404)
 
 body = status("rejections left state intact", client.get("/api/player/status?slot=0", headers=H), 200)
 check("gold still 500 after four refused writes", body["gold"] == 500, body)
-check("is_admin was never writable via status", "is_admin" not in body, body)
+check("an unknown field never becomes part of the record",
+      "wingspan" not in body, body)
 
 
 # =============================================================================
@@ -879,6 +1105,61 @@ check("a rejected write changed NOTHING",
 
 
 # =============================================================================
+# STACK CEILING
+# =============================================================================
+#
+# "A positive integer" is not a bound. Before this, the backpack and the bank
+# both accepted a cell holding a billion potions - the table only checks
+# quantity > 0 - and max_stack was enforced in exactly one place, the loot
+# path, which is the one place the server hands you the item rather than being
+# told about it.
+#
+# It matters more than it looks: items have a `value`, so an unbounded stack is
+# an unbounded gold printer the day a shop exists.
+
+section("STACK CEILING")
+
+status("a stack past the item's max_stack", client.put("/api/character/inventory", headers=H,
+       json={"slot": 0, "inventory": [{"item_id": "smallhealthpotion", "quantity": 21}]}), 400)
+status("exactly max_stack is fine", client.put("/api/character/inventory", headers=H,
+       json={"slot": 0, "inventory": [{"item_id": "smallhealthpotion", "quantity": 20}]}), 200)
+
+# A sword does not stack at all, so its ceiling is 1 regardless of max_stack.
+status("two of an unstackable item in one cell", client.put("/api/character/inventory", headers=H,
+       json={"slot": 0, "inventory": [{"item_id": "ironsword", "quantity": 2}]}), 400)
+status("one of it is fine", client.put("/api/character/inventory", headers=H,
+       json={"slot": 0, "inventory": [{"item_id": "ironsword", "quantity": 1}]}), 200)
+
+status("the billion-potion cell", client.put("/api/character/inventory", headers=H,
+       json={"slot": 0, "inventory": [{"item_id": "smallhealthpotion", "quantity": 999999999}]}), 400)
+
+# THE BANK GOES THROUGH THE SAME VALIDATOR, which is the point of there being
+# one. This check is here because there used to be two copies of it and only
+# one would have got the ceiling.
+status("the bank is bound by the same rule", client.put("/api/account/bank", headers=H,
+       json={"bank_inventory": [{"item_id": "smallhealthpotion", "quantity": 500}]}), 400)
+
+# An item the server has never heard of still has a bound, but not max_stack -
+# ids are deliberately not whitelisted, so that the game can add an item
+# without a matching server deploy.
+status("an unknown item is capped at the ceiling", client.put("/api/character/inventory", headers=H,
+       json={"slot": 0, "inventory": [{"item_id": "notathing", "quantity": 10000}]}), 400)
+status("and allowed below it", client.put("/api/character/inventory", headers=H,
+       json={"slot": 0, "inventory": [{"item_id": "notathing", "quantity": 9999}]}), 200)
+
+# Nothing may be half-written. A legal cell followed by an illegal one must
+# leave the whole array refused, not the first cell stored.
+status("clear the bag", client.put("/api/character/inventory", headers=H,
+       json={"slot": 0, "inventory": []}), 200)
+status("a good cell followed by a bad one", client.put("/api/character/inventory", headers=H,
+       json={"slot": 0, "inventory": [{"item_id": "smallhealthpotion", "quantity": 5},
+                                      {"item_id": "smallhealthpotion", "quantity": 99}]}), 400)
+body = status("nothing was written", client.get("/api/character?slot=0", headers=H), 200)
+check("the refused array left the bag empty",
+      all(c is None for c in body["inventory"]), [c for c in body["inventory"] if c])
+
+
+# =============================================================================
 # CHARACTER - SKILLS
 # =============================================================================
 
@@ -932,8 +1213,11 @@ body = status("stranger sees an empty account", client.get("/api/account", heade
 check("stranger sees no bank items", all(c is None for c in body["bank_inventory"]), body["bank_inventory"][:3])
 check("stranger sees no bank gold", body["bank_gold"] == 0, body)
 check("stranger sees no lusions", body["lusions"] == 0, body)
+# A stack of 99 potions rather than 99 swords: a sword has max_stack 1, and
+# the stack ceiling now refuses that. This check is about ACCOUNT ISOLATION -
+# the quantity is incidental and should not be the thing that fails it.
 status("stranger cannot write our bank", client.put("/api/account/bank", headers=H2,
-       json={"bank_inventory": [{"item_id": "ironsword", "quantity": 99}]}), 200)
+       json={"bank_inventory": [{"item_id": "smallhealthpotion", "quantity": 20}]}), 200)
 body = status("our bank is untouched", client.get("/api/account", headers=H), 200)
 check("the stranger wrote to THEIR bank, not ours",
       body["bank_inventory"][0]["quantity"] == 4, body["bank_inventory"][:2])
@@ -966,6 +1250,146 @@ status("logging out twice", client.post("/api/auth/logout", headers=H2), 401)
 
 
 # =============================================================================
+# MODERATION
+# =============================================================================
+#
+# can_act_on() is tested above as a predicate. This is the machinery around it:
+# who the endpoints let through, what a ban actually does to a live session,
+# and whether the audit log records it.
+
+section("MODERATION")
+
+def _register(name):
+    return client.post("/api/auth/register",
+                       json={"username": name, "password": "password123"}).get_json()
+
+def _rank(name, role):
+    conn = _owner_sq.connect(DB_PATH)
+    conn.execute("UPDATE users SET role = ? WHERE username = ?", (role, name))
+    conn.commit(); conn.close()
+
+OWNER_H = H                                   # checker is ELUSION_OWNER
+_dev = _register("thedev");   _rank("thedev", "dev")
+_mod = _register("themod");   _rank("themod", "mod")
+_mod2 = _register("othermod"); _rank("othermod", "mod")
+_victim = _register("victim")
+
+# tokens have to be re-issued after the rank change, since the row is read per
+# request but the fixtures above registered before being promoted
+DEV_H = {"Authorization": "Bearer " + client.post("/api/auth/login",
+         json={"username": "thedev", "password": "password123"}).get_json()["token"]}
+MOD_H = {"Authorization": "Bearer " + client.post("/api/auth/login",
+         json={"username": "themod", "password": "password123"}).get_json()["token"]}
+PLAYER_H = {"Authorization": "Bearer " + client.post("/api/auth/login",
+            json={"username": "victim", "password": "password123"}).get_json()["token"]}
+
+# ---- who gets through the door --------------------------------------------
+status("a player cannot reach the account list",
+       client.get("/api/staff/users", headers=PLAYER_H), 404)
+status("a mod can", client.get("/api/staff/users", headers=MOD_H), 200)
+
+status("a player cannot ban", client.post("/api/staff/ban", headers=PLAYER_H,
+       json={"username": "themod", "reason": "because"}), 404)
+
+# ---- the hierarchy, through the endpoint rather than the predicate ---------
+status("a mod cannot ban another mod", client.post("/api/staff/ban", headers=MOD_H,
+       json={"username": "othermod", "reason": "turf war", "days": 1}), 404)
+status("a mod cannot ban a dev", client.post("/api/staff/ban", headers=MOD_H,
+       json={"username": "thedev", "reason": "nope", "days": 1}), 404)
+status("a mod cannot ban the owner", client.post("/api/staff/ban", headers=MOD_H,
+       json={"username": "checker", "reason": "nope", "days": 1}), 404)
+status("an account that does not exist is the same 404",
+       client.post("/api/staff/ban", headers=MOD_H,
+       json={"username": "ghost", "reason": "nope", "days": 1}), 404)
+
+# ---- a reason is not optional ---------------------------------------------
+status("a ban with no reason", client.post("/api/staff/ban", headers=MOD_H,
+       json={"username": "victim"}), 400)
+
+# ---- permanence is a higher permission ------------------------------------
+status("a mod cannot ban permanently", client.post("/api/staff/ban", headers=MOD_H,
+       json={"username": "victim", "reason": "forever"}), 403)
+status("nor for longer than a mod's ceiling", client.post("/api/staff/ban", headers=MOD_H,
+       json={"username": "victim", "reason": "ages", "days": 90}), 403)
+
+body = status("a mod may time someone out", client.post("/api/staff/ban", headers=MOD_H,
+              json={"username": "victim", "reason": "language", "days": 3}), 200)
+check("the ban is not permanent", body.get("permanent") is False, body)
+check("and carries an expiry", isinstance(body.get("expires_at"), int), body)
+check("and records who did it", body.get("banned_by") == "themod", body)
+
+# ---- what a ban does to someone already inside ----------------------------
+status("the banned player's live token stops working",
+       client.get("/api/auth/session", headers=PLAYER_H), 401)
+body = status("and they cannot log back in", client.post("/api/auth/login",
+              json={"username": "victim", "password": "password123"}), 403)
+check("the refusal says why", body.get("ban", {}).get("reason") == "language", body)
+
+# ---- unban -----------------------------------------------------------------
+status("a dev can lift a mod's ban", client.post("/api/staff/unban", headers=DEV_H,
+       json={"username": "victim"}), 200)
+body = status("and they can log in again", client.post("/api/auth/login",
+              json={"username": "victim", "password": "password123"}), 200)
+PLAYER_H = {"Authorization": "Bearer " + body["token"]}
+status("unbanning someone who is not banned is a no-op",
+       client.post("/api/staff/unban", headers=DEV_H, json={"username": "victim"}), 200)
+
+# ---- a dev outranks a mod, and the owner outranks everyone ------------------
+status("a dev can ban a mod", client.post("/api/staff/ban", headers=DEV_H,
+       json={"username": "themod", "reason": "abuse of tools"}), 200)
+status("the owner can ban a dev", client.post("/api/staff/ban", headers=OWNER_H,
+       json={"username": "thedev", "reason": "went rogue"}), 200)
+status("and lift it again", client.post("/api/staff/unban", headers=OWNER_H,
+       json={"username": "thedev"}), 200)
+status("and the mod's", client.post("/api/staff/unban", headers=OWNER_H,
+       json={"username": "themod"}), 200)
+
+# UNBANNING DOES NOT HAND THE SESSION BACK. The ban deleted it, and lifting the
+# ban does not resurrect a token - they log in again like anyone else. Worth
+# asserting rather than working around, because a test that quietly reused a
+# dead token would be hiding it.
+status("the unbanned dev's old token is still dead",
+       client.get("/api/auth/session", headers=DEV_H), 401)
+DEV_H = {"Authorization": "Bearer " + client.post("/api/auth/login",
+         json={"username": "thedev", "password": "password123"}).get_json()["token"]}
+MOD_H = {"Authorization": "Bearer " + client.post("/api/auth/login",
+         json={"username": "themod", "password": "password123"}).get_json()["token"]}
+status("but logging in again works", client.get("/api/auth/session", headers=DEV_H), 200)
+
+# ---- granting a rank -------------------------------------------------------
+status("a mod cannot make someone a mod", client.put("/api/staff/role", headers=MOD_H,
+       json={"username": "victim", "role": "mod"}), 403)
+status("a dev cannot make someone a dev", client.put("/api/staff/role", headers=DEV_H,
+       json={"username": "victim", "role": "dev"}), 403)
+body = status("a dev can make someone a mod", client.put("/api/staff/role", headers=DEV_H,
+              json={"username": "victim", "role": "mod"}), 200)
+check("it reports what changed", body.get("was") == "player" and body.get("role") == "mod", body)
+status("the owner can make someone a dev", client.put("/api/staff/role", headers=OWNER_H,
+       json={"username": "victim", "role": "dev"}), 200)
+status("nobody can grant owner", client.put("/api/staff/role", headers=OWNER_H,
+       json={"username": "victim", "role": "owner"}), 400)
+status("and demotion works", client.put("/api/staff/role", headers=OWNER_H,
+       json={"username": "victim", "role": "player"}), 200)
+
+# ---- the audit log ---------------------------------------------------------
+_log = _owner_sq.connect(DB_PATH).execute(
+    "SELECT actor_name, action, target_name, detail FROM staff_actions ORDER BY id").fetchall()
+check("every action was recorded", len(_log) >= 8, len(_log))
+check("a ban records who, what and why",
+      any(a == "themod" and act == "ban" and t == "victim" and "language" in d
+          for a, act, t, d in _log), _log[:4])
+check("a rank change records both sides",
+      any(act == "role" and "player -> mod" in d for _, act, _, d in _log), _log)
+
+body = status("the account list shows rank and reach",
+              client.get("/api/staff/users", headers=MOD_H), 200)
+_by_name = {a["username"]: a for a in body["accounts"]}
+check("the owner is listed as owner", _by_name["checker"]["role"] == "owner", _by_name["checker"])
+check("and is not actionable by a mod", _by_name["checker"]["actionable"] is False, _by_name["checker"])
+check("a player is actionable by a mod", _by_name["victim"]["actionable"] is True, _by_name["victim"])
+
+
+# =============================================================================
 # MIGRATION - AN EXISTING DATABASE
 # =============================================================================
 #
@@ -980,6 +1404,10 @@ status("logging out twice", client.post("/api/auth/logout", headers=H2), 401)
 #
 # So this builds a database in the OLD shape, boots the app against it, and
 # checks the migration actually ran.
+
+def _user_cols_after(conn):
+    return [row[1] for row in conn.execute("PRAGMA table_info(users)")]
+
 
 section("MIGRATION - AN EXISTING DATABASE")
 
@@ -1008,6 +1436,11 @@ _legacy.executescript(
     """
 )
 _legacy.execute("INSERT INTO users VALUES (1,'legacyuser','x',0,0)")
+# An is_admin=1 row in the old shape, so the rank migration has something real
+# to carry across rather than only proving the column appeared. The old column
+# is recreated here deliberately - it is what the migration migrates FROM, and
+# a test for a migration that cannot build the old shape tests nothing.
+_legacy.execute("INSERT INTO users VALUES (2,'legacyflagged','x',1,0)")
 _legacy.execute("INSERT INTO saves (user_id,slot,class_id,name,bank_gold) VALUES (1,0,'warrior','Warrior',400)")
 _legacy.execute("INSERT INTO saves (user_id,slot,class_id,name,bank_gold) VALUES (1,1,'mage','Mage',150)")
 # The same item banked by two characters - two rows under the old key, one
@@ -1043,10 +1476,34 @@ check("the old per-character column was zeroed",
       _db.execute("SELECT SUM(bank_gold) FROM saves").fetchone()[0] == 0)
 check("the legacy table was dropped",
       not _db.execute("SELECT 1 FROM sqlite_master WHERE name='bank_items_legacy'").fetchall())
+
+# THE RANK MIGRATION, against a users table that had no role column at all.
+# CREATE TABLE IF NOT EXISTS would have done nothing here, which is the whole
+# reason this section exists.
+_user_cols = [row[1] for row in _db.execute("PRAGMA table_info(users)")]
+check("users gained the role column", "role" in _user_cols, _user_cols)
+
+_ranks = dict(_db.execute("SELECT username, role FROM users").fetchall())
+check("an is_admin=1 account became dev", _ranks.get("legacyflagged") == "dev", _ranks)
+check("everyone else became a player", _ranks.get("legacyuser") == "player", _ranks)
+
+# AND THEN THE OLD COLUMN GOES. Order matters and this proves it: if the drop
+# ran before the carry-across, legacyflagged would be a player here.
+check("users.is_admin was dropped once role had taken over",
+      "is_admin" not in _user_cols_after(_db),
+      "ALTER TABLE DROP COLUMN needs SQLite 3.35+; this build has %s"
+      % _sqlite3.sqlite_version)
 _db.close()
 
 # Booting twice must not double the gold or duplicate the rows - every server
 # restart runs init_db() again.
+# Demote before the second boot: the migration must not resurrect a rank that
+# was deliberately taken away. It only ever promotes a row still sitting at the
+# default.
+_demote = _sqlite3.connect(LEGACY_DB)
+_demote.execute("UPDATE users SET role = 'player' WHERE username = 'legacyflagged'")
+_demote.commit(); _demote.close()
+
 _spec2 = importlib.util.spec_from_file_location("elusion_legacy2", os.path.join(HERE, "app.py"))
 _again = importlib.util.module_from_spec(_spec2)
 _spec2.loader.exec_module(_again)
@@ -1055,6 +1512,9 @@ check("migrating twice does not double the gold",
       _db.execute("SELECT bank_gold FROM accounts").fetchone()[0] == 550)
 check("migrating twice does not duplicate rows",
       _db.execute("SELECT COUNT(*) FROM bank_items").fetchone()[0] == 2)
+check("and does not re-promote someone who was demoted",
+      _db.execute("SELECT role FROM users WHERE username = 'legacyflagged'").fetchone()[0] == "player",
+      _db.execute("SELECT role FROM users WHERE username = 'legacyflagged'").fetchone()[0])
 _db.close()
 
 os.environ["ELUSION_DB"] = DB_PATH

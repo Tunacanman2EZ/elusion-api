@@ -6,12 +6,12 @@ script is the only intended way to set it - it talks to the database directly
 rather than through a route, so a rank can only be granted from the machine
 holding elusion.db, never over the network. Keep that property.
 
-    python make_admin.py Someone dev        promote to dev
-    python make_admin.py Someone mod        promote to mod
-    python make_admin.py Someone player     demote
+    python set_role.py Someone dev        promote to dev
+    python set_role.py Someone mod        promote to mod
+    python set_role.py Someone player     demote
 
 Ranks run player < mod < dev < owner.
-    python make_admin.py --list             show every account and its rank
+    python set_role.py --list             show every account and its rank
 
 The OWNER is not settable here and never will be. It is named by the
 ELUSION_OWNER environment variable, so that no write to this table - by this
