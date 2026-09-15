@@ -471,9 +471,19 @@ def _migrate_rename_admin_actions(db):
     names = {row[0] for row in db.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table'"
     )}
-    if "admin_actions" not in names or "staff_actions" in names:
-        return
-    db.execute("ALTER TABLE admin_actions RENAME TO staff_actions")
+    if "admin_actions" in names and "staff_actions" not in names:
+        db.execute("ALTER TABLE admin_actions RENAME TO staff_actions")
+
+    # AN INDEX FOLLOWS ITS TABLE THROUGH A RENAME AND KEEPS ITS OWN OLD NAME.
+    # So the line above leaves idx_admin_actions_target sitting on
+    # staff_actions, and the schema block then creates idx_staff_actions_target
+    # beside it: two indexes on one column, one of them still called admin, and
+    # every insert paying to maintain both.
+    #
+    # Unconditional, deliberately - not inside the branch above. A database that
+    # renamed before this line existed has already taken the branch and will
+    # never take it again, and the stale index is still sitting there.
+    db.execute("DROP INDEX IF EXISTS idx_admin_actions_target")
 
 
 def _migrate_add_column(db, table, column, definition):

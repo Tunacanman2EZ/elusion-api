@@ -1433,8 +1433,18 @@ _legacy.executescript(
                         updated_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user_id, slot));
     CREATE TABLE bank_items (user_id INTEGER NOT NULL, slot INTEGER NOT NULL, item_id TEXT NOT NULL,
                              quantity INTEGER NOT NULL CHECK (quantity > 0), PRIMARY KEY (user_id, slot, item_id));
+    CREATE TABLE admin_actions (id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id INTEGER, actor_name TEXT NOT NULL,
+                                action TEXT NOT NULL, target_id INTEGER, target_name TEXT NOT NULL,
+                                detail TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL);
+    CREATE INDEX idx_admin_actions_target ON admin_actions(target_name);
     """
 )
+
+# One real audit row in the old table. The rename has to carry it, not create
+# an empty table beside it - a log that silently stops being the log is worse
+# than no log, and an empty table looks exactly like a quiet database.
+_legacy.execute("INSERT INTO admin_actions (actor_name, action, target_name, created_at)"
+                " VALUES ('someone', 'ban', 'someoneelse', 1)")
 _legacy.execute("INSERT INTO users VALUES (1,'legacyuser','x',0,0)")
 # An is_admin=1 row in the old shape, so the rank migration has something real
 # to carry across rather than only proving the column appeared. The old column
@@ -1493,6 +1503,23 @@ check("users.is_admin was dropped once role had taken over",
       "is_admin" not in _user_cols_after(_db),
       "ALTER TABLE DROP COLUMN needs SQLite 3.35+; this build has %s"
       % _sqlite3.sqlite_version)
+
+# THE AUDIT TABLE, RENAMED RATHER THAN REPLACED.
+_schema = {row[0]: row[1] for row in
+           _db.execute("SELECT name, type FROM sqlite_master WHERE name LIKE '%actions%'")}
+check("admin_actions is gone", "admin_actions" not in _schema, _schema)
+check("staff_actions is there", _schema.get("staff_actions") == "table", _schema)
+check("and the audit row came with it, not an empty table",
+      _db.execute("SELECT actor_name, action, target_name FROM staff_actions").fetchall()
+      == [("someone", "ban", "someoneelse")],
+      _db.execute("SELECT * FROM staff_actions").fetchall())
+
+# An index follows its table through a rename but keeps its old name, so this
+# is the one that would otherwise survive with 'admin' in it forever - beside
+# a duplicate the schema block creates on the same column.
+check("the stale index was dropped", "idx_admin_actions_target" not in _schema, _schema)
+check("and the renamed one exists exactly once",
+      _schema.get("idx_staff_actions_target") == "index", _schema)
 _db.close()
 
 # Booting twice must not double the gold or duplicate the rows - every server
