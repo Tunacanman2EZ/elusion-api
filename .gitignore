@@ -1,8 +1,20 @@
 # The database. Contains real accounts and password hashes — this must
 # never reach a repo, and never sit anywhere a web server can serve it.
+#
+# THE PREFIX PATTERNS ARE THE IMPORTANT ONES. `*.db` only matches a name
+# ENDING in .db, so a backup called elusion.db.before-something sailed
+# straight past it and into a commit. A database copy is usually named by
+# adding a suffix, which is exactly the shape *.db cannot see.
 elusion.db
+elusion.db.*
+elusion*.db
 *.db
+*.db.*
 *.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite*.*
+*.bak
 
 # Virtual environment — recreate with:
 #   python -m venv venv && venv\Scripts\pip install -r requirements.txt
