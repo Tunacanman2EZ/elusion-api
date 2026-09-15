@@ -51,9 +51,65 @@ REQUIRED_FIELDS = ["username", "password"]
 #     cmd          set ELUSION_OWNER=yourname
 #     bash         export ELUSION_OWNER=yourname
 #
+# ...or put it in a .env file next to this one, which is what _load_dotenv()
+# below is for. The variable has to be set in the EXACT shell that launches the
+# server, every time, and forgetting is silent: the server starts fine, nobody
+# is the owner, and the only symptom is that your debug keys stop working. That
+# happened, which is why the boot line below now says who the owner is.
+#
 # Unset means no owner, and every owner check fails closed - a server with no
 # configured owner has no owner, rather than everyone being one.
+
+
+def _load_dotenv():
+    """
+    Read KEY=value lines from a .env beside this file into the environment.
+
+    A REAL ENVIRONMENT VARIABLE ALWAYS WINS. This only fills in what the shell
+    did not set, so an explicit `$env:ELUSION_OWNER = "..."` still overrides the
+    file and there is no way for a stale .env to quietly take precedence over
+    what someone just typed.
+
+    No dependency: python-dotenv would do this better, but it is one more thing
+    to install for eight lines, and requirements.txt being two entries long is
+    worth more than the polish.
+
+    .env is gitignored, which is the point - ELUSION_OWNER must not live in the
+    repository any more than it lives in the database.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError as exc:
+        print(f"[BOOT] could not read .env ({exc}); using the shell environment only")
+
+
+_load_dotenv()
+
 OWNER_USERNAME = os.environ.get("ELUSION_OWNER", "").strip()
+
+# SAY SO AT BOOT, both ways.
+#
+# There was no signal here at all. A server with no owner started exactly like
+# one with an owner, and the first sign was a staff-only feature silently doing
+# nothing - which reads as a broken feature rather than a missing variable.
+if OWNER_USERNAME:
+    print(f"[BOOT] owner: {OWNER_USERNAME}")
+else:
+    print("[BOOT] NO OWNER SET. Every owner and staff check will deny.")
+    print("[BOOT]   PowerShell: $env:ELUSION_OWNER = \"yourname\"")
+    print("[BOOT]   or put ELUSION_OWNER=yourname in a .env beside app.py")
 
 
 # =============================================================================
@@ -1703,11 +1759,26 @@ def status_payload(user_id, slot):
 # the player expects things to stay where they put them. Keyed on item_id it was
 # a set, which would silently merge two stacks and reshuffle the grid.
 #
-# The deposit/withdraw op endpoint is gone with it. An op made sense for a set;
-# for a grid the client always holds the whole picture, and a whole-array replace
-# has no partial state to reconcile. /api/bank/gold stays an op, because gold is
-# the one thing here the server can actually verify - it holds both balances and
-# can conserve the total.
+# The deposit/withdraw op endpoint was removed when this became positional, on
+# the grounds that a grid client always holds the whole picture and a whole-array
+# replace has no partial state to reconcile - while /api/bank/gold kept its op
+# "because gold is the one thing here the server can actually verify: it holds
+# both balances and can conserve the total".
+#
+# THAT LAST SENTENCE WAS THE ARGUMENT AGAINST ITSELF, and POST /api/bank/items
+# now brings the op back. The server holds both sides of an item transfer too -
+# carry_items and bank_items are both its rows - so it could always have
+# conserved items exactly the way it conserves gold. It simply was not asked to.
+# A whole-array replace cannot conserve anything: two arrays that do not add up
+# are indistinguishable from two that do.
+#
+# The layout objection was real and is answered rather than ignored. The server
+# decides which cell a deposited stack lands in, the same way _add_to_backpack()
+# already does for loot, and the response carries BOTH grids. There is no partial
+# state for the client to reconcile because the client is not deciding anything.
+#
+# PUT /api/account/bank still exists and still takes a whole array on trust. It
+# goes when the client no longer needs it - see docs/inventoryauthority.md.
 
 # Must match BANK_MAX_SLOTS in characterdata.gd. Exported into gamedata.json so
 # there is one authored source; the fallback here only applies to an older
@@ -1719,6 +1790,118 @@ def status_payload(user_id, slot):
 # "unused" one and the bank silently shrank by ten cells, at which point every
 # save with an item in cells 40-49 starts failing validation.
 BANK_CAPACITY = int(gamedata.CONSTANTS.get("bank_capacity", 50))
+
+
+def _add_to_bank(user_id, item_id, quantity):
+    """
+    Put quantity of item_id into the bank and return the cells touched, or None
+    when it does not fit.
+
+    The bank's _add_to_backpack(). Same rules for the same reason: tops up an
+    existing stack before opening a cell, and writes NOTHING unless the whole
+    quantity fits. A half-completed deposit is the shape of bug that ends with
+    an item in neither the bag nor the bank.
+    """
+    definition = gamedata.ITEMS.get(item_id, {})
+    stackable = bool(definition.get("stackable", False))
+    max_stack = int(definition.get("max_stack", 1)) if stackable else 1
+    if max_stack < 1:
+        max_stack = 1
+
+    rows = get_db().execute(
+        "SELECT position, item_id, quantity FROM bank_items WHERE user_id = ? ORDER BY position",
+        (user_id,),
+    ).fetchall()
+    occupied = {int(r["position"]): (r["item_id"], int(r["quantity"])) for r in rows}
+
+    remaining = int(quantity)
+    writes = []
+
+    if stackable:
+        for position in sorted(occupied):
+            if remaining <= 0:
+                break
+            held_id, held_qty = occupied[position]
+            if held_id != item_id or held_qty >= max_stack:
+                continue
+            room = max_stack - held_qty
+            moved = min(room, remaining)
+            writes.append((position, item_id, held_qty + moved))
+            remaining -= moved
+
+    for position in range(BANK_CAPACITY):
+        if remaining <= 0:
+            break
+        if position in occupied:
+            continue
+        moved = min(max_stack, remaining)
+        writes.append((position, item_id, moved))
+        occupied[position] = (item_id, moved)
+        remaining -= moved
+
+    if remaining > 0:
+        return None
+
+    db = get_db()
+    for position, written_id, written_qty in writes:
+        db.execute(
+            """
+            INSERT INTO bank_items (user_id, position, item_id, quantity)
+                 VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, position)
+              DO UPDATE SET item_id = excluded.item_id, quantity = excluded.quantity
+            """,
+            (user_id, position, written_id, written_qty),
+        )
+    return [position for position, _, _ in writes]
+
+
+def _take_from_cells(rows, item_id, quantity):
+    """
+    Work out which cells to empty or reduce to remove quantity of item_id.
+
+    Returns (list of (position, new_quantity_or_zero), None) or (None, how many
+    were actually available) when there are not enough. Shared by the backpack
+    and the bank because "take 5 potions out of a positional grid" is one rule,
+    and the last time this project had that rule twice the two copies stopped
+    agreeing about the stack ceiling.
+
+    HIGHEST POSITION FIRST. Emptying the last cell of a split stack leaves the
+    player's grid looking like they expect - things disappear from the end, not
+    out of the middle.
+    """
+    held = [(int(r["position"]), int(r["quantity"]))
+            for r in rows if r["item_id"] == item_id]
+    available = sum(q for _, q in held)
+    if available < quantity:
+        return None, available
+
+    remaining = int(quantity)
+    changes = []
+    for position, held_qty in sorted(held, reverse=True):
+        if remaining <= 0:
+            break
+        taken = min(held_qty, remaining)
+        changes.append((position, held_qty - taken))
+        remaining -= taken
+    return changes, None
+
+
+def _apply_cell_changes(table, key_columns, key_values, changes):
+    """Write back what _take_from_cells worked out. Zero means delete the row."""
+    db = get_db()
+    where = " AND ".join("%s = ?" % column for column in key_columns)
+    for position, new_quantity in changes:
+        if new_quantity <= 0:
+            db.execute(
+                "DELETE FROM %s WHERE %s AND position = ?" % (table, where),
+                (*key_values, position),
+            )
+        else:
+            db.execute(
+                "UPDATE %s SET quantity = ? WHERE %s AND position = ?" % (table, where),
+                (new_quantity, *key_values, position),
+            )
 
 
 def _ensure_account(user_id):
@@ -1886,6 +2069,131 @@ def write_lusions():
     db.commit()
 
     return account_payload(user_id), 200
+
+
+@app.post("/api/bank/items")
+@require_auth
+def move_bank_items():
+    """
+    Move an item between a character's backpack and the shared bank
+    ---
+    tags:
+      - Account
+    consumes:
+      - application/json
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [slot, op, item_id]
+          properties:
+            slot:     {type: integer, example: 0}
+            op:       {type: string,  enum: [deposit, withdraw]}
+            item_id:  {type: string,  example: "tinyhealthpotion"}
+            quantity: {type: integer, example: 5}
+    responses:
+      200:
+        description: Both grids afterwards, plus the account
+      400:
+        description: Bad slot, op, item id or quantity, or not enough on the source side
+      404:
+        description: That slot is empty
+      409:
+        description: The destination is full
+      401:
+        description: Missing, invalid or expired token
+    """
+    # CONSERVES THE TOTAL, which a whole-array replace cannot.
+    #
+    # The server holds both sides of this - carry_items and bank_items are both
+    # its rows - so a transfer is the one shape where it can check that what left
+    # one side is exactly what arrived at the other. PUT /api/account/bank takes
+    # two arrays on trust and has no way to tell a legal pair from an invented
+    # one; two arrays that do not add up look exactly like two that do.
+    payload = request.get_json(silent=True) or {}
+    user_id = g.user["id"]
+
+    slot = parse_slot(payload.get("slot"))
+    if slot is None:
+        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+    if not _slot_exists(user_id, slot):
+        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
+
+    op = str(payload.get("op", "")).strip().lower()
+    if op not in ("deposit", "withdraw"):
+        return bad_request("op must be 'deposit' or 'withdraw'")
+
+    item_id = str(payload.get("item_id", "")).strip()
+    if not item_id or len(item_id) > 64:
+        return bad_request("item_id must be 1-64 characters")
+
+    raw_quantity = payload.get("quantity", 1)
+    if isinstance(raw_quantity, bool):
+        return bad_request("quantity must be a positive integer")
+    try:
+        quantity = int(raw_quantity)
+    except (TypeError, ValueError):
+        return bad_request("quantity must be a positive integer")
+    if quantity <= 0:
+        return bad_request("quantity must be a positive integer")
+    if quantity > QUANTITY_CEILING:
+        return bad_request("quantity must be at most %d" % QUANTITY_CEILING)
+
+    db = get_db()
+
+    if op == "deposit":
+        source_rows = db.execute(
+            "SELECT position, item_id, quantity FROM carry_items WHERE user_id = ? AND slot = ?",
+            (user_id, slot),
+        ).fetchall()
+    else:
+        source_rows = db.execute(
+            "SELECT position, item_id, quantity FROM bank_items WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+
+    changes, available = _take_from_cells(source_rows, item_id, quantity)
+    if changes is None:
+        where = "carried" if op == "deposit" else "banked"
+        return bad_request(
+            "Cannot move %d %s - only %d %s." % (quantity, item_id, available, where)
+        )
+
+    # REMOVE FIRST, THEN ADD, THEN CHECK. The add is the half that can fail on
+    # capacity, and rolling back is how the item gets home - not an "if it fits"
+    # test beforehand, which would be a second implementation of the packing rule
+    # and would disagree with the real one the first time a stack was part-used.
+    if op == "deposit":
+        _apply_cell_changes("carry_items", ("user_id", "slot"), (user_id, slot), changes)
+        written = _add_to_bank(user_id, item_id, quantity)
+        full_message = "The bank is full (%d slots)." % BANK_CAPACITY
+    else:
+        _apply_cell_changes("bank_items", ("user_id",), (user_id,), changes)
+        written = _add_to_backpack(user_id, slot, item_id, quantity)
+        full_message = "Your backpack is full (%d slots)." % CARRY_CAPACITY
+
+    if written is None:
+        # Nothing was committed, so the rollback puts the source rows back
+        # exactly as they were. The item is never in neither place.
+        db.rollback()
+        return {"error": "Conflict", "message": full_message}, 409
+
+    db.commit()
+
+    result = account_payload(user_id)
+    result["slot"] = slot
+    result["op"] = op
+    result["item_id"] = item_id
+    result["quantity"] = quantity
+    result["inventory"] = inventory_payload(user_id, slot)
+    return result, 200
 
 
 @app.post("/api/bank/gold")
@@ -2476,6 +2784,119 @@ def set_account_role():
     db.commit()
 
     return {"username": target["username"], "role": new_role, "was": was}, 200
+
+
+@app.post("/api/staff/grant")
+@require_auth
+@require_role("mod")
+def staff_grant():
+    """
+    Give yourself an item (staff only)
+    ---
+    tags:
+      - Staff
+    consumes:
+      - application/json
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [slot, item_id]
+          properties:
+            slot: {type: integer, example: 0}
+            item_id: {type: string, example: "petsniper"}
+            quantity: {type: integer, example: 1}
+    responses:
+      200:
+        description: The backpack as stored, after the grant
+      400:
+        description: Bad slot, item id or quantity
+      404:
+        description: That slot is empty, or you are not staff
+      409:
+        description: Backpack full
+      401:
+        description: Missing, invalid or expired token
+    """
+    # THE DEBUG KEYS, MOVED TO WHERE THEY CAN BE ENFORCED.
+    #
+    # F1-F7 and the P O I U Y T pet row used to add items to the client's own
+    # inventory, which then pushed the whole bag here on the next save. The rank
+    # check lived in the client - so a patched build that set Api.role to
+    # "owner" got the keys back, and could have skipped them entirely and just
+    # written the item into the array it was going to send anyway.
+    #
+    # Now the client asks and the SERVER decides. require_role above is the real
+    # gate; _staff_debug_allowed() in player.gd is only there to stop an honest
+    # player pressing a key that would be refused.
+    #
+    # SELF ONLY. There is no target parameter and there should not be one until
+    # there is a reason: granting to someone else is a different action with
+    # different consequences, and can_act_on() exists for when that day comes.
+    payload = request.get_json(silent=True) or {}
+    user_id = g.user["id"]
+
+    slot = parse_slot(payload.get("slot"))
+    if slot is None:
+        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+    if not _slot_exists(user_id, slot):
+        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
+
+    item_id = str(payload.get("item_id", "")).strip()
+    if not item_id or len(item_id) > 64:
+        return bad_request("item_id must be 1-64 characters")
+
+    raw_quantity = payload.get("quantity", 1)
+    if isinstance(raw_quantity, bool):
+        return bad_request("quantity must be a positive integer")
+    try:
+        quantity = int(raw_quantity)
+    except (TypeError, ValueError):
+        return bad_request("quantity must be a positive integer")
+    if quantity <= 0:
+        return bad_request("quantity must be a positive integer")
+
+    # The same ceiling an ordinary write gets. Staff is not a reason to be
+    # allowed to create a cell holding a billion potions - that is a corrupt
+    # row, not a privilege, and it would be this endpoint's fault.
+    limit = _stack_limit(item_id)
+    if quantity > limit:
+        return bad_request(
+            "quantity is %d, the most %s stacks to is %d" % (quantity, item_id, limit)
+        )
+
+    db = get_db()
+    written = _add_to_backpack(user_id, slot, item_id, quantity)
+    if written is None:
+        return {
+            "error": "Conflict",
+            "message": "Your backpack is full (%d slots)." % CARRY_CAPACITY,
+        }, 409
+
+    # IN THE SAME TRANSACTION AS THE GRANT. An item that appears with no line in
+    # the log is exactly what this endpoint exists to prevent, and "log it
+    # afterwards" is how that happens the first time something raises in
+    # between.
+    log_staff_action(
+        g.user, "grant", g.user["username"], g.user["id"],
+        "%d x %s into slot %d" % (quantity, item_id, slot),
+    )
+    db.commit()
+
+    return {
+        "slot": slot,
+        "granted_item_id": item_id,
+        "granted_quantity": quantity,
+        "carry_positions": written,
+        "inventory": inventory_payload(user_id, slot),
+    }, 200
 
 
 @app.get("/api/staff/users")

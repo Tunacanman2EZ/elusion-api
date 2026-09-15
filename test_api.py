@@ -1049,6 +1049,129 @@ status("gold move on empty slot", client.post("/api/bank/gold", headers=H,
 
 
 # =============================================================================
+# BANK - ITEMS
+# =============================================================================
+#
+# A TRANSFER, NOT TWO ASSERTIONS. PUT /api/account/bank takes a whole bank array
+# on trust and PUT /api/character/inventory takes a whole backpack array on
+# trust, and nothing checks that what left one equals what arrived at the other:
+# two arrays that do not add up look exactly like two that do.
+#
+# POST /api/bank/items is the one place the server can conserve items, because
+# it owns both sides. The checks that matter here are the ones about the total
+# being preserved and about a refused transfer leaving the item where it started.
+
+section("BANK - ITEMS")
+
+
+def _carried(headers, slot=0):
+    body = client.get("/api/character?slot=%d" % slot, headers=headers).get_json()
+    return sum(c["quantity"] for c in body["inventory"] if c and c["item_id"] == "tinyhealthpotion")
+
+
+def _banked(headers):
+    body = client.get("/api/account", headers=headers).get_json()
+    return sum(c["quantity"] for c in body["bank_inventory"]
+               if c and c["item_id"] == "tinyhealthpotion")
+
+
+# THIS SECTION MUTATES SHARED STATE AND PUTS IT BACK. The suite runs against one
+# database in order, and a later isolation check asserts an exact quantity in
+# bank cell 0 - which the full-bank rollback test below would otherwise leave
+# holding an iron sword. Capture first, restore at the end.
+_BANK_SNAPSHOT = client.get("/api/account", headers=H).get_json()["bank_inventory"]
+_CARRY_SNAPSHOT = client.get("/api/character?slot=0", headers=H).get_json()["inventory"]
+
+status("start with a known backpack", client.put("/api/character/inventory", headers=H,
+       json={"slot": 0, "inventory": [{"item_id": "tinyhealthpotion", "quantity": 10}]}), 200)
+status("and an empty bank", client.put("/api/account/bank", headers=H,
+       json={"bank_inventory": []}), 200)
+
+_before = _carried(H) + _banked(H)
+check("10 potions to start with", _before == 10, _before)
+
+body = status("deposit 4", client.post("/api/bank/items", headers=H,
+              json={"slot": 0, "op": "deposit", "item_id": "tinyhealthpotion", "quantity": 4}), 200)
+check("6 left carried", _carried(H) == 6, _carried(H))
+check("4 now banked", _banked(H) == 4, _banked(H))
+check("NOTHING WAS CREATED OR LOST", _carried(H) + _banked(H) == _before,
+      "%d + %d" % (_carried(H), _banked(H)))
+check("the response carries both grids",
+      "inventory" in body and "bank_inventory" in body, sorted(body.keys()))
+
+status("withdraw 3", client.post("/api/bank/items", headers=H,
+       json={"slot": 0, "op": "withdraw", "item_id": "tinyhealthpotion", "quantity": 3}), 200)
+check("9 carried again", _carried(H) == 9, _carried(H))
+check("1 still banked", _banked(H) == 1, _banked(H))
+check("still conserved", _carried(H) + _banked(H) == _before,
+      "%d + %d" % (_carried(H), _banked(H)))
+
+# A DEPOSIT MERGES onto the stack already there rather than opening a new cell,
+# the same way _add_to_backpack does. If it opened a cell instead, a player who
+# banked potions ten at a time would find the bank full of part-used stacks.
+status("deposit onto the existing banked stack", client.post("/api/bank/items", headers=H,
+       json={"slot": 0, "op": "deposit", "item_id": "tinyhealthpotion", "quantity": 5}), 200)
+_bank_cells = [c for c in client.get("/api/account", headers=H).get_json()["bank_inventory"]
+               if c and c["item_id"] == "tinyhealthpotion"]
+check("one banked stack, not two", len(_bank_cells) == 1, _bank_cells)
+check("holding all 6", _bank_cells[0]["quantity"] == 6, _bank_cells)
+
+# ---- refusals leave both sides untouched -----------------------------------
+status("deposit more than carried", client.post("/api/bank/items", headers=H,
+       json={"slot": 0, "op": "deposit", "item_id": "tinyhealthpotion", "quantity": 999}), 400)
+check("and changed nothing", _carried(H) + _banked(H) == _before,
+      "%d + %d" % (_carried(H), _banked(H)))
+
+status("withdraw more than banked", client.post("/api/bank/items", headers=H,
+       json={"slot": 0, "op": "withdraw", "item_id": "tinyhealthpotion", "quantity": 999}), 400)
+check("and changed nothing either", _carried(H) + _banked(H) == _before,
+      "%d + %d" % (_carried(H), _banked(H)))
+
+status("an item you hold none of", client.post("/api/bank/items", headers=H,
+       json={"slot": 0, "op": "deposit", "item_id": "ironsword", "quantity": 1}), 400)
+
+status("unknown op", client.post("/api/bank/items", headers=H,
+       json={"slot": 0, "op": "launder", "item_id": "tinyhealthpotion", "quantity": 1}), 400)
+status("quantity zero", client.post("/api/bank/items", headers=H,
+       json={"slot": 0, "op": "deposit", "item_id": "tinyhealthpotion", "quantity": 0}), 400)
+status("quantity negative", client.post("/api/bank/items", headers=H,
+       json={"slot": 0, "op": "deposit", "item_id": "tinyhealthpotion", "quantity": -3}), 400)
+status("quantity as a boolean", client.post("/api/bank/items", headers=H,
+       json={"slot": 0, "op": "deposit", "item_id": "tinyhealthpotion", "quantity": True}), 400)
+status("empty item id", client.post("/api/bank/items", headers=H,
+       json={"slot": 0, "op": "deposit", "item_id": "", "quantity": 1}), 400)
+status("a slot with no character", client.post("/api/bank/items", headers=H,
+       json={"slot": 2, "op": "deposit", "item_id": "tinyhealthpotion", "quantity": 1}), 404)
+
+check("after every refusal, the total is still 10",
+      _carried(H) + _banked(H) == _before, "%d + %d" % (_carried(H), _banked(H)))
+
+# ---- THE ROLLBACK, which is the one that would lose items ------------------
+#
+# A deposit removes from the backpack and THEN tries to add to the bank. If the
+# bank is full the add fails, and without a rollback the potions would be gone
+# from both sides - the exact bug the "writes nothing unless it all fits" rule
+# in _add_to_bank exists to prevent, except one level up.
+_full = [{"item_id": "ironsword", "quantity": 1} for _ in range(50)]
+status("fill every bank cell", client.put("/api/account/bank", headers=H,
+       json={"bank_inventory": _full}), 200)
+
+_carried_before_full = _carried(H)
+status("depositing into a full bank is refused", client.post("/api/bank/items", headers=H,
+       json={"slot": 0, "op": "deposit", "item_id": "tinyhealthpotion", "quantity": 1}), 409)
+check("AND THE POTION IS STILL IN THE BACKPACK",
+      _carried(H) == _carried_before_full,
+      "had %d, now %d" % (_carried_before_full, _carried(H)))
+
+# Put back exactly what this section found, so the sections after it see the
+# database they were written against.
+status("restore the bank", client.put("/api/account/bank", headers=H,
+       json={"bank_inventory": _BANK_SNAPSHOT}), 200)
+status("restore the backpack", client.put("/api/character/inventory", headers=H,
+       json={"slot": 0, "inventory": _CARRY_SNAPSHOT}), 200)
+
+
+# =============================================================================
 # CHARACTER - BACKPACK
 # =============================================================================
 
@@ -1371,10 +1494,88 @@ status("nobody can grant owner", client.put("/api/staff/role", headers=OWNER_H,
 status("and demotion works", client.put("/api/staff/role", headers=OWNER_H,
        json={"username": "victim", "role": "player"}), 200)
 
+# ---- staff item grants -----------------------------------------------------
+#
+# THE DEBUG KEYS, WHERE THEY CAN BE ENFORCED. F1-F7 and the pet row used to add
+# items client-side and push the whole bag on the next save, with the rank check
+# living in the client - so a patched build that set Api.role to "owner" got
+# them back, and could have written the item straight into the array it was
+# going to send anyway.
+#
+# A player must not be able to reach this at all. That is the check that turns
+# "players must loot a pet" from a rule into something enforced.
+
+section("STAFF GRANTS")
+
+# The grant needs a character to put things in. Give the mod one.
+status("a mod makes a character", client.put("/api/save", headers=MOD_H,
+       json={"slot": 0, "class_id": "warrior", "name": "Modling"}), 200)
+
+status("a player cannot grant themselves anything",
+       client.post("/api/staff/grant", headers=PLAYER_H,
+                   json={"slot": 0, "item_id": "ironsword", "quantity": 1}), 404)
+
+body = status("a mod can", client.post("/api/staff/grant", headers=MOD_H,
+              json={"slot": 0, "item_id": "ironsword", "quantity": 1}), 200)
+check("the item landed in the backpack",
+      any(cell and cell["item_id"] == "ironsword" for cell in body["inventory"]),
+      body["inventory"])
+check("and the response says what was granted",
+      body["granted_item_id"] == "ironsword" and body["granted_quantity"] == 1, body)
+
+# A PET, which is the whole point. Pets are the rarest loot in the game and the
+# thing a player is supposed to earn.
+body = status("a mod can grant a pet", client.post("/api/staff/grant", headers=MOD_H,
+              json={"slot": 0, "item_id": "petsniper", "quantity": 1}), 200)
+check("the pet is in the bag",
+      any(cell and cell["item_id"] == "petsniper" for cell in body["inventory"]),
+      body["inventory"])
+
+status("a player cannot grant themselves a pet either",
+       client.post("/api/staff/grant", headers=PLAYER_H,
+                   json={"slot": 0, "item_id": "petsniper", "quantity": 1}), 404)
+
+# THE SAME CEILING AS AN ORDINARY WRITE. Staff is not a reason to be allowed to
+# create a corrupt row - a cell holding a billion potions is a bug wearing a
+# privilege.
+status("not past the stack ceiling", client.post("/api/staff/grant", headers=MOD_H,
+       json={"slot": 0, "item_id": "tinyhealthpotion", "quantity": 10 ** 9}), 400)
+status("nor a negative quantity", client.post("/api/staff/grant", headers=MOD_H,
+       json={"slot": 0, "item_id": "ironsword", "quantity": -1}), 400)
+status("nor zero", client.post("/api/staff/grant", headers=MOD_H,
+       json={"slot": 0, "item_id": "ironsword", "quantity": 0}), 400)
+status("nor a boolean dressed as a number", client.post("/api/staff/grant", headers=MOD_H,
+       json={"slot": 0, "item_id": "ironsword", "quantity": True}), 400)
+status("nor an empty item id", client.post("/api/staff/grant", headers=MOD_H,
+       json={"slot": 0, "item_id": "", "quantity": 1}), 400)
+status("nor into a slot with no character", client.post("/api/staff/grant", headers=MOD_H,
+       json={"slot": 3, "item_id": "ironsword", "quantity": 1}), 404)
+
+# EVERY GRANT IS IN THE AUDIT LOG, in the same transaction as the grant itself.
+# An item that appears with no line about it is the thing this endpoint exists
+# to prevent.
+_grants = _owner_sq.connect(DB_PATH).execute(
+    "SELECT actor_name, target_name, detail FROM staff_actions WHERE action = 'grant'"
+).fetchall()
+check("both grants were logged", len(_grants) == 2, _grants)
+check("the log names the granter and what they took",
+      all(a == "themod" and t == "themod" for a, t, _ in _grants), _grants)
+check("including the pet", any("petsniper" in d for _, _, d in _grants), _grants)
+
+# A REFUSED GRANT LEAVES NO LINE. A log that records attempts as if they were
+# grants is worse than no log - it would read as the mod having taken things
+# they never got.
+status("a refused grant", client.post("/api/staff/grant", headers=MOD_H,
+       json={"slot": 0, "item_id": "ironsword", "quantity": -5}), 400)
+_after = _owner_sq.connect(DB_PATH).execute(
+    "SELECT COUNT(*) FROM staff_actions WHERE action = 'grant'").fetchone()[0]
+check("and did not write one", _after == 2, _after)
+
+
 # ---- the audit log ---------------------------------------------------------
 _log = _owner_sq.connect(DB_PATH).execute(
     "SELECT actor_name, action, target_name, detail FROM staff_actions ORDER BY id").fetchall()
-check("every action was recorded", len(_log) >= 8, len(_log))
+check("every action was recorded", len(_log) >= 10, len(_log))
 check("a ban records who, what and why",
       any(a == "themod" and act == "ban" and t == "victim" and "language" in d
           for a, act, t, d in _log), _log[:4])
