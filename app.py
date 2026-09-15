@@ -2679,6 +2679,59 @@ def _parse_positional_items(cells, field):
     return parsed, None
 
 
+def _inventory_totals(user_id, slot):
+    """item_id -> total quantity the server currently records for this slot."""
+    totals = {}
+    rows = get_db().execute(
+        "SELECT item_id, quantity FROM carry_items WHERE user_id = ? AND slot = ?",
+        (user_id, slot),
+    ).fetchall()
+    for row in rows:
+        totals[row["item_id"]] = totals.get(row["item_id"], 0) + int(row["quantity"])
+    return totals
+
+
+def _report_unexplained_gains(user, slot, claimed):
+    """
+    SHADOW MODE. Compares what a client says it holds against what this server
+    last recorded, and logs the difference. REFUSES NOTHING.
+
+    This is step one of moving the backpack to server authority, and it is
+    deliberately a measurement rather than a rule. The server already owns loot
+    acquisition end to end - POST /api/loot/take writes carry_items itself - but
+    shops, crafting, cooking, bank withdrawals and the staff debug keys all still
+    hand items to the client, which then pushes the whole bag back here. So the
+    two sides disagree constantly and most of those disagreements are honest.
+
+    Turning on a rule before knowing which disagreements are honest would refuse
+    real players for buying a potion. Logging first says WHICH path is producing
+    unexplained items, and that is the order to close them in.
+
+    ONLY GAINS ARE LOGGED. A client holding LESS than the server recorded ate a
+    potion, deposited into the bank, or dropped something - all client-side today
+    and all uninteresting. A client holding MORE got it from somewhere this
+    server did not see, and that is the whole question.
+    """
+    before = _inventory_totals(user["id"], slot)
+
+    after = {}
+    for _position, item_id, quantity in claimed:
+        after[item_id] = after.get(item_id, 0) + quantity
+
+    gains = {}
+    for item_id, quantity in after.items():
+        delta = quantity - int(before.get(item_id, 0))
+        if delta > 0:
+            gains[item_id] = delta
+
+    if not gains:
+        return
+
+    detail = ", ".join("%s +%d" % (i, q) for i, q in sorted(gains.items()))
+    print("[LEDGER] %s slot %d claims items the server did not grant: %s"
+          % (user["username"], slot, detail))
+
+
 def _slot_exists(user_id, slot):
     row = get_db().execute(
         "SELECT 1 FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)
@@ -2842,6 +2895,12 @@ def write_inventory():
     items, error = _parse_positional_items(cells, "inventory")
     if error is not None:
         return error
+
+    # MEASURES, DOES NOT REFUSE. See _report_unexplained_gains() for why the
+    # first step of taking authority over the backpack is a log line rather than
+    # a rule: most disagreements here are honest today, and refusing before
+    # knowing which would break buying a potion.
+    _report_unexplained_gains(g.user, slot, items)
 
     parsed = [(user_id, slot, index, item_id, quantity)
               for index, item_id, quantity in items]
