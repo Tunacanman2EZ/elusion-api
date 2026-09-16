@@ -11,6 +11,16 @@ elusion*.db
 *.db
 *.db.*
 *.db-journal
+
+# SQLite's WAL sidecars. *.db-journal above covers rollback-journal mode, which
+# is what this server uses today — but journal_mode=WAL produces elusion.db-wal
+# and elusion.db-shm instead, and neither ends in .db or .db-journal. The -wal
+# file holds transactions not yet folded into the database, which on a login or
+# a registration means password hashes. One PRAGMA away from being live, so it
+# is covered now rather than after.
+*.db-wal
+*.db-shm
+*.db-*
 *.sqlite
 *.sqlite3
 *.sqlite*.*

@@ -31,6 +31,23 @@ DB_PATH = os.environ.get("ELUSION_DB", os.path.join(os.path.dirname(__file__), "
 # constantly, so this is generous - 30 days in seconds.
 TOKEN_TTL = 60 * 60 * 24 * 30
 
+# LOGIN THROTTLE. A real account that fails this many times in a row is frozen
+# for the cooldown below, so a stolen-password guessing run cannot grind at HTTP
+# speed. Only a real row can be locked, so this does reveal that a locked
+# username exists - the standard, accepted trade for per-account lockout. See
+# SECURITY_NOTES.md (E-5). Counting resets on the first correct password.
+LOGIN_MAX_ATTEMPTS = 8
+LOGIN_LOCKOUT_SECONDS = 15 * 60
+
+# SKILL CEILING. Skills have no server-side grant path yet - the client computes
+# skill XP and PUTs it back - so the server cannot yet prove a level was earned.
+# Until it can (see SECURITY_NOTES.md E-2), this cap is the guardrail: it stops
+# a modified client asserting an absurd level, which is both a power cheat and a
+# source of integer/DB nonsense. 99 matches the skill set's RuneScape lineage.
+# A legitimate client never reaches it, so capping costs honest players nothing.
+MAX_SKILL_LEVEL = 99
+MAX_SKILL_XP = 200_000_000
+
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 MIN_PASSWORD_LENGTH = 8
 
@@ -340,6 +357,14 @@ def init_db():
     # not penalised for having played before this column existed.
     _migrate_add_column(db, "saves", "kill_tokens", "REAL NOT NULL DEFAULT 20.0")
 
+    # Millisecond timestamp of the last cast credited to this character, for the
+    # rate limit in /api/fishing/catch. Same shape and same reasoning as the
+    # kill columns above; a separate bucket because fishing and killing are
+    # different activities with different natural rates, and sharing one would
+    # mean a fishing trip throttling a boss fight.
+    _migrate_add_column(db, "saves", "last_cast_at", "INTEGER NOT NULL DEFAULT 0")
+    _migrate_add_column(db, "saves", "cast_tokens", "REAL NOT NULL DEFAULT 6.0")
+
     _migrate_role_column(db)
 
     # AFTER the line above, never before. That migration reads is_admin to
@@ -364,6 +389,12 @@ def init_db():
     _migrate_add_column(db, "users", "ban_reason", "TEXT NOT NULL DEFAULT ''")
     _migrate_add_column(db, "users", "banned_by", "TEXT NOT NULL DEFAULT ''")
     _migrate_add_column(db, "users", "banned_at", "INTEGER NOT NULL DEFAULT 0")
+
+    # LOGIN THROTTLE state. failed_logins counts consecutive misses; lockout_until
+    # is a unix time before which login is refused. Both default 0 so every
+    # existing account starts clean. See login() and SECURITY_NOTES.md (E-5).
+    _migrate_add_column(db, "users", "failed_logins", "INTEGER NOT NULL DEFAULT 0")
+    _migrate_add_column(db, "users", "lockout_until", "INTEGER NOT NULL DEFAULT 0")
 
     db.commit()
     db.close()
@@ -670,6 +701,36 @@ def bearer_token():
     if not header.startswith("Bearer "):
         return None
     return header[7:].strip()
+
+
+def _row_int(row, key):
+    """Read an integer column defensively.
+
+    A row read before the throttle migration ran would not carry the new
+    columns; keys() lets this survive that instead of raising KeyError. Every
+    live row has them after init, so this is belt-and-braces, not the mechanism.
+    """
+    if key in row.keys() and row[key] is not None:
+        return int(row[key])
+    return 0
+
+
+def _register_failed_login(db, row, now):
+    """One more consecutive miss for this account; lock it if that crosses the
+    threshold. Called only for a real row with a wrong password - a login for a
+    username that does not exist has nothing to count against."""
+    count = _row_int(row, "failed_logins") + 1
+    if count >= LOGIN_MAX_ATTEMPTS:
+        db.execute(
+            "UPDATE users SET failed_logins = 0, lockout_until = ? WHERE id = ?",
+            (now + LOGIN_LOCKOUT_SECONDS, row["id"]),
+        )
+    else:
+        db.execute(
+            "UPDATE users SET failed_logins = ? WHERE id = ?",
+            (count, row["id"]),
+        )
+    db.commit()
 
 
 def is_owner(username):
@@ -1058,13 +1119,38 @@ def login():
         (data["username"],),
     ).fetchone()
 
+    now = int(time.time())
+
+    # LOCKOUT comes before the password check on purpose: while an account is
+    # frozen, no amount of guessing gets a verdict, correct or not. Only a real
+    # row can be frozen, so a locked username is knowable - the accepted cost of
+    # per-account lockout (see SECURITY_NOTES.md E-5).
+    if row is not None and _row_int(row, "lockout_until") > now:
+        retry = _row_int(row, "lockout_until") - now
+        return {
+            "error": "Too Many Requests",
+            "message": "Too many failed attempts. Try again in %d seconds." % retry,
+        }, 429
+
     # same response whether the user is missing or the password is wrong -
     # otherwise this endpoint tells an attacker which usernames exist.
     if row is None or not check_password_hash(row["password_hash"], data["password"]):
+        if row is not None:
+            _register_failed_login(db, row, now)
         return {
             "error": "Unauthorized",
             "message": "Incorrect username or password.",
         }, 401
+
+    # A correct password clears the streak - the throttle is about CONSECUTIVE
+    # misses, so one success resets it. Skip the write when there is nothing to
+    # clear, which is the common case.
+    if _row_int(row, "failed_logins") or _row_int(row, "lockout_until"):
+        db.execute(
+            "UPDATE users SET failed_logins = 0, lockout_until = 0 WHERE id = ?",
+            (row["id"],),
+        )
+        db.commit()
 
     # AFTER the password check, deliberately. Telling someone their account is
     # banned before they have proved it is theirs would make this endpoint a
@@ -3112,45 +3198,51 @@ def _inventory_totals(user_id, slot):
     return totals
 
 
-def _report_unexplained_gains(user, slot, claimed):
+def _reconcile_inventory(user, slot, claimed):
     """
-    SHADOW MODE. Compares what a client says it holds against what this server
-    last recorded, and logs the difference. REFUSES NOTHING.
+    SERVER AUTHORITY OVER GAINS. Returns the claimed backpack with any item the
+    client holds MORE of than the server recorded trimmed back down to what the
+    server recorded, and logs the trim. Reordering and reductions pass through
+    untouched. This is the enforce half of what used to be a shadow log.
 
-    This is step one of moving the backpack to server authority, and it is
-    deliberately a measurement rather than a rule. The server already owns loot
-    acquisition end to end - POST /api/loot/take writes carry_items itself - but
-    shops, crafting, cooking, bank withdrawals and the staff debug keys all still
-    hand items to the client, which then pushes the whole bag back here. So the
-    two sides disagree constantly and most of those disagreements are honest.
+    WHY THIS IS SAFE FOR THE LIVE CLIENT. Every legitimate way to GAIN an item
+    already writes carry_items on the server BEFORE the client would sync the
+    bag back: loot (POST /api/loot/take), bank withdrawals (POST /api/bank/items),
+    and the staff grant (POST /api/staff/grant). The client only ever holds what
+    one of those wrote, so an honest sync always matches the record and is never
+    trimmed. Shops, crafting and cooking do not exist server-side yet; the day
+    they do, each must grant through the server the same way - and until then
+    there is no honest client-side gain for this to catch by mistake.
 
-    Turning on a rule before knowing which disagreements are honest would refuse
-    real players for buying a potion. Logging first says WHICH path is producing
-    unexplained items, and that is the order to close them in.
+    A client holding LESS is honest (ate a potion, deposited, dropped) and passes.
+    A client holding MORE than the server ever granted is a modified client, and
+    the excess is trimmed to what was actually granted - usually to nothing.
 
-    ONLY GAINS ARE LOGGED. A client holding LESS than the server recorded ate a
-    potion, deposited into the bank, or dropped something - all client-side today
-    and all uninteresting. A client holding MORE got it from somewhere this
-    server did not see, and that is the whole question.
+    STAFF ARE EXEMPT. A mod or above can already grant themselves anything via
+    POST /api/staff/grant, so clamping them closes no door - it would only make
+    staff tooling and the test fixtures fight the server for zero security gain.
     """
-    before = _inventory_totals(user["id"], slot)
+    if role_at_least(user, "mod"):
+        return claimed
 
-    after = {}
-    for _position, item_id, quantity in claimed:
-        after[item_id] = after.get(item_id, 0) + quantity
+    recorded = _inventory_totals(user["id"], slot)   # item_id -> qty on record
+    running = {}                                       # item_id -> allotted so far
+    kept = []
+    trims = {}
+    for position, item_id, quantity in claimed:
+        room = max(int(recorded.get(item_id, 0)) - running.get(item_id, 0), 0)
+        granted = min(quantity, room)
+        if granted > 0:
+            kept.append((position, item_id, granted))
+            running[item_id] = running.get(item_id, 0) + granted
+        if quantity > granted:
+            trims[item_id] = trims.get(item_id, 0) + (quantity - granted)
 
-    gains = {}
-    for item_id, quantity in after.items():
-        delta = quantity - int(before.get(item_id, 0))
-        if delta > 0:
-            gains[item_id] = delta
-
-    if not gains:
-        return
-
-    detail = ", ".join("%s +%d" % (i, q) for i, q in sorted(gains.items()))
-    print("[LEDGER] %s slot %d claims items the server did not grant: %s"
-          % (user["username"], slot, detail))
+    if trims:
+        detail = ", ".join("%s -%d" % (i, q) for i, q in sorted(trims.items()))
+        print("[LEDGER] trimmed unearned items for %s slot %d: %s"
+              % (user["username"], slot, detail))
+    return kept
 
 
 def _slot_exists(user_id, slot):
@@ -3317,11 +3409,12 @@ def write_inventory():
     if error is not None:
         return error
 
-    # MEASURES, DOES NOT REFUSE. See _report_unexplained_gains() for why the
-    # first step of taking authority over the backpack is a log line rather than
-    # a rule: most disagreements here are honest today, and refusing before
-    # knowing which would break buying a potion.
-    _report_unexplained_gains(g.user, slot, items)
+    # SERVER AUTHORITY. Trim any item claimed beyond what the server granted,
+    # down to the granted amount. Honest syncs (reorders, using/dropping, and
+    # items the server itself wrote via loot/bank/staff) pass through unchanged;
+    # a modified client's fabricated excess is dropped here. See
+    # _reconcile_inventory() and SECURITY_NOTES.md (E-1).
+    items = _reconcile_inventory(g.user, slot, items)
 
     parsed = [(user_id, slot, index, item_id, quantity)
               for index, item_id, quantity in items]
@@ -3413,8 +3506,46 @@ def write_skills():
 
         parsed.append((user_id, slot, name, level, xp))
 
+    # SKILL CEILING. Skills have no server-side grant path yet, so the server
+    # cannot prove a level was earned - but it can refuse an impossible one. A
+    # non-staff claim over the cap is clamped rather than rejected, so a single
+    # over-cap skill never discards the whole (otherwise honest) sync. Staff are
+    # exempt for the same reason as the backpack. See SECURITY_NOTES.md (E-2).
+    if not role_at_least(g.user, "mod"):
+        capped, hits = [], []
+        for (uid, s, name, level, xp) in parsed:
+            if level > MAX_SKILL_LEVEL or xp > MAX_SKILL_XP:
+                hits.append(name)
+                level = min(level, MAX_SKILL_LEVEL)
+                xp = min(xp, MAX_SKILL_XP)
+            capped.append((uid, s, name, level, xp))
+        if hits:
+            print("[SKILLS] capped over-ceiling skills for %s slot %d: %s"
+                  % (g.user["username"], slot, ", ".join(sorted(hits))))
+        parsed = capped
+
+    # THE SERVER OWNS FISHING AND COOKING NOW - the client does not get to
+    # replace them.
+    #
+    # This endpoint replaces the whole skill set with whatever arrives, which is
+    # fine for the four skills the client still grants. It is fatal for the two
+    # it does not: /api/fishing/catch and /api/cooking/cook write those rows
+    # against items the server consumed, and the client's very next sync would
+    # overwrite that with its own stale figure. The grant would survive exactly
+    # until the player picked up a potion.
+    #
+    # Dropped silently rather than refused. A client that has not been updated
+    # still sends all six every save, and 400-ing an otherwise honest sync over
+    # a field it is not allowed to set would break saving entirely.
+    SERVER_OWNED_SKILLS = {"fishing", "cooking"}
+    parsed = [row for row in parsed if row[2] not in SERVER_OWNED_SKILLS]
+
     db = get_db()
-    db.execute("DELETE FROM skills WHERE user_id = ? AND slot = ?", (user_id, slot))
+    db.execute(
+        "DELETE FROM skills WHERE user_id = ? AND slot = ? AND skill_id NOT IN (%s)"
+        % ",".join("?" * len(SERVER_OWNED_SKILLS)),
+        (user_id, slot, *sorted(SERVER_OWNED_SKILLS)),
+    )
     if parsed:
         db.executemany(
             "INSERT INTO skills (user_id, slot, skill_id, level, xp) VALUES (?, ?, ?, ?, ?)",
@@ -3457,7 +3588,7 @@ def write_skills():
 
 # How long the server will honour a bag after it is created.
 #
-# Deliberately far longer than the client's LOOT_BAG_DESPAWN_SECONDS (20). The
+# Deliberately far longer than the client's LOOT_BAG_DESPAWN_SECONDS (45). The
 # client despawning the node is a display decision; if the two disagree the
 # player should lose the bag to the ANIMATION, never to a 410 from a server that
 # expired it a moment early. This exists to stop bags accumulating forever, not
@@ -3466,6 +3597,27 @@ LOOT_BAG_TTL_SECONDS = 600
 
 # Matches BANK_CAPACITY's role for the backpack. The client's grid is 20 cells.
 CARRY_CAPACITY = INVENTORY_CAPACITY
+
+
+# What a fishing spot takes as bait, one per fish landed.
+#
+# NAMED HERE RATHER THAN SENT BY THE CLIENT. fishingspot.gd has its own
+# bait_item_id export so a spot can want something else, but that is a display
+# and early-refusal concern - a client that named its own bait would name the
+# cheapest thing it had.
+FISHING_BAIT_ID = "fishingworm"
+
+# Rods are matched on this suffix, matching fishingspot.gd's _best_rod_tier().
+FISHING_ROD_SUFFIX = "fishingrod"
+
+# Cast rate limit, the same token bucket /api/combat/kill uses.
+#
+# SIZED FOR THE REAL ACTIVITY. A cast is a 2-6.5s wait plus a bite window, so an
+# honest player lands well under one fish every three seconds and never sees
+# this. It exists so a patched client cannot turn the endpoint into a printing
+# press by removing the wait.
+CAST_BUCKET_CAPACITY = 6.0
+CAST_TOKENS_PER_SECOND = 0.4
 
 # The loot panel's grid, in cells. lootbaginventory.gd's LOOT_SIZE.
 #
@@ -3557,6 +3709,134 @@ def _owns_item(user_id, slot, item_id):
         "SELECT 1 FROM bank_items WHERE user_id = ? AND item_id = ? LIMIT 1",
         (user_id, item_id),
     ).fetchone() is not None
+
+
+def _take_from_backpack(user_id, slot, item_id, quantity):
+    """
+    Remove quantity of item_id from the backpack. Returns True, or False when
+    the player does not hold that many - in which case NOTHING is written.
+
+    The mirror of _add_to_backpack() below, and all-or-nothing for the same
+    reason: a half-completed consume is an ingredient that left the bag without
+    producing anything.
+
+    HIGHEST POSITION FIRST, so a partly-used stack is emptied before a full one
+    is broken into. That keeps the bag tidy across a long cooking run instead of
+    leaving a trail of one-item stacks.
+    """
+    quantity = int(quantity)
+    if quantity <= 0:
+        return True
+
+    db = get_db()
+    rows = db.execute(
+        "SELECT position, quantity FROM carry_items "
+        "WHERE user_id = ? AND slot = ? AND item_id = ? ORDER BY position DESC",
+        (user_id, slot, item_id),
+    ).fetchall()
+
+    held = sum(int(r["quantity"]) for r in rows)
+    if held < quantity:
+        return False
+
+    remaining = quantity
+    for row in rows:
+        if remaining <= 0:
+            break
+        position = int(row["position"])
+        have = int(row["quantity"])
+        taken = min(have, remaining)
+        remaining -= taken
+
+        if taken >= have:
+            # The row is deleted rather than set to 0: carry_items carries a
+            # CHECK (quantity > 0) and an empty cell is an absent row.
+            db.execute(
+                "DELETE FROM carry_items WHERE user_id = ? AND slot = ? AND position = ?",
+                (user_id, slot, position),
+            )
+        else:
+            db.execute(
+                "UPDATE carry_items SET quantity = ? "
+                "WHERE user_id = ? AND slot = ? AND position = ?",
+                (have - taken, user_id, slot, position),
+            )
+
+    return True
+
+
+def _best_rod_tier(user_id, slot):
+    """Highest fishing rod tier in this character's backpack, or 0 for none."""
+    rows = get_db().execute(
+        "SELECT DISTINCT item_id FROM carry_items WHERE user_id = ? AND slot = ?",
+        (user_id, slot),
+    ).fetchall()
+
+    best = 0
+    for row in rows:
+        item_id = row["item_id"]
+        if not item_id.endswith(FISHING_ROD_SUFFIX):
+            continue
+        item = gamedata.ITEMS.get(item_id)
+        if item is None:
+            continue
+        best = max(best, int(item["tier"]))
+    return best
+
+
+def _grant_skill_xp(user_id, slot, skill_id, gained):
+    """
+    Add XP to one skill and return (level, xp, levels_gained).
+
+    THE FIRST SERVER-SIDE SKILL GRANT IN THIS FILE. Until now the skills table
+    was written only by PUT /api/character/skills, which replaces the whole set
+    with whatever the client sends - see the note there about why fishing and
+    cooking are now carved out of that.
+
+    AN UPSERT, NOT A DELETE-THEN-INSERT. write_skills() replaces every row
+    because it is given every row; this is given one skill and must leave the
+    rest of the character's progress exactly where it was.
+
+    THE THRESHOLD IS RECOMPUTED, NOT STORED. The skills table is (level, xp)
+    with no xp_to_next column, unlike saves. Deriving it each grant from the
+    same curve the client uses costs one exponent and removes a column that
+    could disagree with the level sitting next to it.
+    """
+    gained = max(int(gained), 0)
+    if gained <= 0:
+        row = get_db().execute(
+            "SELECT level, xp FROM skills WHERE user_id = ? AND slot = ? AND skill_id = ?",
+            (user_id, slot, skill_id),
+        ).fetchone()
+        return (int(row["level"]), int(row["xp"]), 0) if row else (1, 0, 0)
+
+    db = get_db()
+    row = db.execute(
+        "SELECT level, xp FROM skills WHERE user_id = ? AND slot = ? AND skill_id = ?",
+        (user_id, slot, skill_id),
+    ).fetchone()
+
+    level = int(row["level"]) if row else 1
+    xp = int(row["xp"]) if row else 0
+
+    level, xp, _next, levels_gained = gamedata.apply_xp(
+        level, xp, gamedata.xp_needed_for_skill_level(skill_id, level), gained
+    )
+
+    level = min(level, MAX_SKILL_LEVEL)
+    xp = min(xp, MAX_SKILL_XP)
+
+    db.execute(
+        """
+        INSERT INTO skills (user_id, slot, skill_id, level, xp)
+             VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, slot, skill_id)
+          DO UPDATE SET level = excluded.level, xp = excluded.xp
+        """,
+        (user_id, slot, skill_id, level, xp),
+    )
+
+    return level, xp, levels_gained
 
 
 def _add_to_backpack(user_id, slot, item_id, quantity):
@@ -3806,6 +4086,261 @@ def take_loot():
     return result, 200
 
 
+# =============================================================================
+# FISHING AND COOKING
+# =============================================================================
+# BOTH BUILT TO THE RULE IN docs/inventoryauthority.md, which named them before
+# either existed: "Anything that creates, destroys or moves an item is a server
+# endpoint." The client sends that it fished, never what it caught; it sends
+# which fish it wants cooked, never whether that fish burned.
+#
+# Both copy /api/loot/take's shape exactly - validate and 4xx before the first
+# write, then one transaction ending in a single commit, then hand back the
+# totals rather than the delta so a client that drops a response is corrected by
+# the next one it gets.
+
+
+@app.post("/api/fishing/catch")
+@require_auth
+def fishing_catch():
+    """
+    Land a fish
+    ---
+    tags:
+      - Fishing
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [slot]
+          properties:
+            slot: {type: integer, example: 0}
+    responses:
+      200:
+        description: What was caught, and the state it landed in
+      400:
+        description: Bad slot
+      403:
+        description: No rod, or no bait
+      404:
+        description: That slot is empty
+      409:
+        description: Backpack full
+      429:
+        description: Casting faster than the bucket allows
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+    user_id = g.user["id"]
+
+    slot = parse_slot(payload.get("slot"))
+    if slot is None:
+        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+
+    row = get_db().execute(
+        "SELECT last_cast_at, cast_tokens FROM saves WHERE user_id = ? AND slot = ?",
+        (user_id, slot),
+    ).fetchone()
+    if row is None:
+        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
+
+    # THE ROD AND THE BAIT ARE CHECKED AGAINST carry_items, not against anything
+    # the client said. fishingspot.gd runs the same two checks so it can refuse
+    # early and explain why, but that copy is a courtesy - this one decides.
+    rod_tier = _best_rod_tier(user_id, slot)
+    if rod_tier <= 0:
+        return {"error": "Forbidden", "message": "You need a fishing rod."}, 403
+
+    bait_held = get_db().execute(
+        "SELECT COALESCE(SUM(quantity), 0) FROM carry_items "
+        "WHERE user_id = ? AND slot = ? AND item_id = ?",
+        (user_id, slot, FISHING_BAIT_ID),
+    ).fetchone()[0]
+    if int(bait_held) <= 0:
+        return {"error": "Forbidden", "message": "You need worms for bait."}, 403
+
+    # Refill then spend, exactly as /api/combat/kill does.
+    now_ms = int(time.time() * 1000)
+    elapsed_seconds = max(now_ms - int(row["last_cast_at"]), 0) / 1000.0
+    tokens = min(
+        CAST_BUCKET_CAPACITY,
+        float(row["cast_tokens"]) + elapsed_seconds * CAST_TOKENS_PER_SECOND,
+    )
+    if tokens < 1.0:
+        return {
+            "error": "Too Many Requests",
+            "message": "Casts are arriving faster than %g per second." % CAST_TOKENS_PER_SECOND,
+        }, 429
+    tokens -= 1.0
+
+    skills = skills_payload(user_id, slot)
+    fishing_level = int(skills.get("fishing", {}).get("level", 1))
+
+    catch = gamedata.roll_fishing_catch(rod_tier, fishing_level)
+    if catch is None:
+        # No FISH-typed items in the catalogue at all. A server misconfiguration
+        # rather than a player problem, and it must not eat their bait.
+        return {
+            "error": "Conflict",
+            "message": "There is nothing to catch here.",
+        }, 409
+
+    # ---- everything above this line is validation; everything below commits --
+    db = get_db()
+
+    if not _take_from_backpack(user_id, slot, FISHING_BAIT_ID, 1):
+        # Re-checked inside the transaction. The count above was read before the
+        # roll, and two casts racing would both have seen the last worm.
+        return {"error": "Forbidden", "message": "You need worms for bait."}, 403
+
+    written = _add_to_backpack(user_id, slot, catch["item_id"], catch["quantity"])
+    if written is None:
+        # The bait is not spent: nothing has been committed, and returning here
+        # abandons the transaction rather than charging for a fish that had
+        # nowhere to go.
+        return {
+            "error": "Conflict",
+            "message": "Your backpack is full (%d slots)." % CARRY_CAPACITY,
+        }, 409
+
+    level, xp, levels_gained = _grant_skill_xp(user_id, slot, "fishing", catch["xp"])
+
+    db.execute(
+        "UPDATE saves SET last_cast_at = ?, cast_tokens = ? WHERE user_id = ? AND slot = ?",
+        (now_ms, tokens, user_id, slot),
+    )
+    db.commit()
+
+    return {
+        "item_id": catch["item_id"],
+        "quantity": catch["quantity"],
+        "xp": catch["xp"],
+        "carry_positions": written,
+        "levelled_up": levels_gained > 0,
+        "fishing_level": level,
+        "status": status_payload(user_id, slot),
+        "inventory": inventory_payload(user_id, slot),
+        "skills": skills_payload(user_id, slot),
+    }, 200
+
+
+@app.post("/api/cooking/cook")
+@require_auth
+def cooking_cook():
+    """
+    Cook one raw fish
+    ---
+    tags:
+      - Cooking
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [slot, item_id]
+          properties:
+            slot:    {type: integer, example: 0}
+            item_id: {type: string,  example: rawmudfish}
+    responses:
+      200:
+        description: What happened, and the state it landed in
+      400:
+        description: Bad slot or item_id
+      403:
+        description: Cooking level too low
+      404:
+        description: That slot is empty, or you are not carrying that fish
+      409:
+        description: Backpack full, or the item is not cookable
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+    user_id = g.user["id"]
+
+    slot = parse_slot(payload.get("slot"))
+    if slot is None:
+        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+    if not _slot_exists(user_id, slot):
+        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
+
+    item_id = str(payload.get("item_id", "")).strip()
+    if not item_id or len(item_id) > 64:
+        return bad_request("item_id must be 1-64 characters")
+
+    # THE INPUT IS NAMED BY THE CLIENT AND NOTHING ELSE IS. Which of their own
+    # fish to cook is a choice, not a claim - the recipe, the level gate and the
+    # burn roll are all read from data the server holds.
+    held = get_db().execute(
+        "SELECT COALESCE(SUM(quantity), 0) FROM carry_items "
+        "WHERE user_id = ? AND slot = ? AND item_id = ?",
+        (user_id, slot, item_id),
+    ).fetchone()[0]
+    if int(held) <= 0:
+        return {"error": "Not Found", "message": "You are not carrying that."}, 404
+
+    skills = skills_payload(user_id, slot)
+    cooking_level = int(skills.get("cooking", {}).get("level", 1))
+
+    outcome = gamedata.roll_cook(item_id, cooking_level)
+    if not outcome["ok"]:
+        if outcome["reason"] == "level":
+            return {
+                "error": "Forbidden",
+                "message": "You need cooking level %d." % outcome["needs"],
+            }, 403
+        return {
+            "error": "Conflict",
+            "message": "That cannot be cooked.",
+        }, 409
+
+    # ---- everything above this line is validation; everything below commits --
+    db = get_db()
+
+    if not _take_from_backpack(user_id, slot, item_id, 1):
+        return {"error": "Not Found", "message": "You are not carrying that."}, 404
+
+    written = []
+    if not outcome["burnt"]:
+        written = _add_to_backpack(user_id, slot, outcome["output"], 1)
+        if written is None:
+            # The raw fish is not consumed - nothing is committed.
+            return {
+                "error": "Conflict",
+                "message": "Your backpack is full (%d slots)." % CARRY_CAPACITY,
+            }, 409
+
+    level, xp, levels_gained = _grant_skill_xp(user_id, slot, "cooking", outcome["xp"])
+    db.commit()
+
+    return {
+        "item_id": item_id,
+        "burnt": outcome["burnt"],
+        "output": outcome["output"],
+        "xp": outcome["xp"],
+        "carry_positions": written,
+        "levelled_up": levels_gained > 0,
+        "cooking_level": level,
+        "status": status_payload(user_id, slot),
+        "inventory": inventory_payload(user_id, slot),
+        "skills": skills_payload(user_id, slot),
+    }, 200
+
+
 @app.get("/api/loot/bag")
 @require_auth
 def read_loot_bag():
@@ -3880,4 +4415,10 @@ def read_loot_bag():
 # routes ABOVE this line.
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # DEBUG IS OFF UNLESS EXPLICITLY ASKED FOR. debug=True enables the Werkzeug
+    # interactive debugger, which turns any unhandled exception on a reachable
+    # build into arbitrary code execution on the box that holds elusion.db and
+    # its password hashes. Turn it on for a local dev loop with ELUSION_DEBUG=1;
+    # anything anyone else can reach leaves it off. See SECURITY_NOTES.md (E-4).
+    _debug = os.environ.get("ELUSION_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+    app.run(debug=_debug)

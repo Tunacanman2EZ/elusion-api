@@ -141,7 +141,7 @@ def has_item(item_id):
 # a new type at the top would renumber every one below it, and a server
 # filtering on `type == 5` would start excluding the wrong thing without a
 # single error anywhere.
-EXCLUDED_FROM_LOOT = {"PET", "QUEST", "CURRENCY"}
+EXCLUDED_FROM_LOOT = {"PET", "QUEST", "CURRENCY", "FISH"}
 
 
 # =============================================================================
@@ -209,6 +209,17 @@ def pick_weighted_item_id(max_tier):
         if item["tier"] > max_tier:
             continue
         if item["type_name"] in EXCLUDED_FROM_LOOT:
+            continue
+
+        # PER-ITEM OPT-OUT, independent of tier. A cooked fish is a
+        # Type.CONSUMABLE exactly like a potion, so the type exclusion above
+        # cannot reach it - and a slime dropping cooked mudfish takes the point
+        # out of the fishing skill. See ItemData.droppable in the Godot project
+        # for the full reasoning. .get() with a default because a gamedata.json
+        # exported before the field existed simply will not have it, and the
+        # server refusing to boot over an additive field would be worse than
+        # treating an old catalogue as all-droppable.
+        if not item.get("droppable", True):
             continue
 
         weight = 2 ** max(max_tier - item["tier"], 0)
@@ -299,6 +310,147 @@ def build_bag_contents(enemy):
                 contents.append({"item_id": picked, "quantity": 1})
 
     return contents
+
+
+def xp_needed_for_skill_level(skill_id, level):
+    """
+    XP to go from `level` to the next, for one skill.
+
+    Port of PlayerStats.xp_needed_for_skill(): base * factor^(level-1).
+
+    PER SKILL, NOT ONE SHARED CURVE. player.gd uses a different factor for each
+    - cooking climbs at 1.10 where attack climbs at 1.25 - so a single growth
+    here would quietly re-pace every skill the server touches. The table is
+    authored in GameConstants.SKILL_XP_GROWTH and shipped in the JSON.
+    """
+    base = int(CONSTANTS.get("skill_xp_base", 100))
+    growth = CONSTANTS.get("skill_xp_growth", {})
+    factor = float(growth.get(skill_id, 1.18))
+    return int(base * (factor ** max(int(level) - 1, 0)))
+
+
+def fish_ceiling(rod_tier, fishing_level):
+    """
+    Highest fish tier a rod of this tier, in hands of this skill, can pull up.
+
+    THE ROD SETS THE FLOOR, THE SKILL RAISES IT. A rod alone would make fishing
+    a shopping problem; skill alone would make the rods decoration. Both matter,
+    and the divisor is authored in the game (GameConstants.FISHING_TIER_PER_LEVEL)
+    rather than chosen here - see this module's header on restating numbers.
+    """
+    per = int(CONSTANTS.get("fishing_tier_per_level", 20))
+    if per < 1:
+        per = 1
+    return max(1, int(rod_tier) + int(fishing_level) // per)
+
+
+def roll_fishing_catch(rod_tier, fishing_level):
+    """
+    Decide what came out of the water. Returns {item_id, quantity, xp}, or None
+    when the catalogue holds no fish at all.
+
+    THE CLIENT SENDS THAT IT FISHED, NOT WHAT IT GOT. docs/inventoryauthority.md
+    is explicit: "a client that names its own catch is a client that catches
+    whatever it likes." Everything this needs - the rod, the level - is read by
+    the caller from rows the server owns.
+
+    Weighted exactly like pick_weighted_item_id(): 2^(ceiling - tier), so the
+    best fish a player can currently reach is also the rarest, and each tier
+    below it is twice as likely.
+    """
+    ceiling = fish_ceiling(rod_tier, fishing_level)
+
+    candidates = []
+    weights = []
+    total_weight = 0
+
+    for item in ITEMS.values():
+        if item["type_name"] != "FISH":
+            continue
+        if item["tier"] > ceiling:
+            continue
+
+        weight = 2 ** max(ceiling - item["tier"], 0)
+        if weight < 1:
+            weight = 1
+
+        candidates.append(item)
+        weights.append(weight)
+        total_weight += weight
+
+    if not candidates or total_weight <= 0:
+        return None
+
+    roll = _rng.randrange(total_weight)
+    cumulative = 0
+    for index, candidate in enumerate(candidates):
+        cumulative += weights[index]
+        if roll < cumulative:
+            return {
+                "item_id": candidate["item_id"],
+                "quantity": 1,
+                "xp": int(candidate.get("fishing_xp", 0)),
+            }
+
+    return None
+
+
+def burn_chance(item, cooking_level):
+    """
+    Probability this fish is ruined, at this cooking level.
+
+    Worst at the fish's cook_level and zero at its cook_mastery_level, sliding
+    linearly between. cookingscreen.gd shows the player this same curve off the
+    same constant, so the number on the label is the number that gets rolled.
+    """
+    floor_level = int(item.get("cook_level", 1))
+    mastery = int(item.get("cook_mastery_level", 1))
+    worst = float(CONSTANTS.get("cook_burn_max", 0.40))
+
+    if mastery <= floor_level or cooking_level >= mastery:
+        return 0.0
+
+    span = float(mastery - floor_level)
+    into = float(int(cooking_level) - floor_level)
+    chance = worst * (1.0 - into / span)
+    return min(max(chance, 0.0), worst)
+
+
+def roll_cook(item_id, cooking_level):
+    """
+    Cook one raw fish. Returns a dict describing what happened:
+
+        {"ok": False, "reason": "unknown"}      no such item
+        {"ok": False, "reason": "notcookable"}  nothing to cook it into
+        {"ok": False, "reason": "level", "needs": N}
+        {"ok": True, "burnt": True,  "output": "", "xp": 0}
+        {"ok": True, "burnt": False, "output": "cooked...", "xp": N}
+
+    BURNING GRANTS NOTHING, deliberately. If a failed cook still paid XP there
+    would be no cost to cooking above your level and the burn chance would be
+    decoration - a slower road to the same place rather than a reason to wait.
+    """
+    item = ITEMS.get(item_id)
+    if item is None:
+        return {"ok": False, "reason": "unknown"}
+
+    output = str(item.get("cooks_into", ""))
+    if output == "" or output not in ITEMS:
+        return {"ok": False, "reason": "notcookable"}
+
+    needs = int(item.get("cook_level", 1))
+    if int(cooking_level) < needs:
+        return {"ok": False, "reason": "level", "needs": needs}
+
+    if _rng.random() < burn_chance(item, cooking_level):
+        return {"ok": True, "burnt": True, "output": "", "xp": 0}
+
+    return {
+        "ok": True,
+        "burnt": False,
+        "output": output,
+        "xp": int(item.get("cook_xp", 0)),
+    }
 
 
 def roll_kill_rewards(enemy_id):
