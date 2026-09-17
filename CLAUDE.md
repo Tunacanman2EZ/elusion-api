@@ -268,7 +268,9 @@ summon - stepping through is the consent, and it sorts the audience for free.
 app.py          every route, the schema, the migrations
 gamedata.py     loot rolls, XP curve, stat curves - the game's rules
 gamedata.json   exported from the Godot project, NOT hand-edited
-test_api.py     262 checks; read the header before adding to it
+test_api.py     419 checks; read the header before adding to it
+test_security.py   25 checks; server authority - inventory, skills, lockout
+test_throttle.py   44 checks; login defences, rate limits, credential rotation
 set_role.py     sets an account's rank; --list shows every account
 ```
 
@@ -296,22 +298,33 @@ request?** If yes, the decision is on the wrong side of the wire. "I fished"
 is a fact about the player. "I caught a trout" is a decision, and decisions
 belong here.
 
-This matters most for what is NOT built yet - shops, fishing and cooking.
-Building them this way costs nothing now and costs a rewrite each if they are
-built client-side and migrated later. See `docs/inventoryauthority.md`.
+FISHING AND COOKING WERE BUILT THIS WAY AND IT COST NOTHING. The rod and bait
+are checked server-side, the catch is rolled server-side, the XP is granted
+against items the server itself consumed - and `PUT /api/character/skills` now
+DROPS fishing and cooking from whatever the client sends, because a routine
+client sync would otherwise overwrite a grant made seconds earlier. They are the
+worked example for every skill that still needs this. Shops are the remaining
+one. See `docs/inventoryauthority.md`.
 
-`PUT /api/character/inventory` and `PUT /api/account/bank` predate the rule and
-still take a whole array on trust. `_report_unexplained_gains()` logs `[LEDGER]`
-lines when a client claims more than the server granted; it refuses nothing yet,
-because most disagreements are currently honest and a rule written before
-knowing which would refuse real players.
+`PUT /api/character/inventory` predated the rule and has since been brought
+under it: `_report_unexplained_gains()` ran in SHADOW MODE first - logging
+`[LEDGER]` lines and refusing nothing - until the comparison had been proven
+right against real play, and only then started trimming. Shipping the refusal
+first would have broken honest saves. `PUT /api/account/bank` still takes a
+whole array on trust and is the next one to get the same treatment.
 
 ## Known gaps
 
-- The backpack ledger is still client-asserted. `POST /api/loot/take` closed
-  where items come from, not what a client claims to hold.
-- `app.run(debug=True)` is Flask's development server. Right for local play,
-  wrong for anything public; a real deployment needs a WSGI server in front.
+- Four of the six skills - attack, defense, agility, magic - still have no
+  server-side XP grant, so a client can claim any level up to `MAX_SKILL_LEVEL`.
+  Fishing and cooking show the shape the other four need.
+- The kill EVENT is asserted rather than verified. The server rolls the rewards
+  and rate-limits the reports, so this caps the speed of the fraud, not its
+  existence. The deepest open finding; see SECURITY_NOTES.md (E-3).
+- `PUT /api/account/bank` still takes an array on trust.
+- `app.run()` is Flask's development server even with debug off. Right for local
+  play, wrong for anything public; a real deployment needs a WSGI server, TLS,
+  and `ELUSION_TRUSTED_PROXIES` set to match - see `client_ip()`.
 - There is no staff read endpoint yet. `GET /api/staff/user/<name>` behind
   `@require_role("mod")` is what the owner panel's view button needs; it
   currently says it is not built rather than showing an empty result.

@@ -1,8 +1,10 @@
 from flask import Flask, request, g
 from flasgger import Swagger
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 import gamedata
+import logging
 import sqlite3
 import secrets
 import time
@@ -38,6 +40,38 @@ TOKEN_TTL = 60 * 60 * 24 * 30
 # SECURITY_NOTES.md (E-5). Counting resets on the first correct password.
 LOGIN_MAX_ATTEMPTS = 8
 LOGIN_LOCKOUT_SECONDS = 15 * 60
+
+# PER-IP THROTTLE, and the reason the per-account one above is not enough.
+#
+# LOGIN_MAX_ATTEMPTS stops VERTICAL brute force - many passwords against one
+# account. It does nothing about HORIZONTAL: one host trying "password123"
+# against a thousand different usernames never reaches 8 consecutive misses on
+# any single one, so it never trips anything. That is the cheaper attack, it is
+# the one that actually gets run against small games, and it was invisible here.
+#
+# So this counts failures by SOURCE rather than by account, over a rolling
+# window. Distinct usernames are counted separately and more strictly, because
+# twelve failures spread across twelve names is a spray, while twelve against
+# one name is a person who forgot their password.
+IP_MAX_FAILURES = 25              # total failures from one address per window
+IP_MAX_USERNAMES = 6              # distinct usernames failed against per window
+IP_WINDOW_SECONDS = 10 * 60
+IP_LOCKOUT_SECONDS = 15 * 60
+
+# How long a login attempt row is kept. Long enough to see a slow spray in the
+# log, short enough that the table does not grow forever on a box nobody prunes.
+LOGIN_LOG_RETENTION_SECONDS = 60 * 60 * 24 * 14
+
+# HOW MANY REVERSE PROXIES SIT IN FRONT OF THIS APP. Read the long note on
+# client_ip() before changing it - getting this wrong breaks the throttle in one
+# of two opposite and equally bad ways.
+TRUSTED_PROXY_HOPS = int(os.environ.get("ELUSION_TRUSTED_PROXIES", "0") or 0)
+
+if TRUSTED_PROXY_HOPS > 0:
+    # Only when explicitly configured. ProxyFix makes Flask read the client
+    # address out of X-Forwarded-For, which is correct behind a proxy you
+    # control and a forgery hole anywhere else.
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=TRUSTED_PROXY_HOPS, x_proto=TRUSTED_PROXY_HOPS)
 
 # SKILL CEILING. Skills have no server-side grant path yet - the client computes
 # skill XP and PUTs it back - so the server cannot yet prove a level was earned.
@@ -221,6 +255,41 @@ def init_db():
         );
 
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+        -- EVERY LOGIN ATTEMPT, GOOD AND BAD.
+        --
+        -- Two jobs, and it is one table because they need the same rows.
+        -- First, it is what the per-IP throttle counts: a rolling window of
+        -- failures from one address, which no counter on the users table can
+        -- express because the attacker never hits the same account twice.
+        -- Second, it is the forensic record - "tons of failures for one
+        -- username" and "tons of failures from one IP across many usernames"
+        -- are both single queries against it, and neither was answerable
+        -- before this existed.
+        --
+        -- username IS NOT A FOREIGN KEY, deliberately. The interesting rows are
+        -- attempts against names that do NOT exist, which is exactly what a
+        -- spray looks like, and a foreign key would make those unstoreable.
+        -- It is the string that was typed, not a user reference.
+        --
+        -- NO PASSWORD FIELD, not even hashed, not even truncated. There is no
+        -- version of storing what someone typed into a password box that is
+        -- worth the day it leaks - and a mistyped password is usually a real
+        -- password with one character wrong.
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT    NOT NULL DEFAULT '',
+            ip       TEXT    NOT NULL DEFAULT '',
+            ok       INTEGER NOT NULL DEFAULT 0,
+            reason   TEXT    NOT NULL DEFAULT '',
+            at       INTEGER NOT NULL
+        );
+
+        -- The throttle's own query: failures from one ip since a cutoff.
+        CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip, at);
+        -- Pruning, and "what happened to this account" for support.
+        CREATE INDEX IF NOT EXISTS idx_login_attempts_at ON login_attempts(at);
+        CREATE INDEX IF NOT EXISTS idx_login_attempts_user ON login_attempts(username, at);
 
         -- one row per character slot. the primary key is (user_id, slot)
         -- rather than an autoincrement id, so writing a slot twice is an
@@ -715,6 +784,106 @@ def _row_int(row, key):
     return 0
 
 
+def client_ip():
+    """
+    The address this request came from, as far as it can be trusted.
+
+    THIS IS THE PART OF PER-IP THROTTLING THAT GOES WRONG, and it fails in two
+    opposite directions depending on which mistake you make.
+
+    TRUST X-Forwarded-For WHEN YOU ARE NOT BEHIND A PROXY and the header is
+    attacker-controlled: a spray sets a different fake address on every request,
+    every bucket holds one failure, the throttle never fires, and the log fills
+    with invented addresses that frame innocent people.
+
+    IGNORE IT WHEN YOU ARE BEHIND ONE and request.remote_addr is the proxy -
+    the same value for every player alive. One brute-force run then trips the
+    IP lockout for THE ENTIRE PLAYER BASE. The throttle becomes the outage.
+
+    Neither is a setting you can guess from inside the app, so it is not
+    guessed: ELUSION_TRUSTED_PROXIES is 0 by default, meaning "nothing in
+    front of me, believe the socket". Set it to the number of proxies you
+    actually run when you deploy, and ProxyFix reads that many hops back.
+    """
+    return request.remote_addr or ""
+
+
+def _record_login_attempt(db, username, ip, ok, reason=""):
+    """
+    Write one row for this attempt, and shout about the failures.
+
+    BOTH OUTCOMES ARE STORED, not just the failures. A window holding nothing
+    but failures cannot tell "someone is being attacked" from "the server is
+    down for everyone" - the successes are the baseline that makes the failures
+    mean something.
+    """
+    db.execute(
+        "INSERT INTO login_attempts (username, ip, ok, reason, at) VALUES (?, ?, ?, ?, ?)",
+        (str(username or "")[:64], ip, 1 if ok else 0, reason, int(time.time())),
+    )
+    db.commit()
+
+    if not ok:
+        # Also to the app log, so a failure is visible to whoever is tailing
+        # the process without them knowing the schema. warning, not info:
+        # these are the lines someone should actually see.
+        app.logger.warning(
+            "login failed  user=%r  ip=%s  reason=%s",
+            str(username or "")[:64], ip or "?", reason or "bad-credentials",
+        )
+
+
+def _prune_login_attempts(db, now):
+    """Drop rows past the retention window. Called on the login path, which is
+    the only thing that writes here, so the table cannot grow without something
+    also cleaning it."""
+    db.execute(
+        "DELETE FROM login_attempts WHERE at < ?",
+        (now - LOGIN_LOG_RETENTION_SECONDS,),
+    )
+    db.commit()
+
+
+def _ip_throttle_state(db, ip, now):
+    """
+    Is this address currently locked out, and why?
+
+    Returns None when it is fine, or a (reason, retry_seconds) pair.
+
+    COUNTS FAILURES, NOT REQUESTS. A busy household behind one address logging
+    in successfully all day never approaches either ceiling; only misses count,
+    which is what keeps this from punishing shared connections.
+    """
+    if not ip:
+        # No address to attribute anything to. Fall through to the per-account
+        # throttle rather than inventing a bucket every unknown request shares.
+        return None
+
+    cutoff = now - IP_WINDOW_SECONDS
+    row = db.execute(
+        """
+        SELECT COUNT(*) AS failures, COUNT(DISTINCT username) AS names
+        FROM login_attempts
+        WHERE ip = ? AND ok = 0 AND at >= ?
+        """,
+        (ip, cutoff),
+    ).fetchone()
+
+    failures = int(row["failures"] or 0)
+    names = int(row["names"] or 0)
+
+    # THE SPRAY TEST FIRST, because it is the cheaper attack and the tighter
+    # bound. Six different usernames failing from one address inside ten
+    # minutes is not somebody misremembering their own password.
+    if names >= IP_MAX_USERNAMES:
+        return ("ip-spray", IP_LOCKOUT_SECONDS)
+
+    if failures >= IP_MAX_FAILURES:
+        return ("ip-volume", IP_LOCKOUT_SECONDS)
+
+    return None
+
+
 def _register_failed_login(db, row, now):
     """One more consecutive miss for this account; lock it if that crosses the
     threshold. Called only for a real row with a wrong password - a login for a
@@ -1110,6 +1279,24 @@ def login():
         return {"error": "Bad Request", "message": errors}, 400
 
     db = get_db()
+    ip = client_ip()
+    now = int(time.time())
+
+    # THE PER-IP GATE COMES FIRST - before the user lookup, before the account
+    # lockout, before any password hashing. A spray should cost the server one
+    # indexed COUNT and nothing else; running scrypt for an attacker is doing
+    # 32MB of work per guess ON THEIR BEHALF, which turns the good hash into a
+    # denial-of-service lever.
+    _prune_login_attempts(db, now)
+    ip_state = _ip_throttle_state(db, ip, now)
+    if ip_state is not None:
+        reason, retry = ip_state
+        _record_login_attempt(db, (data or {}).get("username", ""), ip, False, reason)
+        return {
+            "error": "Too Many Requests",
+            "message": "Too many failed attempts from this address. Try again in %d seconds." % retry,
+        }, 429
+
     row = db.execute(
         # SELECT * rather than a column list: ban_state() and role_for() both read
         # from this row, and a list here is a list that gets forgotten the next
@@ -1119,14 +1306,13 @@ def login():
         (data["username"],),
     ).fetchone()
 
-    now = int(time.time())
-
     # LOCKOUT comes before the password check on purpose: while an account is
     # frozen, no amount of guessing gets a verdict, correct or not. Only a real
     # row can be frozen, so a locked username is knowable - the accepted cost of
     # per-account lockout (see SECURITY_NOTES.md E-5).
     if row is not None and _row_int(row, "lockout_until") > now:
         retry = _row_int(row, "lockout_until") - now
+        _record_login_attempt(db, data["username"], ip, False, "account-locked")
         return {
             "error": "Too Many Requests",
             "message": "Too many failed attempts. Try again in %d seconds." % retry,
@@ -1137,6 +1323,14 @@ def login():
     if row is None or not check_password_hash(row["password_hash"], data["password"]):
         if row is not None:
             _register_failed_login(db, row, now)
+        # The REASON is recorded even though the RESPONSE cannot distinguish
+        # them. The 401 has to stay identical or it enumerates usernames; the
+        # log is on our side of that line, and "no-such-user" against forty
+        # names is the signature of a spray.
+        _record_login_attempt(
+            db, data["username"], ip, False,
+            "no-such-user" if row is None else "bad-password",
+        )
         return {
             "error": "Unauthorized",
             "message": "Incorrect username or password.",
@@ -1161,6 +1355,7 @@ def login():
     # banned and why. Silence there reads as the game being broken.
     ban = ban_state(row)
     if ban is not None:
+        _record_login_attempt(db, row["username"], ip, False, "banned")
         return {
             "error": "Forbidden",
             "message": "This account is banned." if ban["permanent"]
@@ -1169,6 +1364,7 @@ def login():
         }, 403
 
     token, expires_at = issue_token(row["id"])
+    _record_login_attempt(db, row["username"], ip, True, "")
 
     return {
         "user_id": row["id"],
@@ -1248,6 +1444,195 @@ def logout():
     db.execute("DELETE FROM sessions WHERE token = ?", (bearer_token(),))
     db.commit()
     return "", 204
+
+
+@app.post("/api/auth/logout-all")
+@require_auth
+def logout_all():
+    """
+    Invalidate every session for the logged-in account
+    ---
+    tags:
+      - Auth
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+    responses:
+      200:
+        description: Sessions invalidated
+        schema:
+          type: object
+          properties:
+            revoked:
+              type: integer
+      401:
+        description: Missing, invalid or expired token
+    """
+    # WHY THIS EXISTS, given TOKEN_TTL is thirty days.
+    #
+    # A long token is the right call for a game - nobody wants to retype a
+    # password to play for twenty minutes - but it is only defensible if there
+    # is a way to END one early. Without this, a token that leaks stays valid
+    # for up to a month and nothing anyone can do shortens that: changing a
+    # password would not help, because /api/auth/logout only kills the token
+    # doing the asking, and the attacker is holding a different one.
+    #
+    # So the answer to "30 days is a long time" is not a smaller number that
+    # annoys every honest player. It is this: the window stays generous, and it
+    # can be slammed shut on demand.
+    #
+    # DELETES THE CALLER'S TOKEN TOO. "Log out everywhere" that leaves the
+    # device you typed it on still logged in is not what anyone means by it,
+    # and if the reason you pressed it is that you think you were compromised,
+    # the ambiguity is the last thing you need.
+    db = get_db()
+    cursor = db.execute("DELETE FROM sessions WHERE user_id = ?", (g.user["id"],))
+    db.commit()
+
+    app.logger.warning(
+        "all sessions revoked  user=%r  ip=%s  count=%d",
+        g.user["username"], client_ip() or "?", cursor.rowcount,
+    )
+
+    return {"revoked": cursor.rowcount}, 200
+
+
+@app.post("/api/auth/password")
+@require_auth
+def change_password():
+    """
+    Change the logged-in account's password
+    ---
+    tags:
+      - Auth
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          properties:
+            current_password:
+              type: string
+            new_password:
+              type: string
+    responses:
+      200:
+        description: Password changed; every session was revoked and a new one issued
+        schema:
+          type: object
+          properties:
+            token:
+              type: string
+            expires_at:
+              type: integer
+            revoked:
+              type: integer
+      400:
+        description: Validation error
+      401:
+        description: Missing token, or the current password is wrong
+      429:
+        description: Too many failed attempts
+    """
+    # THE OTHER HALF OF E-6. logout-all lets you end sessions; without this
+    # there was no way to change the credential that leaked, so an attacker who
+    # had the password simply logged back in and got a fresh 30-day token.
+    # Revoking without rotating is a door you keep closing on someone holding
+    # the key.
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return bad_request("Payload must be a JSON object.")
+
+    current = data.get("current_password")
+    new = data.get("new_password")
+
+    if not isinstance(current, str) or not isinstance(new, str):
+        return bad_request("current_password and new_password are required strings.")
+    if len(new) < MIN_PASSWORD_LENGTH:
+        return bad_request(
+            "Field 'new_password' must be at least %d characters." % MIN_PASSWORD_LENGTH
+        )
+    if new == current:
+        return bad_request("The new password must be different from the current one.")
+
+    db = get_db()
+    ip = client_ip()
+    now = int(time.time())
+
+    row = db.execute("SELECT * FROM users WHERE id = ?", (g.user["id"],)).fetchone()
+    if row is None:
+        # The token resolved a moment ago, so this is a deleted account racing
+        # its own session rather than anything the caller did.
+        return {"error": "Unauthorized", "message": "No such account."}, 401
+
+    # THE CURRENT PASSWORD IS REQUIRED, and it is the whole point. A valid token
+    # is not proof of identity here - a stolen token is exactly the situation
+    # this endpoint exists for, and letting one set a new password would hand
+    # the account to the thief rather than take it back.
+    #
+    # THROTTLED LIKE LOGIN, for the same reason: this is a second place to guess
+    # a password, and one that answers from an authenticated session. Leaving it
+    # unthrottled would put the lock back on the front door and a window beside
+    # it. Both ceilings apply, and a miss counts against both.
+    ip_state = _ip_throttle_state(db, ip, now)
+    if ip_state is not None:
+        reason, retry = ip_state
+        _record_login_attempt(db, row["username"], ip, False, reason)
+        return {
+            "error": "Too Many Requests",
+            "message": "Too many failed attempts from this address. Try again in %d seconds." % retry,
+        }, 429
+
+    if _row_int(row, "lockout_until") > now:
+        retry = _row_int(row, "lockout_until") - now
+        _record_login_attempt(db, row["username"], ip, False, "account-locked")
+        return {
+            "error": "Too Many Requests",
+            "message": "Too many failed attempts. Try again in %d seconds." % retry,
+        }, 429
+
+    if not check_password_hash(row["password_hash"], current):
+        _register_failed_login(db, row, now)
+        _record_login_attempt(db, row["username"], ip, False, "bad-password-on-change")
+        return {
+            "error": "Unauthorized",
+            "message": "The current password is incorrect.",
+        }, 401
+
+    # ONE TRANSACTION: re-hash, revoke, re-issue. Splitting these leaves a window
+    # where the password is new and the attacker's session is still live, which
+    # is the exact state the endpoint exists to remove.
+    #
+    # EVERY session goes, including the caller's own, and then a fresh one is
+    # issued to the caller. That ordering matters: "change my password" must not
+    # be a way to log everyone out except whoever currently holds a stolen token.
+    new_hash = generate_password_hash(new)
+    db.execute(
+        "UPDATE users SET password_hash = ?, failed_logins = 0, lockout_until = 0 WHERE id = ?",
+        (new_hash, row["id"]),
+    )
+    cursor = db.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+    db.commit()
+
+    revoked = cursor.rowcount
+    token, expires_at = issue_token(row["id"])
+    _record_login_attempt(db, row["username"], ip, True, "password-changed")
+
+    app.logger.warning(
+        "password changed  user=%r  ip=%s  sessions_revoked=%d",
+        row["username"], ip or "?", revoked,
+    )
+
+    return {"token": token, "expires_at": expires_at, "revoked": revoked}, 200
 
 
 # =============================================================================
