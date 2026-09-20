@@ -2655,7 +2655,7 @@ def parse_pet_id(raw):
 #
 # The tuple below is now only a FALLBACK, for a gamedata.json exported before
 # equip_slot_name existed - the same arrangement the regen constants use.
-# _warn_if_equipment_unexported() says so at boot when it is in play.
+# _warn_if_protections_unarmed() says so at boot when it is in play.
 EQUIP_SLOTS_FALLBACK = (
     "weapon", "helm", "chest", "legs", "boots", "shield", "ring", "amulet",
 )
@@ -3290,7 +3290,7 @@ DERIVED_STATS = ("max_hp", "max_mana", "max_stamina")
 # and the sanitiser began rewriting honest saves with garbage.
 #
 # gamedata falls back to the old literals when gamedata.json predates the
-# export, so an un-regenerated file still runs. _warn_if_regen_unexported()
+# export, so an un-regenerated file still runs. _warn_if_protections_unarmed()
 # says so once at boot rather than letting it pass unnoticed, because measuring
 # against numbers nobody is keeping in step is the exact failure this move was
 # meant to end.
@@ -3335,38 +3335,105 @@ LEVELUP_GRANT_ID = "__levelup__"
 REVIVE_EXPLAINS_EVERYTHING = True
 
 
-def _warn_if_regen_unexported():
-    """Say once, at boot, if gamedata.json predates the regen export."""
-    if not gamedata.REGEN_EXPORTED:
-        app.logger.warning(
-            "gamedata.json has no regen constants - the healing check is using "
-            "app.py's fallback copies. Re-run the Godot export tool "
-            "(src/tools/exportgamedata.gd) to pick up PlayerStats."
-        )
+# PROTECTIONS THAT ARE ONLY AS REAL AS THE CATALOGUE THEY READ.
+#
+# Every one of these FAILS OPEN when its field is missing, and that is the
+# right call: a server whose gamedata.json predates a field must keep serving
+# rather than refuse every request. See the spawn ceiling's note for the full
+# argument.
+#
+# WHAT WAS WRONG WAS THAT IT WAS QUIET. gamedata.json in this repo once sat 46
+# hours behind the Godot export and all four of these were open the whole time
+# - equipment validation, the spawn ceiling, the regen rates and the potion
+# amounts, none of them doing anything, with 1,515 tests passing because every
+# suite builds its own fixture and none of them read the file that ships.
+#
+# TWO THINGS CHANGED, and the other one matters more. test_catalogue.py asserts
+# these flags against the REAL gamedata.json, so a stale copy is now a red test
+# rather than a silence. This block is the production half: CI cannot see the
+# file on the deployed box.
+#
+# A TABLE, NOT FOUR FUNCTIONS. There were two of these written out longhand and
+# the two that arrived later never got written at all - which is the whole
+# incident in one sentence. Adding a protection means adding a row here, and a
+# row is small enough that it actually happens.
+EXPORT_DEPENDENT_PROTECTIONS = (
+    (
+        "equip_slot_name",
+        lambda: gamedata.EQUIP_EXPORTED,
+        "equipment saves fall back to EQUIP_SLOTS_FALLBACK and nothing "
+        "verifies an item belongs in the slot it was sent for - the state "
+        "that let {\"helm\": \"embersword\"} through",
+    ),
+    (
+        "placed_count",
+        lambda: gamedata.SPAWNS_EXPORTED,
+        "the spawn ceiling is disabled entirely - kill claims are bounded "
+        "only by the token bucket",
+    ),
+    (
+        "regen_percent_per_second",
+        lambda: gamedata.REGEN_EXPORTED,
+        "the healing check measures against app.py's fallback literals "
+        "rather than against PlayerStats",
+    ),
+    (
+        "restore_amount",
+        lambda: any("restore_amount" in item for item in gamedata.ITEMS.values()),
+        "a consume grant carries no amount, and an unknown amount makes "
+        "_report_unexplained_heals() return early - one cheap potion "
+        "explains a heal of any size",
+    ),
+)
 
 
-def _warn_if_equipment_unexported():
-    """Say once, at boot, if gamedata.json predates the equipment export.
+def _warn_if_protections_unarmed():
+    """Say once, at boot, which export-gated protections are not running.
 
-    It matters more than the regen warning does. Without equip_slot_name the
-    server cannot tell a helmet from a sword, so /api/save falls back to
-    checking only that the slot is one of EQUIP_SLOTS_FALLBACK and the item
-    exists - which is the state that let {"helm": "embersword"} through in the
-    first place."""
-    if not gamedata.EQUIP_EXPORTED:
-        app.logger.warning(
-            "gamedata.json carries no equip_slot_name - equipment saves are "
-            "checked against app.py's fallback slot list and nothing verifies "
-            "that an item belongs in the slot it is sent for. Re-run the Godot "
-            "export tool (src/tools/exportgamedata.gd)."
-        )
+    ONE BLOCK, NOT ONE LINE EACH. Four separate warnings scroll; a block with a
+    count in its first line reads as an event. Same reasoning as collapsing the
+    export tool's per-boss warnings into a single line.
+
+    ERROR, NOT WARNING. A warning is what this was, and a warning is what got
+    scrolled past for 46 hours. Nothing here is a style preference or a
+    deprecation - these lines mean a security control that the code believes is
+    running is not running.
+    """
+    unarmed = [(field, why) for field, armed, why in EXPORT_DEPENDENT_PROTECTIONS
+               if not armed()]
+    if not unarmed:
+        return
+
+    app.logger.error(
+        "%d of %d export-gated protections are NOT ARMED - gamedata.json is "
+        "stale or incomplete:",
+        len(unarmed), len(EXPORT_DEPENDENT_PROTECTIONS),
+    )
+    for field, why in unarmed:
+        app.logger.error("    missing %-26s %s", field, why)
+    app.logger.error(
+        "    FIX: re-run src/tools/exportgamedata.gd in Godot, then copy "
+        "Elusion_RPG/data/gamedata.json over this folder's gamedata.json"
+    )
+
+    # REFUSING TO BOOT IS THE OTHER OPTION, and it is deliberately not the
+    # default. Uncomment to take it:
+    #
+    #     raise gamedata.GameDataError(
+    #         "refusing to serve with %d protections unarmed" % len(unarmed))
+    #
+    # The argument for it is that a game with real accounts should not quietly
+    # serve with equipment validation off. The argument against is that it
+    # turns a missed copy into an outage at the worst possible moment, and the
+    # honest state today is that nobody is watching the log at 3am either way.
+    # Left as a one-line flip rather than decided here, because it is a
+    # deployment posture question and not a code question.
 
 
 # AT IMPORT, which is boot for this app - init_db() runs the same way a few
 # hundred lines up. Said once rather than per request, because a warning that
 # repeats on every status write is one nobody reads.
-_warn_if_regen_unexported()
-_warn_if_equipment_unexported()
+_warn_if_protections_unarmed()
 
 
 def _report_unexplained_heals(db, user_id, slot, before, after):
