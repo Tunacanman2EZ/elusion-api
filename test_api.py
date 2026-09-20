@@ -443,10 +443,26 @@ status("read empty slot", client.get("/api/player/status?slot=2", headers=H), 40
 status("read bad slot", client.get("/api/player/status?slot=9", headers=H), 400)
 status("read missing slot param", client.get("/api/player/status", headers=H), 400)
 
-body = status("partial write: gold only", client.put("/api/player/status", headers=H,
-              json={"slot": 0, "gold": 500}), 200)
-check("partial write left hp untouched", body["hp"] == 180, body)
-check("partial write applied gold", body["gold"] == 500, body)
+# GOLD IS SERVER-OWNED NOW, AND THIS BLOCK USED TO PROVE THE OPPOSITE.
+#
+# It asserted that PUT /api/player/status applied a gold figure the client sent.
+# It passed, and that was the bug: one request set any balance an authenticated
+# player liked, and the supply invariant broke the instant it did. `gold` was in
+# STATUS_FIELDS and had never been added to SERVER_OWNED_STATS, so PUT /api/save
+# refused a client's gold while this endpoint took it.
+#
+# The partial-write half is still worth proving, so it is kept - on a field the
+# client may legitimately write.
+body = status("partial write: one field only", client.put("/api/player/status", headers=H,
+              json={"slot": 0, "hp": 170}), 200)
+check("partial write left gold untouched", body["gold"] == 0, body)
+check("partial write applied hp", body["hp"] == 170, body)
+
+body = status("a client pushing its own gold", client.put("/api/player/status", headers=H,
+              json={"slot": 0, "gold": 1_000_000}), 200)
+check("gold is ignored, not stored", body["gold"] == 0, body)
+check("and the server names it as disregarded",
+      "gold" in body.get("ignored", []), body)
 
 # REWRITTEN. These used to raise max_hp and then hp underneath it, and assert
 # that mismatched pairs returned 400. max_hp is derived now - see DERIVED STATS
@@ -466,19 +482,26 @@ body = status("same pair, keys reversed", client.put("/api/player/status", heade
               json={"max_hp": 999, "hp": 999, "slot": 0}), 200)
 check("key order does not change the outcome",
       body["hp"] == 180 and body["max_hp"] == 180, body)
+# ON hp RATHER THAN gold, because a server-owned field is dropped BEFORE it is
+# parsed - a malformed gold value would now return 200 and prove nothing about
+# parse_stat(). These have to ride on a field the client may still write, or
+# they quietly stop testing the validator.
 status("negative value", client.put("/api/player/status", headers=H,
-       json={"slot": 0, "gold": -1}), 400)
+       json={"slot": 0, "hp": -1}), 400)
 status("boolean instead of int", client.put("/api/player/status", headers=H,
-       json={"slot": 0, "gold": True}), 400)
+       json={"slot": 0, "hp": True}), 400)
 status("value past the ceiling", client.put("/api/player/status", headers=H,
-       json={"slot": 0, "gold": 10 ** 12}), 400)
+       json={"slot": 0, "hp": 10 ** 12}), 400)
 status("only unknown fields", client.put("/api/player/status", headers=H,
        json={"slot": 0, "wingspan": 1}), 400)
 status("write to empty slot", client.put("/api/player/status", headers=H,
-       json={"slot": 2, "gold": 1}), 404)
+       json={"slot": 2, "hp": 1}), 404)
 
 body = status("rejections left state intact", client.get("/api/player/status?slot=0", headers=H), 200)
-check("gold still 500 after four refused writes", body["gold"] == 500, body)
+# 180, not the 170 written further up: the clamping cases between here and
+# there ended with hp pinned to the class maximum, which is the last value a
+# refused write must not have disturbed.
+check("hp still 180 after four refused writes", body["hp"] == 180, body)
 check("an unknown field never becomes part of the record",
       "wingspan" not in body, body)
 
@@ -762,6 +785,55 @@ def clear_backpack(username, slot):
     conn.close()
 
 
+def fill_backpack(username, slot, entries):
+    """Seed carry_items directly, as if the server had already granted these.
+
+    The backpack is under server authority now: PUT /api/character/inventory
+    reconciles a non-staff account against what the server recorded rather than
+    setting arbitrary items. A fixture that needs a regular player to HOLD items
+    therefore establishes them at the record level, the same way plant_bag
+    plants a loot bag. Positional from cell 0."""
+    conn = _sq.connect(DB_PATH)
+    conn.row_factory = _sq.Row
+    user_id = conn.execute(
+        "SELECT id FROM users WHERE username = ?", (username,)
+    ).fetchone()["id"]
+    conn.execute("DELETE FROM carry_items WHERE user_id = ? AND slot = ?", (user_id, slot))
+    conn.executemany(
+        "INSERT INTO carry_items (user_id, slot, position, item_id, quantity)"
+        " VALUES (?, ?, ?, ?, ?)",
+        [(user_id, slot, i, item_id, qty) for i, (item_id, qty) in enumerate(entries)],
+    )
+    conn.commit()
+    conn.close()
+
+
+def fill_bank(username, entries):
+    """Seed bank_items directly, as if the server had already banked these.
+
+    THE BANK'S fill_backpack, AND FOR THE SAME REASON. PUT /api/account/bank now
+    reconciles a non-staff account against what the server recorded, so it can
+    no longer be used to PLACE items - only to reorder ones already there. A
+    fixture that needs a player to HOLD something in the bank establishes it at
+    the record level, the way fill_backpack and plant_bag do.
+
+    Account-wide, so no slot: the bank is shared between a player's characters.
+    Positional from cell 0."""
+    conn = _sq.connect(DB_PATH)
+    conn.row_factory = _sq.Row
+    user_id = conn.execute(
+        "SELECT id FROM users WHERE username = ?", (username,)
+    ).fetchone()["id"]
+    conn.execute("DELETE FROM bank_items WHERE user_id = ?", (user_id,))
+    conn.executemany(
+        "INSERT INTO bank_items (user_id, position, item_id, quantity) VALUES (?, ?, ?, ?)",
+        [(user_id, i, item_id, qty) for i, (item_id, qty) in enumerate(entries)],
+    )
+    conn.commit()
+    conn.close()
+
+
+
 # ---- STACKING ---------------------------------------------------------------
 #
 # THE REASON THIS MATTERS IS THE RESPONSE, NOT THE DATABASE.
@@ -843,8 +915,11 @@ check("the duplicate did not also take a backpack cell",
 # THE BANK COUNTS AS OWNING IT. A pet is a collectible, and putting one in the
 # bank is what a collection looks like - it must not start dropping again.
 clear_backpack("bagtester", 0)
-status("bank the pet", client.put("/api/account/bank", headers=H4,
-       json={"bank_inventory": [{"item_id": "petpoisonslimesmall", "quantity": 1}]}), 200)
+# Seeded at the record level rather than asserted through PUT /api/account/bank.
+# That endpoint used to accept any array; it now reconciles against what the
+# server banked, so using it to PLACE a pet would be testing the trim, not the
+# duplicate-pet rule this section is about.
+fill_bank("bagtester", [("petpoisonslimesmall", 1)])
 BAG = plant_bag("bagtester", 0, [("petpoisonslimesmall", 1)])
 body = status("a pet held only in the bank", client.post("/api/loot/take", headers=H4,
               json={"bag_id": BAG, "position": 0}), 200)
@@ -857,8 +932,9 @@ check("still counts as owned", body.get("duplicate_pet") is True, body)
 # the player can make room and ask again.
 
 clear_backpack("bagtester", 0)
-status("fill every cell", client.put("/api/character/inventory", headers=H4,
-       json={"slot": 0, "inventory": [{"item_id": "ironsword", "quantity": 1}] * 20}), 200)
+# Server authority: a regular player cannot PUT items it never earned, so this
+# full pack is established at the record level (see fill_backpack).
+fill_backpack("bagtester", 0, [("ironsword", 1)] * 20)
 
 BAG = plant_bag("bagtester", 0, [("bushamulet", 1)])
 status("take into a full backpack", client.post("/api/loot/take", headers=H4,
@@ -877,10 +953,8 @@ check("still twenty swords and nothing else",
 # potion stack at 18 leaves room for 2, and asking for 5 has to be all or
 # nothing.
 clear_backpack("bagtester", 0)
-status("nineteen swords and a part-used potion stack", client.put("/api/character/inventory", headers=H4,
-       json={"slot": 0,
-             "inventory": [{"item_id": "ironsword", "quantity": 1}] * 19
-                          + [{"item_id": "smallhealthpotion", "quantity": 18}]}), 200)
+fill_backpack("bagtester", 0,
+              [("ironsword", 1)] * 19 + [("smallhealthpotion", 18)])
 BAG = plant_bag("bagtester", 0, [("smallhealthpotion", 5)])
 status("a take that only partly fits", client.post("/api/loot/take", headers=H4,
        json={"bag_id": BAG, "position": 0}), 409)
@@ -977,17 +1051,143 @@ check("what one character banked, another can see",
 
 
 # =============================================================================
+# EQUIPMENT AND HOTBAR SURVIVE A RE-LOGIN
+# =============================================================================
+# Both are strings the client cannot keep for itself. hotbar_assignments used
+# to live only in the local slot dictionary, so it survived a scene change and
+# not a re-login - the pet came back, because active_pet_id has a column, and
+# the hotbar did not, because it had none. Equipment would have inherited that
+# exact hole.
+
+section("SAVE - EQUIPMENT AND HOTBAR")
+
+def save_slot(**fields):
+    body = {"slot": 0, "class_id": "warrior", "name": "checker"}
+    body.update(fields)
+    return client.put("/api/save", headers=H, json=body)
+
+
+def slot_zero():
+    body = client.get("/api/save", headers=H).get_json()
+    rows = body if isinstance(body, list) else (body.get("saves") or body.get("slots") or [])
+    for row in rows:
+        if row.get("slot") == 0:
+            return row
+    return {}
+
+
+# THE CHARACTER HAS TO BE OLD ENOUGH TO WEAR THIS, and until the equipment
+# export existed it did not have to be. parse_equipment() skips
+# gamedata.equip_check() entirely on a gamedata.json that predates
+# equip_slot_name, so this block spent its whole life dressing a LEVEL 1
+# warrior in level 22 ember gear and getting a 200 for it. The first run after
+# the export turned that into five failures - which is the gate reporting for
+# duty, not a regression.
+#
+# Raised where the server keeps it rather than claimed over the wire: level is
+# in SERVER_OWNED_STATS precisely so a client cannot buy its way past this
+# check by asserting a number, and a test that set it through the payload
+# would be testing a door the server does not have.
+save_slot(area="field")          # make sure slot 0 exists before updating it
+_lvl = _owner_sq.connect(DB_PATH)
+_lvl.execute("UPDATE saves SET level = 22 WHERE user_id = "
+             "(SELECT id FROM users WHERE username = 'checker') AND slot = 0")
+_lvl.commit()
+_lvl.close()
+
+status("a save with a full set of gear", save_slot(equipment={
+    "weapon": "embersword", "helm": "emberhelm", "chest": "emberchest",
+    "legs": "emberlegs", "shield": "embershield",
+    "ring": "emberring", "amulet": "emberamulet",
+}), 200)
+
+# AND THE GATE IS REAL, asserted here rather than assumed from the 200 above.
+# Without this line the block passes just as happily on a server that skipped
+# equip_check() altogether, which is the state it actually shipped in.
+status("but a level 22 warrior still cannot wear a mage's robe",
+       save_slot(equipment={"chest": "ironrobe"}), 400)
+status("nor a sword on their head",
+       save_slot(equipment={"helm": "embersword"}), 400)
+
+body = slot_zero()
+check("the server stored all seven pieces", len(body.get("equipment", {})) == 7,
+      body.get("equipment"))
+check("and kept them by slot name, not position",
+      body.get("equipment", {}).get("weapon") == "embersword", body.get("equipment"))
+
+status("a save with a hotbar", save_slot(
+    hotbar=["tinyhealthpotion", "", "embersword"]), 200)
+body = slot_zero()
+check("the hotbar came back", body.get("hotbar", [])[0] == "tinyhealthpotion",
+      body.get("hotbar"))
+check("padded to nine, so the client always draws nine",
+      len(body.get("hotbar", [])) == 9, body.get("hotbar"))
+
+# THE RULE THAT MATTERS MOST: a save that says nothing about gear must not
+# undress you. Several callers write this slot and not all of them know what
+# the player is wearing - the same reasoning active_pet_id carries.
+status("a save that mentions neither", save_slot(area="field"), 200)
+body = slot_zero()
+check("gear is untouched by a save that does not mention it",
+      len(body.get("equipment", {})) == 7, body.get("equipment"))
+check("and so is the hotbar",
+      body.get("hotbar", [])[0] == "tinyhealthpotion", body.get("hotbar"))
+
+# Refusals. An id the catalogue has never heard of is the one that matters:
+# without it, the column becomes a place to stash arbitrary strings.
+status("an equip slot that does not exist", save_slot(
+    equipment={"hat": "emberhelm"}), 400)
+status("an item that does not exist", save_slot(
+    equipment={"helm": "sombrero"}), 400)
+status("equipment sent as a list", save_slot(equipment=["emberhelm"]), 400)
+status("a hotbar item that does not exist", save_slot(hotbar=["sombrero"]), 400)
+status("a hotbar sent as a string", save_slot(hotbar="potion"), 400)
+
+body = slot_zero()
+check("and not one refusal disturbed what was stored",
+      len(body.get("equipment", {})) == 7
+      and body.get("hotbar", [])[0] == "tinyhealthpotion",
+      [body.get("equipment"), body.get("hotbar")])
+
+# Taking everything off is a deliberate act, not an omission.
+status("clearing gear explicitly", save_slot(equipment={}), 200)
+check("takes everything off", slot_zero().get("equipment") == {}, slot_zero().get("equipment"))
+
+# A short hotbar is an older client, not a liar.
+status("a hotbar shorter than nine", save_slot(hotbar=["tinyhealthpotion"]), 200)
+check("is padded rather than refused", len(slot_zero().get("hotbar", [])) == 9,
+      slot_zero().get("hotbar"))
+
+
+# =============================================================================
 # ACCOUNT - LUSIONS
 # =============================================================================
 
 section("ACCOUNT - LUSIONS")
 
-body = status("set lusions", client.put("/api/account/lusions", headers=H, json={"lusions": 40}), 200)
-check("stored", body["lusions"] == 40, body)
-status("negative lusions", client.put("/api/account/lusions", headers=H, json={"lusions": -1}), 400)
-status("lusions as a string", client.put("/api/account/lusions", headers=H, json={"lusions": "lots"}), 400)
-body = status("unchanged after refusals", client.get("/api/account", headers=H), 200)
-check("still 40", body["lusions"] == 40, body)
+# LUSIONS ARE SERVER-OWNED NOW, and this block used to prove the opposite - it
+# asserted that a figure the client sent was stored, and it passed.
+#
+# Lusions have exactly one sink: reviving after death. So the balance IS the
+# death penalty, and a client able to write it had removed the cost of dying
+# from the game. Created by the server when a duplicate pet converts, spent by
+# the server at /api/character/revive, and written by nobody else.
+#
+# The validation cases went with it. A field that is dropped before it is parsed
+# cannot return 400 for being malformed, and keeping cases that expect one would
+# only prove the endpoint still reads something it must not.
+body = status("a client pushing its own lusions",
+              client.put("/api/account/lusions", headers=H, json={"lusions": 40}), 200)
+check("the figure is ignored, not stored", body["lusions"] == 0, body)
+check("and the server names it as disregarded",
+      "lusions" in body.get("ignored", []), body)
+
+body = status("a nonsense figure is ignored just the same",
+              client.put("/api/account/lusions", headers=H, json={"lusions": -1}), 200)
+check("still nothing", body["lusions"] == 0, body)
+
+body = status("reading it back", client.get("/api/account", headers=H), 200)
+check("the balance never moved", body["lusions"] == 0, body)
 
 
 # =============================================================================
@@ -1003,6 +1203,34 @@ section("BANK - GOLD")
 # gold from a real drop, and the numbers moved - correctly. What actually matters
 # here is that the TOTAL is conserved across every transfer, so that is what is
 # asserted, against whatever the balance happens to be.
+
+
+def fund_gold(username, slot, amount):
+    """Put gold in a purse the way the world does, for a fixture.
+
+    THE LEDGER ROW IS NOT OPTIONAL. This used to be a PUT to
+    /api/player/status with a gold figure, which worked because gold was not
+    server-owned - the hole these tests now assert is closed. Writing the
+    balance alone would leave SUM(ledger.delta) behind SUM(purses) and break
+    the invariant test_economy.py exists to hold, so the row goes in beside it,
+    exactly as gold_delta() would. This stands in for a loot drop, which is the
+    only place gold is really created.
+    """
+    conn = _owner_sq.connect(DB_PATH)
+    uid = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()[0]
+    conn.execute("UPDATE saves SET gold = gold + ? WHERE user_id = ? AND slot = ?",
+                 (amount, uid, slot))
+    conn.execute(
+        "INSERT INTO gold_ledger (at, user_id, slot, delta, reason, detail) "
+        "VALUES (?, ?, ?, ?, 'test_fixture', 'bank section funding')",
+        (int(time.time()), uid, slot, amount),
+    )
+    conn.commit()
+    conn.close()
+
+
+fund_gold("checker", 0, 500)
+
 body = status("account and carried gold", client.get("/api/player/status?slot=0", headers=H), 200)
 CARRIED = body["gold"]
 check("the character is carrying something to bank", CARRIED >= 500, body)
@@ -1290,15 +1518,18 @@ section("CHARACTER - SKILLS")
 
 body = status("write skills", client.put("/api/character/skills", headers=H,
               json={"slot": 0, "skills": {
-                  "attack": {"level": 12, "xp": 340},
+                  "defense": {"level": 12, "xp": 340},
                   "magic":  {"level": 3,  "xp": 9},
               }}), 200)
-check("skills round-trip", body["skills"]["attack"]["level"] == 12, body["skills"])
+# defense, NOT attack: attack joined SERVER_OWNED_SKILLS when /api/combat/kill
+# started granting it, so the client can no longer write it and a round-trip
+# through this endpoint is exactly what must NOT happen for it.
+check("skills round-trip", body["skills"]["defense"]["level"] == 12, body["skills"])
 
 status("an unknown skill", client.put("/api/character/skills", headers=H,
        json={"slot": 0, "skills": {"swimming": {"level": 1, "xp": 0}}}), 400)
 status("skill level 0", client.put("/api/character/skills", headers=H,
-       json={"slot": 0, "skills": {"attack": {"level": 0, "xp": 0}}}), 400)
+       json={"slot": 0, "skills": {"defense": {"level": 0, "xp": 0}}}), 400)
 status("skills that are not an object", client.put("/api/character/skills", headers=H,
        json={"slot": 0, "skills": []}), 400)
 
@@ -1352,7 +1583,7 @@ status("stranger cannot read our character", client.get("/api/character?slot=0",
 status("stranger cannot write our backpack", client.put("/api/character/inventory", headers=H2,
        json={"slot": 0, "inventory": [{"item_id": "ironsword", "quantity": 99}]}), 404)
 status("stranger cannot write our skills", client.put("/api/character/skills", headers=H2,
-       json={"slot": 0, "skills": {"attack": {"level": 99, "xp": 0}}}), 404)
+       json={"slot": 0, "skills": {"defense": {"level": 99, "xp": 0}}}), 404)
 
 # Read the balance BEFORE the stranger tries anything, so this asserts that
 # nothing changed rather than asserting a number that earlier sections move.

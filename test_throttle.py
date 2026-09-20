@@ -141,6 +141,102 @@ check("an unrelated address is completely unaffected",
 token = r.get_json()["token"]
 
 
+section("THE LOCKOUT MUST NOT FEED ITSELF")
+# THE LAUNCH-DAY OUTAGE, and it is in this file because the section above
+# passes happily while it is broken.
+#
+# Every check up to here fires the gate a fixed number of times and then stops.
+# Real clients do not stop - they retry on their own - and the first version of
+# _ip_throttle_state() counted ANY row that was not 'register-%', including the
+# rows the gate itself writes when it refuses. Each refusal carried the
+# username it had just refused, so:
+#
+#     six typos behind one address trip the spray rule
+#     -> every later attempt is refused and LOGGED as a new failed username
+#     -> the window never falls below six distinct names
+#     -> the lockout renews for as long as anyone keeps trying
+#
+# Measured before the fix: sixty players with the CORRECT password, retrying
+# continuously behind one address, were refused for four full windows and only
+# got in when every client went silent at the same moment.
+#
+# That is the normal case, not an edge case. A household, a student hall, a
+# carrier's NAT - and the entire player base at once behind a proxy with
+# ELUSION_TRUSTED_PROXIES left at 0, which wsgi.py only warns about.
+#
+# The window is shortened here rather than waiting ten real minutes. The
+# RATIO is what is under test: after one full window of pressure, an address
+# whose only failures were the gate's own refusals must be free again.
+
+SHARED = "198.51.100.200"
+_real_window = app_module.IP_WINDOW_SECONDS
+_real_lockout = app_module.IP_LOCKOUT_SECONDS
+app_module.IP_WINDOW_SECONDS = 2
+app_module.IP_LOCKOUT_SECONDS = 2
+
+import time as _time                                        # noqa: E402
+
+for i in range(12):
+    client.post("/api/auth/register",
+                json={"username": "shared%02d" % i, "password": REAL_PASSWORD},
+                environ_base={"REMOTE_ADDR": SHARED})
+
+# Six people behind one address mistype their own password.
+for i in range(app_module.IP_MAX_USERNAMES):
+    login("shared%02d" % i, "WRONGPASSWORD", ip=SHARED)
+
+check("six typos from one address do trip the gate",
+      login("shared06", REAL_PASSWORD, ip=SHARED).status_code == 429,
+      "the spray rule is not firing at all, which is a different bug")
+
+# Now everyone retries CORRECTLY and continuously, as a game client does.
+codes = []
+_start = _time.time()
+_n = 0
+while _time.time() - _start < app_module.IP_WINDOW_SECONDS * 3:
+    codes.append(login("shared%02d" % (_n % 12), REAL_PASSWORD, ip=SHARED).status_code)
+    _n += 1
+    _time.sleep(0.05)
+
+check("the address frees itself while clients are still retrying",
+      200 in codes,
+      "%d attempts over three windows, every one refused - the gate is "
+      "counting its own refusals as evidence again" % len(codes))
+
+# AND THE GATE STILL WORKS. Half this section is worthless without this: a
+# throttle that never fires also never feeds itself.
+SPRAYER = "203.0.113.200"
+sprayed = [login("shared%02d" % i, "GUESSEDPASSWORD", ip=SPRAYER).status_code
+           for i in range(app_module.IP_MAX_USERNAMES + 6)]
+check("a real spray is still stopped at IP_MAX_USERNAMES",
+      429 in sprayed and sprayed.index(429) == app_module.IP_MAX_USERNAMES,
+      sprayed)
+check("and stays stopped while it keeps spraying",
+      {login("shared%02d" % (i + 20), "GUESSEDPASSWORD", ip=SPRAYER).status_code
+       for i in range(5)} == {429},
+      "the sprayer got back in")
+
+# A BANNED PLAYER IS NOT EVIDENCE EITHER - their password was CORRECT, and
+# counting the refusal would let one banned account lock out their household.
+HOUSE = "198.51.100.210"
+for name in ("housea", "houseb"):
+    client.post("/api/auth/register", json={"username": name, "password": REAL_PASSWORD},
+                environ_base={"REMOTE_ADDR": HOUSE})
+_con = db()
+_con.execute("UPDATE users SET is_banned = 1, ban_expires_at = NULL, ban_reason = 'x', "
+             "banned_by = 'owneraccount', banned_at = 0 WHERE username = 'housea'")
+_con.commit()
+banned_codes = {login("housea", REAL_PASSWORD, ip=HOUSE).status_code for _ in range(15)}
+check("a banned player retrying is refused with 403, not counted as a spray",
+      banned_codes == {403}, banned_codes)
+check("and their housemate still logs in",
+      login("houseb", REAL_PASSWORD, ip=HOUSE).status_code == 200,
+      "one ban took out the whole address")
+
+app_module.IP_WINDOW_SECONDS = _real_window
+app_module.IP_LOCKOUT_SECONDS = _real_lockout
+
+
 section("THE LOG")
 rows = db().execute("SELECT username, ip, ok, reason FROM login_attempts").fetchall()
 check("attempts are recorded", len(rows) > 0, len(rows))
@@ -299,6 +395,105 @@ trail = " ".join(str(tuple(row)) for row in db().execute("SELECT * FROM login_at
 check("neither password reached the log", OLD_PW not in trail and NEW_PW not in trail)
 check("the rotation is in the audit trail", "password-changed" in trail)
 check("so is the failed attempt at it", "bad-password-on-change" in trail)
+
+
+section("THE SPAWN CEILING - kills bounded by what the world contains")
+# The token bucket above caps the RATE of kill claims at a number somebody
+# chose. This caps the COUNT at what actually exists: an enemy placed three
+# times, on a respawner, cannot die more than three times per respawn however
+# loudly a client insists.
+#
+# WHY NOT A DAMAGE BUDGET, since that is the idea everyone reaches for first.
+# The server knows the player's gear and every enemy's hp, so bounding total hp
+# destroyed by dps x elapsed looks strictly better. It was measured and it is
+# not: the tank's aura damages every enemy in range and the mage's cast
+# explodes, so a budget that does not refuse honest AoE needs roughly 8x
+# headroom - and a cheater inherits all of it, landing LOOSER than the token
+# bucket it would have replaced. Bounding by what exists has no such slack.
+#
+# HALF THESE CHECKS ARE ABOUT NOT REFUSING ANYONE. A ceiling that bites a real
+# player is worse than no ceiling, because the report is "the game randomly
+# stops giving me xp" and the cause is invisible. The window arithmetic exists
+# to make that impossible rather than unlikely - see KILL_WINDOW_SECONDS.
+
+import gamedata as _gd                                      # noqa: E402
+
+_spawn_user = "spawncap"
+r = client.post("/api/auth/register",
+                json={"username": _spawn_user, "password": REAL_PASSWORD},
+                environ_base={"REMOTE_ADDR": "192.0.2.90"})
+_sh = {"Authorization": "Bearer " + r.get_json()["token"]}
+client.put("/api/save", headers=_sh,
+           json={"slot": 0, "class_id": "warrior", "name": "Cap", "area": "field"})
+
+# The real catalogue may predate the placement export, in which case the
+# ceiling is inactive by design. Inject a count so the RULE is tested either
+# way - a check that silently does nothing on an un-exported gamedata.json is
+# the failure mode this whole file exists to avoid.
+_target = "darkbushmage"
+_saved_enemy = dict(_gd.ENEMIES[_target])
+_saved_flag = _gd.SPAWNS_EXPORTED
+_gd.ENEMIES[_target]["placed_count"] = 2
+_gd.SPAWNS_EXPORTED = True
+
+
+def _kill(enemy_id):
+    return client.post("/api/combat/kill", headers=_sh,
+                       json={"slot": 0, "enemy_id": enemy_id}).status_code
+
+
+def _age_kills(seconds):
+    """Move recorded kills back in time, so a long session runs in an instant."""
+    conn = db()
+    conn.execute("UPDATE kill_reports SET at = at - ?", (seconds,))
+    conn.execute("UPDATE saves SET last_kill_at = last_kill_at - ?", (seconds * 1000,))
+    conn.commit()
+
+
+_ceiling = int(2 * (app_module.KILL_WINDOW_SECONDS
+                    / app_module.KILL_RESPAWN_FLOOR_SECONDS + 1))
+_paid = 0
+for _i in range(_ceiling + 5):
+    if _kill(_target) == 200:
+        _paid += 1
+    if _i % 20 == 19:
+        _age_kills(30)          # let the token bucket refill without ageing past the window
+
+check("two placed enemies pay out exactly their ceiling",
+      _paid == _ceiling,
+      "%d paid, ceiling is %d (2 placed x (%d/%d + 1))"
+      % (_paid, _ceiling, app_module.KILL_WINDOW_SECONDS,
+         app_module.KILL_RESPAWN_FLOOR_SECONDS))
+check("and the refusal is 429, not a 400",
+      _kill(_target) == 429,
+      "this is 'not yet', not 'never' - a 4xx that reads as permanent would "
+      "send a player looking for a broken account")
+
+# THE WINDOW MOVES. A ceiling that never releases is a ban, not a rate limit.
+_age_kills(app_module.KILL_WINDOW_SECONDS + 5)
+check("once the window has passed, the same enemy pays again",
+      _kill(_target) == 200,
+      "the ceiling is permanent, which is not what a rolling window means")
+
+# FAIL OPEN, TWICE, and both are load-bearing.
+_gd.ENEMIES[_target]["placed_count"] = 0
+_age_kills(app_module.KILL_WINDOW_SECONDS + 5)
+_zero = [_kill(_target) for _ in range(12)]
+check("an enemy placed nowhere is never judged",
+      429 not in _zero,
+      "placed_count 0 means 'spawned somewhere I cannot see' - the poison "
+      "slime's smalls come from its own script and appear in no scene")
+
+_gd.SPAWNS_EXPORTED = False
+_gd.ENEMIES[_target]["placed_count"] = 1
+_age_kills(app_module.KILL_WINDOW_SECONDS + 5)
+_unexported = [_kill(_target) for _ in range(12)]
+check("a gamedata.json with no placement data disables the ceiling",
+      429 not in _unexported,
+      "a half-upgraded server must keep accepting kills, not refuse every one")
+
+_gd.SPAWNS_EXPORTED = _saved_flag
+_gd.ENEMIES[_target] = _saved_enemy
 
 
 print("\n" + "=" * 60)

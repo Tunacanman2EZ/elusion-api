@@ -11,23 +11,53 @@ the point — the fixes only make sense against the thing they fix.
 | # | Finding | Severity | Status |
 |---|---------|----------|--------|
 | E-1 | Inventory is client-authoritative | critical (economy) | **Closed** |
-| E-2 | Skills are client-authoritative and uncapped | critical (balance) | **Partly closed** — capped, and 2 of 6 skills fully server-owned |
+| E-2 | Skills are client-authoritative and uncapped | critical (balance) | **Partly closed** — capped, and 3 of 6 skills fully server-owned |
 | E-3 | The kill *event* is asserted, not verified | high | **Open** — named, rate-limited, not fixed |
 | E-4 | `app.run(debug=True)` | critical if exposed | **Closed** |
-| E-5 | No login throttling | medium | **Closed** |
+| E-5 | No login throttling | medium | **Closed** — incl. E-5f, the throttle that fed itself |
 | E-6 | Long token with no credential rotation | low–medium | **Closed** |
+| E-7 | Item *use* is client-authoritative | low–medium (balance) | **Closed** |
+| E-8 | **A client could set its own gold** | **critical (economy)** | **Closed** |
+| E-9 | Current hp/mana/stamina are client-written | high | **Open** — measured, not refused |
+| E-10 | **Lusions were client-written, so dying was free** | **high (balance)** | **Closed** |
+| E-11 | A banned player could sign straight back up | medium (moderation) | **Closed** — as far as addresses honestly allow |
+| E-12 | The sanction ladder had only one rung | low (moderation) | **Closed** — a kick is not a ban |
 
-Four closed, one partly, one open. **E-3 is the honest one**: it is the deepest
-finding, it is still live, and no amount of work elsewhere substitutes for it.
+Eight closed, one partly, two open.
 
-Covered by three suites, all green together — 488 assertions:
-`test_api.py` (419) · `test_security.py` (25) · `test_throttle.py` (44).
+**E-8 was the worst thing in this file and it was never in it.** Every other
+finding here was found by attacking the API deliberately; that one turned up by
+accident while wiring an unrelated endpoint, which is the part worth sitting
+with. `gold` was one of `STATUS_FIELDS` and had never been added to
+`SERVER_OWNED_STATS`, so a single `PUT /api/player/status` set any balance an
+authenticated player liked — and the supply invariant this whole economy rests
+on broke on that one call. The vendor sink, the kingdom tax and every trade
+valuation sat on top of it. Closed, and `test_economy.py` now attacks it
+directly rather than only walking in through the front door.
+
+**E-3 is still the deepest**, and E-9 is its other face: both exist because the
+server never observes combat.
+
+**E-10 is E-8 again, one endpoint over**, and that is the pattern worth naming:
+both were a currency field the client could write because nobody had marked it
+owned. After two, the question stopped being "is this endpoint safe" and became
+**"which fields can a client still write, and who decided that?"** — and the
+answer for the rest is now a list rather than an assumption.
+
+Covered by nine suites, all green together — 1,515 checks:
+`test_api.py` (443) · `test_economy.py` (295) · `test_security.py` (223) ·
+`test_equipment.py` (196) · `test_loot.py` (182) · `test_throttle.py` (55) ·
+`test_map.py` (48) · `test_gathering.py` (44) · `test_settings.py` (28).
+
+Every suite points `ELUSION_DB` at a throwaway file *before* importing `app.py`,
+because `app.py` reads the path and calls `init_db()` at import time. A suite
+that imported first and repointed after would run against the real database.
 
 ---
 
 ## What changed, per finding
 
-### E-1 — Inventory · CLOSED
+### E-1 — Inventory and bank · CLOSED
 
 `PUT /api/character/inventory` now reconciles against what the server actually
 granted instead of storing what the client claims. Fabricated items are trimmed
@@ -54,18 +84,35 @@ This kills the absurd-value cheat — a level-1 character claiming 2^31 attack �
 but it is a guardrail, not authority. A client can still claim any level *up to*
 the cap.
 
-**Real authority, for two skills.** `fishing` and `cooking` are now genuinely
-server-owned: `/api/fishing/catch` and `/api/cooking/cook` grant their XP against
-items the server itself consumed, and `PUT /api/character/skills` **drops** those
-two from whatever the client sends. They are dropped silently rather than
+**Real authority, for three skills.** `fishing`, `cooking` and now `attack` are
+genuinely server-owned. Fishing and cooking grant their XP against items the
+server itself consumed. Attack was the easiest of the three and the longest
+overlooked: `/api/combat/kill` has *always* rolled `attack_xp` from the enemy's
+own profile — the client could never name its own reward — but it handed the
+number back and trusted the client to bank it and PUT the total home. The
+decision was server-side and the bookkeeping was not. It is now granted at the
+moment of the kill, inside the same transaction as the character XP, and
+`PUT /api/character/skills` **drops** all three from whatever the client sends. They are dropped silently rather than
 refused, deliberately: an un-updated client still sends all six every save, and
 400-ing an otherwise honest sync over a field it is not allowed to set would
 break saving entirely.
 
-**What is left:** attack, defense, agility and magic still have no server-side
-grant path, so they remain claimable up to the cap. Closing this means giving
-each one a server-observed event that grants its XP — the same shape fishing and
-cooking now have. Fishing and cooking are the proof the shape works.
+**What is left, and why it is harder than it looks.** Defense, agility and
+magic remain claimable up to the cap — but they are not simply un-migrated, and
+the obvious fix is wrong.
+
+The tempting interim check was "reject any skill level the character's level
+could not support". It does not survive contact with the client. **Agility
+trains on distance moved** (`player.gd`, `agility_xp_per_1000_px = 3`) and
+**defense on damage taken** — neither involves killing anything, so neither is
+correlated with character XP at all. A level 1 character who walks far enough
+legitimately earns agility, and a bound of `character_level + N` would clamp
+honest play to catch a cheat. Measured against the real curves, attack tops out
+near 0.55x character level while agility has no ceiling relative to it.
+
+So the remaining three need what attack, fishing and cooking got: a
+server-observed event to hang the grant on. Until the server can see a dodge or
+a hit taken, a heuristic would cost more in false positives than it saves.
 
 ### E-3 — The kill event · OPEN
 
@@ -76,9 +123,68 @@ bucket — but it never verifies the fight happened.
 
 **The rate limit caps the speed of the fraud, not its existence.** Closing this
 needs server-side encounter state, or at minimum tying kill reports to
-server-known spawns, and that is a larger piece of work than everything above it
-combined. It is listed here rather than quietly omitted because an open finding
-you have named is a different thing from one you have not noticed.
+server-known spawns — a change on both sides of the wire, and a larger piece of
+work than everything above it combined.
+
+**A second bound arrived since: the spawn ceiling.** The token bucket caps the
+*rate* of claims at a number somebody chose. This caps the *count* at what the
+world contains — an enemy placed once, on a 30-second respawner, cannot die
+more than once per respawn however loudly a client insists. `exportgamedata.gd`
+walks the scenes and ships `placed_count`; `/api/combat/kill` counts that
+account's paid kills of that enemy out of `kill_reports` and refuses past
+`placed x (window / respawn_floor + 1)`.
+
+Measured against the same hour of flat-out farming: **18,000 kills/hour under
+the bucket alone, 5,208 with the ceiling**, against roughly 300 for honest
+play. Not a fix for E-3 — the fraud still exists, it is simply bounded by
+content instead of by a guess.
+
+**The idea it replaced is worth recording, because it sounded better.** The
+server knows each player's gear and each enemy's hp, so bounding total hp
+destroyed by `dps x elapsed` looks strictly tighter and needs no export at all.
+It does not survive this game's classes: the tank's aura damages every enemy in
+range and the mage's cast explodes, so a budget that never refuses honest AoE
+needs roughly 8x headroom — and a cheater inherits all of it, landing **looser
+than the bucket it would have replaced**. Bounding by what exists has no such
+slack, because a tank killing six at once is six spawn points that cannot pay
+again until they respawn. The general form: *bound by what exists, not by what
+the player can do* — a capability bound must fit the best case, and the cheater
+gets that whole allowance.
+
+**It fails open twice, deliberately.** A `gamedata.json` from before the
+placement export disables the ceiling entirely, so a half-upgraded server keeps
+accepting kills rather than refusing every one. And `placed_count == 0` means
+"spawned somewhere the export cannot see" — the poison slime's smalls come from
+its own script and appear in no scene — where refusing would break a real
+fight. The cost is a real exemption for runtime-spawned enemies, and it is
+worth naming: today that is `poisonslimesmall` at 25 xp, the lowest-value enemy
+in the game.
+
+**What has changed is that it is now measurable.** Until recently nothing
+recorded a kill at all, so the fraud was not merely unpunished, it was
+*invisible*: a client reporting one boss an hour forever looked exactly like a
+player who enjoys the boss. `kill_reports` now stores every claim the server
+paid out — enemy, rewards as paid, the level it was claimed at — and refused
+kills leave no row, so the log and the payouts cannot drift apart. The same
+shape as `login_attempts`, for the same reason.
+
+That is deliberately groundwork and not a fix. **A threshold picked without data
+is how honest players get clamped** — the interim skill-level bound proposed
+under E-2 was exactly that mistake, and it did not survive contact with the
+client. This makes the data exist first:
+
+```sql
+-- what is this account killing, and how fast
+SELECT enemy_id, COUNT(*) AS n, MIN(at), MAX(at)
+FROM kill_reports WHERE user_id = ? GROUP BY enemy_id ORDER BY n DESC;
+
+-- who reports the most valuable enemy, and at what character level
+SELECT user_id, level_at, COUNT(*) AS n
+FROM kill_reports WHERE enemy_id = 'boss' GROUP BY user_id ORDER BY n DESC;
+```
+
+It is listed as open rather than quietly omitted because an open finding you
+have named is a different thing from one you have not noticed.
 
 ### E-4 — Debug · CLOSED
 
@@ -166,6 +272,57 @@ GROUP BY username ORDER BY misses DESC;
 Rows are pruned past `LOGIN_LOG_RETENTION_SECONDS` (14 days) on the login path,
 so the only thing that writes to the table is also the thing that cleans it.
 
+#### E-5f — The throttle was feeding itself · CLOSED
+
+Found by load-testing rather than by attacking: the question was "what happens
+when a thousand people log in on day one", and the answer was **nobody logs in
+at all**.
+
+`login_attempts` records everything that happens at this door, and most of it
+is not evidence. In particular the gate's **own refusals** are written there,
+each carrying the username it had just refused. `_ip_throttle_state()` counted
+any row that was not `register-%`, so those refusals counted toward the
+condition that produced them:
+
+```
+six typos behind one address trip the spray rule
+  -> every later attempt is refused and LOGGED as a new failed username
+  -> the window never falls below six distinct names
+  -> the lockout renews for as long as anyone keeps trying
+```
+
+**Measured, not reasoned about.** Sixty players with the CORRECT password,
+retrying continuously behind one address, were refused for four full windows
+and only got in once every client went silent *at the same moment*. Game
+clients retry on their own, so that moment does not arrive.
+
+**Why this was a launch-day outage and not an edge case.** Shared addresses are
+the normal case — a household, a student hall, a mobile carrier's NAT — and
+*every player at once* if this sits behind a proxy with
+`ELUSION_TRUSTED_PROXIES` left at 0, which `wsgi.py` only warns about. Six
+typos anywhere in the player base and the game is shut.
+
+The fix is a shape change, not a number change: the reason filter is now an
+**allowlist** (`THROTTLE_EVIDENCE_REASONS`) of the three reasons that mean a
+credential was actually checked and actually failed — `no-such-user`,
+`bad-password`, `bad-password-on-change`. Deliberately excluded:
+
+| reason | why it is not evidence |
+|---|---|
+| `ip-spray`, `ip-volume` | this gate's own refusals — the bug above |
+| `register-*` | a clumsy signup must not cost anyone their login |
+| `account-locked` | no credential was checked; counting it lets one account's lockout escalate to the whole address |
+| `banned` | the password was **correct**; a banned player retrying would lock out their household |
+
+`/register`'s throttle was already an allowlist (`reason = 'register-conflict'`)
+and was never affected — which is the argument for the shape. A denylist's
+failure mode is silent: a refusal reason added later becomes evidence by
+default and nothing says so.
+
+`test_throttle.py` covers it, and those checks are **mutation-tested** — reverted
+to the old rule they fail, which is the only way to know a regression test for
+"it recovers" is testing anything.
+
 ### E-6 — Long token, no credential rotation · CLOSED
 
 Not in the original audit; found later, recorded here rather than fixed quietly.
@@ -205,6 +362,368 @@ Three decisions in it worth stating:
   caller, so "change my password" can never be a way to sign out everyone
   *except* whoever holds the stolen token.
 
+### E-7 — Item use is client-authoritative · CLOSED
+
+Added when the requirement fields were, because writing a gate and not enforcing
+it is worse than having no gate: it reads as a control in the source and is not
+one.
+
+`ItemData` carries `required_level` (character level, for gear you buy) and
+`required_skill` / `required_skill_level` (a named skill, for things you cook or
+catch). `inventoryscreen.gd` checked both before the use dispatch — **on the
+player's machine**, with no consume endpoint behind it. A potion was drunk
+entirely client-side and reached the server as an inventory sync one item
+shorter, which E-1's reconciliation accepts, because losing an item is exactly
+what an honest use looks like.
+
+`POST /api/character/consume` is the fix. The server reads the character's level
+and skills from its own rows, checks both requirements, destroys one from the
+stack itself, and the client applies the effect only on a 200. The client check
+stays where it was and is now a courtesy rather than the rule — it is the fast
+answer, so a player four levels short is told instantly instead of a round trip
+later.
+
+**Two things came out of building it, both worth more than the fix.**
+
+The first was a bug in the fix. Skill rows are written when a skill is first
+trained, so a brand new character has none — and the first draft read "cooking
+is missing from your levels" as "cooking is not a skill" and let it through. A
+gate that opens for every new account is worse than no gate. `VALID_SKILLS` is
+now passed in so the two questions stay separate: not a real skill passes
+loudly, untrained is level 1 and the gate holds. Found by a smoke test, not by
+review.
+
+The second was E-8, below.
+
+**What it does not close.** The *effect* is still the client's — the server does
+not know what a potion restores, because `restore_target` and `restore_amount`
+are not exported to `gamedata.json`. And a cheat that heals without drinking
+anything never touches this endpoint at all. That is E-9.
+
+### E-8 — A client could set its own gold · CLOSED
+
+**Found by accident, which is the part worth recording.** It surfaced while
+wiring the client half of E-7, not during any of the deliberate attacks that
+produced every other finding in this file.
+
+`gold` is one of `STATUS_FIELDS`. It had never been added to
+`SERVER_OWNED_STATS`. So:
+
+```
+PUT /api/player/status   {"slot": 0, "gold": 1000000}   ->   200
+```
+
+and the invariant the entire `gold_ledger` exists to hold:
+
+```
+SUM(gold_ledger.delta) = 0        SUM(saves.gold) + SUM(bank_gold) = 1,000,000
+```
+
+Nothing was minted through `gold_delta()`, so the recorded side never moved
+while a purse went to a million. The vendor sink, the kingdom tax, every trade
+valuation and the whole of `test_economy.py` sit on that equation.
+
+`PUT /api/save` had always refused a client's gold. The two write paths had
+simply drifted, and the one that drifted was the one nobody thought of as an
+economy endpoint.
+
+**Closed by adding `gold` to `SERVER_OWNED_STATS`** — ignored rather than
+refused, like every other owned field, and named in `ignored` so an honest
+client can see it is being corrected. Safe to close outright with no shadow
+pass, because nothing honest pushes a gold figure: `/api/loot/take` resolves a
+currency drop straight into a balance through `gold_delta()` and calls itself
+the only place gold is created, and shop, bank and trade all write their own
+rows. The one client path that added gold locally was the gold-pile handler in
+`inventoryscreen.gd`, and a gold pile cannot reach a backpack at all — `CURRENCY`
+is in `EXCLUDED_FROM_LOOT`.
+
+**Why the suite did not catch it, which is the lesson.** `test_economy.py` had
+268 checks and a mutation-tested invariant, and every one of them moved gold
+through a server path and then asserted the books balanced. Not one tried the
+front door of the balance itself. **An invariant only tells you about the paths
+somebody walked.** There is now a section that attacks it directly, and the old
+`test_api.py` case that asserted gold *was* stored — which passed, and was the
+bug written down as an expectation — is now the assertion that it is ignored.
+
+### E-9 — Current hp, mana and stamina are client-written · OPEN
+
+Named here because E-8 came out of looking at the same endpoint, and this is
+what is left of it.
+
+`PUT /api/player/status` accepts any `hp` up to the maximum the server derives
+from class and level. That ceiling is real and it is not the interesting part:
+underneath it, a patched client heals to full whenever it likes and never dies.
+Potions become decoration, and E-7's gate is moot for anyone willing to skip the
+potion entirely.
+
+**It cannot be refused yet, and the reason is honest rather than lazy.**
+`player.gd` regenerates all three stats continuously — a percentage of each
+stat's own maximum per second, with a floor — so a character returns to full in
+about a minute of standing still. A check that did not model that would flag
+every player in the game.
+
+**So it is measured instead.** `_report_unexplained_heals()` compares each rise
+against what regeneration could have produced in the elapsed time, and asks
+whether an authorised consume explains the rest. It logs and refuses nothing —
+the same staging E-1 used, for the reason written into that function: shipping
+the refusal before the comparison had proven itself would break honest saves for
+real players.
+
+Three things have to happen before it can bite:
+
+1. **Export `regen_percent_per_second` and `regen_minimum_per_second`.** They are
+   `@export` values on the player *scene*, so the numbers in `app.py` are a
+   copy — and copied constants drift. This project has that scar already; see
+   the xp-formula note in `exportgamedata.gd`.
+2. **Export `restore_amount`**, so a consume explains *how much* rather than
+   merely *that a potion existed*. The window can shrink to seconds after that.
+3. ~~Give revive an endpoint~~ → done, and it turned into **E-10** below. An
+   honest revive now leaves a grant row and no longer appears in the log at all.
+
+### E-10 — Lusions were client-written, so dying was free · CLOSED
+
+Found while building the revive endpoint E-9 asked for, which is the second
+time in two days that fixing one thing has walked into a bigger one.
+
+`PUT /api/account/lusions` took an absolute figure and stored it:
+
+```python
+lusions = parse_stat(payload.get("lusions"))
+db.execute("UPDATE accounts SET lusions = ? WHERE user_id = ?", (lusions, user_id))
+```
+
+No provenance, no delta, no ledger — lusions have never had one. **The same
+mistake as E-8, one endpoint over.**
+
+**Why a second currency mattered more than its size suggests.** Lusions have
+exactly one sink in the game: reviving after death, at `revive_cost` a go. A
+currency with one sink *is* that sink, so the balance was the death penalty —
+and `gameover.gd` ran the whole transaction locally anyway: it read the balance,
+called `add_account_lusions(-cost)`, wrote full hp, mana and stamina into the
+save slot itself, and reloaded the world. The server saw a smaller number and a
+healthier character arrive by PUT and believed both, because it had no
+authoritative balance of its own to disagree with.
+
+So death cost nothing. Not "cost little" — nothing, for any client willing to
+skip one line.
+
+**Closed in two halves.** `PUT /api/account/lusions` now ignores what it is sent
+and reads back the server's own figure, the same ignored-not-refused treatment
+gold got. And `POST /api/character/revive` does the transaction: it refuses
+anyone who is not dead *by the server's own stored hp*, charges the cost from
+the server's own balance, restores the three resources from the class curve, and
+records a grant row.
+
+**Three details worth keeping.**
+
+- **Only the dead may be revived.** Without that check this becomes "pay 20
+  lusions for a full heal, any time" — a different feature, with different
+  balance consequences, that nobody designed. The client now writes `hp = 0`
+  before asking, because the death arrives by a debounced save that may not have
+  landed yet, and the record should say so regardless.
+- **402, not 403.** Not having the lusions is a price, not a permission. Both
+  numbers go back so the screen can show the shortfall.
+- **It closes the last big false positive in E-9's log.** An honest revive is a
+  jump from zero to full in no time at all — exactly the shape the reconciler
+  flags. It now leaves a row in `consume_grants` like a potion does, so the log
+  stays about cheating rather than about dying.
+
+### The economy · a surface that did not exist at audit time
+
+Player-to-player trading is new since the original audit and is worth stating
+plainly, because it changes the threat model: **two clients can now cooperate.**
+Until trading existed, every exploit had one beneficiary and the server only had
+to distrust one party per request.
+
+What holds:
+
+- **Gold is double-entry.** Every creation and destruction writes a `gold_ledger`
+  row, against the invariant `SUM(delta) == SUM(saves.gold) + SUM(bank_gold)`.
+- **A transfer writes no row, deliberately** — both purses are already inside the
+  right-hand sum, so a transfer that *did* write would net to zero and pass
+  anyway. This makes the invariant alone a **weak** test, which is the trap worth
+  naming: `test_economy.py` therefore asserts row counts and the minted total
+  beside it, and mutates the ledger on purpose to confirm the check fails when it
+  should.
+- **The swap is server-side and atomic.** Both parties confirm, then
+  `_execute_trade()` moves items and gold inside one transaction.
+- **A failed execution kills the trade for both sides.** `db.rollback()` undoes
+  the confirmation made in *this* request and not the one the other player
+  committed minutes ago, which left trades wedged half-confirmed until
+  `_trade_refuse()` existed. Found by a test written on speculation, not by a
+  report.
+- **Self-trade is refused explicitly** rather than left to chance — it would run
+  every step against one account and the arithmetic would look fine.
+- **One open trade per player**, enforced with a 409, and offers expire after
+  `TRADE_EXPIRY_SECONDS` (600). That bounds the row growth an abusive client can
+  cause without a rate limit of its own.
+- **The tax is charged server-side**, on what you *receive*, valued from the
+  server's own item table rather than anything the client sends. It rounds up
+  with a floor of 1, so splitting a trade to dodge it costs strictly more.
+
+What is accepted rather than solved:
+
+- **The trade endpoints have no throttle of their own.** The one-open-trade rule
+  and the expiry cap the state a client can accumulate, so this is request churn
+  rather than resource exhaustion, but an offer/cancel loop is unbounded in rate.
+  Worth a token bucket if abuse ever appears; not worth pre-emptive complexity.
+- **`GET /api/players/nearby` discloses who is online and which area they are
+  in**, to any authenticated player. That is what the endpoint is *for* — you
+  cannot offer a trade to someone you cannot name — and it is the honest maximum
+  today: the server stores `saves.area` and nothing finer, so no coordinate
+  exists to leak. If real presence arrives, the position it gains is the thing to
+  re-examine, not this.
+
+### E-11 — A banned player could sign straight back up · CLOSED (as far as it can be)
+
+Not found by attacking the API. Found by asking what happens on day one with
+real players, which is a different question from "can I break this" and turns
+up different answers.
+
+A ban did exactly what it said: `is_banned` set, sessions deleted in the same
+transaction, `user_for_token()` re-checking it on every authenticated route so a
+surviving token grants nothing. All correct, and all about **that account**.
+Thirty seconds later the same person registered a new one and the server had no
+opinion, because nothing connected the two.
+
+**What "fixed" can honestly mean here.** A dynamic address and any VPN defeat
+address matching outright, so a claim to stop ban evasion would be false. What
+is achievable is narrower and still worth having: make the lazy case fail, and
+make the determined case *visible*. Those are two separate mechanisms and they
+are deliberately not the same mechanism.
+
+**1 · `account_ips`, and why it is not `login_attempts`.** A new table of
+`(user_id, ip, first_seen, last_seen)`, UPSERTed on successful login and on
+registration. Written **only on success** — a failed login says nothing about
+who was at the keyboard, and recording those would fill the table with the
+addresses of whoever is currently guessing at an account. `first_seen` is the
+half that separates "has genuinely played from here" from "appeared today".
+
+**2 · Registration is refused from an address holding a live ban.** 403, not
+429: this is "not from here", and a retry timer would invite the retrying it
+exists to stop. The banned account's name is not returned — whoever is reading
+either already knows it, or is a stranger who should not be told who was banned
+on a shared address.
+
+**It expires with the ban, by construction.** The check runs through
+`ban_state()`, which reads expiry against now, so a served sentence stops
+blocking the moment it is up and no scheduled job has to run for that to happen.
+An address cannot be poisoned in two years by something somebody else did on it.
+
+**Logins are deliberately untouched.** Blocking those too would mean banning one
+teenager takes out their household, their school, or everyone behind a mobile
+carrier — the same failure `_ip_throttle_state()`'s own comment refuses, and
+worse than the evasion it would prevent. The sibling keeps playing. The cost is
+that the sibling's *friend* cannot sign up from that house while the ban runs,
+which is accepted and stated rather than hidden.
+
+**And the block stops applying on a crowded address, because otherwise it is a
+weapon.** The first version had no such limit, and the attack against it is
+free: get yourself banned on purpose from a campus, a library or a carrier NAT,
+and every stranger behind that address is locked out of registering — for good,
+if the ban is permanent. Your own account was already gone, so you spent
+nothing. Run against this code, forty unrelated accounts on one address and one
+deliberate ban made the forty-first person unable to sign up.
+
+Above `EVASION_BLOCK_MAX_ACCOUNTS = 12` distinct accounts, the address is a
+building rather than a household and the block does not apply. That is a real
+cost — an evader who finds a crowded address registers freely — accepted
+because a VPN already sells them that outcome, and because the link view still
+surfaces every one of those accounts. The bar for *refusing a stranger an
+account* is deliberately higher than the bar for *marking a link weak in a view
+a human reads*, which is why this is a separate constant from
+`SHARED_ADDRESS_ACCOUNTS`.
+
+**3 · Linked accounts in the staff view, which never ban anything.** The
+determined evader gets through step 2, so `GET /api/staff/user/<name>` now
+carries the other accounts seen at this one's addresses. That is the half that
+survives a VPN: it cannot stop the next account, it makes it arrive visible
+instead of arriving unknown.
+
+**The part that took the most thought was not accusing people.** A link through
+an address shared by three accounts and one through a carrier pool of two
+hundred are different facts, and reporting them identically is how a mod at 3am
+bans somebody's flatmate. Each link carries `quietest_address_accounts` — the
+smallest crowd on any address the two share — and is marked `strong` or `weak`
+against `SHARED_ADDRESS_ACCOUNTS = 6`. The raw counts are returned beside the
+verdict so a mod can disagree without reading the source. Banned accounts sort
+first, because burying the one relevant name under nine strangers is the same as
+not showing it.
+
+Gated behind `can_act_on()`, not the `mod` rank that opens the route: this is a
+list of *other people*, most of whom are not the subject of the lookup. A mod
+sees a player's links and not another mod's, and nobody sees the owner's.
+
+**A bug worth recording, because the failure mode is the interesting part.**
+`_ban_evasion_state()` first shipped selecting only the three columns its own
+logic branched on, while `ban_state()` reads five. `sqlite3.Row` raises
+`IndexError` for a column the SELECT did not fetch — so **every blocked
+registration returned 500**. The decision was right, the refusal happened, and
+the response was a crash: the feature looked broken while working perfectly, and
+a test asserting only "was it refused?" would have passed. `test_security.py`
+asserts the status code, and `ban_state()`'s docstring now names the five
+columns it requires.
+
+Fifteen checks cover the link view and thirteen the block, and **most of them
+are about who is *not* hit**: the sibling still logs in, the stranger elsewhere
+registers, the campus is not lockable, the served sentence stops blocking by
+itself, the linked account is not banned by having been linked. A narrowness
+guarantee cannot be demonstrated by the blocking behaviour — only by the people
+who still get through.
+
+### E-12 — The sanction ladder had only one rung · CLOSED
+
+Not a vulnerability. A moderation tool that made overreacting the cheapest
+option, which produces the same outcome by a different route.
+
+`POST /api/staff/ban` deletes the target's sessions in the same transaction —
+correct, and the reason a banned player holding a 30-day token does not keep
+playing. But it meant **deleting sessions was only reachable by banning**. A
+mod who wanted to interrupt something — a shared account to re-secure, a
+session left open on a machine somebody no longer controls, a stuck client, or
+simply buying a minute to read a report before deciding — had to choose between
+banning and doing nothing.
+
+`POST /api/staff/kick` is that middle rung. It ends every session for an
+account and does nothing else: no ban, no rank change, and the player logs
+straight back in. It revokes **access**, not permission.
+
+**That reversibility is the whole point and also the honest limit.** Against
+someone actively cheating a kick is a speed bump, because they still hold the
+password. It must never be presented to players as punishment — if it is, the
+reconnect reads as the ban having failed.
+
+Same reach as every other sanction (`can_act_on()` through
+`_moderation_target`), so a mod cannot kick a mod and nobody can kick the
+owner, and the refusal is the same 404 every out-of-reach target gets rather
+than a 403 that would map who outranks whom. Logged to `staff_actions` with the
+session count and reason, because a session that ends for no visible reason is
+a support ticket.
+
+**Live sessions are now in the staff view**, which is what makes the choice
+between a kick and a ban informed. `login_attempts` answered "who has been
+trying"; nothing answered "who is holding a key", so a mod could not see
+whether there was anything to kick, or confirm afterwards that a banned player
+was actually out.
+
+**No tokens in that payload — absent, not masked.** A staff view is the worst
+possible place for a readable token, because the people reading it are the ones
+with reach. What it carries is the shape: how many sessions exist and when each
+expires. There is no `issued_at` because the table holds none, and deriving it
+as `expires_at - TOKEN_TTL` would be right only for rows issued under the
+current TTL and silently wrong for every older one — against a fixed TTL the
+expiry already says how old a session is.
+
+Unlike the addresses and the linked accounts, the session count is **not**
+gated behind `can_act_on()`. Those two are facts about other people; a session
+count is a fact about this account alone, and gating it would gate the sanction
+rather than the personal data.
+
+Twelve checks in `test_security.py`, and most of them assert what a kick does
+**not** do: it does not ban, it does not stop the player logging back in, it
+does not reach further than a ban would, and kicking an account with nothing
+live reports zero rather than erroring.
+
 ### Already solid — credit where due
 
 Worth being explicit so the migration does not accidentally regress them:
@@ -219,10 +738,23 @@ Worth being explicit so the migration does not accidentally regress them:
   from the `ELUSION_OWNER` env var, so no request can grant it, with a DB `CHECK`
   as defence in depth and `can_act_on()` guarding staff actions.
 - **Character level is server-owned** — proven below (claimed 99, stayed 1).
+- **Gold is server-owned** — on both write paths now, and attacked directly by
+  `test_economy.py` rather than only implied by the invariant. See E-8 for why
+  that distinction cost something.
+- **Lusions are server-owned** — created only by a duplicate-pet conversion,
+  spent only at `/api/character/revive`, and writable by nobody. See E-10.
+- **Death has a price again** — the revive is a server transaction, so the
+  penalty cannot be skipped by a client that simply declines to pay it.
 - **Loot acquisition is server-owned** — `POST /api/loot/take` writes
   `carry_items` itself rather than trusting the client.
 - **Kill rewards are server-rolled** and rate-limited — E-3's weakness is the
   event, not the payout.
+- **Gold cannot be minted undetectably** — every creation and destruction is a
+  ledger row against a stated invariant, and the suite that checks it is
+  mutation-tested rather than merely passing.
+- **The vendor destroys gold rather than moving it**, and the kingdom board sums
+  the ledger on request instead of keeping a running total. A second place the
+  truth lives is a first disagreement nobody can resolve.
 - **`.gitignore`** uses prefix patterns (`*.db.*`) precisely because a plain
   `*.db` once let a `.db.before-…` backup slip into a commit. That lesson is
   written into the file itself.
@@ -389,15 +921,22 @@ the order it should happen.
 4. ~~Throttle `login`~~ → **E-5 closed**, per-account and per-IP, with a log.
 5. ~~Add `POST /api/auth/password`~~ → **E-6 closed**, rotation and revocation
    in one transaction, throttled like login.
-6. **Give attack/defense/agility/magic server-granted XP**, the way fishing and
-   cooking now have → closes **E-2** properly rather than capping it. *Cheap
-   interim check available today:* reject any skill level the character's own
-   level could not support — skill 99 on a level-1 character is a state
-   legitimate play cannot produce, so it is both an exploit and a ready-made
-   detection signal.
-7. **Verify the kill** — server-side encounter state, or at minimum tie kill
-   reports to server-known enemy spawns → closes **E-3**, the deepest one,
-   correctly saved for last.
+6. ~~Give **attack** server-granted XP~~ → done; it is granted at the kill and
+   dropped from client syncs.
+7. ~~Add a consume endpoint~~ → **E-7 closed**; and ~~gold made server-owned~~ →
+   **E-8 closed**, the one that was never on this list because nobody had
+   noticed it.
+8. **Export the regen constants and `restore_amount`**, then give revive an
+   endpoint → lets **E-9**'s reconciler stop logging and start refusing. Three
+   small pieces of export work standing between a measurement and a control.
+9. **Give defense, agility and magic server-observed events** to grant against.
+   Not a heuristic — see the note under E-2 above on why a character-level bound
+   is wrong for skills that train on movement and damage taken.
+10. **Verify the kill** — server-side encounter state, or at minimum tie kill
+    reports to server-known enemy spawns → closes **E-3**, the deepest one,
+    correctly saved for last. Note that tying kills to the character's *area*
+    is not a substitute: `saves.area` is written by the client, so a client that
+    wants boss kills simply claims to be on the boss floor first.
 
 The original test still applies to every step: re-run the three `curl` claims
 from the audit above. Rows 1 and 2 now come back trimmed or capped, the way
