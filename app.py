@@ -3300,6 +3300,17 @@ DERIVED_STATS = ("max_hp", "max_mana", "max_stamina")
 # fractional accumulators.
 HEAL_ALLOWANCE_MARGIN = 1.25
 
+# THE ENFORCED LINE, as a multiple of the same allowance. See _reconcile_heals()
+# for why there are two and why this one is deliberately loose.
+#
+# TIGHTEN THIS, DO NOT WIDEN IT. It starts generous because the evidence for the
+# tight line is eighteen simulated scenarios rather than real traffic, and the
+# log records every rise that falls between the two so the decision to close the
+# gap can be made from data. A band that stays empty across real play is the
+# argument for lowering this to 1.25; a band that fills with honest players is
+# the proof that shipping the tight clamp would have broken them.
+HEAL_CLAMP_MARGIN = 3.00
+
 # Two writes in the same second must not read as "healed with zero time
 # available". Treated as at least this many seconds apart.
 HEAL_MINIMUM_ELAPSED_SECONDS = 2.0
@@ -3381,7 +3392,7 @@ EXPORT_DEPENDENT_PROTECTIONS = (
         "restore_amount",
         lambda: any("restore_amount" in item for item in gamedata.ITEMS.values()),
         "a consume grant carries no amount, and an unknown amount makes "
-        "_report_unexplained_heals() return early - one cheap potion "
+        "_reconcile_heals() return early - one cheap potion "
         "explains a heal of any size",
     ),
 )
@@ -3436,10 +3447,48 @@ def _warn_if_protections_unarmed():
 _warn_if_protections_unarmed()
 
 
-def _report_unexplained_heals(db, user_id, slot, before, after):
+def _reconcile_heals(db, user_id, slot, before, after):
     """
-    Log any rise in hp/mana/stamina that regeneration and authorised consumables
-    cannot account for. Writes nothing, refuses nothing, returns nothing.
+    Trim any rise in hp/mana/stamina that regeneration and authorised
+    consumables cannot account for. Returns {field: corrected} for the caller
+    to apply, empty when there is nothing to correct.
+
+    RENAMED FROM _report_unexplained_heals, because it no longer only reports.
+    It sits beside _reconcile_bank() and _reconcile_inventory() now, does the
+    same job as those two - compare the claim to the record and correct it -
+    and is named for it.
+
+    TWO LINES, NOT ONE, AND THAT IS THE WHOLE DESIGN.
+
+        HEAL_ALLOWANCE_MARGIN   1.25x   the TIGHT line: what regen plus
+                                        consumes can honestly produce.
+                                        Logged, never enforced.
+        HEAL_CLAMP_MARGIN       3.00x   the LOOSE line: enforced.
+
+    Enforcing at 1.25x on the evidence available would be the E-2 mistake - a
+    threshold picked from eighteen simulated scenarios rather than from real
+    traffic. Enforcing at 3x cannot plausibly catch an honest player: it is
+    three times more healing than the game can produce, and a rise that large
+    did not come from the game.
+
+    Meanwhile every rise landing BETWEEN the two lines is logged as
+    "tight-clamp would have caught this". That is the evidence for closing the
+    gap later, gathered while a control is already running rather than instead
+    of one. If that band stays empty across real play, 1.25x is safe and the
+    log is what says so. If it fills up with honest players, the band is the
+    proof that shipping the tight clamp would have broken them.
+
+    CLAMPS, DOES NOT REFUSE. A 400 here fails the whole save, and the save
+    carries XP, gold, position and inventory - punishing a suspicious hp figure
+    by discarding a legitimate half-hour of play is a worse bug than the cheat.
+    Trimmed to what the player could have earned, exactly as
+    _reconcile_inventory() trims a bag, and the write proceeds.
+
+    WHAT IT STILL DOES NOT DO. It bounds the RATE of unexplained healing, not
+    its existence: measured against a 180 hp pool, roughly 7 hp per save slips
+    under the tight line and ~14 full heals an hour under it. That is the same
+    shape as the kill bucket, and the reason both are controls rather than
+    proofs is the same - the server does not observe combat. See E-3.
 
     THE CHECK IS PER-POOL NOW, not per-character. The first version asked "did
     this character drink anything recently", which meant one cheap stamina
@@ -3491,7 +3540,7 @@ def _report_unexplained_heals(db, user_id, slot, before, after):
             risen[field] = (gained, allowance)
 
     if not risen:
-        return
+        return {}
 
     # WHAT THE SERVER AUTHORISED IN THE WINDOW, by pool.
     since = int(time.time()) - HEAL_EXPLAIN_WINDOW_SECONDS
@@ -3506,7 +3555,7 @@ def _report_unexplained_heals(db, user_id, slot, before, after):
             # in any of them. They are special cases rather than large amounts
             # because "as much as you had room for" is not a number the server
             # can write down in advance.
-            return
+            return {}
         target = str(row["target"] or "").lower()
         if target in granted:
             granted[target] += float(row["amount"] or 0)
@@ -3516,7 +3565,7 @@ def _report_unexplained_heals(db, user_id, slot, before, after):
             # rather than zero: it explains nothing on its own, but it must not
             # be reported as a cheat either, because the server genuinely does
             # not know what it did.
-            return
+            return {}
 
     still_unexplained = {
         field: (gained, allowance)
@@ -3524,7 +3573,7 @@ def _report_unexplained_heals(db, user_id, slot, before, after):
         if gained > allowance + granted.get(field, 0.0)
     }
     if not still_unexplained:
-        return
+        return {}
 
     # THE LINE SAYS WHAT WAS ALLOWED AND WHAT WAS GRANTED, per pool, because
     # "unexplained heal" on its own is not something anyone can act on. The old
@@ -3540,6 +3589,32 @@ def _report_unexplained_heals(db, user_id, slot, before, after):
         ),
         HEAL_EXPLAIN_WINDOW_SECONDS,
     )
+
+    # THE ENFORCED LINE. Everything above this point is the 1.25x measurement
+    # and is unchanged; this is the only part that acts.
+    #
+    # The ratio is taken against the TIGHT allowance, so widening the enforced
+    # margin never widens what gets logged. The two numbers stay independent on
+    # purpose: one is the honest estimate, the other is how much benefit of the
+    # doubt is currently being given, and conflating them is how a temporary
+    # margin quietly becomes the definition of honest.
+    corrections = {}
+    for field, (gained, allowance) in still_unexplained.items():
+        ceiling = allowance + granted.get(field, 0.0)
+        if gained <= ceiling * (HEAL_CLAMP_MARGIN / HEAL_ALLOWANCE_MARGIN):
+            # Between the lines. Logged above, deliberately not trimmed - this
+            # is the band that decides whether the tight margin is safe.
+            continue
+        corrections[field] = int(before[field] or 0) + int(ceiling)
+
+    if corrections:
+        app.logger.warning(
+            "heal clamped: user=%s slot=%s  %s",
+            user_id, slot,
+            "  ".join("%s %s -> %d" % (field, after[field], value)
+                      for field, value in sorted(corrections.items())),
+        )
+    return corrections
 
 
 def parse_stat(raw):
@@ -3689,10 +3764,17 @@ def write_player_status():
     db = get_db()
     if updates:
         # BEFORE THE WRITE, because it compares the stored row to the merged
-        # one and the stored row is about to stop existing. It only reads, and
-        # it deliberately cannot fail the request - see its own comment on why
-        # this pass refuses nothing.
-        _report_unexplained_heals(db, user_id, slot, row, merged)
+        # one and the stored row is about to stop existing.
+        #
+        # IT CORRECTS RATHER THAN REFUSING, and the corrections go into BOTH
+        # `merged` and `updates`: merged is what the rest of this function
+        # reasons about, updates is what actually reaches the UPDATE statement.
+        # Writing only one of them is how a clamp becomes decorative - the log
+        # would say "clamped" and the client's figure would be stored anyway.
+        healed = _reconcile_heals(db, user_id, slot, row, merged)
+        for field, value in healed.items():
+            merged[field] = value
+            updates[field] = value
 
         assignments = ", ".join("%s = ?" % f for f in updates)
         values = list(updates.values()) + [int(time.time()), user_id, slot]
@@ -7318,7 +7400,7 @@ def character_consume():
 # and a client that can write the balance has removed the cost of death from
 # the game.
 #
-# ALSO THE OTHER HALF OF THE HEALING RECONCILER. _report_unexplained_heals()
+# ALSO THE OTHER HALF OF THE HEALING RECONCILER. _reconcile_heals()
 # flags a rise that regeneration and consumables cannot account for, and an
 # honest revive is exactly such a rise - a jump from 0 to full in no time at
 # all. Before this endpoint existed the server could not tell that from a cheat,

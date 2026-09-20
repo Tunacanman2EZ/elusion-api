@@ -1232,8 +1232,22 @@ r = client.put("/api/player/status", headers=patient, json={"slot": 0, "hp": MAX
 logged = drained()
 check("1 hp to full with no potion is logged", "unexplained heal" in logged, logged)
 check("and the request still succeeded (shadow mode)", r.status_code == 200, r.status_code)
-check("and the claimed hp was still stored",
-      client.get("/api/player/status?slot=0", headers=patient).get_json()["hp"] == MAX_HP)
+# THIS ASSERTION USED TO BE THE BUG, WRITTEN DOWN AS AN EXPECTATION.
+#
+# It read "and the claimed hp was still stored", and it passed, because E-9 was
+# in shadow mode and the reconciler logged without acting. That is precisely
+# the shape of the test_api.py case that asserted gold WAS stored while E-8 was
+# open - a suite can only tell you about the behaviour somebody decided to
+# assert, and asserting the current behaviour makes a vulnerability look load
+# bearing.
+#
+# The claim is now trimmed to what regeneration could have produced, and the
+# request still succeeds, because a 400 here would discard the XP, gold and
+# inventory riding along in the same save.
+stored = client.get("/api/player/status?slot=0", headers=patient).get_json()["hp"]
+check("and the claimed hp was TRIMMED, not stored", stored < MAX_HP,
+      "stored %s of %s" % (stored, MAX_HP))
+check("trimmed to the allowance rather than to zero", stored >= 1, stored)
 
 set_stored(hp=1, updated_at=int(time.time()))
 authorise_potion()

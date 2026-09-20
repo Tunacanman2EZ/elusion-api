@@ -18,12 +18,21 @@ the point — the fixes only make sense against the thing they fix.
 | E-6 | Long token with no credential rotation | low–medium | **Closed** |
 | E-7 | Item *use* is client-authoritative | low–medium (balance) | **Closed** |
 | E-8 | **A client could set its own gold** | **critical (economy)** | **Closed** |
-| E-9 | Current hp/mana/stamina are client-written | high | **Open** — measured, not refused |
+| E-9 | Current hp/mana/stamina are client-written | high | **Closed** — clamped; a rate bound, not a proof |
 | E-10 | **Lusions were client-written, so dying was free** | **high (balance)** | **Closed** |
 | E-11 | A banned player could sign straight back up | medium (moderation) | **Closed** — as far as addresses honestly allow |
 | E-12 | The sanction ladder had only one rung | low (moderation) | **Closed** — a kick is not a ban |
+| E-13 | **Four protections were unarmed against the shipped catalogue** | **high** | **Closed** — and it is the reason this table needed a footnote |
 
-Eight closed, one partly, two open.
+Ten closed, one partly, one open.
+
+**"Closed" in this table means closed in the code.** E-13 is here because for 46
+hours that was not the same thing as closed on the server. `gamedata.json` in
+this repo sat behind the Godot export, and four controls that read **Closed**
+above — E-1's equipment half, E-7's potion amounts, E-9's regen rates and E-3's
+spawn ceiling — were failing open in production with every test green. A
+register that does not distinguish *implemented* from *running* is telling you
+something slightly false, so `test_catalogue.py` now asserts the second one.
 
 **E-8 was the worst thing in this file and it was never in it.** Every other
 finding here was found by attacking the API deliberately; that one turned up by
@@ -35,8 +44,11 @@ on broke on that one call. The vendor sink, the kingdom tax and every trade
 valuation sat on top of it. Closed, and `test_economy.py` now attacks it
 directly rather than only walking in through the front door.
 
-**E-3 is still the deepest**, and E-9 is its other face: both exist because the
-server never observes combat.
+**E-3 is now the only one left, and it is the deepest.** E-9 was its other
+face — both exist because the server never observes combat — and closing E-9
+did not change that. What it did was bound the consequence: a heal the game
+cannot explain is trimmed to what it can. E-3's consequence is still unbounded
+in kind, only in rate.
 
 **E-10 is E-8 again, one endpoint over**, and that is the pattern worth naming:
 both were a currency field the client could write because nobody had marked it
@@ -44,10 +56,17 @@ owned. After two, the question stopped being "is this endpoint safe" and became
 **"which fields can a client still write, and who decided that?"** — and the
 answer for the rest is now a list rather than an assumption.
 
-Covered by nine suites, all green together — 1,515 checks:
-`test_api.py` (443) · `test_economy.py` (295) · `test_security.py` (223) ·
+Covered by eleven suites, all green together — 1,556 checks:
+`test_api.py` (444) · `test_economy.py` (295) · `test_security.py` (224) ·
 `test_equipment.py` (196) · `test_loot.py` (182) · `test_throttle.py` (55) ·
-`test_map.py` (48) · `test_gathering.py` (44) · `test_settings.py` (28).
+`test_map.py` (48) · `test_gathering.py` (44) · `test_settings.py` (28) ·
+`test_healing.py` (27) · `test_catalogue.py` (13).
+
+`test_catalogue.py` is the odd one and deliberately so. The other nine point
+`ELUSION_GAMEDATA` at a fixture they build themselves, which is correct — a
+test of the spawn ceiling should control how many of an enemy exist. It also
+means none of them ever read the file that ships, which is exactly how E-13
+survived 1,515 passing checks.
 
 Every suite points `ELUSION_DB` at a throwaway file *before* importing `app.py`,
 because `app.py` reads the path and calls `init_db()` at import time. A suite
@@ -159,6 +178,13 @@ its own script and appear in no scene — where refusing would break a real
 fight. The cost is a real exemption for runtime-spawned enemies, and it is
 worth naming: today that is `poisonslimesmall` at 25 xp, the lowest-value enemy
 in the game.
+
+**The first of those two fail-opens then fired for real, and nobody noticed for
+46 hours.** The shipped `gamedata.json` carried no `placed_count` at all, so the
+ceiling described above was not running: kills were bounded by the token bucket
+alone, at 18,000/hour rather than 5,208. The design was right and the file
+disarmed it. See **E-13** — `test_catalogue.py` now asserts the ceiling is
+actually armed, because the measurement below is worth nothing otherwise.
 
 **What has changed is that it is now measurable.** Until recently nothing
 recorded a kill at all, so the fraud was not merely unpunished, it was
@@ -395,10 +421,17 @@ review.
 
 The second was E-8, below.
 
-**What it does not close.** The *effect* is still the client's — the server does
-not know what a potion restores, because `restore_target` and `restore_amount`
-are not exported to `gamedata.json`. And a cheat that heals without drinking
-anything never touches this endpoint at all. That is E-9.
+**What it does not close.** The *effect* is still the client's: the server
+destroys the item and says what it should restore, but nothing verifies that the
+client applied that and only that. A cheat that heals without drinking anything
+never touches this endpoint at all. That is E-9.
+
+~~The server does not know what a potion restores~~ → it does now.
+`restore_target` and `restore_amount` are exported, and `/api/character/consume`
+writes both into `consume_grants`, which is what let E-9's check become per-pool
+instead of per-character. Kept struck through rather than deleted because the
+note was true when written and the sequence is the point: the gate came first,
+the amount second, and the check that needs the amount is still last.
 
 ### E-8 — A client could set its own gold · CLOSED
 
@@ -445,7 +478,7 @@ somebody walked.** There is now a section that attacks it directly, and the old
 `test_api.py` case that asserted gold *was* stored — which passed, and was the
 bug written down as an expectation — is now the assertion that it is ignored.
 
-### E-9 — Current hp, mana and stamina are client-written · OPEN
+### E-9 — Current hp, mana and stamina are client-written · CLOSED
 
 Named here because E-8 came out of looking at the same endpoint, and this is
 what is left of it.
@@ -456,7 +489,11 @@ underneath it, a patched client heals to full whenever it likes and never dies.
 Potions become decoration, and E-7's gate is moot for anyone willing to skip the
 potion entirely.
 
-**It cannot be refused yet, and the reason is honest rather than lazy.**
+**It is clamped now**, and the rest of this section is how that became safe to
+do. What follows was written while it was open; it is kept because the sequence
+is the argument.
+
+**It could not be refused then, and the reason was honest rather than lazy.**
 `player.gd` regenerates all three stats continuously — a percentage of each
 stat's own maximum per second, with a floor — so a character returns to full in
 about a minute of standing still. A check that did not model that would flag
@@ -469,16 +506,110 @@ the same staging E-1 used, for the reason written into that function: shipping
 the refusal before the comparison had proven itself would break honest saves for
 real players.
 
-Three things have to happen before it can bite:
+Three things had to happen before it could bite. **All three are done** — what
+is left is not a piece of work, it is a decision:
 
-1. **Export `regen_percent_per_second` and `regen_minimum_per_second`.** They are
-   `@export` values on the player *scene*, so the numbers in `app.py` are a
-   copy — and copied constants drift. This project has that scar already; see
-   the xp-formula note in `exportgamedata.gd`.
-2. **Export `restore_amount`**, so a consume explains *how much* rather than
-   merely *that a potion existed*. The window can shrink to seconds after that.
+1. ~~Export `regen_percent_per_second` and `regen_minimum_per_second`~~ → done.
+   They are `PlayerStats` values read through `gamedata.regen_rate_for()`, so
+   the allowance is measured against the game's own numbers rather than against
+   copies in `app.py`. Copied constants drift; this project has that scar
+   already, in the xp-formula note in `exportgamedata.gd`.
+2. ~~Export `restore_amount`~~ → done. A consume grant carries its target pool
+   and its size, so the check is per-pool: a cheap stamina potion no longer
+   explains an arbitrary jump in health, which is the hole it used to leave.
 3. ~~Give revive an endpoint~~ → done, and it turned into **E-10** below. An
    honest revive now leaves a grant row and no longer appears in the log at all.
+
+**So what remains is evidence, not plumbing.** The check has never refused
+anything, and flipping it to refuse is only safe once the log has shown it stays
+quiet across honest play — all four classes, idle regen, a potion mid-fight, a
+level-up refill, a revive, and a client that saves rarely. That is the same
+staging E-1 used, and the reason is written into `_report_unexplained_gains()`:
+shipping a refusal before the comparison has proven itself breaks honest saves
+for real players. A threshold picked without data is how honest players get
+clamped.
+
+**And E-13 is why that evidence is worth nothing until the catalogue is
+current.** Until recently the shipped `gamedata.json` carried no regen constants
+and no restore amounts, so the check was running on `app.py`'s fallback literals
+and treating every grant as an unknown quantity — which makes it return early
+and explain anything. A quiet log under those conditions was not evidence of
+anything at all.
+
+---
+
+**How it closed.** `_report_unexplained_heals()` is `_reconcile_heals()` now —
+renamed because it no longer only reports, and because it does the same job as
+`_reconcile_bank()` and `_reconcile_inventory()`: compare the claim to the
+record and correct it.
+
+**There are two lines, and that is the whole design.**
+
+| | | |
+|---|---|---|
+| `HEAL_ALLOWANCE_MARGIN` | 1.25x | the honest estimate — **logged, never enforced** |
+| `HEAL_CLAMP_MARGIN` | 3.00x | **enforced** |
+
+Enforcing at 1.25x on the evidence available would have been the E-2 mistake
+in a new place: a threshold taken from eighteen simulated scenarios rather than
+from real traffic. Enforcing at 3x cannot plausibly catch an honest player —
+it is three times more healing than the game can produce.
+
+The point is what happens *between* them. Every rise landing in that band is
+logged as a rise a tight clamp would have caught, and stored untouched. That
+is the evidence for closing the gap, gathered **while a control is already
+running** rather than instead of one. A band that stays empty across real play
+is the argument for lowering the enforced line to 1.25; a band that fills with
+honest players is proof that shipping the tight clamp would have broken them.
+The ratio is taken against the tight allowance, so widening what is enforced
+never widens what is logged — the two numbers stay independent on purpose,
+because conflating them is how a temporary margin quietly becomes the
+definition of honest.
+
+**It clamps; it does not refuse.** A 400 fails the whole save, and that save
+carries XP, gold, position and inventory. Discarding a legitimate half-hour of
+play to punish a suspicious hp figure is a worse bug than the cheat, so the
+figure is trimmed to what the player could have earned and the write proceeds —
+exactly as `_reconcile_inventory()` trims a bag.
+
+**What closing it broke, which was the most useful part.** Four checks in the
+existing suites failed, and one of them was this, in `test_security.py`:
+
+```python
+check("and the claimed hp was still stored", ... == MAX_HP)
+```
+
+That assertion **was the vulnerability, written down as an expectation**, and
+it passed for precisely that reason. It is the same shape as the `test_api.py`
+case that asserted gold *was* stored while E-8 was open. Twice now, which makes
+it worth naming as a class rather than as an anecdote: **a suite only tells you
+about behaviour somebody chose to assert, and asserting current behaviour makes
+a hole look load-bearing.** The other three were measuring the derived-`max_hp`
+clamp and had only ever known about one ceiling on `hp`; they now assert that
+both compose and that `hp` lands at the tighter of the two.
+
+**What it still does not do,** and the table says so rather than claiming a
+proof: it bounds the *rate* of unexplained healing, not its existence. Measured
+against a 180 hp pool, roughly 7 hp per save passes under the tight line, and
+the enforced line is three times that until the band gives a reason to close
+it. At the client's own ten-second save ceiling that is real healing. It is the
+same shape as the kill bucket and it has the same root — **the server does not
+observe combat** — which is E-3, and the only finding left.
+
+`test_healing.py` is the evidence: 27 checks driving the real endpoint, not the
+function, because the merge and clamp logic above it can change what `after`
+even looks like. Ten honest scenarios assert silence — regen after a fight, a
+full minute back to maximum, ten minutes offline returning at full, a save
+every ten seconds mid-fight, two saves in the same second, a potion, a potion
+plus regen, a level-up refill, a revive, mana at the floor rate — and five
+cheats assert the opposite, because a check that never fires is quiet for the
+wrong reason. The clamp is mutation-tested: disabled, three of its checks fail.
+
+A bug in that suite is worth recording. Its first draft filtered consumables on
+`item["restore_target"]`, which is the enum **integer**, so every potion
+silently failed to match and the potion scenarios tested nothing. That is the
+exact mistake `restore_for()`'s own docstring warns against. It goes through
+the accessor now, so the test cannot drift from the server.
 
 ### E-10 — Lusions were client-written, so dying was free · CLOSED
 
@@ -724,6 +855,93 @@ Twelve checks in `test_security.py`, and most of them assert what a kick does
 does not reach further than a ban would, and kicking an account with nothing
 live reports zero rather than erroring.
 
+### E-13 — Four protections were unarmed against the shipped catalogue · CLOSED
+
+Not an attack. Found by reading the file the server actually loads, while
+starting work on E-9 — which is the second time in this file that opening one
+finding has walked into a bigger one.
+
+`gamedata.json` lives in two places: the Godot project exports it, and a copy is
+carried across to this folder by hand. The copy was **46 hours behind**. Same
+code, two catalogues:
+
+```
+                             shipped copy      fresh export
+EQUIP_EXPORTED                   False            True
+SPAWNS_EXPORTED                  False            True
+REGEN_EXPORTED                   False            True
+restore_for('tinyhealthpotion') ('', 0)        ('HP', 20)
+spawn_count_for('windslime')        0              1
+```
+
+Each of those is a gate, so each was open:
+
+- **E-1's equipment half.** Without `equip_slot_name` the server cannot tell a
+  helmet from a sword, and `parse_equipment()` falls back to checking only that
+  the slot name is in `EQUIP_SLOTS_FALLBACK` — the state that let
+  `{"helm": "embersword"}` through in the first place.
+- **E-3's spawn ceiling.** Gated entirely on `SPAWNS_EXPORTED`. Kill claims were
+  bounded by the token bucket alone: 18,000/hour rather than 5,208.
+- **E-9's measurement.** The allowance was computed from `app.py`'s fallback
+  literals instead of from `PlayerStats`.
+- **E-7's amounts.** `restore_for()` returning `('', 0)` writes a grant with an
+  empty target and a zero amount, and `_report_unexplained_heals()` treats an
+  unknown amount as *unknown* and returns early rather than calling it a cheat.
+  So one potion of any kind explained a heal of any size — the exact hole the
+  per-pool rewrite was built to close, reopened by a data file.
+
+**Failing open was correct and is unchanged.** A server whose catalogue predates
+a field must keep serving rather than refuse every request; a half-upgraded
+deployment that 400s every kill is a worse outage than a temporarily loose
+check. The bug was never the fail-open. It was that it was **silent**.
+
+**Why 1,515 passing checks said nothing.** Every suite sets `ELUSION_GAMEDATA`
+to a fixture it builds itself, which is right — a test of the spawn ceiling
+should decide how many of an enemy exist rather than inherit whatever the last
+export produced. The consequence is that all nine tested the code's behaviour
+*given* a catalogue and none tested the catalogue. The controls were correct,
+tested, and pointed at a file that did not arm them.
+
+That is this project's own recurring failure with a new coat on: **something
+that looks finished and does nothing.** It has now appeared in a scene that
+drew no pixels, a handler wired to a `print`, a stat that bought attack speed
+for the wrong character, and here, in four security controls at once.
+
+**Closed in two halves.**
+
+`test_catalogue.py` reads the real `gamedata.json` — it pops `ELUSION_GAMEDATA`
+explicitly, so a developer running the whole directory in one shell cannot
+accidentally test whichever fixture ran last. It asserts two things per
+protection, because a flag can be true while the data under it is useless:
+`EQUIP_EXPORTED` is `any("equip_slot_name" in item ...)`, so one item carrying
+the field turns it green while the other 122 fall through the check. Run against
+the stale catalogue it fails 6; against the current one it passes 16.
+
+It deliberately asserts **no date, no hash, no byte count**. Those fail on every
+legitimate re-export, and a test that cries wolf is a test somebody deletes. An
+optional section does compare against the Godot copy directly when
+`ELUSION_GODOT_DATA` points at it, and says out loud that it is skipping when it
+does not.
+
+`_warn_if_protections_unarmed()` is the production half, since CI cannot see the
+file on the deployed box. It replaces two hand-written warnings — and the fact
+that the two protections added later never got one is the entire incident in a
+sentence, so it is a table now. It logs at **error**: these lines mean a control
+the code believes is running is not running, and a warning is precisely what got
+scrolled past for 46 hours.
+
+**Refusing to boot is left as a commented one-line flip**, not taken. The case
+for it is that a game holding real accounts should not quietly serve with
+equipment validation off. The case against is that it converts a missed copy
+into an outage at the worst possible moment, and nobody is reading the log at
+3am either way. It is a deployment posture question, and recording the argument
+is worth more than silently picking a side.
+
+**The general form.** A protection that reads its own configuration has two
+failure modes, and the tests only ever covered one. *Is the logic right* is what
+a fixture answers. *Is it turned on where it runs* is a different question and
+needs a different test.
+
 ### Already solid — credit where due
 
 Worth being explicit so the migration does not accidentally regress them:
@@ -926,9 +1144,12 @@ the order it should happen.
 7. ~~Add a consume endpoint~~ → **E-7 closed**; and ~~gold made server-owned~~ →
    **E-8 closed**, the one that was never on this list because nobody had
    noticed it.
-8. **Export the regen constants and `restore_amount`**, then give revive an
-   endpoint → lets **E-9**'s reconciler stop logging and start refusing. Three
-   small pieces of export work standing between a measurement and a control.
+8. ~~Export the regen constants and `restore_amount`, then give revive an
+   endpoint~~ → done, and **E-9 closed** on top of them. Clamped at a loose
+   margin with the honest one still logging, so the band between the two is the
+   evidence for tightening it later. The one follow-up worth remembering is not
+   code: **watch that band, and lower `HEAL_CLAMP_MARGIN` to 1.25 once it has
+   stayed empty across real play.**
 9. **Give defense, agility and magic server-observed events** to grant against.
    Not a heuristic — see the note under E-2 above on why a character-level bound
    is wrong for skills that train on movement and damage taken.

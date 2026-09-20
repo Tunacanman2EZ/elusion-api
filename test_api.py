@@ -473,15 +473,25 @@ body = status("hp below the class maximum", client.put("/api/player/status", hea
               json={"slot": 0, "hp": 50}), 200)
 check("applies as sent", body["hp"] == 50, body)
 
+# TWO CEILINGS ON hp NOW, and this pair used to only know about one.
+#
+# max_hp is derived, so a forged one is replaced by the curve's answer. That is
+# what these two checks are for and it is unchanged. What changed is that the
+# heal reconciler is no longer in shadow mode: 50 -> 180 in no elapsed time is
+# also a rise regeneration cannot explain, so hp lands at the TIGHTER of the
+# two ceilings rather than at max_hp. Asserting 180 here would now be asserting
+# that the heal clamp did not run.
 body = status("hp above it, with a forged max_hp", client.put("/api/player/status", headers=H,
               json={"slot": 0, "hp": 999, "max_hp": 999}), 200)
-check("clamped to the curve's answer, not the client's",
-      body["hp"] == 180 and body["max_hp"] == 180, body)
+check("max_hp is the curve's answer, not the client's", body["max_hp"] == 180, body)
+check("and hp is bounded by both ceilings, landing at the tighter one",
+      50 <= body["hp"] < 180, body)
 
 body = status("same pair, keys reversed", client.put("/api/player/status", headers=H,
               json={"max_hp": 999, "hp": 999, "slot": 0}), 200)
 check("key order does not change the outcome",
-      body["hp"] == 180 and body["max_hp"] == 180, body)
+      body["max_hp"] == 180 and body["hp"] < 180, body)
+CLAMPED_HP = body["hp"]
 # ON hp RATHER THAN gold, because a server-owned field is dropped BEFORE it is
 # parsed - a malformed gold value would now return 200 and prove nothing about
 # parse_stat(). These have to ride on a field the client may still write, or
@@ -498,10 +508,13 @@ status("write to empty slot", client.put("/api/player/status", headers=H,
        json={"slot": 2, "hp": 1}), 404)
 
 body = status("rejections left state intact", client.get("/api/player/status?slot=0", headers=H), 200)
-# 180, not the 170 written further up: the clamping cases between here and
-# there ended with hp pinned to the class maximum, which is the last value a
-# refused write must not have disturbed.
-check("hp still 180 after four refused writes", body["hp"] == 180, body)
+# AGAINST WHAT THE LAST ACCEPTED WRITE ACTUALLY STORED, not a literal. This
+# used to read 180, because the clamping cases above ended with hp pinned to
+# the class maximum. They now end at the heal reconciler's ceiling instead, and
+# hardcoding either number tests the clamp rather than the thing this check is
+# about - that a REFUSED write disturbs nothing.
+check("hp unchanged after four refused writes", body["hp"] == CLAMPED_HP,
+      "wanted %s, got %s" % (CLAMPED_HP, body["hp"]))
 check("an unknown field never becomes part of the record",
       "wingspan" not in body, body)
 
