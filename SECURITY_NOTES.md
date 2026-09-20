@@ -186,6 +186,51 @@ alone, at 18,000/hour rather than 5,208. The design was right and the file
 disarmed it. See **E-13** — `test_catalogue.py` now asserts the ceiling is
 actually armed, because the measurement below is worth nothing otherwise.
 
+**THREE WAYS TO TIGHTEN IT WERE MEASURED AND ALL THREE WERE REJECTED.** Written
+down because each sounded convincing, each would have cost a change across the
+export tool, the server *and* the client, and the numbers say none of them is
+worth it. Measured against the real roster — 42 placed instances, a 300s window
+and a 30s respawn floor:
+
+| idea | ceiling | vs today |
+|---|---|---|
+| today: `placed x (W/respawn + 1)` | 5,544 kills/hr | — |
+| **per-spawn-point claims** — the client names *which* spawn point died, so each pays once per respawn | 5,040 | **9% tighter** |
+| **per-scene attribution** — a player is in one place, so bound by the best single scene rather than the whole world | 4,200 | **16.7% tighter** |
+| **per-enemy time-to-kill floor** — you cannot kill a 8,216 hp boss faster than its hp over your best single-target dps | 4,967 | **1.4% tighter** |
+
+Honest play is roughly 300 kills/hour, so the gap is 18x today and would be 14x
+with all three. **That is not a change in posture, and it is three moving parts
+for it.**
+
+Why each fails is worth more than the numbers:
+
+- **Per-spawn-point** adds almost nothing because the existing ceiling is
+  *already* `placed_count x respawn rate`. Naming the individual point only
+  removes the `+1` slack per window. The bound was doing that work already.
+- **Per-scene** fails on this world's shape: `field.tscn` holds 35 of the 42
+  placed instances, so "one scene at a time" barely constrains anything. It
+  would bind on a game with evenly distributed content. This is not one.
+- **Time-to-kill** binds on exactly three enemies — `fireboss` (43.1s),
+  `earthboss` (38.7s), `iceboss` (32.5s) — because everything else in the game
+  dies in under the 30s respawn floor anyway. Note that this is NOT the dps
+  *budget* idea rejected above and does not share its flaw: AoE kills more
+  things at once, it does not make one thing die faster, so a single-target
+  floor is not inflated by the tank's aura. It is simply that almost nothing in
+  this game is tanky enough for the floor to matter.
+
+**The general lesson, and it is the same one as the dps budget: the spawn
+ceiling already extracts nearly all the signal the content contains.** The
+remaining 18x exists because any content-derived bound has to permit the
+theoretical maximum — every spawn point killed the instant it respawns, forever
+— and nothing in the data distinguishes that from a real player who walks,
+misses, and stops for tea. No refinement of *what exists* closes that, because
+the gap is not about what exists. It is about what happened, and the server was
+not there.
+
+So E-3 stays open, and the next move on it is not a tighter bound. It is the
+server observing combat, which is an architecture change and not a refinement.
+
 **What has changed is that it is now measurable.** Until recently nothing
 recorded a kill at all, so the fraud was not merely unpunished, it was
 *invisible*: a client reporting one boss an hour forever looked exactly like a
@@ -1153,11 +1198,17 @@ the order it should happen.
 9. **Give defense, agility and magic server-observed events** to grant against.
    Not a heuristic — see the note under E-2 above on why a character-level bound
    is wrong for skills that train on movement and damage taken.
-10. **Verify the kill** — server-side encounter state, or at minimum tie kill
-    reports to server-known enemy spawns → closes **E-3**, the deepest one,
-    correctly saved for last. Note that tying kills to the character's *area*
-    is not a substitute: `saves.area` is written by the client, so a client that
-    wants boss kills simply claims to be on the boss floor first.
+10. **Verify the kill** — server-side encounter state → closes **E-3**, the
+    last one open. Note that tying kills to the character's *area* is not a
+    substitute: `saves.area` is written by the client, so a client that wants
+    boss kills simply claims to be on the boss floor first.
+
+    ~~or at minimum tie kill reports to server-known enemy spawns~~ →
+    **measured and rejected.** It is 9% tighter, and two neighbouring ideas
+    (per-scene attribution, a per-enemy time-to-kill floor) are 16.7% and 1.4%.
+    The table under E-3 has the numbers. Nothing short of observing the fight
+    moves this meaningfully, so the next step on E-3 is the architecture
+    change or nothing — there is no cheap intermediate left to buy.
 
 The original test still applies to every step: re-run the three `curl` claims
 from the audit above. Rows 1 and 2 now come back trimmed or capped, the way

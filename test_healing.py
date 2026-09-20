@@ -327,13 +327,23 @@ section("Past the enforced line")
 
 lines = attempt({"hp": 20}, {"hp": MAX_HP}, 2)
 clamped = stored_hp()
-check("a full heal from nothing is trimmed", clamped < MAX_HP,
-      "stored %d of %d" % (clamped, MAX_HP))
-check("trimmed to roughly what regen allowed, not to zero",
-      20 < clamped < 20 + int(2 * RATE * TIGHT) + 5,
-      "stored %d, floor was 20" % clamped)
-check("and the clamp says so in the log",
-      any("heal clamped" in line for line in ear.lines), ear.lines)
+check("a full heal from nothing is always REPORTED", bool(lines), lines)
+
+if app_module.HEAL_CLAMP_ENFORCED:
+    check("...and trimmed", clamped < MAX_HP, "stored %d of %d" % (clamped, MAX_HP))
+    check("trimmed to roughly what regen allowed, not to zero",
+          20 < clamped < 20 + int(2 * RATE * TIGHT) + 5,
+          "stored %d, floor was 20" % clamped)
+    check("and the clamp says so in the log",
+          any("heal clamped" in line for line in ear.lines), ear.lines)
+else:
+    # ENFORCEMENT IS OFF. It was on for an hour and the first honest save it
+    # saw was a zero-to-full refill from player.gd::_ready(), which the server
+    # has no record of - see HEAL_CLAMP_ENFORCED in app.py.
+    check("...and stored as sent, because enforcement is off",
+          clamped == MAX_HP, clamped)
+    check("and nothing claims to have clamped it",
+          not any("heal clamped" in line for line in ear.lines), ear.lines)
 
 # THE SAVE MUST STILL SUCCEED. A 400 here would discard the XP, gold, position
 # and inventory riding along in the same request - punishing a suspicious hp
@@ -351,7 +361,7 @@ check("and the rest of the save survived it",
 if potions:
     pid, ptarget, heal = potions[0]
     attempt({"hp": 20}, {"hp": MAX_HP}, 2, [(pid, ptarget, heal)])
-    check("an authorised potion raises the clamp floor by its amount",
+    check("an authorised potion raises the floor by its amount",
           stored_hp() >= 20 + heal, "stored %d, potion was +%d" % (stored_hp(), heal))
 
 

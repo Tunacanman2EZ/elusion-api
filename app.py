@@ -661,6 +661,10 @@ def init_db():
             user_id   INTEGER PRIMARY KEY,
             lusions   INTEGER NOT NULL DEFAULT 0 CHECK (lusions >= 0),
             bank_gold INTEGER NOT NULL DEFAULT 0 CHECK (bank_gold >= 0),
+            -- What dying has cost this account, cumulatively. Never decreases;
+            -- see the migration for why it is account-shared rather than
+            -- per-character.
+            score     INTEGER NOT NULL DEFAULT 0 CHECK (score >= 0),
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
 
@@ -852,6 +856,19 @@ def init_db():
     # Kill-rate tokens. Defaults to the full bucket so an existing character is
     # not penalised for having played before this column existed.
     _migrate_add_column(db, "saves", "kill_tokens", "REAL NOT NULL DEFAULT 20.0")
+
+    # WHAT DEATH HAS COST THIS ACCOUNT, cumulatively, and the only number in
+    # the game that is supposed to go up when you lose.
+    #
+    # ACCOUNT-SHARED, like lusions and the bank, because one of the two things
+    # it counts already is: lusions are account-wide, so a per-character score
+    # would credit whichever character happened to be holding the body. A
+    # lifetime figure for the player is also the one a leaderboard wants.
+    #
+    # ADDED BY MIGRATION rather than only in CREATE TABLE, because elusion.db
+    # already exists and holds real accounts. A column that only appears for
+    # new databases is how the two halves of this project drift apart.
+    _migrate_add_column(db, "accounts", "score", "INTEGER NOT NULL DEFAULT 0")
 
     # Millisecond timestamp of the last cast credited to this character, for the
     # rate limit in /api/fishing/catch. Same shape and same reasoning as the
@@ -3311,6 +3328,71 @@ HEAL_ALLOWANCE_MARGIN = 1.25
 # the proof that shipping the tight clamp would have broken them.
 HEAL_CLAMP_MARGIN = 3.00
 
+# ENFORCEMENT IS OFF, AND THIS IS WHY.
+#
+# It was on for about an hour. The first real save it saw was an honest one and
+# it took 370 hp and 114 stamina off a real character:
+#
+#     unexplained heal: hp +480 vs regen 110 + granted 0  (elapsed 11.0s)
+#     heal clamped:     hp 480 -> 110   stamina 205 -> 91
+#
+# At 4.4x the allowance it was not close to the 3x line - it was nowhere near
+# it, which is the part worth keeping. The argument for enforcing at 3x was
+# that three times more healing than the game can produce cannot plausibly be
+# honest. That argument was wrong, and it was wrong by a factor rather than at
+# the margin.
+#
+# WHAT PRODUCED IT, and it is not a cheat or a bug: player.gd::_ready() reads
+#
+#     hp = max_hp if (was_full_hp or hp <= 0) else clampi(hp, 0, max_hp)
+#
+# A character stored at 0 stands up at full, deliberately and with a comment
+# explaining that the alternative is spawning a corpse that dies on its first
+# frame. The death penalty is carried by lost gold and the lusion cost of a
+# revive, not by refusing to let the player stand. Nothing about that reaches
+# the server: no /api/character/revive call, no consume_grants row, nothing for
+# the reconciler to find.
+#
+# SO THE FIX IS NOT A WIDER MARGIN. A margin wide enough to admit a
+# zero-to-full refill is a margin wide enough to admit any heal at all, which
+# is not a control. The fix is that the client's one remaining legitimate
+# refill has to leave a record, the way the level-up and the revive already do.
+# Until it does, this measures and says so and changes nothing.
+#
+# THE DISCIPLINE THIS RESTORES is the one SECURITY_NOTES already had written
+# down under E-1: log first, refuse second, and let the log decide. The band
+# between the two margins is still recording, so when the refill is accounted
+# for there will be real evidence rather than another argument from plausibility.
+#
+# ----------------------------------------------------------------------------
+# BACK ON, AND THIS TIME FOR A REASON RATHER THAN AN ARGUMENT.
+#
+# The refill above is gone. player.gd::_ready() no longer stands a character
+# stored at 0 up at full - it routes to the game over screen, which is where
+# the death penalty lives, and closes the separate hole where logging out at 0
+# hp returned the character alive with every item. So the one confirmed false
+# positive no longer exists.
+#
+# The client's remaining full-heal paths were enumerated rather than assumed,
+# which is what was missing the first time:
+#
+#   the `level` setter        fires on load, then SAVEABLE_STATS writes the
+#                             stored hp over it - net zero
+#   level_up()                /api/combat/kill writes a LEVELUP grant in the
+#                             same transaction, so it is already explained
+#   has_active_revive         declared, read once, and set to true by NOTHING
+#                             in the project - the branch cannot run
+#   hp <= 0 on load           removed
+#
+# That leaves no refill the server does not already know about. Not a proof -
+# an enumeration of a client this size is only as good as the reading - but it
+# is evidence of a kind the first attempt did not have.
+#
+# WHAT WOULD SEND THIS BACK TO False: an `unexplained heal` line for a player
+# who was playing honestly. That is the only signal that matters, and the log
+# is still the thing that produces it.
+HEAL_CLAMP_ENFORCED = True
+
 # Two writes in the same second must not read as "healed with zero time
 # available". Treated as at least this many seconds apart.
 HEAL_MINIMUM_ELAPSED_SECONDS = 2.0
@@ -3598,6 +3680,10 @@ def _reconcile_heals(db, user_id, slot, before, after):
     # purpose: one is the honest estimate, the other is how much benefit of the
     # doubt is currently being given, and conflating them is how a temporary
     # margin quietly becomes the definition of honest.
+    if not HEAL_CLAMP_ENFORCED:
+        # Measured and reported above; nothing is corrected. See the constant.
+        return {}
+
     corrections = {}
     for field, (gained, allowance) in still_unexplained.items():
         ceiling = allowance + granted.get(field, 0.0)
@@ -4065,7 +4151,13 @@ def _ensure_account(user_id):
     db = get_db()
     db.execute("INSERT OR IGNORE INTO accounts (user_id) VALUES (?)", (user_id,))
     return db.execute(
-        "SELECT lusions, bank_gold FROM accounts WHERE user_id = ?", (user_id,)
+        # score IS IN THE SELECT, and leaving it out cost a test run. A
+        # sqlite3.Row raises IndexError for a column that was not fetched, so
+        # account_payload() guards with .keys() - and that guard turned a
+        # missing column into a silent 0 rather than a crash, which is the
+        # worse of the two failures. The guard stays; this is what makes it
+        # never fire.
+        "SELECT lusions, bank_gold, score FROM accounts WHERE user_id = ?", (user_id,)
     ).fetchone()
 
 
@@ -4085,6 +4177,11 @@ def account_payload(user_id):
     return {
         "lusions": int(row["lusions"]),
         "bank_gold": int(row["bank_gold"]),
+        # KEYED WITH .get() RATHER THAN row["score"], because a sqlite3.Row
+        # raises IndexError for a column the SELECT did not fetch, and
+        # _ensure_account() predates this one. The narrow-SELECT trap is how a
+        # correct refusal turned into a 500 once already - see E-11.
+        "score": int(row["score"]) if "score" in row.keys() else 0,
         "bank_inventory": cells,
         "capacity": BANK_CAPACITY,
     }
@@ -7546,6 +7643,28 @@ def character_revive():
         # spent on anything.
         lusion_delta(db, user_id, slot, -cost, "revive",
                      "revive from slot %d" % slot)
+
+    # THE SCORE IS WHAT DYING TOOK, and it is the one number in the game that
+    # goes up when you lose.
+    #
+    # BOTH PAYMENT PATHS COUNT. The 20-lusion revive keeps everything you were
+    # carrying; the gold revive burns 80% of what you hold. They cost very
+    # different things and both are a price paid for dying, so both score.
+    #
+    # LUSIONS AND GOLD ARE COUNTED 1:1, and that is a decision rather than an
+    # oversight - they are different currencies and this adds them into one
+    # figure. It is the simplest rule that is not arbitrary, and if the two
+    # should ever weigh differently this is the single line to change. Naming
+    # it here because an unweighted sum of two currencies is exactly the kind
+    # of thing that later reads as a bug nobody noticed.
+    #
+    # IN THE SAME TRANSACTION as the payment above and the heal below, so a
+    # crash cannot bank the score for a revive that did not happen or take the
+    # payment for one that scored nothing.
+    db.execute(
+        "UPDATE accounts SET score = score + ? WHERE user_id = ?",
+        (int(cost), user_id),
+    )
 
     db.execute(
         "UPDATE saves SET hp = ?, mana = ?, stamina = ?, "

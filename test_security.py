@@ -1245,9 +1245,20 @@ check("and the request still succeeded (shadow mode)", r.status_code == 200, r.s
 # request still succeeds, because a 400 here would discard the XP, gold and
 # inventory riding along in the same save.
 stored = client.get("/api/player/status?slot=0", headers=patient).get_json()["hp"]
-check("and the claimed hp was TRIMMED, not stored", stored < MAX_HP,
-      "stored %s of %s" % (stored, MAX_HP))
-check("trimmed to the allowance rather than to zero", stored >= 1, stored)
+if app_module.HEAL_CLAMP_ENFORCED:
+    check("and the claimed hp was TRIMMED, not stored", stored < MAX_HP,
+          "stored %s of %s" % (stored, MAX_HP))
+    check("trimmed to the allowance rather than to zero", stored >= 1, stored)
+else:
+    # SHADOW MODE, AND SAID SO. The old version of this assertion read "and the
+    # claimed hp was still stored" with no explanation, which is how a
+    # vulnerability ends up looking load-bearing. Storing the claim is what
+    # happens while the clamp only reports; the check names that rather than
+    # implying it is the desired end state.
+    check("the claim is stored, because enforcement is off - the log is the"
+          " control today", stored == MAX_HP, stored)
+    check("but it was reported, which is the half that is always on",
+          "unexplained heal" in logged, logged)
 
 set_stored(hp=1, updated_at=int(time.time()))
 authorise_potion()
@@ -1567,6 +1578,7 @@ expected = _math.ceil(1000 * RATE)
 check("the price is a share of carry AND bank together",
       int(body.get("cost", -1)) == expected, [body.get("cost"), expected])
 
+
 carry, bank = purses("rich")
 check("the carry purse is spent first", carry == 0, carry)
 check("and the bank covers the rest", bank == 1000 - expected, [bank, 1000 - expected])
@@ -1784,6 +1796,53 @@ check("and the refusal says how to fix it",
 shutil.rmtree(_stale_dir, ignore_errors=True)
 
 print("      (EQUIP_EXPORTED = %s)" % exported)
+
+
+# =============================================================================
+# SCORE - THE ONE NUMBER THAT GOES UP WHEN YOU LOSE
+# =============================================================================
+# What dying has cost this account, cumulatively. Both revive routes feed it:
+# the lusion route keeps everything you carried, the gold route burns 80% of
+# what you hold, and both are a price paid for dying.
+
+def score_of(headers):
+    return int(client.get("/api/account", headers=headers).get_json().get("score", -1))
+
+check("the gold revive above scored exactly what it burned",
+      score_of(rich) == expected, [score_of(rich), expected])
+
+# A SECOND DEATH ADDS, it does not replace. Trivial to get wrong with a SET.
+bank_and_carry("rich", 0, 500)
+kill("rich")
+r = client.post("/api/character/revive", headers=rich, json={"slot": 0, "pay": "gold"})
+second = int(r.get_json().get("cost", 0))
+check("a second death adds to the score rather than replacing it",
+      score_of(rich) == expected + second, [score_of(rich), expected, second])
+
+# THE LUSION ROUTE SCORES TOO, at 1:1 with gold - a decision, not an accident,
+# and app.py says so at the line that does it.
+lus = register("scorer")
+make_char(lus)
+give_lusions("scorer", 100)
+before = score_of(lus)
+kill("scorer")
+r = revive(lus)
+check("the lusion revive succeeds", r.status_code == 200, r.status_code)
+check("and scores the lusions it cost",
+      score_of(lus) == before + int(r.get_json().get("cost", 0)),
+      [score_of(lus), before, r.get_json().get("cost")])
+
+# A REFUSED REVIVE MUST NOT SCORE. The payment and the score are one
+# transaction; a 402 that still moved the number would be the worse half of it.
+broke = register("broke")
+make_char(broke)
+kill("broke")
+before = score_of(broke)
+r = revive(broke)
+check("a revive nobody can afford is refused", r.status_code == 402, r.status_code)
+check("and scores nothing", score_of(broke) == before, [score_of(broke), before])
+
+check("a fresh account starts at zero", score_of(register("newborn")) == 0)
 
 
 print("\n" + "=" * 60)

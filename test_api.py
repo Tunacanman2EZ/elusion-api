@@ -484,13 +484,23 @@ check("applies as sent", body["hp"] == 50, body)
 body = status("hp above it, with a forged max_hp", client.put("/api/player/status", headers=H,
               json={"slot": 0, "hp": 999, "max_hp": 999}), 200)
 check("max_hp is the curve's answer, not the client's", body["max_hp"] == 180, body)
-check("and hp is bounded by both ceilings, landing at the tighter one",
-      50 <= body["hp"] < 180, body)
+# READS THE FLAG rather than hardcoding a mode. The heal reconciler enforces or
+# only reports depending on HEAL_CLAMP_ENFORCED, and a suite that asserted one
+# of those would break every time the flag moved - which it already has once,
+# in both directions, inside an hour.
+if app_module.HEAL_CLAMP_ENFORCED:
+    check("and hp is bounded by both ceilings, landing at the tighter one",
+          50 <= body["hp"] < 180, body)
+else:
+    check("and hp reaches max_hp, because the heal clamp only reports today",
+          body["hp"] == 180, body)
 
 body = status("same pair, keys reversed", client.put("/api/player/status", headers=H,
               json={"max_hp": 999, "hp": 999, "slot": 0}), 200)
 check("key order does not change the outcome",
-      body["max_hp"] == 180 and body["hp"] < 180, body)
+      body["max_hp"] == 180
+      and (body["hp"] < 180 if app_module.HEAL_CLAMP_ENFORCED else body["hp"] == 180),
+      body)
 CLAMPED_HP = body["hp"]
 # ON hp RATHER THAN gold, because a server-owned field is dropped BEFORE it is
 # parsed - a malformed gold value would now return 200 and prove nothing about
