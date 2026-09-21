@@ -1024,6 +1024,51 @@ Worth being explicit so the migration does not accidentally regress them:
 
 ---
 
+### E-14 — A kick or a ban never reached a game that was already running · CLOSED
+
+Found while building the staff panel, by asking what a kick looks like from
+the other side.
+
+E-12 says a kick revokes access and a ban deletes the target's sessions "in the
+same transaction". Both true, and both only on the server. The client never
+asked again: it validated its token once, at the login screen, and after that
+nothing it did in the world depended on the answer. A kicked player went on
+walking, fighting and looting until they happened to restart - their saves
+bouncing off a dead token with nothing on screen to say so. A ban kept a player
+in the game for exactly as long as they chose to stay.
+
+**The heartbeat.** While a character is in the world the game calls
+`GET /api/auth/session` every 15 seconds (`Api.HEARTBEAT_SECONDS`), and a 401
+sends the player to the login screen with a line saying the server signed them
+out. Any other request that bounces off a dead token triggers a beat at once,
+so in practice a kick lands in about a second.
+
+**Only a 401 signs anyone out.** A plain 401 elsewhere is not proof - changing
+a password answers 401 for a mistyped current password - so other requests
+only ASK for a beat and the beat decides. No answer, a 500, and a 404 from some
+other program on the port all mean "no verdict". A server restart must not be
+a mass kick.
+
+**The login screen does not say which.** A kick, a ban and an expired login
+all look the same from the client: the session is gone. A banned player finds
+out the rest on their next login attempt, which now shows the ban's end date
+and reason (the 403 always carried both; the screen showed neither).
+
+**Presence came with it.** The heartbeat stamps `sessions.last_seen_at`, and
+`GET /api/staff/users` reports `online` for a beat within 45 seconds. "Has a
+live session" could not answer that - sessions last thirty days and survive
+the game being closed - so a kick list sorted by it would have led with last
+week's visitors. The stamp is keyed by token, so one open device cannot vouch
+for another, and it never extends `expires_at`.
+
+**Limit, stated plainly:** a modified client can ignore the 401 and keep
+drawing the world. It still cannot save, trade, loot or report a kill, because
+every one of those is authenticated server-side. What the heartbeat fixes is
+the honest client that simply never found out.
+
+Twelve checks in `test_api.py` (presence, the heartbeat, the migration) and
+a STAFF PANEL section in the Godot suite, each mutation-tested.
+
 ## Not code — required before this is reachable by anyone else
 
 These cannot be closed in `app.py` and are listed so they are not mistaken for

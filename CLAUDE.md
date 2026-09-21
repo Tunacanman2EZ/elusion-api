@@ -179,8 +179,20 @@ never over the network. Keep that property in anything that replaces it.
 
 ## Moderation
 
-Built. `POST /api/staff/ban`, `POST /api/staff/unban`, `PUT /api/staff/role`,
-`GET /api/staff/users`.
+Built. `POST /api/staff/ban`, `POST /api/staff/kick`, `POST /api/staff/unban`,
+`PUT /api/staff/role`, `GET /api/staff/users`. The game's Staff button (HUD,
+mods and up) drives all of them; the owner's backquote console still exists.
+
+**Kicks and bans reach a running game through the heartbeat.** Both delete the
+target's sessions, and the client calls `GET /api/auth/session` every 15
+seconds while a character is in the world - a 401 there sends it to the login
+screen. Only a 401: no answer, a 500 or a 404 says nothing about the login, and
+a server restart must not be a mass kick.
+
+**Online means a heartbeat within `ONLINE_WINDOW_SECONDS` (45)**, stamped on
+`sessions.last_seen_at` by that same call. Not "holds a session" - sessions
+last thirty days and survive the game being closed. The heartbeat does not
+extend `expires_at`.
 
 **"staff" is not a fifth rank.** It is the set of ranks above player - mod, dev
 and owner - because all three use these routes and they need one word between

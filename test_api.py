@@ -1764,6 +1764,93 @@ status("nobody can grant owner", client.put("/api/staff/role", headers=OWNER_H,
 status("and demotion works", client.put("/api/staff/role", headers=OWNER_H,
        json={"username": "victim", "role": "player"}), 200)
 
+# ---- who is online ---------------------------------------------------------
+#
+# A session lasts thirty days, so "holds a session" is not "is playing". The
+# staff list reads presence off the heartbeat instead - GET /api/auth/session,
+# which the game calls every 15 seconds - and these pin the three states a
+# kick list has to tell apart: here now, logged in but gone quiet, logged out.
+
+def _listed(name, headers=OWNER_H):
+    for entry in client.get("/api/staff/users", headers=headers).get_json()["accounts"]:
+        if entry["username"] == name:
+            return entry
+    return None
+
+def _one_row(sql, args):
+    # Opened and CLOSED per query. A connection left open holds the scratch
+    # database, and on Windows that is what made teardown fail before.
+    conn = _owner_sq.connect(DB_PATH)
+    try:
+        return conn.execute(sql, args).fetchone()
+    finally:
+        conn.close()
+
+def _age_heartbeats(name, seconds):
+    conn = _owner_sq.connect(DB_PATH)
+    conn.execute("UPDATE sessions SET last_seen_at = last_seen_at - ?"
+                 " WHERE user_id = (SELECT id FROM users WHERE username = ?)",
+                 (seconds, name))
+    conn.commit(); conn.close()
+
+_present = _register("present")
+_PRESENT_H = {"Authorization": "Bearer " + _present["token"]}
+_entry = _listed("present")
+check("every listed account says whether it is online",
+      _entry is not None and "online" in _entry and "last_seen_at" in _entry, _entry)
+check("an account that just logged in is online", _entry and _entry["online"] is True, _entry)
+_clock = client.get("/api/staff/users", headers=OWNER_H).get_json().get("now")
+check("the list carries the server's clock, so 'last seen' needs no client clock",
+      isinstance(_clock, int) and abs(_clock - time.time()) < 5, _clock)
+
+_age_heartbeats("present", app_module.ONLINE_WINDOW_SECONDS + 5)
+check("gone quiet past the window reads offline, though the session is alive",
+      _listed("present")["online"] is False and
+      client.get("/api/character", headers=_PRESENT_H).status_code != 401,
+      "a thirty-day token must not keep someone on the kick list")
+
+_expiry_before = _one_row("SELECT expires_at FROM sessions WHERE token = ?",
+                          (_present["token"],))[0]
+status("the heartbeat", client.get("/api/auth/session", headers=_PRESENT_H), 200)
+check("brings them back online", _listed("present")["online"] is True, _listed("present"))
+check("and does NOT extend the login",
+      _one_row("SELECT expires_at FROM sessions WHERE token = ?",
+               (_present["token"],))[0] == _expiry_before,
+      "a heartbeat proves the game is running, not that the login is fresh")
+
+# ONLY THE SESSION THAT BEAT. A second device left open elsewhere must not be
+# vouched for by this one - the stamp is keyed by token, not by account.
+_second = client.post("/api/auth/login",
+                      json={"username": "present", "password": "password123"}).get_json()
+_age_heartbeats("present", 10_000)
+client.get("/api/auth/session", headers=_PRESENT_H)
+_rows = {
+    tok: _one_row("SELECT last_seen_at FROM sessions WHERE token = ?", (tok,))[0]
+    for tok in (_present["token"], _second["token"])
+}
+check("the heartbeat stamps its own session and no other",
+      _rows[_present["token"]] > _rows[_second["token"]], _rows)
+
+# AN EXPIRED LOGIN IS NOT PRESENCE, however recent its last beat. Expired
+# rows are only swept when their token is next used, so one can sit in the
+# table looking fresh.
+client.get("/api/auth/session", headers=_PRESENT_H)
+_conn = _owner_sq.connect(DB_PATH)
+_conn.execute("UPDATE sessions SET expires_at = 1 WHERE user_id ="
+              " (SELECT id FROM users WHERE username = 'present')")
+_conn.commit(); _conn.close()
+check("an expired session does not count, however recent its heartbeat",
+      _listed("present")["online"] is False, _listed("present"))
+_PRESENT_H = {"Authorization": "Bearer " + client.post("/api/auth/login",
+              json={"username": "present", "password": "password123"}).get_json()["token"]}
+
+client.post("/api/staff/kick", headers=OWNER_H, json={"username": "present"})
+_entry = _listed("present")
+check("a kicked account is offline and shows no heartbeat",
+      _entry["online"] is False and _entry["last_seen_at"] == 0, _entry)
+status("and its heartbeat is refused - this 401 is how the game notices",
+       client.get("/api/auth/session", headers=_PRESENT_H), 401)
+
 # ---- staff item grants -----------------------------------------------------
 #
 # THE DEBUG KEYS, WHERE THEY CAN BE ENFORCED. F1-F7 and the pet row used to add
@@ -1963,6 +2050,12 @@ check("the legacy table was dropped",
 # reason this section exists.
 _user_cols = [row[1] for row in _db.execute("PRAGMA table_info(users)")]
 check("users gained the role column", "role" in _user_cols, _user_cols)
+
+# PRESENCE, against the three-column sessions table every database before it
+# had. The staff list selects last_seen_at; without this migration it would
+# 500 on the real elusion.db while this suite, building fresh, stayed green.
+check("sessions gained the last_seen_at column",
+      "last_seen_at" in [row[1] for row in _db.execute("PRAGMA table_info(sessions)")])
 
 _ranks = dict(_db.execute("SELECT username, role FROM users").fetchall())
 check("an is_admin=1 account became dev", _ranks.get("legacyflagged") == "dev", _ranks)

@@ -403,9 +403,13 @@ def init_db():
             ON staff_actions(target_name);
 
         CREATE TABLE IF NOT EXISTS sessions (
-            token      TEXT    PRIMARY KEY,
-            user_id    INTEGER NOT NULL,
-            expires_at INTEGER NOT NULL,
+            token        TEXT    PRIMARY KEY,
+            user_id      INTEGER NOT NULL,
+            expires_at   INTEGER NOT NULL,
+            -- The last time this client proved it was running. See
+            -- ONLINE_WINDOW_SECONDS: a session lives thirty days, so "has a
+            -- session" says nothing about whether anyone is playing.
+            last_seen_at INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
 
@@ -909,6 +913,11 @@ def init_db():
     _migrate_add_column(db, "users", "banned_by", "TEXT NOT NULL DEFAULT ''")
     _migrate_add_column(db, "users", "banned_at", "INTEGER NOT NULL DEFAULT 0")
 
+    # PRESENCE. See ONLINE_WINDOW_SECONDS. Existing sessions start at 0, which
+    # reads as offline until their client's next heartbeat - the truthful
+    # default for a row nobody has vouched for yet.
+    _migrate_add_column(db, "sessions", "last_seen_at", "INTEGER NOT NULL DEFAULT 0")
+
     # LOGIN THROTTLE state. failed_logins counts consecutive misses; lockout_until
     # is a unix time before which login is refused. Both default 0 so every
     # existing account starts clean. See login() and SECURITY_NOTES.md (E-5).
@@ -1284,12 +1293,15 @@ def validate_credentials(payload):
 def issue_token(user_id):
     """Mint a session token and store it. Returns (token, expires_at)."""
     token = secrets.token_urlsafe(32)
-    expires_at = int(time.time()) + TOKEN_TTL
+    now = int(time.time())
+    expires_at = now + TOKEN_TTL
 
     db = get_db()
+    # Seen NOW: whoever just logged in is, by definition, at the keyboard.
     db.execute(
-        "INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)",
-        (token, user_id, expires_at),
+        "INSERT INTO sessions (token, user_id, expires_at, last_seen_at)"
+        " VALUES (?, ?, ?, ?)",
+        (token, user_id, expires_at, now),
     )
     db.commit()
 
@@ -2380,6 +2392,26 @@ def session_info():
       401:
         description: Missing, invalid or expired token
     """
+    # THIS IS ALSO THE HEARTBEAT. The game calls it every HEARTBEAT seconds
+    # while a character is in the world, for two reasons:
+    #
+    #   a 401 here is how a kicked or banned player finds out. Both delete the
+    #   session; without a regular call the client never asks, and keeps
+    #   playing until it is restarted - which made a kick a suggestion.
+    #
+    #   the stamp below is how staff see who is actually playing. A session
+    #   lasts thirty days, so "holds a session" is not "online".
+    #
+    # ONE UPDATE BY PRIMARY KEY. The token is the row, so this touches exactly
+    # the session asking and nothing else. expires_at is NOT extended: a
+    # heartbeat proves the client is running, not that the login is fresher.
+    db = get_db()
+    db.execute(
+        "UPDATE sessions SET last_seen_at = ? WHERE token = ?",
+        (int(time.time()), bearer_token()),
+    )
+    db.commit()
+
     return {
         "user_id": g.user["id"],
         "username": g.user["username"],
@@ -4975,6 +5007,16 @@ def combat_kill():
 # 2am should only be able to make the reversible one.
 MAX_MOD_BAN_DAYS = 30
 
+# WHO COUNTS AS ONLINE: a session whose client called GET /api/auth/session
+# within this many seconds. The game sends that heartbeat every 15 seconds, so
+# 45 is three missed beats - one slow request does not flicker someone
+# offline, and a closed game drops off the list within the minute.
+#
+# NOT "has a live session". Sessions last thirty days and survive the game
+# being closed, so that count answered "who has logged in this month", and a
+# kick list sorted by it put last week's visitors at the top.
+ONLINE_WINDOW_SECONDS = 45
+
 
 @app.post("/api/staff/ban")
 @require_auth
@@ -5414,7 +5456,7 @@ def staff_grant():
 @require_role("mod")
 def list_accounts():
     """
-    Every account, with rank and ban state
+    Every account, with rank, ban state and whether they are online
     ---
     tags:
       - Moderation
@@ -5429,13 +5471,27 @@ def list_accounts():
       401:
         description: Missing, invalid or expired token
     """
-    rows = get_db().execute(
+    db = get_db()
+    rows = db.execute(
         "SELECT * FROM users ORDER BY id"
     ).fetchall()
+
+    # PRESENCE IN ONE QUERY, not one per account. Only unexpired sessions: an
+    # expired row is dead whatever its last heartbeat says.
+    now = int(time.time())
+    seen = {
+        int(r["user_id"]): int(r["last_seen"] or 0)
+        for r in db.execute(
+            "SELECT user_id, MAX(last_seen_at) AS last_seen FROM sessions"
+            " WHERE expires_at > ? GROUP BY user_id",
+            (now,),
+        ).fetchall()
+    }
 
     accounts = []
     for row in rows:
         ban = ban_state(row)
+        last_seen = seen.get(int(row["id"]), 0)
         accounts.append({
             "id": row["id"],
             "username": row["username"],
@@ -5445,9 +5501,15 @@ def list_accounts():
             # Whether YOU can act on this person, so a client can grey out the
             # buttons rather than offering them and being refused.
             "actionable": can_act_on(g.user, row),
+            # See ONLINE_WINDOW_SECONDS. 0 means no live session at all.
+            "online": last_seen > 0 and now - last_seen <= ONLINE_WINDOW_SECONDS,
+            "last_seen_at": last_seen,
         })
 
-    return {"accounts": accounts}, 200
+    # THE SERVER'S CLOCK, so "last seen 4 min ago" is worked out against the
+    # same clock that wrote last_seen_at - a client whose own clock is off by
+    # an hour would otherwise say so about everyone.
+    return {"accounts": accounts, "now": now}, 200
 
 
 @app.get("/api/staff/user/<username>")
