@@ -360,6 +360,12 @@ rule.
 - `app.run()` is Flask's development server even with debug off. Right for local
   play, wrong for anything public; a real deployment needs a WSGI server, TLS,
   and `ELUSION_TRUSTED_PROXIES` set to match - see `client_ip()`.
+- The Werkzeug debugger has ONE switch: `ELUSION_DEBUG=1`, local only.
+  `FLASK_DEBUG` or `flask run --debugger` without it, or any debug flag with a
+  proxy configured, makes app.py refuse to start; and a request that arrives
+  through the interactive debugger anyway gets a 503 before any route runs.
+  Keep all three in `debugger_refusal()` / `_refuse_under_unasked_debugger()`
+  rather than adding a fourth check somewhere else. SECURITY_NOTES.md, E-4c.
 - The owner panel's view button now has its endpoint: `GET /api/staff/user/
   <name>` behind `@require_role("mod")`. It returns rank, ban state, characters,
   grouped kill reports, a login summary and the staff history. IP ADDRESSES ARE

@@ -11,6 +11,7 @@ import secrets
 import time
 import os
 import re
+import sys
 from functools import wraps
 
 app = Flask(__name__)
@@ -316,6 +317,109 @@ else:
     print("[BOOT] NO OWNER SET. Every owner and staff check will deny.")
     print("[BOOT]   PowerShell: $env:ELUSION_OWNER = \"yourname\"")
     print("[BOOT]   or put ELUSION_OWNER=yourname in a .env beside app.py")
+
+
+# =============================================================================
+# E-4 - THE WERKZEUG DEBUGGER, AND EVERY DOOR IT CAN COME IN BY
+# =============================================================================
+# The interactive debugger turns an unhandled exception into a Python console
+# in the browser: arbitrary code execution on the box that holds elusion.db and
+# its password hashes. The run block at the bottom of this file has kept it off
+# unless ELUSION_DEBUG=1 since the audit - but that block is ONE way to start
+# this server, and it was the only one guarded. Probed on Flask 3.1.3 by
+# fetching the debugger's own stylesheet, which only exists while it is
+# attached:
+#
+#     python app.py                                   404   off
+#     python app.py, ELUSION_DEBUG=1                  200   on, as asked
+#     flask --app app run --debug                     200   on, never asked
+#     FLASK_DEBUG=1 flask --app app run               200   on, never asked
+#     flask --app app run --debugger                  200   on, never asked
+#     ELUSION_DEBUG=1 with ELUSION_TRUSTED_PROXIES=1  200   on, behind a proxy
+#
+# `flask run` never executes the run block, so the flag it guards was never
+# consulted. FLASK_DEBUG=1 is also a very ordinary thing to have in a shell
+# from some other Flask project.
+#
+# ONE SWITCH NOW, TWO LOCKS ON IT:
+#
+#   at import   refuse to start if FLASK_DEBUG or `flask run --debugger` asks
+#               for the debugger without ELUSION_DEBUG, or if any of them is
+#               set while a proxy is configured - a proxy in front means other
+#               people reach this server, and that is exactly where the
+#               debugger must not be.
+#   per request refuse to serve at all if the interactive debugger is wrapped
+#               around this app anyway, by any door not listed above. It looks
+#               for the debugger itself rather than for the ways of asking for
+#               it, so a future door is covered too.
+#
+# --debugger IS IN THE FIRST LIST, NOT ONLY THE SECOND, because the second is
+# not enough for it: the per-request guard stops every route, but the
+# debugger's own /console page is served outside this app. It is PIN-locked -
+# checked, it says "console is locked" - and a lock is a thing you rely on only
+# when there is no way to not have the door at all.
+
+_TRUTHY = ("1", "true", "yes", "on")
+
+
+def _flag(value):
+    return str(value or "").strip().lower() in _TRUTHY
+
+
+def debugger_refusal(env, argv=()):
+    """
+    Why the Werkzeug debugger must not run with this environment, or None.
+
+    A pure function of the environment and command line so test_security.py can
+    hand it a table of them rather than restarting a server for each one.
+    """
+    wants_ours = _flag(env.get("ELUSION_DEBUG"))
+    wants_flask = _flag(env.get("FLASK_DEBUG")) or "--debugger" in argv
+    try:
+        proxies = int(str(env.get("ELUSION_TRUSTED_PROXIES", "0") or 0).strip() or 0)
+    except ValueError:
+        proxies = 0   # reported by wsgi.py's preflight; not this function's job
+    if wants_flask and not wants_ours:
+        return ("FLASK_DEBUG or --debugger is set, which makes `flask run` attach "
+                "the Werkzeug debugger - arbitrary code execution for anyone who can "
+                "reach this server. This project's switch is ELUSION_DEBUG=1, for a "
+                "local dev loop only. Drop the flag, or set ELUSION_DEBUG=1 as well "
+                "if you really mean it.")
+    if (wants_ours or wants_flask) and proxies > 0:
+        return ("a debug flag is set while ELUSION_TRUSTED_PROXIES is %d. A proxy in "
+                "front means other people reach this server, and the Werkzeug "
+                "debugger must never be reachable by anyone else." % proxies)
+    return None
+
+
+def debugger_permitted(env, argv=()):
+    """The interactive debugger may be attached: asked for, and nothing refuses it."""
+    return _flag(env.get("ELUSION_DEBUG")) and debugger_refusal(env, argv) is None
+
+
+# AFTER _load_dotenv(), so a debug flag in .env is judged exactly like one in
+# the shell - a .env copied from a dev machine is the likeliest way to ship one.
+_DEBUGGER_REFUSAL = debugger_refusal(os.environ, sys.argv)
+if _DEBUGGER_REFUSAL is not None:
+    raise SystemExit("[BOOT] refusing to start: " + _DEBUGGER_REFUSAL)
+DEBUGGER_PERMITTED = debugger_permitted(os.environ, sys.argv)
+
+
+@app.before_request
+def _refuse_under_unasked_debugger():
+    # werkzeug.debug.preserve_context is set on every request that passes
+    # through the INTERACTIVE debugger (DebuggedApplication with evalex on) -
+    # the dangerous mode, whichever way it was attached. The debugger can only
+    # open a console on an exception raised inside this app, so refusing every
+    # request before any route runs leaves it nothing to open one on - and a
+    # server answering 503 to everything is a misconfiguration nobody misses.
+    if "werkzeug.debug.preserve_context" in request.environ and not DEBUGGER_PERMITTED:
+        return {
+            "error": "Service Unavailable",
+            "message": "The Werkzeug debugger is attached to this server without "
+                       "ELUSION_DEBUG. Restart it without --debug / --debugger.",
+        }, 503
+    return None
 
 
 # =============================================================================
@@ -8959,5 +9063,8 @@ if __name__ == "__main__":
     # build into arbitrary code execution on the box that holds elusion.db and
     # its password hashes. Turn it on for a local dev loop with ELUSION_DEBUG=1;
     # anything anyone else can reach leaves it off. See SECURITY_NOTES.md (E-4).
-    _debug = os.environ.get("ELUSION_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
-    app.run(debug=_debug)
+    #
+    # DEBUGGER_PERMITTED, not the raw flag: the same decision the import-time
+    # refusal and the per-request guard make, so there is one rule and three
+    # places it is enforced rather than three rules.
+    app.run(debug=DEBUGGER_PERMITTED)

@@ -1719,6 +1719,74 @@ _dbg = os.environ.get("ELUSION_DEBUG", "").strip().lower() in ("1", "true", "yes
 check("debug is off when ELUSION_DEBUG is unset", _dbg is False, _dbg)
 
 
+print("\n=== E-4c  EVERY DOOR THE DEBUGGER CAN COME IN BY ===\n")
+#
+# The check above only ever proved the run block was safe. `flask run --debug`,
+# FLASK_DEBUG=1 and `flask run --debugger` never execute that block, and all
+# three attached the Werkzeug debugger - probed on Flask 3.1.3 by fetching the
+# debugger's own stylesheet, 200 for each of them. These are the three doors,
+# the proxy case, and the lock behind them.
+
+_refuse = app_module.debugger_refusal
+_permit = app_module.debugger_permitted
+check("nothing set: nothing to refuse", _refuse({}) is None)
+check("ELUSION_DEBUG alone, local: allowed - the dev loop still works",
+      _refuse({"ELUSION_DEBUG": "1"}) is None and _permit({"ELUSION_DEBUG": "1"}))
+check("FLASK_DEBUG alone is refused, and says which flag",
+      "FLASK_DEBUG" in (_refuse({"FLASK_DEBUG": "1"}) or ""), _refuse({"FLASK_DEBUG": "1"}))
+check("so is `flask run --debugger`, which sets no variable at all",
+      _refuse({}, ["flask", "run", "--debugger"]) is not None)
+check("both switches together is a deliberate choice, and allowed",
+      _refuse({"FLASK_DEBUG": "1", "ELUSION_DEBUG": "1"}) is None)
+check("any debug flag behind a proxy is refused - others can reach it",
+      "PROXIES" in (_refuse({"ELUSION_DEBUG": "1", "ELUSION_TRUSTED_PROXIES": "1"}) or "").upper())
+check("FLASK_DEBUG=0 is not a request for the debugger",
+      _refuse({"FLASK_DEBUG": "0"}) is None and not _permit({"FLASK_DEBUG": "0"}))
+check("and nothing but ELUSION_DEBUG ever permits it",
+      not _permit({}) and not _permit({"FLASK_DEBUG": "1"}))
+check("this suite's own server is not permitted one", app_module.DEBUGGER_PERMITTED is False)
+
+# THE LOCK BEHIND THE DOORS. werkzeug.debug.preserve_context is set on every
+# request that passes through the INTERACTIVE debugger, however it was
+# attached. Without permission, every request is refused before a route runs,
+# so there is no exception for a console to open on.
+_plain = client.get("/api/status")
+_wrapped = client.get("/api/status",
+                      environ_base={"werkzeug.debug.preserve_context": lambda _ctx: None})
+check("a request through an unasked-for debugger is refused", _wrapped.status_code == 503,
+      _wrapped.status_code)
+check("and the refusal says why", "debugger" in json.dumps(_wrapped.get_json()).lower())
+check("while the same request without one is served", _plain.status_code == 200,
+      _plain.status_code)
+
+
+import subprocess
+
+
+def import_app_with(env_overrides, argv=None):
+    """Import app.py in a child - the refusal is a SystemExit at import."""
+    env = dict(os.environ)
+    for key in ("ELUSION_DEBUG", "FLASK_DEBUG", "ELUSION_TRUSTED_PROXIES"):
+        env.pop(key, None)
+    env.update(env_overrides)
+    env["ELUSION_DB"] = os.path.join(tempfile.gettempdir(), "elusion_debugdoor.db")
+    code = "import sys; sys.argv = %r; import app" % (argv or ["app.py"])
+    r = subprocess.run([sys.executable, "-c", code], cwd=HERE, env=env,
+                       capture_output=True, text=True, timeout=120)
+    return r.returncode, (r.stderr or "") + (r.stdout or "")
+
+
+code, out = import_app_with({"FLASK_DEBUG": "1"})
+check("FLASK_DEBUG=1 stops app.py loading at all", code != 0, code)
+check("with the reason on screen", "refusing to start" in out and "FLASK_DEBUG" in out, out[-300:])
+code, out = import_app_with({}, ["flask", "run", "--debugger"])
+check("`flask run --debugger` stops it too", code != 0 and "--debugger" in out, (code, out[-300:]))
+code, out = import_app_with({"ELUSION_DEBUG": "1", "ELUSION_TRUSTED_PROXIES": "2"})
+check("and debug behind a proxy", code != 0 and "refusing to start" in out, (code, out[-300:]))
+code, out = import_app_with({})
+check("an ordinary environment loads normally", code == 0, (code, out[-300:]))
+
+
 print("\n=== E-4b  THE DEPLOY PREFLIGHT ACTUALLY REFUSES ===\n")
 #
 # wsgi.py's preflight is a list of checks nothing had ever executed. That is the
