@@ -8,23 +8,35 @@ the point — the fixes only make sense against the thing they fix.
 
 ## Status
 
-| # | Finding | Severity | Status |
-|---|---------|----------|--------|
-| E-1 | Inventory is client-authoritative | critical (economy) | **Closed** |
-| E-2 | Skills are client-authoritative and uncapped | critical (balance) | **Partly closed** — capped, and 3 of 6 skills fully server-owned |
-| E-3 | The kill *event* is asserted, not verified | high | **Open** — named, rate-limited, not fixed |
-| E-4 | `app.run(debug=True)` | critical if exposed | **Closed** |
-| E-5 | No login throttling | medium | **Closed** — incl. E-5f, the throttle that fed itself |
-| E-6 | Long token with no credential rotation | low–medium | **Closed** |
-| E-7 | Item *use* is client-authoritative | low–medium (balance) | **Closed** |
-| E-8 | **A client could set its own gold** | **critical (economy)** | **Closed** |
-| E-9 | Current hp/mana/stamina are client-written | high | **Closed** — clamped; a rate bound, not a proof |
-| E-10 | **Lusions were client-written, so dying was free** | **high (balance)** | **Closed** |
-| E-11 | A banned player could sign straight back up | medium (moderation) | **Closed** — as far as addresses honestly allow |
-| E-12 | The sanction ladder had only one rung | low (moderation) | **Closed** — a kick is not a ban |
-| E-13 | **Four protections were unarmed against the shipped catalogue** | **high** | **Closed** — and it is the reason this table needed a footnote |
+Two columns are there for whoever reads this later — me in six months, or
+someone deciding whether to trust the server. **Risk if exploited** is what an
+attacker actually gets, in one sentence. **Fix** names the *kind* of control
+first, so the pattern is visible at a glance, then says in a line where it
+lives.
 
-Ten closed, one partly, one open.
+| # | Finding | Severity | Status | Risk if exploited | Fix |
+|---|---------|----------|--------|-------------------|-----|
+| E-1 | Inventory is client-authoritative | critical (economy) | **Closed** | A modified client can write any item into its bag or bank — the best gear in the game, in any quantity — on its next save. | **Server-side authority.** Every save is reconciled against what the server actually granted and fabricated items are trimmed away; run in log-only shadow mode first, enforced once the comparison was proven. |
+| E-2 | Skills are client-authoritative and uncapped | critical (balance) | **Partly closed** — capped, and 3 of 6 skills fully server-owned | A player can claim any skill level and skip all progression — level-99 attack on a character made a minute ago. | **Hard cap + server-side authority (partial).** Claims are clamped at 99; fishing, cooking and attack XP are granted only by the server and dropped from client saves. Defense, agility and magic can still be claimed up to the cap. |
+| E-3 | The kill *event* is asserted, not verified | high | **Open** — named, rate-limited, not fixed | A script can report kills it never fought and farm XP and loot without playing. | **Rate limit + content bound — not a fix.** The server rolls its own rewards, refuses reward-less enemies, rate-limits with a token bucket, and caps kills at what the world's respawners can produce (18,000/hr down to 5,208). Closing it needs server-side encounter state. |
+| E-4 | `app.run(debug=True)` | critical if exposed | **Closed** — every door, not only `python app.py` (E-4c) | Any crash on a reachable server hands an attacker a Python shell on the machine holding every password hash. | **Safe default + refusal.** The debugger is off unless `ELUSION_DEBUG=1`; the server refuses to start if `FLASK_DEBUG` or `flask run --debugger` asks for it instead, or if any debug flag is set behind a proxy; and it refuses every request if the interactive debugger is attached some other way. |
+| E-5 | No login throttling | medium | **Closed** — incl. E-5f, the throttle that fed itself | Passwords can be guessed at machine speed — one account at a time, or one common password across every account. | **Rate limit.** 8 misses lock an account for 15 minutes, checked before the password; per-address ceilings (6 usernames, 25 failures per 10 minutes) stop spraying. E-5f: the gate's own refusals no longer count as evidence, which had locked shared connections out indefinitely. |
+| E-6 | Long token with no credential rotation | low–medium | **Closed** | A leaked 30-day token keeps working for a month, and changing the password did not end it. | **Revocation + rotation.** Log out everywhere; a password change re-hashes, ends every session and issues one new token in a single transaction, and needs the current password — a token alone is not enough. |
+| E-7 | Item *use* is client-authoritative | low–medium (balance) | **Closed** | Any player can use gear and potions their level or skills do not allow. | **Server-side authority.** `POST /api/character/consume` checks requirements against the server's own rows and destroys the item itself; the client applies the effect only on a 200. |
+| E-8 | **A client could set its own gold** | **critical (economy)** | **Closed** | A player can mint infinite gold, destroying the economy and progression. | **Server-side authority.** `gold` joined `SERVER_OWNED_STATS` on the status endpoint (ignored, not refused); `test_economy.py` now attacks it directly and holds the gold ledger to its invariant. |
+| E-9 | Current hp/mana/stamina are client-written | high | **Closed** — clamped; a rate bound, not a proof | A patched client heals to full whenever it likes and can never die. | **Extra check (clamp).** Every rise is reconciled against what regeneration plus authorised potions could produce; anything past a 3x margin is trimmed and the save still goes through. Measured log-only before it was enforced. |
+| E-10 | **Lusions were client-written, so dying was free** | **high (balance)** | **Closed** | A player can set their own revive currency, so death costs nothing. | **Server-side authority.** Lusion writes are ignored; `POST /api/character/revive` charges the server's own balance, only for a character the server knows is dead, and records the grant. |
+| E-11 | A banned player could sign straight back up | medium (moderation) | **Closed** — as far as addresses honestly allow | A ban lasts about thirty seconds — the time it takes to register a new account. | **Extra check + visibility.** Registration is refused from an address holding a live ban; staff see linked accounts rated strong or weak, and nothing is banned automatically. A VPN still defeats it, and this file says so. |
+| E-12 | The sanction ladder had only one rung | low (moderation) | **Closed** — a kick is not a ban | Staff had to ban someone to remove them, so the smallest available response was the harshest. | **New tool.** `POST /api/staff/kick` ends every session without banning, under the same rank rules and audit log as a ban. |
+| E-13 | **Four protections were unarmed against the shipped catalogue** | **high** | **Closed** — and it is the reason this table needed a footnote | Four fixes marked Closed were silently off in production, so everything they block was open with every test green. | **Deployment check.** `test_catalogue.py` asserts the shipped `gamedata.json` arms each protection, and the server logs an error at boot for any control running unarmed. |
+| E-14 | A kick or a ban never reached a game that was already running | medium (moderation) | **Closed** | A kicked or banned player keeps playing for as long as they leave the game open. | **Heartbeat.** The game re-checks its session every 15 seconds and on any 401, and a dead session sends it to the login screen — a kick lands in about a second. Only a 401 signs anyone out, so a server restart is never a mass kick. |
+
+Twelve closed, one partly, one open.
+
+**The Fix column has a shape.** Five of the fourteen fixes are *server-side
+authority* — something the client could write, which the server now owns. The
+rest are limits on rate, checks on what is plausible, and tooling for staff.
+Read down that column before reading anything else in this file.
 
 **"Closed" in this table means closed in the code.** E-13 is here because for 46
 hours that was not the same thing as closed on the server. `gamedata.json` in
@@ -56,11 +68,12 @@ owned. After two, the question stopped being "is this endpoint safe" and became
 **"which fields can a client still write, and who decided that?"** — and the
 answer for the rest is now a list rather than an assumption.
 
-Covered by eleven suites, all green together — 1,556 checks:
-`test_api.py` (444) · `test_economy.py` (295) · `test_security.py` (224) ·
-`test_equipment.py` (196) · `test_loot.py` (182) · `test_throttle.py` (55) ·
-`test_map.py` (48) · `test_gathering.py` (44) · `test_settings.py` (28) ·
-`test_healing.py` (27) · `test_catalogue.py` (13).
+Covered by twelve suites, all green together — 1,635 checks, run with one
+command (`run_tests.ps1`):
+`test_api.py` (454) · `test_economy.py` (295) · `test_security.py` (248) ·
+`test_equipment.py` (197) · `test_loot.py` (182) · `test_throttle.py` (55) ·
+`test_settings.py` (49) · `test_map.py` (48) · `test_gathering.py` (44) ·
+`test_healing.py` (28) · `test_equipmove.py` (22) · `test_catalogue.py` (13).
 
 `test_catalogue.py` is the odd one and deliberately so. The other nine point
 `ELUSION_GAMEDATA` at a fixture they build themselves, which is correct — a
@@ -263,6 +276,59 @@ have named is a different thing from one you have not noticed.
 Werkzeug interactive debugger turns any unhandled exception on a reachable build
 into arbitrary code execution on the box holding `elusion.db` and its password
 hashes, so the default had to be the safe one.
+
+#### E-4c — The run block was one door of four · CLOSED
+
+Asked for again, as "fix E-4 immediately", and the right response was to
+check whether the first fix held rather than to repeat it. It held - for
+`python app.py`, the one way of starting the server it guarded. The finding
+said *"must be False anywhere anyone else can reach it"*, and the question
+that sentence actually asks is how many ways there are to start it.
+
+Probed on Flask 3.1.3 by fetching the debugger's own stylesheet
+(`/?__debugger__=yes&cmd=resource&f=style.css`), which only exists while the
+debugger is attached:
+
+```
+                                                     before     after
+python app.py                                         off        off
+python app.py, ELUSION_DEBUG=1                        on         on    - asked for, local
+flask --app app run --debug                           ON         refuses to start
+FLASK_DEBUG=1 flask --app app run                     ON         refuses to start
+flask --app app run --debugger                        ON         refuses to start
+ELUSION_DEBUG=1, ELUSION_TRUSTED_PROXIES=1            ON         refuses to start
+debug + proxy set in .env rather than the shell       ON         refuses to start
+```
+
+`flask run` never executes the run block, so `ELUSION_DEBUG` was never
+consulted, and `FLASK_DEBUG=1` is an ordinary thing to have left in a shell
+from some other Flask project. Under `--debugger` the debugger's `/console`
+page answered 200 - PIN-locked ("console is locked"), and a lock is what you
+rely on only when there is no way to not have the door.
+
+**One switch, two locks.**
+
+- **At import** — `debugger_refusal(env, argv)`, a pure function: refuse to
+  start if `FLASK_DEBUG` or `--debugger` asks for the debugger without
+  `ELUSION_DEBUG`, or if any of them is set while `ELUSION_TRUSTED_PROXIES` is
+  above 0. A proxy in front means other people reach this server, which is the
+  exact condition the finding names. Judged after `.env` is read, so a flag in
+  a copied `.env` is caught like one in the shell.
+- **Per request** — if `werkzeug.debug.preserve_context` is in the WSGI
+  environ, the request came through the *interactive* debugger, however it was
+  attached. Without permission every request gets a 503 before any route runs,
+  which leaves the debugger no exception to open a console on. It looks for the
+  debugger itself rather than for the ways of asking, so a fifth door is
+  covered too.
+
+Both switches together (`FLASK_DEBUG=1` and `ELUSION_DEBUG=1`, no proxy) is
+allowed: that is somebody who meant it, on their own machine.
+
+Seventeen checks in `test_security.py` (E-4c): the decision table, the
+per-request lock through the test client, and four child processes that try to
+import `app.py` the ways above. Four deliberate breakages - the lock removed,
+`--debugger` forgotten, the proxy rule removed, the refusal downgraded to a
+warning - each caught.
 
 ### E-5 — Login throttling · CLOSED
 
@@ -987,43 +1053,6 @@ failure modes, and the tests only ever covered one. *Is the logic right* is what
 a fixture answers. *Is it turned on where it runs* is a different question and
 needs a different test.
 
-### Already solid — credit where due
-
-Worth being explicit so the migration does not accidentally regress them:
-
-- **Password storage** — `scrypt` (Werkzeug's default at 3.x: `32768:8:1`) with a
-  per-password random salt and the cost parameters stored in the hash itself, so
-  the work factor can be raised later without invalidating old rows. Nothing in
-  `app.py` touches `hashlib`.
-- **Authentication** — bearer tokens from `secrets.token_urlsafe(32)`,
-  server-side sessions with expiry, sessions deleted on ban.
-- **Authorization** — a real role ladder; **`owner` is not storable**. It comes
-  from the `ELUSION_OWNER` env var, so no request can grant it, with a DB `CHECK`
-  as defence in depth and `can_act_on()` guarding staff actions.
-- **Character level is server-owned** — proven below (claimed 99, stayed 1).
-- **Gold is server-owned** — on both write paths now, and attacked directly by
-  `test_economy.py` rather than only implied by the invariant. See E-8 for why
-  that distinction cost something.
-- **Lusions are server-owned** — created only by a duplicate-pet conversion,
-  spent only at `/api/character/revive`, and writable by nobody. See E-10.
-- **Death has a price again** — the revive is a server transaction, so the
-  penalty cannot be skipped by a client that simply declines to pay it.
-- **Loot acquisition is server-owned** — `POST /api/loot/take` writes
-  `carry_items` itself rather than trusting the client.
-- **Kill rewards are server-rolled** and rate-limited — E-3's weakness is the
-  event, not the payout.
-- **Gold cannot be minted undetectably** — every creation and destruction is a
-  ledger row against a stated invariant, and the suite that checks it is
-  mutation-tested rather than merely passing.
-- **The vendor destroys gold rather than moving it**, and the kingdom board sums
-  the ledger on request instead of keeping a running total. A second place the
-  truth lives is a first disagreement nobody can resolve.
-- **`.gitignore`** uses prefix patterns (`*.db.*`) precisely because a plain
-  `*.db` once let a `.db.before-…` backup slip into a commit. That lesson is
-  written into the file itself.
-
----
-
 ### E-14 — A kick or a ban never reached a game that was already running · CLOSED
 
 Found while building the staff panel, by asking what a kick looks like from
@@ -1068,6 +1097,43 @@ the honest client that simply never found out.
 
 Twelve checks in `test_api.py` (presence, the heartbeat, the migration) and
 a STAFF PANEL section in the Godot suite, each mutation-tested.
+
+### Already solid — credit where due
+
+Worth being explicit so the migration does not accidentally regress them:
+
+- **Password storage** — `scrypt` (Werkzeug's default at 3.x: `32768:8:1`) with a
+  per-password random salt and the cost parameters stored in the hash itself, so
+  the work factor can be raised later without invalidating old rows. Nothing in
+  `app.py` touches `hashlib`.
+- **Authentication** — bearer tokens from `secrets.token_urlsafe(32)`,
+  server-side sessions with expiry, sessions deleted on ban.
+- **Authorization** — a real role ladder; **`owner` is not storable**. It comes
+  from the `ELUSION_OWNER` env var, so no request can grant it, with a DB `CHECK`
+  as defence in depth and `can_act_on()` guarding staff actions.
+- **Character level is server-owned** — proven below (claimed 99, stayed 1).
+- **Gold is server-owned** — on both write paths now, and attacked directly by
+  `test_economy.py` rather than only implied by the invariant. See E-8 for why
+  that distinction cost something.
+- **Lusions are server-owned** — created only by a duplicate-pet conversion,
+  spent only at `/api/character/revive`, and writable by nobody. See E-10.
+- **Death has a price again** — the revive is a server transaction, so the
+  penalty cannot be skipped by a client that simply declines to pay it.
+- **Loot acquisition is server-owned** — `POST /api/loot/take` writes
+  `carry_items` itself rather than trusting the client.
+- **Kill rewards are server-rolled** and rate-limited — E-3's weakness is the
+  event, not the payout.
+- **Gold cannot be minted undetectably** — every creation and destruction is a
+  ledger row against a stated invariant, and the suite that checks it is
+  mutation-tested rather than merely passing.
+- **The vendor destroys gold rather than moving it**, and the kingdom board sums
+  the ledger on request instead of keeping a running total. A second place the
+  truth lives is a first disagreement nobody can resolve.
+- **`.gitignore`** uses prefix patterns (`*.db.*`) precisely because a plain
+  `*.db` once let a `.db.before-…` backup slip into a commit. That lesson is
+  written into the file itself.
+
+---
 
 ## Not code — required before this is reachable by anyone else
 
@@ -1181,6 +1247,9 @@ rather than farming for it. This matches the honour-system caveats already
 written into the client's own respawner and `report_kill` comments.
 
 ### E-4 — `app.run(debug=True)` · *critical if ever exposed* · **fix on its own terms**
+**Closed — see E-4 and E-4c above.** Kept as written at audit time; line 3883 was
+the run block then, and it is the last line of `app.py` now.
+
 Line 3883. Identical footgun to the recipe app: the Werkzeug interactive debugger
 turns any unhandled exception on a reachable-off-localhost build into **arbitrary
 code execution on the host** — which here is the box holding `elusion.db` and its

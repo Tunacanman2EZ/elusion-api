@@ -1,5 +1,6 @@
 """The options screen's rules, checked. Run: python3 test_settings.py"""
-from sim_settings import Settings, DEFAULTS, WINDOW_SIZES, VSYNC_MODES, FRAME_CAPS
+from sim_settings import (Settings, DEFAULTS, WINDOW_SIZES, VSYNC_MODES, FRAME_CAPS,
+                          RENDER_RESOLUTIONS, LIGHTING_MODES, BACKGROUND_FPS, fps_cap_for)
 
 passed = failed = 0
 
@@ -28,7 +29,7 @@ section("THE SCHEMA")
 s = Settings()
 check("a fresh install reads every default",
       all(s.get_value(k) == DEFAULTS[k] for k in DEFAULTS))
-check("and knows nine settings", len(DEFAULTS) == 9, sorted(DEFAULTS))
+check("and knows twelve settings", len(DEFAULTS) == 12, sorted(DEFAULTS))
 
 # A KEY THAT IS NOT IN DEFAULTS CANNOT BE SET. The alternative is a typo that
 # stores fine, reads back as null, and becomes "my setting will not save".
@@ -95,7 +96,7 @@ for k, v in [("volume_master", 0.1), ("fullscreen", True),
     s.set_value(k, v)
 check("four settings changed", len(s.values) == 4, s.values)
 s.reset()
-check("reset returns every one of the nine to its default",
+check("reset returns every one of the twelve to its default",
       all(s.get_value(k) == DEFAULTS[k] for k in DEFAULTS), s.values)
 check("including ones that were never touched",
       s.get_value("vsync") == DEFAULTS["vsync"])
@@ -156,6 +157,30 @@ s.set_value("frame_cap", "144")
 check("a string cap is a whole number", s.get_value("frame_cap") == 144 and isinstance(s.get_value("frame_cap"), int))
 check("no offered cap sits within 2 fps of 60 Hz except 60 itself",
       all(c == 60 or abs(c - 60) > 2 for c in FRAME_CAPS if c), FRAME_CAPS)
+
+section("PERFORMANCE")
+# Every option here trades looks for speed, so the defaults are the game as
+# authored - except the background limit, which costs nothing anyone sees.
+check("full resolution by default", DEFAULTS["render_resolution"] == "screen")
+check("full lighting by default", DEFAULTS["lighting"] == "full")
+check("the background limit is on by default", DEFAULTS["background_fps_limit"] is True)
+check("30 is offered for the weakest machines, right after Unlimited", FRAME_CAPS[1] == 30)
+s = Settings()
+s.set_value("lighting", "Simple")
+check("case does not matter to lighting", s.get_value("lighting") == "simple")
+s.set_value("render_resolution", "potato")
+check("an unknown resolution is the default", s.get_value("render_resolution") == "screen")
+s.load_settings({"lighting": 1})
+check("a non-string in the file is the default, not a crash", s.get_value("lighting") == "full")
+check("every choice the pickers offer survives a round trip",
+      all(Settings().normalise("render_resolution", m) == m for m in RENDER_RESOLUTIONS)
+      and all(Settings().normalise("lighting", m) == m for m in LIGHTING_MODES))
+# (player's cap, focused, limit on) -> max_fps
+table = [(0, True, True, 0), (144, True, True, 144),
+         (0, False, True, BACKGROUND_FPS), (144, False, True, BACKGROUND_FPS),
+         (10, False, True, 10), (0, False, False, 0)]
+wrong = [row for row in table if fps_cap_for(*row[:3]) != row[3]]
+check("the frame cap in and out of focus", not wrong, wrong)
 
 section("WHAT APPLYING TOUCHES")
 # _apply() dispatches on the key. Setting the window mode flickers the window,
