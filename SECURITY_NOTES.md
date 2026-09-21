@@ -1135,6 +1135,52 @@ Worth being explicit so the migration does not accidentally regress them:
 
 ---
 
+## The security bot — attacking a running server, not the source
+
+`security_bot.py` is a red-team harness that asks a different question from
+`test_security.py`. That suite imports `app.py` and drives it through Flask's
+test client; it goes red when a fix is deleted from the code. The bot spawns a
+real server on a socket, registers fake players, and attacks it over HTTP with
+nothing an outside attacker would not have. It goes red when the *running*
+server lets an attack through — a bad deploy, a stale binary, a config that
+skips a guard — which is the failure the source-level suite cannot see.
+
+    python3 security_bot.py                 # spins up its own throwaway server
+    python3 security_bot.py --players 20
+
+**It re-derives the invariants from ground truth, not the server's report.**
+Each attack is verified by reading the SQLite rows directly — `saves.gold`,
+`accounts.lusions`, `carry_items`, `skills` — never through a read endpoint,
+because a read endpoint can 404 in a broken state (a giant gold write does
+exactly that) and a readback that silently returns zero would call a landed
+attack "blocked". The gold check is the full ledger equation from ground truth,
+and it is cross-checked against the dev `/api/economy/supply` endpoint: if the
+two disagree, that disagreement is itself a finding.
+
+**The attacks, each tied to a finding it would reopen:** mint gold via
+`/player/status` (E-8), mint lusions via `/account/lusions` (E-10), write hp
+above the maximum (E-9), fabricate an item in the backpack (E-1), claim a skill
+past the cap (E-2), equip an item you do not own (E-1). Kill farming (E-3,
+open) has no invariant to break — the server pays out a bounded number on
+purpose — so it is reported as a measured sustained rate against the content
+ceiling, never as a pass or fail.
+
+**Safe by construction.** The bot mutates whatever it points at, so by default
+it starts its own server on a scratch database and deletes it. `--server` needs
+`--allow-live`, and is refused outright against a database named `elusion.db`.
+
+**It was validated by breaking the server on purpose.** Building it turned up
+three attacks that could not actually fail — a skill claim in the wrong shape,
+an item claim refused on the stack ceiling before the guard it meant to test,
+and an equip that named a slot the server derives for itself — each of which
+would have reported "blocked" forever against a vulnerable server. All three
+were corrected, then confirmed: with E-1, E-2, E-8, E-9 and E-10 each
+reintroduced one at a time, the matching attack line and the matching invariant
+both go red and the run exits non-zero. An attack that cannot detect its own
+target is worth less than no attack, because it reads as coverage.
+
+---
+
 ## Not code — required before this is reachable by anyone else
 
 These cannot be closed in `app.py` and are listed so they are not mistaken for
