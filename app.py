@@ -3015,13 +3015,41 @@ def write_save():
     # has to reach it. The SELECT above is the only thing between the two, and
     # a read is not a write: every refusal below still happens before anything
     # is stored.
-    equip_key_sent = "equipment" in payload
-    equipment = (parse_equipment(payload.get("equipment"), class_id, stored_level)
-                 if equip_key_sent else {})
-    if equip_key_sent and equipment is None:
-        return bad_request(
-            "equipment must be an object of {slot: item_id} naming items this "
-            "character can actually wear in that slot")
+    # IGNORED, NOT REFUSED - and this is the line that makes equipment
+    # server-owned rather than merely server-moved.
+    #
+    # /api/character/equip and /unequip take the item OUT of the backpack and
+    # put it back, in one transaction, and the take IS the ownership check.
+    # All of that is worth nothing if a client can then PUT whatever equipment
+    # map it likes here: it would simply skip the endpoints and dress itself,
+    # in the column combat reads to decide what a hit is worth. That is E-1
+    # one column over, and E-8 one field over.
+    #
+    # IGNORED rather than 400, exactly like gold. An un-updated client still
+    # sends `equipment` on every save, and refusing an otherwise honest sync
+    # over a field it is no longer allowed to set would break saving for
+    # anyone who had not restarted their game. It is named in `ignored` so a
+    # client can see it is being dropped rather than silently disagreeing with
+    # the server forever.
+    #
+    # parse_equipment() is still used - by nothing on this path now, but it is
+    # what the equip endpoint's checks are made of, and it stays the one place
+    # that knows what a wearable map looks like.
+    equipment_ignored = "equipment" in payload
+
+    # ALWAYS 0, and that is the whole point rather than a leftover.
+    #
+    # The upsert below reads this as "did the caller supply equipment" and
+    # writes excluded.equipment when it is true. Setting it from the payload
+    # while forcing `equipment` to {} - which is what the first draft of this
+    # change did - would write an EMPTY map over the character's gear on every
+    # save. That is the same stripping bug this whole endpoint pair exists to
+    # fix, reintroduced by the fix.
+    #
+    # Zero means the CASE keeps saves.equipment, which is what the equip
+    # endpoints wrote and the only thing that should ever have written it.
+    equip_key_sent = 0
+    equipment = {}
 
     # ON CONFLICT rather than DELETE-then-INSERT: an upsert is one statement,
     # so there is no window where the slot exists in neither state.
@@ -3056,7 +3084,7 @@ def write_save():
          json.dumps(equipment), json.dumps(hotbar or [""] * HOTBAR_SIZE),
          json.dumps(explored), now,
          1 if pet_key_sent else 0,
-         1 if equip_key_sent else 0,
+         equip_key_sent,
          1 if hotbar_key_sent else 0,
          1 if explored_key_sent else 0),
     )
@@ -3105,6 +3133,17 @@ def write_save():
     result = {"slot": slot, "updated_at": now}
     if pet_key_sent:
         result["active_pet_id"] = active_pet_id
+
+    # SAID OUT LOUD, the way gold is. A client that keeps sending `equipment`
+    # is not doing anything wrong - it simply predates the endpoints - but a
+    # field that is silently dropped is a client and a server disagreeing
+    # forever with nothing to notice it by.
+    if equipment_ignored:
+        result["ignored"] = ["equipment"]
+        result["equipment"] = _stored_json(
+            get_db().execute(
+                "SELECT equipment FROM saves WHERE user_id = ? AND slot = ?",
+                (g.user["id"], slot)).fetchone()["equipment"], {})
     return result, 200
 
 
@@ -6148,6 +6187,26 @@ def shop_catalogue(shop_id):
             "required_skill": definition.get("required_skill", ""),
             "required_skill_level": definition.get("required_skill_level", 1),
 
+            # THE THIRD HALF, and the one a weapon rack needs most. A sword
+            # and a staff sit side by side at the same price and the same
+            # level, and nothing on the row said which of them a warrior can
+            # actually hold - so the first time you find out is when the
+            # equip endpoint refuses it, after you have paid.
+            #
+            # An empty list means "anyone", which is most of the catalogue, so
+            # the panel prints nothing rather than "Needs: anyone".
+            #
+            # FROM THE SERVER'S OWN COPY, like the price and the level, for
+            # the reason those are: one source, and a stale client cannot
+            # disagree with it.
+            "required_classes": list(definition.get("required_classes") or []),
+
+            # WHAT IT IS, for the same row. A tooltip that says "Ember Staff"
+            # and a price is a tooltip that made you click to learn anything.
+            "equip_slot_name": definition.get("equip_slot_name", ""),
+            "damage": int(definition.get("damage", 0) or 0),
+            "armor_value": int(definition.get("armor_value", 0) or 0),
+
             "max_stack": definition.get("max_stack", 1),
             "price": gamedata.shop_price(shop["shop_id"], item_id),
         })
@@ -7079,7 +7138,12 @@ def read_character():
         return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
 
     row = get_db().execute(
-        "SELECT class_id, name, area, active_pet_id, bank_gold FROM saves WHERE user_id = ? AND slot = ?",
+        # equipment IS IN THE SELECT. sqlite3.Row raises IndexError for a
+        # column the query did not fetch, so adding a key to the payload above
+        # without adding it here turns a read into a 500. Third time that trap
+        # has been stepped in today; it is always the same two lines apart.
+        "SELECT class_id, name, area, active_pet_id, bank_gold, equipment "
+        "FROM saves WHERE user_id = ? AND slot = ?",
         (user_id, slot),
     ).fetchone()
 
@@ -7091,6 +7155,23 @@ def read_character():
         "active_pet_id": row["active_pet_id"],
         "status": status,
         "inventory": inventory_payload(user_id, slot),
+        # EQUIPMENT TRAVELS WITH THE BAG, and the two being split across
+        # endpoints is what cost a character its gear on every login.
+        #
+        # GET /api/save carried equipment and no inventory; this carried
+        # inventory and no equipment. The client merges both, and
+        # characterdata.gd::_sanitize_character_slot() reconciled the gear
+        # against the bag - so it ran with equipment from one response and an
+        # EMPTY inventory from the other, concluded the player owned none of
+        # what they were wearing, and cleared every slot. Two endpoints each
+        # correct on its own, and a reconciliation firing when only one half
+        # had arrived.
+        #
+        # The prune is going away with the move to server-owned equipment, but
+        # a read that answers half a question is worth fixing on its own terms:
+        # the next thing to ask this endpoint what a character is wearing
+        # should not have to know to ask somewhere else.
+        "equipment": _stored_json(row["equipment"], {}),
         "skills": skills_payload(user_id, slot),
     }, 200
 
@@ -7337,6 +7418,231 @@ def write_skills():
 # restores - `restore_target` and `restore_amount` are not in gamedata.json - so
 # it authorises and destroys, and the client applies. That is deliberately where
 # the line sits today rather than a pretence that it sits further along.
+
+# =============================================================================
+# EQUIPMENT IS A MOVE, NOT A REFERENCE
+# =============================================================================
+# WHAT THIS REPLACES, and why it had to become an endpoint rather than a
+# client gesture.
+#
+# Equipping used to be a POINTER: `equipment` named an item that was also
+# sitting in the backpack, and characterdata.gd's prune_equipment() cleared
+# any slot naming something the bag did not contain. The bag was the record of
+# ownership and the doll was a view onto it - which is why an equipped chest
+# piece showed up twice on screen, once in each panel.
+#
+# That arrangement carried the ownership check for free: the bag is reconciled
+# against what the server granted (E-1), so gear pointing into it was
+# reconciled too. The moment equipping MOVES the item out of the bag, both of
+# those stop applying, and `equipment` becomes a client-written field that
+# nothing reconciles - in the column combat reads to decide what a hit is
+# worth. That is E-1 again, one column over, and it is the reason this is a
+# server endpoint instead of two lines in the UI.
+#
+# SO THE SERVER MOVES IT. Taking from the bag IS the ownership check: you
+# cannot equip what _take_from_backpack() cannot find. Nothing needs
+# reconciling afterwards because the client never gets to assert the result.
+# Same shape as /api/character/consume, for the same reason - the client asks,
+# the server moves, the client renders the answer.
+
+def _equipment_of(row):
+    """The stored map, parsed. Always a dict, even for a row that predates it."""
+    return _stored_json(row["equipment"], {})
+
+
+def _equip_row(user_id, slot):
+    return get_db().execute(
+        "SELECT class_id, level, equipment FROM saves WHERE user_id = ? AND slot = ?",
+        (user_id, slot),
+    ).fetchone()
+
+
+@app.post("/api/character/equip")
+@require_auth
+def equip_item():
+    """
+    Move one item from the backpack onto the character
+    ---
+    tags: [Character]
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [slot, item_id]
+          properties:
+            slot:    {type: integer, example: 0}
+            item_id: {type: string,  example: cobaltrobe}
+    responses:
+      200: {description: Equipped. Returns the new equipment map and bag layout}
+      400: {description: Bad slot or item_id}
+      403: {description: Wrong slot for this item, wrong class, or too low a level}
+      404: {description: No character in that slot, or you are not carrying that}
+      409: {description: The piece coming off has nowhere to go}
+    """
+    payload = request.get_json(silent=True) or {}
+    user_id = g.user["id"]
+
+    slot = parse_slot(payload.get("slot"))
+    if slot is None:
+        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+
+    item_id = str(payload.get("item_id", "")).strip()
+    if not item_id or len(item_id) > 64:
+        return bad_request("item_id must be 1-64 characters")
+
+    row = _equip_row(user_id, slot)
+    if row is None:
+        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
+
+    # THE SLOT IS DERIVED FROM THE ITEM, never taken from the request. There is
+    # then nothing for the two to disagree about, and equipmentpanel.gd already
+    # works this way - "the square's name is ignored on purpose".
+    target = gamedata.equip_slot_for(item_id)
+    if not target:
+        if item_id not in gamedata.ITEMS:
+            return bad_request("No such item '%s'." % item_id)
+        return {"error": "Forbidden", "message": "That is not equipment."}, 403
+
+    # THE SERVER'S OWN LEVEL AND CLASS, never the body's. Same reason
+    # parse_equipment() takes them as arguments rather than reading a payload:
+    # a client that could name its own level could wear anything.
+    verdict = gamedata.equip_check(item_id, target, str(row["class_id"]), int(row["level"]))
+    if not verdict.get("ok", False):
+        reason = verdict.get("reason", "")
+        if reason == "unknown":
+            return bad_request("No such item '%s'." % item_id)
+        if reason == "notgear":
+            return {"error": "Forbidden", "message": "That is not equipment."}, 403
+        if reason == "class":
+            return {"error": "Forbidden",
+                    "message": "Your class cannot wear that.",
+                    "allowed": verdict.get("allowed", [])}, 403
+        if reason == "level":
+            return {"error": "Forbidden",
+                    "message": "That needs level %d." % int(verdict.get("needs", 0)),
+                    "needs": int(verdict.get("needs", 0))}, 403
+        return {"error": "Forbidden", "message": "That cannot be equipped."}, 403
+
+    worn = _equipment_of(row)
+    coming_off = str(worn.get(target, ""))
+
+    # ---- everything above this line is validation; everything below commits --
+
+    db = get_db()
+
+    # TAKE FIRST, THEN PUT BACK, and the order is load-bearing rather than
+    # tidy. Taking the new item may free the cell the old one needs - swapping
+    # your only chest piece for another should always work, and it only does
+    # if the bag is measured after the incoming item has left it.
+    if not _take_from_backpack(user_id, slot, item_id, 1):
+        return {"error": "Not Found", "message": "You are not carrying that."}, 404
+
+    if coming_off:
+        if _add_to_backpack(user_id, slot, coming_off, 1) is None:
+            # ALL OR NOTHING. The take above is undone rather than left
+            # standing - an item that left the bag and reached neither the
+            # doll nor the floor is the worst outcome available here.
+            _add_to_backpack(user_id, slot, item_id, 1)
+            return {"error": "Conflict",
+                    "message": "Your bag is full - nowhere to put what you are wearing."}, 409
+
+    worn[target] = item_id
+    db.execute(
+        "UPDATE saves SET equipment = ?, updated_at = ? WHERE user_id = ? AND slot = ?",
+        (json.dumps(worn), int(time.time()), user_id, slot),
+    )
+    db.commit()
+
+    return {
+        "slot": slot,
+        "equipped": item_id,
+        "equip_slot": target,
+        "unequipped": coming_off,
+        "equipment": worn,
+        # THE AUTHORITATIVE LAYOUT, handed back so the client renders what the
+        # server did rather than guessing at it. /api/loot/take does the same.
+        "inventory": inventory_payload(user_id, slot),
+    }
+
+
+@app.post("/api/character/unequip")
+@require_auth
+def unequip_item():
+    """
+    Move one item off the character and back into the backpack
+    ---
+    tags: [Character]
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [slot, equip_slot]
+          properties:
+            slot:       {type: integer, example: 0}
+            equip_slot: {type: string,  example: chest}
+    responses:
+      200: {description: Unequipped. Returns the new equipment map and bag layout}
+      400: {description: Bad slot or equip_slot}
+      404: {description: No character in that slot, or nothing worn there}
+      409: {description: The bag is full}
+    """
+    payload = request.get_json(silent=True) or {}
+    user_id = g.user["id"]
+
+    slot = parse_slot(payload.get("slot"))
+    if slot is None:
+        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+
+    target = str(payload.get("equip_slot", "")).strip().lower()
+    if target not in EQUIP_SLOTS:
+        return bad_request("equip_slot must be one of: %s" % ", ".join(EQUIP_SLOTS))
+
+    row = _equip_row(user_id, slot)
+    if row is None:
+        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
+
+    worn = _equipment_of(row)
+    item_id = str(worn.get(target, ""))
+    if not item_id:
+        # 404 RATHER THAN A CHEERFUL 200. Taking off a slot that is already
+        # empty means the client and the server disagree about what is worn,
+        # and answering "done" would let that disagreement persist silently.
+        return {"error": "Not Found", "message": "Nothing is worn there."}, 404
+
+    # ---- everything above this line is validation; everything below commits --
+
+    if _add_to_backpack(user_id, slot, item_id, 1) is None:
+        return {"error": "Conflict",
+                "message": "Your bag is full."}, 409
+
+    worn.pop(target, None)
+    db = get_db()
+    db.execute(
+        "UPDATE saves SET equipment = ?, updated_at = ? WHERE user_id = ? AND slot = ?",
+        (json.dumps(worn), int(time.time()), user_id, slot),
+    )
+    db.commit()
+
+    return {
+        "slot": slot,
+        "unequipped": item_id,
+        "equip_slot": target,
+        "equipment": worn,
+        "inventory": inventory_payload(user_id, slot),
+    }
+
 
 @app.post("/api/character/consume")
 @require_auth

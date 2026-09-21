@@ -806,6 +806,25 @@ res = client.put("/api/save", headers=H, json=C.save_body(0, local))
 check("the body ServerStorage builds is one the server accepts",
       res.status_code == 200, res.get_json())
 
+# EQUIPMENT NO LONGER ARRIVES THIS WAY, and the save above proves only that a
+# client still sending it is not broken by that. Getting dressed is
+# /api/character/equip, which takes each piece OUT of the backpack - the take
+# being the ownership check - so the fixture has to own the gear first.
+import sqlite3 as _eqsq
+_eq = _eqsq.connect(_db)
+_uid = _eq.execute("SELECT id FROM users WHERE username = 'gearcheck'").fetchone()[0]
+for _pos, _item in enumerate(PLATE):
+    _eq.execute("INSERT OR REPLACE INTO carry_items (user_id, slot, position,"
+                " item_id, quantity) VALUES (?, 0, ?, ?, 1)", (_uid, _pos, _item))
+_eq.commit(); _eq.close()
+
+_worn_ok = True
+for _item in PLATE:
+    if client.post("/api/character/equip", headers=H,
+                   json={"slot": 0, "item_id": _item}).status_code != 200:
+        _worn_ok = False
+check("every piece equips through the endpoint", _worn_ok)
+
 row = server_slot()
 check("all eight pieces came back", len(row.get("equipment", {})) == 8,
       row.get("equipment"))
@@ -845,15 +864,18 @@ for label, equipment in [
     ("a level 1 character in a level 22 sword", {"weapon": "embersword"}),
     ("a slot that has never existed", {"robe": "ironrobe"}),
 ]:
-    res = client.put("/api/save", headers=H, json={
-        "slot": 0, "class_id": "warrior", "name": "warrior",
-        "equipment": equipment})
-    client_verdict = C.Player("warrior", 1).equip_check(
-        list(equipment.values())[0])
+    # AGAINST THE ENDPOINT, not /api/save. The save ignores equipment now, so
+    # comparing a client refusal to a 400 there would be comparing it to a
+    # door that no longer exists. The three questions are unchanged; only the
+    # place that asks them moved.
+    _item = list(equipment.values())[0]
+    res = client.post("/api/character/equip", headers=H,
+                      json={"slot": 0, "item_id": _item})
+    client_verdict = C.Player("warrior", 1).equip_check(_item)
     check("%s: refused by both" % label,
-          res.status_code == 400 and (not client_verdict["ok"]
-                                      or client_verdict["slot"]
-                                      != list(equipment)[0]),
+          res.status_code in (400, 403, 404)
+          and (not client_verdict["ok"]
+               or client_verdict["slot"] != list(equipment)[0]),
           [res.status_code, client_verdict])
 
 check("and not one refusal disturbed what was stored",

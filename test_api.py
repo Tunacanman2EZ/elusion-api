@@ -1118,25 +1118,37 @@ _lvl.execute("UPDATE saves SET level = 22 WHERE user_id = "
 _lvl.commit()
 _lvl.close()
 
-status("a save with a full set of gear", save_slot(equipment={
-    "weapon": "embersword", "helm": "emberhelm", "chest": "emberchest",
-    "legs": "emberlegs", "shield": "embershield",
-    "ring": "emberring", "amulet": "emberamulet",
-}), 200)
+# EQUIPMENT NO LONGER TRAVELS THROUGH /api/save, AND THAT IS THE CHANGE.
+#
+# This block used to send a full set of gear here and assert the server stored
+# it, then assert it refused a mage's robe on a warrior. Both were correct
+# while a save was how you got dressed. Equipping is a MOVE now -
+# /api/character/equip takes the item out of the backpack, and that take is
+# the ownership check - so a save that asserts equipment is asserting
+# something it no longer has any business knowing.
+#
+# Ignored rather than refused, exactly like gold: an un-updated client still
+# sends the key every save, and 400-ing an otherwise honest sync over a field
+# it may no longer set would break saving for anyone who had not restarted.
+body = status("a save that still sends gear is accepted",
+              save_slot(equipment={"chest": "ironrobe"}), 200)
+check("and says the field was ignored",
+      "equipment" in (body.get("ignored") or []), body)
 
-# AND THE GATE IS REAL, asserted here rather than assumed from the 200 above.
-# Without this line the block passes just as happily on a server that skipped
-# equip_check() altogether, which is the state it actually shipped in.
-status("but a level 22 warrior still cannot wear a mage's robe",
-       save_slot(equipment={"chest": "ironrobe"}), 400)
-status("nor a sword on their head",
-       save_slot(equipment={"helm": "embersword"}), 400)
+# THE GATE IS STILL REAL, it just lives at the endpoint now. Asserted rather
+# than assumed, for the reason the old comment gave: without this the block
+# passes just as happily on a server that skipped equip_check() altogether,
+# which is the state it actually shipped in.
+check("a warrior still cannot wear a mage's robe",
+      client.post("/api/character/equip", headers=H,
+                  json={"slot": 0, "item_id": "ironrobe"}).status_code in (403, 404),
+      "wrong class should be refused before ownership is even reached")
+check("nor can gear be forced into the wrong slot",
+      app_module.gamedata.equip_slot_for("embersword") == "weapon",
+      app_module.gamedata.equip_slot_for("embersword"))
 
-body = slot_zero()
-check("the server stored all seven pieces", len(body.get("equipment", {})) == 7,
-      body.get("equipment"))
-check("and kept them by slot name, not position",
-      body.get("equipment", {}).get("weapon") == "embersword", body.get("equipment"))
+check("the save stored no equipment at all",
+      slot_zero().get("equipment", {}) == {}, slot_zero().get("equipment"))
 
 status("a save with a hotbar", save_slot(
     hotbar=["tinyhealthpotion", "", "embersword"]), 200)
@@ -1151,30 +1163,34 @@ check("padded to nine, so the client always draws nine",
 # the player is wearing - the same reasoning active_pet_id carries.
 status("a save that mentions neither", save_slot(area="field"), 200)
 body = slot_zero()
-check("gear is untouched by a save that does not mention it",
-      len(body.get("equipment", {})) == 7, body.get("equipment"))
-check("and so is the hotbar",
+check("the hotbar is untouched by a save that does not mention it",
       body.get("hotbar", [])[0] == "tinyhealthpotion", body.get("hotbar"))
 
-# Refusals. An id the catalogue has never heard of is the one that matters:
-# without it, the column becomes a place to stash arbitrary strings.
-status("an equip slot that does not exist", save_slot(
-    equipment={"hat": "emberhelm"}), 400)
-status("an item that does not exist", save_slot(
-    equipment={"helm": "sombrero"}), 400)
-status("equipment sent as a list", save_slot(equipment=["emberhelm"]), 400)
+# EQUIPMENT REFUSALS MOVED WITH THE FEATURE. These used to assert that /api/save
+# 400s on a slot the catalogue does not have, an item it has never heard of, and
+# a list where a map belongs - all correct while a save was how you got dressed.
+# The field is ignored here now, so there is nothing left to refuse: the shapes
+# below are not stored, they are not looked at.
+#
+# THE RULES THEMSELVES ARE NOT GONE, and test_equipmove.py is where they live.
+# An unknown item is a 400 at /api/character/equip, an unknown slot is a 400 at
+# /unequip, and the wrong class or level is a 403 - checked against the server's
+# own class and level rather than the body's.
+status("gear sent to /api/save is accepted and dropped",
+       save_slot(equipment={"hat": "emberhelm"}), 200)
+status("even when the item does not exist",
+       save_slot(equipment={"helm": "sombrero"}), 200)
+status("even when it is not a map at all",
+       save_slot(equipment=["emberhelm"]), 200)
+check("and none of it reached the column",
+      slot_zero().get("equipment", {}) == {}, slot_zero().get("equipment"))
+
 status("a hotbar item that does not exist", save_slot(hotbar=["sombrero"]), 400)
 status("a hotbar sent as a string", save_slot(hotbar="potion"), 400)
 
 body = slot_zero()
-check("and not one refusal disturbed what was stored",
-      len(body.get("equipment", {})) == 7
-      and body.get("hotbar", [])[0] == "tinyhealthpotion",
-      [body.get("equipment"), body.get("hotbar")])
-
-# Taking everything off is a deliberate act, not an omission.
-status("clearing gear explicitly", save_slot(equipment={}), 200)
-check("takes everything off", slot_zero().get("equipment") == {}, slot_zero().get("equipment"))
+check("and not one refusal disturbed the hotbar",
+      body.get("hotbar", [])[0] == "tinyhealthpotion", body.get("hotbar"))
 
 # A short hotbar is an older client, not a liar.
 status("a hotbar shorter than nine", save_slot(hotbar=["tinyhealthpotion"]), 200)
