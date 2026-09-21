@@ -882,9 +882,19 @@ check("and not one refusal disturbed what was stored",
       len(server_slot().get("equipment", {})) == 8,
       server_slot().get("equipment"))
 
-os.unlink(_db)
-
+# Verdict first, housekeeping after, and housekeeping cannot change the verdict
+# - see the note at the end of test_healing.py, which is where deleting the
+# scratch file before printing the result turned thirty passing checks into a
+# failed suite with no summary line at all.
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))
 print("=" * 60)
+
+import gc  # noqa: E402  - wanted only for the teardown below
+gc.collect()
+try:
+    os.unlink(_db)
+except OSError as exc:
+    print("  note: could not remove %s (%s)" % (_db, exc))
+
 raise SystemExit(1 if failed else 0)

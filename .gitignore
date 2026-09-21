@@ -35,3 +35,20 @@ __pycache__/
 
 # Local overrides
 .env
+
+# The transcript run_tests.ps1 writes. Committing it puts one machine's run in
+# the repo, where it reads as the current state of the suite forever after. The
+# Godot half already ignores its own for this reason, and the copy sitting in
+# that repo is dated two days OLDER than the testrunner.gd it claims to be the
+# output of - which is exactly the confusion being avoided here.
+test_results.txt
+
+# Leftovers from when two suites kept their scratch database beside the code.
+# They use the temp directory now, like the other ten, because a file written
+# into the project folder is one the virus scanner takes a handle on - and
+# Windows will not delete a file with an open handle, which turned a fully
+# passing test_healing.py run into a PermissionError at teardown. These entries
+# stay so an older run's file cannot be committed by accident. Both are safe to
+# delete by hand.
+_test_healing.db
+_test_equipmove.db

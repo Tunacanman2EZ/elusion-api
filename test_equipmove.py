@@ -9,10 +9,14 @@ check, and the client never asserts the result.
 
 The checks below are mostly about what must NOT be possible.
 """
-import importlib.util, json, os, sqlite3, sys
+import gc, importlib.util, json, os, sqlite3, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(HERE, "_test_equipmove.db")
+
+# Temp directory, not beside this file - see the note in test_healing.py. A
+# scratch database written into the project folder is a file the virus scanner
+# takes a handle on, and on Windows an open handle means it cannot be deleted.
+DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_equipmove_test.db")
 os.environ["ELUSION_DB"] = DB_PATH
 os.environ["ELUSION_OWNER"] = "NOT_A_TEST_ACCOUNT"
 os.environ.pop("ELUSION_GAMEDATA", None)
@@ -146,8 +150,17 @@ r = client.put("/api/save", headers=H, json={"slot": 0, "class_id": "warrior", "
 check("a save that mentions no equipment leaves it alone",
       worn(H).get("chest") == CHEST, worn(H))
 
-os.unlink(DB_PATH)
+# Verdict first, housekeeping after, and housekeeping cannot change the verdict
+# - see the longer note at the end of test_healing.py, which is where deleting
+# the scratch file before printing the result cost a green run.
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))
 print("=" * 60)
+
+gc.collect()
+try:
+    os.unlink(DB_PATH)
+except OSError as exc:
+    print("  note: could not remove %s (%s)" % (DB_PATH, exc))
+
 raise SystemExit(1 if failed else 0)

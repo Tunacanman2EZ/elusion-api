@@ -2030,5 +2030,15 @@ if failures:
         print("    - " + name)
 print("=" * 60)
 
-os.remove(DB_PATH)
+# The summary is already printed above, but the exit code is not set yet, and
+# a raise here would make it 1 on a passing run. Housekeeping does not get a
+# vote on the verdict - see the note at the end of test_healing.py, where the
+# same line deleted a green result instead of a scratch file.
+import gc  # noqa: E402  - wanted only for the teardown below
+gc.collect()
+try:
+    os.remove(DB_PATH)
+except OSError as exc:
+    print("  note: could not remove %s (%s)" % (DB_PATH, exc))
+
 sys.exit(1 if failed else 0)

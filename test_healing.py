@@ -32,15 +32,27 @@ explain anything. A quiet log measured under those conditions is not evidence.
 See E-13. test_catalogue.py is what keeps that true.
 """
 
+import gc
 import importlib.util
 import logging
 import os
 import sqlite3
 import sys
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(HERE, "_test_healing.db")
+
+# THE SCRATCH DATABASE GOES IN THE TEMP DIRECTORY, like the other ten suites.
+# It used to sit beside this file, which puts it under whatever watches the
+# project folder: a real-time virus scanner or the search indexer takes a
+# transient handle on a file the moment it is written there, and on Windows a
+# file with ANY open handle cannot be deleted. That is what turned a fully
+# passing run into a PermissionError at teardown.
+#
+# HERE is still needed - for sys.path and for locating app.py. It was never
+# needed for a throwaway database.
+DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_healing_test.db")
 
 os.environ["ELUSION_DB"] = DB_PATH
 os.environ["ELUSION_OWNER"] = "NOT_A_TEST_ACCOUNT"
@@ -394,9 +406,24 @@ print("            = %d hp/hour of invisible healing, against a %d hp pool"
 print("  This check bounds the RATE of unexplained healing, not its existence -")
 print("  the same shape as the kill bucket. It is a control, not a proof.")
 
-os.unlink(DB_PATH)
-
+# THE VERDICT COMES BEFORE THE HOUSEKEEPING, and that ordering is a fix rather
+# than tidiness. This used to unlink first, so a scratch file something else was
+# still holding raised PermissionError AFTER all thirty checks had passed: no
+# summary line, exit 1, and a runner correctly reporting a failed suite that had
+# not failed anything. Half an hour went into the healing logic before anyone
+# looked at the last line of the file.
+#
+# Cleanup is housekeeping. It does not get a vote on whether the code under test
+# is correct, so it happens after the verdict and it cannot change it.
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))
 print("=" * 60)
+
+gc.collect()   # release any sqlite3.Connection still reachable only from a cycle
+try:
+    os.unlink(DB_PATH)
+except OSError as exc:
+    print("  note: could not remove %s (%s)" % (DB_PATH, exc))
+    print("        harmless - the next run deletes it before it starts")
+
 raise SystemExit(1 if failed else 0)
