@@ -1,7 +1,13 @@
 """The options screen's rules, checked. Run: python3 test_settings.py"""
-from sim_settings import Settings, DEFAULTS, WINDOW_SIZES
+from sim_settings import Settings, DEFAULTS, WINDOW_SIZES, VSYNC_MODES, FRAME_CAPS
 
 passed = failed = 0
+
+
+def normalise_ok(mode):
+    s = Settings()
+    s.set_value("vsync", mode)
+    return s.get_value("vsync") == mode
 
 
 def check(label, ok, detail=None):
@@ -22,7 +28,7 @@ section("THE SCHEMA")
 s = Settings()
 check("a fresh install reads every default",
       all(s.get_value(k) == DEFAULTS[k] for k in DEFAULTS))
-check("and knows eight settings", len(DEFAULTS) == 8, sorted(DEFAULTS))
+check("and knows nine settings", len(DEFAULTS) == 9, sorted(DEFAULTS))
 
 # A KEY THAT IS NOT IN DEFAULTS CANNOT BE SET. The alternative is a typo that
 # stores fine, reads back as null, and becomes "my setting will not save".
@@ -89,7 +95,7 @@ for k, v in [("volume_master", 0.1), ("fullscreen", True),
     s.set_value(k, v)
 check("four settings changed", len(s.values) == 4, s.values)
 s.reset()
-check("reset returns every one of the eight to its default",
+check("reset returns every one of the nine to its default",
       all(s.get_value(k) == DEFAULTS[k] for k in DEFAULTS), s.values)
 check("including ones that were never touched",
       s.get_value("vsync") == DEFAULTS["vsync"])
@@ -110,9 +116,46 @@ check("the default is the viewport exactly",
 # entry - the player may have dragged the window corner, and reporting
 # 1280x720 at that point would be the panel contradicting what they can see.
 check("a size the list has selects that row",
-      WINDOW_SIZES.index((1920, 1080)) == 2)
+      WINDOW_SIZES.index((2560, 1440)) == 1)
+# 1920x1080 is NOT offered, deliberately - it is 1.5x the viewport and the
+# integer scaler would draw it at 1x inside a black frame. This check used to
+# assert it WAS at index 2, against a stale copy of the list. See sim_settings.
+check("and 1080p is not in the list at all", (1920, 1080) not in WINDOW_SIZES)
 check("a hand-dragged size selects nothing at all",
       ((1366, 768) in WINDOW_SIZES) is False)
+
+section("V-SYNC IS A MODE, AND THE OLD FILE STORED A BOOL")
+# Every options.cfg written before this change has vsync=true or vsync=false.
+# ConfigFile hands those back as bools; they have to keep meaning what they
+# meant, and anything the apply step does not know has to become the default
+# rather than a value the match statement falls through.
+s = Settings()
+s.load_settings({"vsync": True})
+check("an old vsync=true loads as 'on'", s.get_value("vsync") == "on", s.get_value("vsync"))
+s.load_settings({"vsync": False})
+check("and vsync=false as 'off'", s.get_value("vsync") == "off", s.get_value("vsync"))
+s.load_settings({"vsync": "false"})
+check("the string 'false' too - a hand-edited file", s.get_value("vsync") == "off")
+s.set_value("vsync", "Adaptive")
+check("case is not the player's problem", s.get_value("vsync") == "adaptive")
+s.set_value("vsync", "banana")
+check("nonsense becomes the default, loudly nothing", s.get_value("vsync") == "on")
+check("every mode the picker offers survives a round trip",
+      all(Settings().set_value("vsync", m) is None and normalise_ok(m) for m in VSYNC_MODES))
+
+section("THE CAP IS THE PLAYER'S, OR NOTHING")
+# The whole regression that reintroduced the tearing band was code choosing a
+# cap by itself - ceil(refresh) - 1. The schema's default is the fix: 0, and
+# nothing normalises it to anything else.
+check("the default cap is no cap", DEFAULTS["frame_cap"] == 0)
+check("and Unlimited is the first thing the picker offers", FRAME_CAPS[0] == 0)
+s = Settings()
+s.set_value("frame_cap", -5)
+check("a negative cap is 0", s.get_value("frame_cap") == 0)
+s.set_value("frame_cap", "144")
+check("a string cap is a whole number", s.get_value("frame_cap") == 144 and isinstance(s.get_value("frame_cap"), int))
+check("no offered cap sits within 2 fps of 60 Hz except 60 itself",
+      all(c == 60 or abs(c - 60) > 2 for c in FRAME_CAPS if c), FRAME_CAPS)
 
 section("WHAT APPLYING TOUCHES")
 # _apply() dispatches on the key. Setting the window mode flickers the window,

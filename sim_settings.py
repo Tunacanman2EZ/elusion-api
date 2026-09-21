@@ -14,13 +14,39 @@ DEFAULTS = {
     "volume_music": 0.7,
     "volume_sfx": 1.0,
     "fullscreen": False,
-    "vsync": True,
+    "vsync": "on",        # a MODE now: off / on / adaptive / fast
+    "frame_cap": 0,       # 0 = no cap
     "window_width": 1280,
     "window_height": 720,
     "damage_numbers": True,
 }
 
-WINDOW_SIZES = [(1280, 720), (1600, 900), (1920, 1080), (2560, 1440)]
+# THIS LIST DRIFTED ONCE. It carried four sizes while settings.gd carried
+# three, and test_settings.py stayed green against a picker the game did not
+# have - "index((1920, 1080)) == 2" was checking a row that no longer
+# existed. A transcription is only worth having while it matches; the
+# comment at the top of this file is the contract and this line is where it
+# was broken.
+WINDOW_SIZES = [(1280, 720), (2560, 1440), (3840, 2160)]
+
+VSYNC_MODES = ["off", "on", "adaptive", "fast"]
+FRAME_CAPS = [0, 60, 120, 144, 165, 240, 360]
+
+
+def normalise_vsync(value):
+    """settings.gd normalise_vsync(): old bools and unknown strings."""
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    s = str(value).lower()
+    if s == "true":
+        return "on"
+    if s == "false":
+        return "off"
+    return s if s in VSYNC_MODES else "on"
+
+
+def normalise_frame_cap(value):
+    return max(0, int(value))
 
 
 class Settings:
@@ -41,7 +67,17 @@ class Settings:
             return int(value)
         if isinstance(like, float):
             return float(value)
+        if isinstance(like, str):
+            return str(value)
         return value
+
+    @staticmethod
+    def normalise(key, typed):
+        if key == "vsync":
+            return normalise_vsync(typed)
+        if key == "frame_cap":
+            return normalise_frame_cap(typed)
+        return typed
 
     def get_value(self, key):
         if key not in DEFAULTS:
@@ -53,7 +89,7 @@ class Settings:
         if key not in DEFAULTS:
             self.errors.append(key)
             return
-        typed = self.coerce(value, DEFAULTS[key])
+        typed = self.normalise(key, self.coerce(value, DEFAULTS[key]))
         if self.values.get(key, None) == typed and not self._loading:
             return
         self.values[key] = typed
