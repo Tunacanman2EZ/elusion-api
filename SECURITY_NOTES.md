@@ -267,6 +267,40 @@ SELECT user_id, level_at, COUNT(*) AS n
 FROM kill_reports WHERE enemy_id = 'boss' GROUP BY user_id ORDER BY n DESC;
 ```
 
+**Those queries are now a tool: `killwatch.py`.** It reads `kill_reports`
+read-only (`mode=ro`, the same discipline as `canary.py` — a watch must never be
+what changed the thing it watches) and sorts accounts into two piles that are
+different in kind:
+
+- **IMPOSSIBLE** — a claim the server's *own* rules should have refused: more
+  kills of an enemy inside a window than the spawn ceiling allows, or a kill of a
+  reward-less enemy the handler 400s before it writes a row. A row like this does
+  not mean a player is fast; it means **a defence that should have been running
+  was not** — the ceiling disarmed by a stale `gamedata.json` (E-13, the 46-hour
+  gap), or a validation path bypassed. This is **false-positive-free by
+  construction**: it replays the live gate's exact arithmetic, so it can only
+  flag a kill the live server itself would have refused — never an honest one.
+  It sets a non-zero exit and speaks even under `--quiet`. It is an alarm.
+- **SUSPICIOUS** — legal under today's bounds but far outside honest play: a
+  sustained rate many times the ~300/hr baseline, a boss farmed faster than
+  anyone should, a character farming only the ceiling-exempt enemy, a boss killed
+  far below the level its killers reach it at (median taken over *killers*, one
+  vote each, so a high-volume cheat cannot drag the bar down to itself). This is a
+  **review, not a verdict.** The tool ranks these accounts and prints the raw
+  number each one tripped on; it bans nothing and enforces no threshold, because
+  a threshold picked without data is how honest players get clamped — the same
+  lesson that put the groundwork before the rule. Under `--quiet` these stay
+  silent; run it as a digest to read them.
+
+**This is detection, not the prevention E-3 ultimately needs, and that is the
+honest posture *while this is single-player*.** The fraud today is a player
+cheating their own save — so making it visible and bannable is proportionate,
+and the architecture change (the server observing combat) is the move for the day
+it stops being self-harm: when multiplayer makes one player's invented boss kills
+everyone else's inflated economy. `killwatch.py` is what watches the gap until
+then, and `test_killwatch.py` proves it fires on breaches and stays quiet on
+honest bursts (a slime split, both boss instances down at once).
+
 It is listed as open rather than quietly omitted because an open finding you
 have named is a different thing from one you have not noticed.
 

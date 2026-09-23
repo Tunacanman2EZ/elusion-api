@@ -30,8 +30,23 @@ waitress-serve --listen=127.0.0.1:5000 wsgi:application
 | `ELUSION_TRUSTED_PROXIES` | number of proxies you run | See **The proxy setting** below — wrong in either direction is bad |
 | `ELUSION_DB` | a path outside any web root | It holds real password hashes |
 | `ELUSION_DEBUG` | **unset** | `wsgi.py` refuses to start if it is set |
+| `ELUSION_RATE_LIMIT` | e.g. `"600 per minute"` (optional) | Per-IP request ceiling; **unset = off** |
 
 `wsgi.py` checks all of these at boot and says which one is wrong.
+
+### Rate limiting (`ELUSION_RATE_LIMIT`)
+
+Off unless you name a limit, because the right number depends on how chatty your
+client is — measure before you tighten. Accepts `"600 per minute"`, `"600/60"`,
+`"10 per second"`, or a bare number (per minute). Login and registration already
+have their own tighter throttles; this is the blanket ceiling over everything
+else.
+
+It counts **in memory, per worker**, so under `gunicorn -w 4` the real ceiling
+is four times what you set — fine as a DoS ceiling, not a precise fair-use
+limit. Start generous (a value no real player hits in a burst), watch the logs,
+and tighten with data. For a precise limit shared across all four workers, move
+the counter to Redis or the `login_attempts` SQLite pattern.
 
 ---
 
@@ -103,9 +118,10 @@ address that changes every request, means it is not.
       scrypt hashes of real passwords. `wsgi.py` catches the obvious paths, not
       every arrangement.
 - [ ] **`.env` is not in the repo** and not readable by other users on the box.
-- [ ] **Backups of `elusion.db`**, somewhere `*.db*` in `.gitignore` cannot help
-      you — losing it loses every account. Copy it while the server is stopped,
-      or use `sqlite3 elusion.db ".backup"`, which is safe on a live database.
+- [ ] **Backups of `elusion.db`**, somewhere off the box — losing it loses every
+      account. Run `backup_db.py` on a schedule (see **Backups** below); it takes
+      a consistent snapshot while the server is live and verifies it before
+      trusting it.
 - [ ] **All four suites green against the deployed code**, not against a working
       copy: `test_api.py`, `test_security.py`, `test_throttle.py`,
       `test_gathering.py`.
@@ -119,6 +135,96 @@ address that changes every request, means it is not.
 
 ---
 
+## Backups
+
+`backup_db.py` makes a consistent, self-verifying snapshot — safe to run while
+players are online (it uses SQLite's online-backup API, not a file copy) — and
+keeps the newest N:
+
+```
+python3 backup_db.py --db /path/to/elusion.db --out /var/backups/elusion --keep 30
+```
+
+It reopens the copy it just wrote, runs `integrity_check`, and reads a real row
+before trusting it, and it **exits non-zero** if anything fails — so a scheduler
+knows the night it matters. Send the backups somewhere **off the box**: a backup
+on the same disk as the database dies with it.
+
+**Linux (cron)** — nightly at 03:15:
+
+```
+15 3 * * * cd /srv/elusion && /usr/bin/python3 backup_db.py --db elusion.db --out /var/backups/elusion --keep 30 >> /var/log/elusion-backup.log 2>&1
+```
+
+**Windows (Task Scheduler)** — a daily task that runs:
+
+```
+python C:\path\to\backup_db.py --db C:\path\to\elusion.db --out D:\backups\elusion --keep 30
+```
+
+**Test the restore, once.** A backup you have never restored is a rumour: copy a
+backup file to a scratch path, point a throwaway server at it, and log in.
+
+---
+
+## Watching the live economy
+
+`canary.py` reads the live database — read-only, so it can never be what broke a
+number — and checks the invariants the ledger exists to hold: gold and lusions
+conserved, no negative balances, no skill past the cap. Run it on a schedule; it
+**exits non-zero** the moment one drifts, which is a bug or a tamper and either
+way something to see the same day.
+
+```
+python3 canary.py --db /path/to/elusion.db --quiet
+```
+
+`--quiet` prints nothing while all is well, so a cron line only speaks up when it
+should. Turn the non-zero exit into however you already get paged — mail, a
+channel webhook, whatever:
+
+```
+15 * * * * cd /srv/elusion && python3 canary.py --db elusion.db --quiet || mail -s "ELUSION CANARY FAILED" you@example.com < /dev/null
+```
+
+(Hourly above; the check is cheap. Point it at the same database the server writes.)
+
+---
+
+## Watching what players claim to kill
+
+`canary.py` watches the economy's arithmetic; `killwatch.py` watches player
+behaviour. It reads `kill_reports` — read-only, same discipline — and sorts
+accounts into two piles: **IMPOSSIBLE** (a claim the server's own rules should
+have refused — the spawn ceiling breached, a reward-less enemy paid — which means
+a defence was not running) and **SUSPICIOUS** (legal but far outside honest play
+— a sustained rate, a boss farmed fast, the ceiling blind spot, an under-levelled
+boss). The first is an alarm; the second is a review list. It bans nothing.
+
+```
+python3 killwatch.py --db /path/to/elusion.db          # full review dossier
+python3 killwatch.py --db /path/to/elusion.db --quiet   # cron: speak only on an alarm
+```
+
+The exit code is **non-zero only on an IMPOSSIBLE finding** — a wall that came
+down, page it — and `--quiet` prints nothing unless one exists. A server full of
+merely-SUSPICIOUS accounts exits 0: those are for you to read, not for a pager to
+scream about. So it splits into two schedules, an alarm and a digest:
+
+```
+# hourly alarm: silent unless a defence stopped running
+7 * * * * cd /srv/elusion && python3 killwatch.py --db elusion.db --quiet || mail -s "ELUSION KILLWATCH ALARM" you@example.com < /dev/null
+
+# weekly digest: the review list, whatever it holds
+0 9 * * 1 cd /srv/elusion && python3 killwatch.py --db elusion.db | mail -s "Elusion weekly kill review" you@example.com
+```
+
+`--window` and `--respawn` must match the server's spawn-ceiling constants; the
+defaults already do. This is the standing watch over **E-3** (below) until the
+day combat is server-observed.
+
+---
+
 ## What is still open when it goes live
 
 These are real and named rather than hidden. Full detail in `SECURITY_NOTES.md`.
@@ -127,7 +233,9 @@ These are real and named rather than hidden. Full detail in `SECURITY_NOTES.md`.
 rewards and rate-limits the reports, but never confirms a fight happened. A
 modified client can report kills it did not make, at the sustained token rate.
 This caps the *speed* of the fraud, not its existence, and it is the one that
-matters most with strangers connected.
+matters most with strangers connected. Not closed, but now **watched**:
+`killwatch.py` (above) turns an invisible claim into a flagged, bannable account,
+and alarms outright if the rate limit or spawn ceiling ever stops running.
 
 **E-2 — three skills are still client-claimed.** `defense`, `agility` and
 `magic` have no server-observed event to grant against, so a client can claim
