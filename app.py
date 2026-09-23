@@ -7,6 +7,7 @@ from werkzeug.exceptions import HTTPException
 import gamedata
 import json
 import logging
+import collections
 import sqlite3
 import secrets
 import time
@@ -413,6 +414,101 @@ _DEBUGGER_REFUSAL = debugger_refusal(os.environ, sys.argv)
 if _DEBUGGER_REFUSAL is not None:
     raise SystemExit("[BOOT] refusing to start: " + _DEBUGGER_REFUSAL)
 DEBUGGER_PERMITTED = debugger_permitted(os.environ, sys.argv)
+
+
+# =============================================================================
+# OBSERVABILITY - per-endpoint request timing
+# =============================================================================
+# A server you cannot see is a server you cannot trust to stay fast. This keeps
+# a rolling window of every endpoint's response times in memory and serves the
+# percentiles at GET /api/metrics (owner only), so a latency regression shows up
+# as a number the day it happens instead of as a player complaint next week. It
+# is the live counterpart to loadtest.py: that one measures BEFORE you ship,
+# this one watches AFTER.
+#
+# PER WORKER, exactly like the rate limiter. Under `gunicorn -w 4` each worker
+# keeps its own window and /api/metrics reports whichever worker answered the
+# call - enough to spot a slow endpoint or a latency creep, not a fleet-wide
+# total. One shared view would need the counters in Redis or a table; that is a
+# deliberate later step, not smuggled in under an in-memory dict.
+#
+# BOUNDED BY CONSTRUCTION. Each endpoint holds at most METRICS_SAMPLES recent
+# timings in a deque that drops the oldest, so memory cannot grow without bound
+# however long the process lives or however many routes it serves.
+METRICS_SAMPLES = 2048
+SLOW_REQUEST_MS = 1000.0
+
+_metrics_lock = threading.Lock()
+_metrics = {}
+_metrics_started = time.time()
+
+
+def _metrics_bucket(key):
+    bucket = _metrics.get(key)
+    if bucket is None:
+        bucket = {"dur": collections.deque(maxlen=METRICS_SAMPLES), "n": 0, "err": 0}
+        _metrics[key] = bucket
+    return bucket
+
+
+def _pct(ordered, p):
+    m = len(ordered)
+    return round(ordered[min(m - 1, int(m * p))], 1) if m else 0.0
+
+
+@app.before_request
+def _metrics_start():
+    # The FIRST before_request, so even a request refused by a later guard - the
+    # debugger block, the JSON-object check, the rate limiter - is still timed.
+    g._m_t0 = time.perf_counter()
+    return None
+
+
+@app.after_request
+def _metrics_record(resp):
+    t0 = g.pop("_m_t0", None)
+    if t0 is None:
+        return resp
+    dur_ms = (time.perf_counter() - t0) * 1000.0
+    # request.endpoint is the view's stable name; path is the fallback for a 404
+    # that matched no route. The method is included so a GET and a PUT on one
+    # path are told apart.
+    key = "%s %s" % (request.method, request.endpoint or request.path)
+    with _metrics_lock:
+        bucket = _metrics_bucket(key)
+        bucket["dur"].append(dur_ms)
+        bucket["n"] += 1
+        if resp.status_code >= 500:
+            bucket["err"] += 1
+    if dur_ms >= SLOW_REQUEST_MS:
+        app.logger.warning("[SLOW] %s took %.0f ms -> %d", key, dur_ms, resp.status_code)
+    return resp
+
+
+def _metrics_summary():
+    with _metrics_lock:
+        snapshot = [(k, list(v["dur"]), v["n"], v["err"]) for k, v in _metrics.items()]
+    endpoints = {}
+    total = 0
+    for key, durs, n, err in snapshot:
+        total += n
+        ordered = sorted(durs)
+        endpoints[key] = {
+            "count": n,
+            "error_rate": round(err / n, 4) if n else 0.0,
+            "p50_ms": _pct(ordered, 0.50),
+            "p95_ms": _pct(ordered, 0.95),
+            "p99_ms": _pct(ordered, 0.99),
+            "max_ms": round(ordered[-1], 1) if ordered else 0.0,
+            "recent_samples": len(ordered),
+        }
+    return {
+        "uptime_seconds": int(time.time() - _metrics_started),
+        "total_requests": total,
+        "window_per_endpoint": METRICS_SAMPLES,
+        "scope": "one worker (per-process); under gunicorn -w N this is that worker's view",
+        "endpoints": dict(sorted(endpoints.items(), key=lambda kv: -kv[1]["count"])),
+    }
 
 
 @app.before_request
@@ -2335,6 +2431,36 @@ def require_auth(view):
         return view(*args, **kwargs)
 
     return wrapped
+
+
+# =============================================================================
+# OPS
+# =============================================================================
+
+@app.get("/api/metrics")
+@require_auth
+@require_owner
+def metrics():
+    """
+    Live per-endpoint request latency (owner only)
+    ---
+    tags:
+      - Ops
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+    responses:
+      200:
+        description: Per-endpoint count, error rate, p50/p95/p99/max latency, plus uptime
+      404:
+        description: Not the owner (same 404 the other owner routes give)
+      401:
+        description: Missing, invalid or expired token
+    """
+    return _metrics_summary(), 200
 
 
 # =============================================================================

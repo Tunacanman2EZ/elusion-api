@@ -304,3 +304,30 @@ paths, reporting req/s and p50/p95/p99. Read the write ceiling at the lowest
 concurrency where 2xx is still ~100% — above that the spawn ceiling starts
 (correctly) returning 429 as a handful of test accounts out-kill the world.
 **It mutates what it points at, so never aim `--url` at production.**
+
+## Watching latency (live)
+
+`loadtest.py` proves speed *before* you ship; **`GET /api/metrics`** watches it
+*after*. The server times every request in memory and serves per-endpoint
+percentiles to the owner:
+
+```
+curl -s -H "Authorization: Bearer <owner-token>" https://host/api/metrics
+```
+
+Each endpoint reports `count`, `error_rate`, `p50_ms/p95_ms/p99_ms/max_ms` and a
+recent-sample count, plus process `uptime_seconds` and `total_requests`. It is
+how a latency regression becomes a number the day it happens instead of a player
+complaint next week — the live counterpart to the benchmark. The heavy endpoint
+is `register` (scrypt hashing, ~100ms by design); everything else should sit in
+single-digit milliseconds.
+
+**Per worker, like the rate limiter.** Under `gunicorn -w 4` each worker keeps
+its own window, so `/api/metrics` reports whichever worker answered — enough to
+spot a slow endpoint or a creep, not a fleet-wide total. A shared view would need
+the counters in Redis or a table; deliberately left as a later step. The memory
+is bounded (`METRICS_SAMPLES` recent timings per endpoint, oldest dropped).
+
+Any request slower than `SLOW_REQUEST_MS` (1s) is also logged as
+`[SLOW] <method> <endpoint> took <n> ms`, so a stall shows up in the log even if
+nobody is watching the metrics endpoint at that moment.
