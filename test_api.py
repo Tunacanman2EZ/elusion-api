@@ -1555,15 +1555,18 @@ check("the refused array left the bag empty",
 
 section("CHARACTER - SKILLS")
 
-body = status("write skills", client.put("/api/character/skills", headers=H,
+body = status("write skills is accepted", client.put("/api/character/skills", headers=H,
               json={"slot": 0, "skills": {
                   "defense": {"level": 12, "xp": 340},
                   "magic":  {"level": 3,  "xp": 9},
               }}), 200)
-# defense, NOT attack: attack joined SERVER_OWNED_SKILLS when /api/combat/kill
-# started granting it, so the client can no longer write it and a round-trip
-# through this endpoint is exactly what must NOT happen for it.
-check("skills round-trip", body["skills"]["defense"]["level"] == 12, body["skills"])
+# EVERY skill is server-owned now (E-2 close): defense, agility and magic joined
+# attack/fishing/cooking, so the client can no longer write ANY of them. The
+# request is still accepted - an un-updated client's save must not 400 over a
+# field it may no longer set - but the claim is DROPPED. A round-trip must NOT
+# return the level the client named; it comes from /api/skill/train instead.
+check("a skill claim does not round-trip (server-owned)",
+      body["skills"].get("defense", {}).get("level") != 12, body["skills"])
 
 status("an unknown skill", client.put("/api/character/skills", headers=H,
        json={"slot": 0, "skills": {"swimming": {"level": 1, "xp": 0}}}), 400)

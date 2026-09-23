@@ -252,22 +252,25 @@ put_bank(owner, [{"item_id": "embersword", "quantity": 1}])
 check("the owner may still set an arbitrary bank",
       banked(owner) == {"embersword": 1}, banked(owner))
 
-print("\n=== E-2  SKILLS ARE CAPPED FOR A REGULAR CLIENT ===\n")
+print("\n=== E-2  ALL SKILLS ARE SERVER-OWNED; CLIENT CLAIMS ARE DROPPED ===\n")
 
-# MAGIC, NOT ATTACK. The cap is about what a client may CLAIM, and attack is no
-# longer claimable at all - /api/combat/kill grants it and PUT /skills drops it.
-# Testing the cap through a server-owned skill would measure the drop instead.
+# magic was the last client-claimable skill; it is now server-owned like the
+# rest - /api/skill/train grants it - so a PUT claim is DROPPED, not stored, and
+# not clamped-and-stored either. The whole point of E-2 is that the client no
+# longer names any skill level.
+# A dropped skill leaves no row, so it reads back as base level (None/absent or 1)
+# - never the claimed value. The claim not landing is the whole point.
 r = put_skills(player, {"magic": {"level": 999, "xp": 0}})
-check("an over-cap skill is accepted as a request", r.status_code == 200, r.status_code)
-check("but the level is clamped to the ceiling", skill_level(player, "magic") == app_module.MAX_SKILL_LEVEL,
+check("a skill claim is still accepted as a request (not 400)", r.status_code == 200, r.status_code)
+check("but the claimed level is dropped, not stored", skill_level(player, "magic") in (None, 1),
       skill_level(player, "magic"))
 
 put_skills(player, {"magic": {"level": 40, "xp": 0}})
-check("a legitimate level is stored unchanged", skill_level(player, "magic") == 40,
+check("even a legitimate-looking claim is dropped - the server owns it", skill_level(player, "magic") in (None, 1),
       skill_level(player, "magic"))
 
 put_skills(owner, {"magic": {"level": 999, "xp": 0}})
-check("the owner bypasses the skill cap", skill_level(owner, "magic") == 999,
+check("the owner's claim is dropped too - server-owned means server-owned", skill_level(owner, "magic") in (None, 1),
       skill_level(owner, "magic"))
 
 

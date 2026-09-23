@@ -228,16 +228,17 @@ if TRUSTED_PROXY_HOPS > 0:
 # home. The decision was server-side and the bookkeeping was not, which is the
 # gap E-2 describes. Granting it where it is rolled closes that for attack.
 #
-# DEFENSE, AGILITY AND MAGIC ARE DELIBERATELY ABSENT. They are not merely
-# un-migrated; the server cannot see the events that earn them. Defense trains
-# on damage taken and agility on distance moved (player.gd:
-# agility_xp_per_1000_px), neither of which involves killing anything, so there
-# is no server-side moment to hang a grant on. Any bound derived from character
-# level would be wrong for exactly the same reason: a level 1 character who
-# walks far enough legitimately earns agility, and clamping that would punish
-# honest play to catch a cheat. They need their own server-observed events
-# first. See SECURITY_NOTES.md (E-2).
-SERVER_OWNED_SKILLS = {"fishing", "cooking", "attack"}
+# DEFENSE, AGILITY AND MAGIC NOW HAVE THEIR SERVER-OBSERVED EVENT: /api/skill/train.
+# They train on damage taken, distance moved and magic damage dealt - none of
+# which involves killing anything, so there was no server-side moment to hang a
+# grant on, and a character-level bound would have punished the honest level-1
+# who walked far. The client cannot be made to prove those events happened, but
+# it CAN be stopped from claiming more than physically possible: /api/skill/train
+# takes the raw XP the client accumulated and clamps each skill to a generous
+# MAX_TRAIN_XP_PER_SEC x elapsed, then grants it here. "Instant level 99" becomes
+# "spend the real hours", the same posture as the kill rate limit - and, exactly
+# like attack, the number is now decided and recorded server-side. See E-2.
+SERVER_OWNED_SKILLS = {"fishing", "cooking", "attack", "defense", "agility", "magic"}
 
 # SKILL CEILING. The three skills above are granted server-side; the rest are
 # still the client's to compute and PUT back, so the server cannot prove those
@@ -248,6 +249,48 @@ SERVER_OWNED_SKILLS = {"fishing", "cooking", "attack"}
 # A legitimate client never reaches it, so capping costs honest players nothing.
 MAX_SKILL_LEVEL = 99
 MAX_SKILL_XP = 200_000_000
+
+# =============================================================================
+# SKILL TRAINING - the server-observed event for defense, agility and magic
+# =============================================================================
+# These three train on continuous play - damage taken, distance moved, magic
+# damage dealt - not on a discrete moment like a kill. So the client accumulates
+# the RAW xp it earned and reports it to /api/skill/train, and the server does
+# the two things the client cannot be trusted to do: it CLAMPS the report to what
+# is physically possible in the elapsed time, and it applies class proficiency.
+# It cannot prove the play happened - no more than /api/combat/kill can prove a
+# fight did - but it caps the RATE, which turns "claim 99 instantly" into "report
+# at the honest ceiling for the real number of hours", and it makes the value
+# server-decided and server-recorded instead of client-asserted.
+#
+# THE CAPS ARE DELIBERATELY GENEROUS. Too tight is the E-2 mistake - clamping an
+# honest player to catch a cheat - so each sits well above the fastest real earn
+# rate: agility from distance (~2000 px/s -> 6 xp/s) plus sprint (~1 xp/s),
+# defense at half the damage a crowd can land, magic at a mage's burst. Tune them
+# DOWN only with playtest data showing the honest ceiling is lower; start loose.
+MAX_TRAIN_XP_PER_SEC = {
+    "agility": 20.0,
+    "defense": 100.0,
+    "magic": 300.0,
+}
+# The most a single report may bank, so a client whose last_train_at is 0 (a
+# fresh character) or which was offline for hours cannot cash one giant report -
+# it gets at most this many seconds of budget. The client reports every few
+# seconds, so this is pure slack for an honest one.
+MAX_TRAIN_ELAPSED_SECONDS = 60.0
+
+# Class proficiency: the specialty each class trains 50% faster. This is static
+# class data that lived only in the client (_set_skill_proficiency); it belongs
+# here now that the grant does. Anything unlisted is 1.0.
+SKILL_PROFICIENCY = {
+    "warrior": {"attack": 1.5},
+    "mage":    {"magic": 1.5},
+    "healer":  {"magic": 1.5},
+    "tank":    {"defense": 1.5},
+}
+# The skills /api/skill/train grants against. attack, fishing and cooking have
+# their own server-observed events already.
+TRAINABLE_SKILLS = ("agility", "defense", "magic")
 
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 MIN_PASSWORD_LENGTH = 8
@@ -1258,6 +1301,11 @@ def init_db():
     # Kill-rate tokens. Defaults to the full bucket so an existing character is
     # not penalised for having played before this column existed.
     _migrate_add_column(db, "saves", "kill_tokens", "REAL NOT NULL DEFAULT 20.0")
+
+    # When this character last reported skill-training activity to
+    # /api/skill/train. 0 means never, which the endpoint reads as "clamp the
+    # first report to the elapsed budget" rather than handing it the whole 1970.
+    _migrate_add_column(db, "saves", "last_train_at", "INTEGER NOT NULL DEFAULT 0")
 
     # WHAT DEATH HAS COST THIS ACCOUNT, cumulatively, and the only number in
     # the game that is supposed to go up when you lose.
@@ -7924,6 +7972,95 @@ def write_skills():
     db.commit()
 
     return {"slot": slot, "skills": skills_payload(user_id, slot)}, 200
+
+
+@app.post("/api/skill/train")
+@require_auth
+def train_skills():
+    """
+    Report training activity for agility, defense and magic
+    ---
+    tags:
+      - Character
+    consumes:
+      - application/json
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [slot]
+          properties:
+            slot:    {type: integer, example: 0}
+            agility: {type: integer, description: "raw agility XP earned since the last report"}
+            defense: {type: integer, description: "raw defense XP earned since the last report"}
+            magic:   {type: integer, description: "raw magic XP earned since the last report"}
+    responses:
+      200:
+        description: The three trained skills as stored after the grant
+      400:
+        description: Bad slot or a malformed amount
+      404:
+        description: That slot is empty
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+    user_id = g.user["id"]
+
+    slot = parse_slot(payload.get("slot"))
+    if slot is None:
+        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+
+    db = get_db()
+    row = db.execute(
+        "SELECT class_id, last_train_at FROM saves WHERE user_id = ? AND slot = ?",
+        (user_id, slot),
+    ).fetchone()
+    if row is None:
+        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
+
+    now_ms = int(time.time() * 1000)
+
+    # THE BUDGET. Time since the last report, capped: a fresh character
+    # (last_train_at 0) or one back from hours offline gets at most
+    # MAX_TRAIN_ELAPSED_SECONDS of budget, never the whole gap. This is what
+    # stops a single giant report from cashing an impossible amount at once.
+    elapsed_s = (now_ms - int(row["last_train_at"])) / 1000.0
+    elapsed_s = max(0.0, min(elapsed_s, MAX_TRAIN_ELAPSED_SECONDS))
+
+    prof = SKILL_PROFICIENCY.get(row["class_id"], {})
+
+    results = {}
+    for skill in TRAINABLE_SKILLS:
+        reported = parse_stat(payload.get(skill, 0))
+        if reported is None:
+            return bad_request("%s must be a non-negative integer" % skill)
+        # Clamp the raw report to what is physically earnable in the elapsed
+        # budget, THEN apply proficiency. A client reporting a billion gets the
+        # ceiling; an honest one is never anywhere near it.
+        allowed = MAX_TRAIN_XP_PER_SEC[skill] * elapsed_s
+        raw = min(float(reported), allowed)
+        gained = int(max(0.0, raw) * prof.get(skill, 1.0))
+        level, xp, levels_gained = _grant_skill_xp(user_id, slot, skill, gained)
+        results[skill] = {"level": level, "xp": xp, "levels_gained": levels_gained}
+
+    # Stamp the report time in the SAME transaction as the grants, so a crash
+    # cannot bank the XP and lose the timestamp - which would hand the next
+    # report a second helping of the same budget.
+    db.execute(
+        "UPDATE saves SET last_train_at = ?, updated_at = ? WHERE user_id = ? AND slot = ?",
+        (now_ms, int(time.time()), user_id, slot),
+    )
+    db.commit()
+
+    return {"slot": slot, "skills": results}, 200
 
 
 # =============================================================================

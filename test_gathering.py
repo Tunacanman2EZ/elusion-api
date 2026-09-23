@@ -179,17 +179,19 @@ check("the XP awarded matches the fish's own value",
       r.get_json()["xp"] == FISH[r.get_json()["item_id"]]["fishing_xp"],
       (r.get_json()["xp"], r.get_json()["item_id"]))
 
-# THE CLIENT CANNOT WRITE THIS SKILL BACK. A normal client syncs all six skills
-# on save; if that overwrote fishing, every grant would survive until the next
-# routine save and no further.
+# THE CLIENT CANNOT WRITE ANY SKILL BACK NOW. A normal client still syncs all
+# six on save; if that overwrote fishing, every grant would survive until the
+# next routine save and no further. With the E-2 close, defense/agility/magic
+# joined fishing/cooking/attack as server-owned, so the sync drops ALL of them -
+# fishing here, and defense right beside it.
 level_now = skill(angler, "fishing")["level"]
 client.put("/api/character/skills", headers=angler,
            json={"slot": 0, "skills": {"fishing": {"level": 99, "xp": 0},
                                        "defense": {"level": 5, "xp": 0}}})
 check("a client claiming fishing 99 is ignored",
       skill(angler, "fishing")["level"] == level_now, skill(angler, "fishing"))
-check("but the client's other skills still sync",
-      skill(angler, "defense")["level"] == 5, skill(angler, "defense"))
+check("and a claim of defense - now server-owned too - is dropped, not synced",
+      skill(angler, "defense")["level"] == 1, skill(angler, "defense"))
 
 
 section("FISHING  -  THE ROD TIER IS A CEILING, NOT A SUGGESTION")

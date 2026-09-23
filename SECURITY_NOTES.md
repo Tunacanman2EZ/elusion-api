@@ -17,7 +17,7 @@ lives.
 | # | Finding | Severity | Status | Risk if exploited | Fix |
 |---|---------|----------|--------|-------------------|-----|
 | E-1 | Inventory is client-authoritative | critical (economy) | **Closed** | A modified client can write any item into its bag or bank — the best gear in the game, in any quantity — on its next save. | **Server-side authority.** Every save is reconciled against what the server actually granted and fabricated items are trimmed away; run in log-only shadow mode first, enforced once the comparison was proven. |
-| E-2 | Skills are client-authoritative and uncapped | critical (balance) | **Partly closed** — capped, and 3 of 6 skills fully server-owned | A player can claim any skill level and skip all progression — level-99 attack on a character made a minute ago. | **Hard cap + server-side authority (partial).** Claims are clamped at 99; fishing, cooking and attack XP are granted only by the server and dropped from client saves. Defense, agility and magic can still be claimed up to the cap. |
+| E-2 | Skills are client-authoritative and uncapped | critical (balance) | **Closed** — all 6 skills server-owned | A player can claim any skill level and skip all progression — level-99 attack on a character made a minute ago. | **Server-side authority.** All six skills are granted only by the server and dropped from client saves. Fishing, cooking and attack ride their own events; defense, agility and magic report activity to `/api/skill/train`, which clamps each to a generous per-second ceiling × elapsed time and applies class proficiency itself. A client claim earns nothing. |
 | E-3 | The kill *event* is asserted, not verified | high | **Open** — named, rate-limited, not fixed | A script can report kills it never fought and farm XP and loot without playing. | **Rate limit + content bound — not a fix.** The server rolls its own rewards, refuses reward-less enemies, rate-limits with a token bucket, and caps kills at what the world's respawners can produce (18,000/hr down to 5,208). Closing it needs server-side encounter state. |
 | E-4 | `app.run(debug=True)` | critical if exposed | **Closed** — every door, not only `python app.py` (E-4c) | Any crash on a reachable server hands an attacker a Python shell on the machine holding every password hash. | **Safe default + refusal.** The debugger is off unless `ELUSION_DEBUG=1`; the server refuses to start if `FLASK_DEBUG` or `flask run --debugger` asks for it instead, or if any debug flag is set behind a proxy; and it refuses every request if the interactive debugger is attached some other way. |
 | E-5 | No login throttling | medium | **Closed** — incl. E-5f, the throttle that fed itself | Passwords can be guessed at machine speed — one account at a time, or one common password across every account. | **Rate limit.** 8 misses lock an account for 15 minutes, checked before the password; per-address ceilings (6 usernames, 25 failures per 10 minutes) stop spraying. E-5f: the gate's own refusals no longer count as evidence, which had locked shared connections out indefinitely. |
@@ -106,10 +106,10 @@ first — comparing the claim to the record and *logging* the difference while
 refusing nothing. Shipping the refusal before the log had proven the comparison
 was right would have broken honest saves for real players.
 
-### E-2 — Skills · PARTLY CLOSED
+### E-2 — Skills · CLOSED
 
-Two separate pieces of progress, and the gap between them is the finding that
-remains.
+Was two pieces of progress with a gap between them; the gap is now closed by
+`/api/skill/train` (below).
 
 **The ceiling.** `MAX_SKILL_LEVEL = 99` clamps over-cap claims from non-staff.
 This kills the absurd-value cheat — a level-1 character claiming 2^31 attack —
@@ -129,22 +129,35 @@ refused, deliberately: an un-updated client still sends all six every save, and
 400-ing an otherwise honest sync over a field it is not allowed to set would
 break saving entirely.
 
-**What is left, and why it is harder than it looks.** Defense, agility and
-magic remain claimable up to the cap — but they are not simply un-migrated, and
-the obvious fix is wrong.
+**The last three are now closed too — `POST /api/skill/train`.** Defense,
+agility and magic train on continuous play — damage taken, distance moved, magic
+damage dealt — not on a discrete moment like a kill, so there was no server event
+to hang a grant on. The character-level bound was rejected for good reason
+(**agility trains on distance moved**, `agility_xp_per_1000_px = 3`, and
+**defense on damage taken** — neither correlates with character level, so a
+`character_level + N` bound clamps the honest level-1 who walked far).
 
-The tempting interim check was "reject any skill level the character's level
-could not support". It does not survive contact with the client. **Agility
-trains on distance moved** (`player.gd`, `agility_xp_per_1000_px = 3`) and
-**defense on damage taken** — neither involves killing anything, so neither is
-correlated with character XP at all. A level 1 character who walks far enough
-legitimately earns agility, and a bound of `character_level + N` would clamp
-honest play to catch a cheat. Measured against the real curves, attack tops out
-near 0.55x character level while agility has no ceiling relative to it.
+The fix is the same posture as the kill event. The client cannot be made to
+*prove* it took damage or moved, but it can be stopped from claiming more than
+physically possible: it accumulates the raw XP it earned and reports it to
+`/api/skill/train`, and the server **clamps each skill to a generous
+`MAX_TRAIN_XP_PER_SEC × elapsed`** (a fresh or long-idle character gets at most
+`MAX_TRAIN_ELAPSED_SECONDS` of budget), **applies class proficiency server-side**
+(the 1.5× specialty, moved off the client), and grants it through the same
+`_grant_skill_xp` that attack uses. All six skills are now in
+`SERVER_OWNED_SKILLS`, so `PUT /api/character/skills` drops every one — the
+client no longer names any skill level.
 
-So the remaining three need what attack, fishing and cooking got: a
-server-observed event to hang the grant on. Until the server can see a dodge or
-a hit taken, a heuristic would cost more in false positives than it saves.
+**What it does and does not close.** "Claim level 99 instantly" is gone — the
+rate cap turns it into "report at the honest ceiling for the real number of
+hours", and the value is server-decided and server-recorded. What remains is the
+same residual as the kill event: a modified client that idles reporting the
+ceiling amount every second still trains at the honest *maximum* rate without
+playing. Closing that would need the server to observe position and damage
+directly, which it does not — so, exactly like E-3, the rate is bounded and the
+existence is not. The caps are deliberately generous (tune *down* with playtest
+data, never up on a guess), because a tight cap is the very mistake this finding
+warned about.
 
 ### E-3 — The kill event · OPEN
 
