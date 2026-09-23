@@ -251,13 +251,56 @@ but it is worth knowing which is which before anyone asks.
 
 ## Sizing
 
-SQLite with WAL handles this comfortably at small scale — it is one file and the
-write volume is a handful of rows per kill. The thing that will hurt first is
-not the database but `-w 4` gunicorn workers each holding their own connection;
-watch for `database is locked` under concurrency before assuming you need
-Postgres.
+SQLite in **WAL mode with `synchronous=NORMAL`** handles this comfortably at
+small-to-medium scale — it is one file and the write volume is a handful of rows
+per kill. Both PRAGMAs are set in `get_db()` on every connection, alongside
+`busy_timeout=5000` (a contended writer waits for the lock instead of erroring).
+
+**Measured** (`loadtest.py`, `gunicorn -w 4`, a 2-core box — real hardware does
+more):
+
+| path | throughput | note |
+|---|---|---|
+| `GET /api/player/status` (read) | ~1,000 req/s | scales with cores, sub-2ms uncontended |
+| `POST /api/combat/kill` (write) | ~560 committed/s | heaviest transaction; ~2.2× the pre-WAL number |
+
+The write path is the ceiling, because SQLite serialises writers on one lock —
+WAL makes each commit cheaper and stops writers blocking readers, but it does
+**not** give you multiple concurrent writers. So write throughput is bounded by
+how fast one writer can commit, not by worker count. If a kill ever needs to be
+faster, shorten its transaction (it writes `saves`, `gold_ledger`,
+`kill_reports`, `skills` and a loot roll in one) before reaching for Postgres.
+Postgres is the endgame for true multi-writer concurrency, and nothing before it
+is needed to launch.
+
+**WAL writes two sidecar files** next to the database, `elusion.db-wal` and
+`elusion.db-shm`. Keep them on the same filesystem as the database (they are, by
+construction) and never back up the `.db` alone by copying it — `backup_db.py`
+uses SQLite's online-backup API, which captures the WAL correctly; a bare `cp`
+would not. `canary.py`, `backup_db.py` and `security_bot.py` all read the live
+WAL database `mode=ro` without trouble.
 
 The `login_attempts` table prunes itself on the login path
 (`LOGIN_LOG_RETENTION_SECONDS`, 14 days), so it will not grow without bound.
 Nothing else in the schema self-prunes: `staff_actions` is append-only by
 design, because an audit trail that deletes itself is not one.
+
+## Benchmarking
+
+`loadtest.py` is the repeatable proof that a change made the server faster, not
+quietly slower — run it before and after. Point it at a server you started
+(any platform), or let it launch a throwaway one on Linux:
+
+```
+# benchmark your running server (start it however you deploy — waitress/gunicorn):
+python3 loadtest.py --url http://127.0.0.1:5000
+
+# or, on Linux, let it spin up a scratch gunicorn and clean up after:
+python3 loadtest.py --launch --workers 4
+```
+
+It seeds throwaway accounts and sweeps concurrency against the read and write
+paths, reporting req/s and p50/p95/p99. Read the write ceiling at the lowest
+concurrency where 2xx is still ~100% — above that the spawn ceiling starts
+(correctly) returning 429 as a handful of test accounts out-kill the world.
+**It mutates what it points at, so never aim `--url` at production.**

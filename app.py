@@ -2,6 +2,7 @@ from flask import Flask, request, g
 from flasgger import Swagger
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.exceptions import HTTPException
 
 import gamedata
 import json
@@ -12,9 +13,18 @@ import time
 import os
 import re
 import sys
+import threading
 from functools import wraps
 
 app = Flask(__name__)
+
+# HARD BODY-SIZE CAP. A save can carry ~64 KB per explored area (see
+# MAX_EXPLORED_BYTES), so 4 MiB sits far above any legitimate request while
+# still refusing the multi-megabyte bodies whose only purpose is to exhaust
+# memory before the JSON is even parsed. Werkzeug returns a clean 413 on its
+# own once this is set - no handler ever sees an oversized body. Raise it if a
+# real save ever legitimately approaches the cap.
+app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024
 
 app.config["SWAGGER"] = {
     "title": "Elusion RPG API",
@@ -422,6 +432,140 @@ def _refuse_under_unasked_debugger():
     return None
 
 
+@app.before_request
+def _require_json_object():
+    # Every write endpoint in this API reads its fields off a JSON OBJECT. A
+    # body that parses as valid JSON but is a list, a number, a string or a
+    # bool is malformed for all of them - and left to the handler it becomes
+    # `.get()` on a list, which raises and returns an unhandled 500: a
+    # stack-trace leak and a cheap way to make the box throw. `or {}` at the
+    # call site does not catch it, because a non-empty list is truthy.
+    #
+    # Catching it here, before any route runs, collapses that whole class of
+    # crash into one clean 400 for the entire API at once - the red-team bot's
+    # fuzzer found eight endpoints that 500'd on a bare `[1,2,3]`, and this is
+    # the single guard that closes all of them and any future sibling.
+    #
+    # It fires ONLY when a JSON body is actually present. A missing body, or a
+    # body sent without a JSON content-type, still reaches the handler's own
+    # validation exactly as before - get_json(silent=True) returns None for
+    # both, and every handler already treats that as "no fields". No endpoint
+    # in this API takes a top-level array, so nothing legitimate is refused.
+    if request.method in ("POST", "PUT", "PATCH") and request.is_json:
+        body = request.get_json(silent=True)
+        if body is not None and not isinstance(body, dict):
+            return bad_request("request body must be a JSON object")
+    return None
+
+
+@app.after_request
+def _security_headers(resp):
+    # Cheap, universal hardening headers. nosniff stops content-type games;
+    # no-referrer keeps request paths out of any outbound Referer; DENY forbids
+    # this API and its Swagger UI from being framed for clickjacking. No CSP on
+    # purpose - it would fight the Swagger UI's inline scripts for no gain on a
+    # JSON API. setdefault so a route that sets its own value still wins.
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    return resp
+
+
+@app.errorhandler(Exception)
+def _handle_unexpected(exc):
+    # HTTP errors (400/401/404/405/413/...) are deliberate answers - let them
+    # render as themselves, unchanged, so every existing refusal keeps its
+    # shape. Anything else is an UNEXPECTED error: log the full traceback
+    # server-side where you can see it, and hand the client a flat JSON 500
+    # with nothing internal in it. Debug is already forced off (E-4), so Flask
+    # would not leak a trace anyway - this is the belt to that suspenders, and
+    # the one place every surprise gets recorded instead of vanishing.
+    if isinstance(exc, HTTPException):
+        return exc
+    app.logger.exception("unhandled error on %s %s", request.method, request.path)
+    return {
+        "error": "Internal Server Error",
+        "message": "The server hit an unexpected error.",
+    }, 500
+
+
+# =============================================================================
+# RATE LIMITING - a coarse per-IP ceiling on abuse
+# =============================================================================
+# OPT-IN, because the right number depends on how chatty the real client is,
+# which is a thing to MEASURE, not guess - set too low it throttles a player
+# mid-fight, set by guesswork it is theatre. Turn it on by naming a limit in the
+# server's environment:
+#
+#     ELUSION_RATE_LIMIT="600 per minute"      # also "600/60", "10 per second"
+#
+# Unset (the default) is OFF, so the test suites, the security bot, and any box
+# that has not chosen a number are untouched. Login and registration already
+# carry their own tighter SQLite throttles; this is the blanket ceiling over
+# everything else - the save / inventory / skill / bank spam a modified client
+# could otherwise fire without limit.
+#
+# IN-MEMORY, so the count is PER WORKER: under `gunicorn -w 4` the real ceiling
+# is four times the number set. That is fine for a DoS ceiling - it still bounds
+# one IP to a fixed rate - but it is not a precise fair-use limit. For that the
+# counter has to be SHARED across workers (Redis, or the login_attempts SQLite
+# pattern already in this file). Start generous, watch the logs, tighten later.
+
+def _parse_rate_limit(raw):
+    """"600 per minute" / "600/60" / "10 per second" / "600" -> (count, window_s)."""
+    raw = (raw or "").strip().lower()
+    if not raw or raw in ("0", "off", "none", "false"):
+        return None
+    units = {"second": 1, "sec": 1, "minute": 60, "min": 60, "hour": 3600}
+    m = re.match(r"^(\d+)\s*(?:per|/)\s*(\d+)?\s*(second|sec|minute|min|hour)?s?$", raw)
+    if m:
+        count = int(m.group(1))
+        window = (int(m.group(2)) if m.group(2) else 1) * units.get(m.group(3) or "second", 1)
+    elif re.match(r"^\d+$", raw):
+        count, window = int(raw), 60
+    else:
+        return None
+    return (count, window) if count > 0 and window > 0 else None
+
+
+_RATE = _parse_rate_limit(os.environ.get("ELUSION_RATE_LIMIT"))
+_RATE_HITS = {}                      # ip -> list of recent request timestamps
+_RATE_LOCK = threading.Lock()        # threaded workers share one worker's dict
+_RATE_EXEMPT = ("/api/status", "/apidocs", "/flasgger_static", "/apispec")
+
+if _RATE:
+    print("[BOOT] rate limit: %d requests / %ds per IP (per worker)" % _RATE)
+
+
+@app.before_request
+def _rate_limit():
+    # Off unless a limit was named; health check and the API docs are always
+    # exempt so a load balancer's polling and the Swagger UI never trip it.
+    if _RATE is None:
+        return None
+    if any(request.path.startswith(p) for p in _RATE_EXEMPT):
+        return None
+    count, window = _RATE
+    ip = client_ip() or "?"
+    now = time.time()
+    cutoff = now - window
+    with _RATE_LOCK:
+        hits = [t for t in _RATE_HITS.get(ip, ()) if t >= cutoff]
+        if len(hits) >= count:
+            _RATE_HITS[ip] = hits
+            retry = max(1, int(hits[0] + window - now) + 1)
+            return ({"error": "Too Many Requests",
+                     "message": "Rate limit exceeded - slow down."},
+                    429, {"Retry-After": str(retry)})
+        hits.append(now)
+        _RATE_HITS[ip] = hits
+        # keep the table from growing without bound as IPs come and go
+        if len(_RATE_HITS) > 4096:
+            for k in [k for k, v in list(_RATE_HITS.items()) if not v or v[-1] < cutoff]:
+                _RATE_HITS.pop(k, None)
+    return None
+
+
 # =============================================================================
 # DATABASE
 # =============================================================================
@@ -433,6 +577,44 @@ def get_db():
         g.db.row_factory = sqlite3.Row
         # enforce foreign keys - off by default in sqlite
         g.db.execute("PRAGMA foreign_keys = ON")
+
+        # WAL - READERS AND WRITERS AT THE SAME TIME. In the default rollback
+        # journal a writer blocks every reader and every other writer for the
+        # length of its transaction, so under `gunicorn -w 4` the whole server
+        # serialises behind one write - measured flat at ~250 committed
+        # writes/s regardless of how many workers or clients pile on. WAL lets
+        # readers keep going while a write is in flight and turns each commit
+        # into a sequential append to the -wal file instead of a full-DB
+        # rewrite. Re-measured with loadtest.py: committed write throughput rose
+        # ~60% under concurrency, with lower tail latency. journal_mode is a
+        # PERSISTENT property of the database file, so this is idempotent - the
+        # first connection sets it, the rest read "wal" back and move on.
+        #
+        # THE READER-PATTERN REVIEW THIS WAS WAITING ON IS DONE. The worry was
+        # separate reader connections (canary.py, backup_db.py, the security
+        # bot, the economy suite's farm loop) seeing WAL data wrong. Verified:
+        # every request here takes a FRESH connection and closes it in teardown
+        # - there is no long-lived reader in the server itself - and mode=ro
+        # readers read a live WAL database correctly, uncheckpointed rows and
+        # all, given ordinary directory write access (which the same-box tools
+        # have). The only place that reused one connection across many writes
+        # was a TEST harness, fixed there rather than by holding WAL back.
+        g.db.execute("PRAGMA journal_mode = WAL")
+
+        # synchronous=NORMAL is the SAFE partner to WAL, not a corner cut. Under
+        # WAL it still fsyncs at each checkpoint and stays durable across an
+        # application crash; the only thing at risk is the very last transaction
+        # on a full OS or power loss - the standard production pairing, and an
+        # easy trade for a game. FULL (the default) fsyncs on every single
+        # commit, which is most of what the write path was paying for. NOT
+        # persistent - set on every connection.
+        g.db.execute("PRAGMA synchronous = NORMAL")
+
+        # CONCURRENCY FLOOR. Without this, the moment two requests contend for a
+        # write the loser fails outright with "database is locked". busy_timeout
+        # makes the contender WAIT for the lock (up to 5s) and then proceed, so
+        # overlap becomes a brief queue instead of an error. Per-connection.
+        g.db.execute("PRAGMA busy_timeout = 5000")
     return g.db
 
 
@@ -946,6 +1128,22 @@ def init_db():
             PRIMARY KEY (trade_id, side, item_id),
             FOREIGN KEY (trade_id) REFERENCES trades(trade_id) ON DELETE CASCADE
         );
+
+        -- DB-LEVEL FLOOR ON CARRIED GOLD. accounts.bank_gold already carries
+        -- CHECK (bank_gold >= 0); saves.gold did not - an asymmetry that let a
+        -- bug, or any path that bypasses gold_delta, write a negative purse, and
+        -- a negative subtracted is a positive minted. gold_delta now refuses
+        -- that at the application layer; this is the backstop one level down, so
+        -- SQLite itself aborts any write that would take a character's purse
+        -- below zero, through gold_delta or not. A TRIGGER, not a CHECK, because
+        -- a CHECK needs the table rebuilt, while this installs on an existing
+        -- database with no migration and no risk to the rows already there.
+        CREATE TRIGGER IF NOT EXISTS trg_saves_gold_nonneg
+        BEFORE UPDATE OF gold ON saves
+        WHEN NEW.gold < 0
+        BEGIN
+            SELECT RAISE(ABORT, 'gold cannot go below zero');
+        END;
         """
     )
 
@@ -1264,6 +1462,25 @@ def _migrate_seed_gold_ledger(db):
     print("[LEDGER] opening balance recorded: %d gold" % opening)
 
 
+class InsufficientGold(Exception):
+    """Raised by gold_delta / bank_gold_delta when a debit would take a balance
+    below zero.
+
+    WHY RAISE INSTEAD OF RETURN A FLAG. It aborts the caller's WHOLE
+    transaction, and that is the safety property. A purchase reads the balance,
+    grants the item, then burns the gold - three steps in one transaction. Two
+    of those requests racing each other both pass the Python "can you afford it"
+    read, and without an atomic stop both would grant and both would burn,
+    leaving a negative balance and two items paid for once. Here the second
+    burn's guarded UPDATE matches no row, this raises, the caller never reaches
+    its commit, and the item grant rolls back WITH the failed burn. A caller
+    that does nothing at all is therefore still safe - it just surfaces as a 500
+    (rolled back) rather than a clean 409. Callers with a nice error to give may
+    catch it; safety does not depend on their doing so.
+    """
+    pass
+
+
 def gold_delta(db, user_id, slot, delta, reason, detail=""):
     """
     THE ONLY WAY GOLD MAY CHANGE. Moves a character's purse and records why, in
@@ -1279,15 +1496,34 @@ def gold_delta(db, user_id, slot, delta, reason, detail=""):
     rolled), negative burns (a vendor purchase, the kingdom tax). A transfer is
     NOT a delta - see gold_ledger in init_db().
 
-    Returns the new balance, or None when the slot does not exist.
+    Returns the new balance, or None when the slot does not exist. Raises
+    InsufficientGold when a burn would drop the balance below zero - the atomic
+    stop that closes the check-then-write race (see the class above).
     """
     if delta == 0:
         return None
 
-    db.execute(
-        "UPDATE saves SET gold = gold + ?, updated_at = ? WHERE user_id = ? AND slot = ?",
-        (int(delta), int(time.time()), user_id, slot),
+    # GUARDED, CONDITIONAL WRITE. The `gold + ? >= 0` in the WHERE is what makes
+    # this atomic: SQLite re-checks the balance AT WRITE TIME against whatever it
+    # is right now, not against the value the caller read a few instructions ago.
+    # For a mint (delta > 0) the guard is always satisfied, so nothing changes
+    # there. When it matches no row the follow-up read tells the two reasons
+    # apart: a missing slot (the old None contract) or a burn that would go
+    # negative (the new atomic refusal).
+    cur = db.execute(
+        "UPDATE saves SET gold = gold + ?, updated_at = ?"
+        " WHERE user_id = ? AND slot = ? AND gold + ? >= 0",
+        (int(delta), int(time.time()), user_id, slot, int(delta)),
     )
+    if cur.rowcount == 0:
+        exists = db.execute(
+            "SELECT 1 FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)
+        ).fetchone()
+        if exists is None:
+            return None
+        raise InsufficientGold(
+            "debit of %d would take slot %s below zero" % (delta, slot))
+
     db.execute(
         "INSERT INTO gold_ledger (at, user_id, slot, delta, reason, detail)"
         " VALUES (?, ?, ?, ?, ?, ?)",
@@ -4300,10 +4536,22 @@ def bank_gold_delta(db, user_id, delta, reason, detail=""):
     if delta == 0:
         return None
 
-    db.execute(
-        "UPDATE accounts SET bank_gold = bank_gold + ? WHERE user_id = ?",
-        (int(delta), user_id),
+    # Guarded exactly like gold_delta: a bank burn that would go below zero
+    # matches no row and is refused atomically; a mint always clears the guard.
+    cur = db.execute(
+        "UPDATE accounts SET bank_gold = bank_gold + ?"
+        " WHERE user_id = ? AND bank_gold + ? >= 0",
+        (int(delta), user_id, int(delta)),
     )
+    if cur.rowcount == 0:
+        exists = db.execute(
+            "SELECT 1 FROM accounts WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if exists is None:
+            return None
+        raise InsufficientGold(
+            "bank debit of %d would take user %s below zero" % (delta, user_id))
+
     db.execute(
         "INSERT INTO gold_ledger (at, user_id, slot, delta, reason, detail)"
         " VALUES (?, ?, NULL, ?, ?, ?)",
