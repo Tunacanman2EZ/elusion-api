@@ -52,3 +52,7 @@ test_results.txt
 # delete by hand.
 _test_healing.db
 _test_equipmove.db
+
+# Commit message drafts used with git commit -F. Scratch, not record -
+# the durable version lives in DEPLOY.md and SECURITY_NOTES.md.
+commit_*.txt
