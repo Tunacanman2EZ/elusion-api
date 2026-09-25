@@ -172,15 +172,45 @@ try {
         # the scrape misses it says so rather than reporting a confident zero -
         # a crashed suite prints no summary at all, and calling that "0 failed"
         # would turn a traceback into a green run.
-        $summary = [regex]::Matches($text, '(\d+)\s+passed,\s+(\d+)\s+failed')
-        if ($summary.Count -gt 0) {
-            $last = $summary[$summary.Count - 1]
-            $p = [int]$last.Groups[1].Value
-            $f = [int]$last.Groups[2].Value
+        # THREE SHAPES, BECAUSE THE SUITES PRINT THREE SHAPES. The original
+        # pattern matched only "N passed, M failed", and five suites do not
+        # write that: broadcast, maintenance, recovery and teleport end with
+        # "passed: N   failed: M", and killwatch with "PASSED N  FAILED M".
+        #
+        # The cost was not cosmetic. Those five were reported as "no summary
+        # line - suite did not reach the end" on every clean run, the footer
+        # permanently carried the "(at least one suite printed no summary)"
+        # caveat, and 201 passing checks were missing from the total - so the
+        # number at the bottom was wrong, and the one warning that should mean
+        # "a suite crashed" meant nothing at all because it was always on.
+        #
+        # ORDERED MOST-SPECIFIC FIRST and the LAST match in the text wins, both
+        # for the same reason as before: a suite that prints a per-section
+        # tally before its final one must be read from the end.
+        $patterns = @(
+            '(\d+)\s+passed,\s+(\d+)\s+failed',
+            'passed:\s*(\d+)\s+failed:\s*(\d+)',
+            'PASSED\s+(\d+)\s+FAILED\s+(\d+)'
+        )
+        $p = $null; $f = $null
+        foreach ($pattern in $patterns) {
+            $summary = [regex]::Matches($text, $pattern)
+            if ($summary.Count -gt 0) {
+                $last = $summary[$summary.Count - 1]
+                $p = [int]$last.Groups[1].Value
+                $f = [int]$last.Groups[2].Value
+                break
+            }
+        }
+        if ($null -ne $p) {
             $grandPassed += $p
             $grandFailed += $f
             $counts = "{0} passed, {1} failed" -f $p, $f
         } else {
+            # STILL SAYS SO RATHER THAN GUESSING ZERO. A suite that crashes
+            # prints no summary at all, and calling that "0 failed" would turn
+            # a traceback into a green run. That reasoning was right; it was
+            # only firing on the wrong suites.
             $parsedAll = $false
             $counts = "no summary line - suite did not reach the end"
         }

@@ -185,23 +185,52 @@ def trade_tax(taxable_value):
 def revive_gold_cost(total_gold):
     """
     What reviving costs in gold, given everything the account holds - carry and
-    bank together. Mirrors GameConstants.REVIVE_GOLD_RATE.
+    bank together. Mirrors GameConstants.REVIVE_GOLD_RATE and
+    GameConstants.REVIVE_GOLD_MINIMUM.
 
     A SHARE RATHER THAN A PRICE, and the consequences are the point. A flat
     figure is unaffordable at level 3 and pocket change at level 30, so death
     would sting at exactly one point in the game. Eighty percent of everything
-    always hurts - and, being a share of what you HAVE, it can always be paid.
-    Nobody is stranded on the death screen with no way back.
+    always hurts - and, being a share of what you HAVE, it scales with the
+    player rather than with the calendar.
 
     ROUNDED UP, like the trade tax and for the same reason: rounding down would
-    make a very small balance free. Zero in, zero out - an account with nothing
-    is offered the lusion route or the walk of shame, not a free resurrection.
+    make a very small balance free.
+
+    AND A FLOOR UNDER IT, which is new and which deliberately gives up the old
+    guarantee that this could always be paid.
+
+    A pure share has a hole at the bottom. Eighty percent of the thirty gold a
+    fresh character is carrying is twenty-four gold, and twenty-four gold is not
+    a death - it is a toll. Worse, it got cheaper the less you had, so the
+    correct play after dying broke was to die again rather than walk. The floor
+    makes the first deaths cost something real and leaves the curve above it
+    exactly as it was: at 5,000 gold the share is 4,000 and the floor is not
+    even in the conversation.
+
+    WHERE THE FLOOR ACTUALLY BITES, in three bands - and they are three, not
+    two, which is worth writing down because the obvious reading gets it wrong:
+
+        under 100    the price exceeds the balance   -> the gold route is refused
+        100 to 123   the floor is above the share    -> you pay 100, not the share
+        124 and up   the share is above the floor    -> nothing changed at all
+
+    The share drops below the floor at 125, but the route only CLOSES at 100:
+    between the two you can still pay, you simply pay the floor. Refusing is
+    the honest answer below that - the caller turns the unaffordable cost into
+    a 402 naming it, and the lusion route and the walk both still exist. That
+    is the trade being made on purpose: one of the three ways back is closed to
+    a player with almost nothing, and the other two are not.
+
+    Zero in, zero out, still: an account holding nothing is not quoted a price
+    it could never have paid.
     """
     total = int(total_gold)
     if total <= 0:
         return 0
     rate = float(CONSTANTS.get("revive_gold_rate", 0.80))
-    return int(math.ceil(total * rate))
+    floor = int(CONSTANTS.get("revive_gold_minimum", 0) or 0)
+    return max(floor, int(math.ceil(total * rate)))
 
 
 def max_stats_for(class_id, level):
@@ -234,6 +263,181 @@ def max_stats_for(class_id, level):
 def has_item(item_id):
     """Mirrors ItemRegistry.has_item()."""
     return item_id in ITEMS
+
+
+def item_value(item_id):
+    """What one of these is worth in gold. 0 for anything unpriced."""
+    record = ITEMS.get(item_id) or {}
+    try:
+        return max(0, int(record.get("value", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+# =============================================================================
+# GOLD DENOMINATIONS
+# =============================================================================
+# A gold drop used to be one heap: roll an amount, then pick one of two item
+# ids by a threshold and put THAT MANY of it in the bag. A tier 8 kill paid
+# out thirty thousand of a thing called "A Few Coins".
+#
+# Now the amount is broken into coins. The ladder is ordered highest first and
+# every step divides evenly into the one above it, which is what makes greedy
+# change-making exact - and exact is the whole requirement here, because a
+# remainder is gold that was rolled and never arrived.
+#
+# NAMED EXPLICITLY, WITH A FALLBACK THAT CANNOT GO STALE. The list comes from
+# baseenemy.gd through gamedata.json, so the game and the server cannot hold
+# two different ladders. If that key is missing - an older export, or a
+# regenerated file from a build that predates it - the ladder is derived from
+# the items themselves: every CURRENCY item with a price, biggest first. That
+# keeps working rather than silently paying nothing.
+
+def gold_denominations():
+    """[(item_id, value)] highest value first. Never includes lusions."""
+    named = CONSTANTS.get("gold_denomination_ids") or []
+    out = []
+    for item_id in named:
+        value = item_value(item_id)
+        if has_item(item_id) and value > 0:
+            out.append((item_id, value))
+
+    if not out:
+        premium = CONSTANTS.get("lusions_item_id", "lusions")
+        for item_id, record in ITEMS.items():
+            if item_id == premium:
+                continue
+            if str(record.get("type_name", "")) != "CURRENCY":
+                continue
+            value = item_value(item_id)
+            if value > 0:
+                out.append((item_id, value))
+
+    out.sort(key=lambda pair: pair[1], reverse=True)
+    return out
+
+
+# =============================================================================
+# THE JACKPOT DICE
+# =============================================================================
+# THE PROBLEM THIS SOLVES. The ordinary roll tops out at unit * spread, and at
+# the highest loot tier in the game that is a few thousand gold. The top three
+# rungs of the coin ladder - a stack, a pile, a platinum coin - were therefore
+# unreachable: they existed, they had prices, and nothing could ever drop one.
+# A denomination nobody can get is just a file.
+#
+# FIVE DICE, AND YOU WANT SIXES. Every gold drop rolls GOLD_JACKPOT_DICE of
+# them; the number that come up on the top face picks a multiplier. Three
+# sixes happens now and then, four is rare, and five is one roll in 7776.
+#
+# WHY DICE RATHER THAN A FLAT PERCENTAGE. Because the shape is the point. A
+# 0.013% chance of a big multiplier and five-sixes-in-a-row are the same
+# number, but only one of them has near misses - and four sixes landing a few
+# times an evening is what makes the fifth feel like it is coming. The player
+# never sees the dice; they see a platinum coin, which is unmistakable.
+#
+# ALIGNED WITH WHAT KILLED YOU. The multiplier scales the tier's own roll
+# rather than replacing it, so a jackpot off a slime is a pleasant surprise
+# and a jackpot off a boss is the only way a platinum coin enters the game.
+
+def gold_multiplier_for(sixes):
+    """The multiplier for that many top-face dice. 1 for an ordinary roll."""
+    table = CONSTANTS.get("gold_jackpot_multipliers") or []
+    if not table:
+        return 1
+    index = max(0, min(int(sixes), len(table) - 1))
+    try:
+        return max(1, int(table[index]))
+    except (TypeError, ValueError):
+        return 1
+
+
+def jackpot_allowed(max_tier):
+    """Whether a drop at this loot tier may roll the dice at all.
+
+    THE STARTING AREA IS EXCLUDED ON PURPOSE. A windfall is only a windfall
+    against a baseline, and a new player whose third slime pays out a gold
+    coin has had the rest of the first area's economy handed to them before
+    they have met it. It also puts the top of the ladder where the top of the
+    game is: if the easiest thing in the world can roll a platinum coin, the
+    coin says nothing about what you beat.
+    """
+    floor = int(CONSTANTS.get("gold_jackpot_min_tier", 0) or 0)
+    if floor <= 0:
+        return True
+    try:
+        return int(max_tier) >= floor
+    except (TypeError, ValueError):
+        return False
+
+
+def roll_gold_jackpot(max_tier=None, rng=None):
+    """(sixes, multiplier) for one drop's dice. (0, 1) when the tier is barred."""
+    if rng is None:
+        rng = _rng
+    if max_tier is not None and not jackpot_allowed(max_tier):
+        # NO DICE ROLLED AT ALL, rather than dice whose result is discarded.
+        # Same outcome, but it keeps the rng stream identical to what it was
+        # before the jackpot existed for every low-tier drop - so nothing in
+        # the starting area shifts its loot because this feature was added.
+        return 0, 1
+    dice = int(CONSTANTS.get("gold_jackpot_dice", 0) or 0)
+    faces = max(2, int(CONSTANTS.get("gold_jackpot_faces", 6) or 6))
+    if dice <= 0:
+        return 0, 1
+    sixes = sum(1 for _ in range(dice) if rng.randint(1, faces) == faces)
+    return sixes, gold_multiplier_for(sixes)
+
+
+def make_change(amount, ladder=None):
+    """[{"item_id", "quantity"}] adding up to EXACTLY `amount`.
+
+    GREEDY, WHICH IS ONLY CORRECT BECAUSE OF THE LADDER'S SHAPE. Each
+    denomination divides evenly into the next, so taking as many of the
+    biggest as fit and moving down can never strand a remainder it cannot
+    pay. A ladder of 7s and 13s would need real change-making and could still
+    come up short - and coming up short here means gold quietly going missing
+    between the roll and the bag.
+    """
+    amount = max(0, int(amount))
+    if amount <= 0:
+        return []
+
+    if ladder is None:
+        ladder = gold_denominations()
+    if not ladder:
+        return []
+
+    coins = []
+    left = amount
+    for item_id, value in ladder:
+        if value <= 0 or left < value:
+            continue
+        count = left // value
+        left -= count * value
+        coins.append({"item_id": item_id, "quantity": int(count)})
+
+    # THE REMAINDER IS NOT ROUNDED AWAY. If the smallest coin is worth more
+    # than one gold there can be a few left over, and dropping them would
+    # mean the amount rolled and the amount paid are different numbers. One
+    # more of the smallest coin is worth slightly more than was rolled, which
+    # is the error worth having: generous beats missing, and it is visible.
+    if left > 0:
+        smallest_id, smallest_value = ladder[-1]
+        if coins and coins[-1]["item_id"] == smallest_id:
+            coins[-1]["quantity"] += 1
+        else:
+            coins.append({"item_id": smallest_id, "quantity": 1})
+
+    return coins
+
+
+def change_total(coins, ladder=None):
+    """What a decomposition is actually worth - the check on make_change."""
+    if ladder is None:
+        ladder = gold_denominations()
+    prices = dict(ladder)
+    return sum(int(c["quantity"]) * int(prices.get(c["item_id"], 0)) for c in coins)
 
 
 def restore_for(item_id):
@@ -721,14 +925,29 @@ def build_bag_contents(enemy):
     spread = int(CONSTANTS.get("gold_spread", 25))
     unit = max(1, int(round(base * (ratio ** (max_tier - 1)))))
     gold_amount = _rng.randint(unit, unit * spread)
-    threshold = int(CONSTANTS.get("large_gold_threshold", 100))
-    gold_id = (
-        CONSTANTS.get("gold_large_id", "largeamountofgold")
-        if gold_amount >= threshold
-        else CONSTANTS.get("gold_small_id", "smallamountofgold")
-    )
-    if has_item(gold_id):
-        contents.append({"item_id": gold_id, "quantity": gold_amount})
+
+    # THE DICE, ON TOP OF THE ORDINARY ROLL. See THE JACKPOT DICE above for
+    # why this is dice and not a percentage, and why it multiplies the tier's
+    # own roll instead of replacing it.
+    sixes, multiplier = roll_gold_jackpot(max_tier)
+    if multiplier > 1:
+        gold_amount *= multiplier
+    # PAID IN COINS, NOT IN ONE HEAP. See make_change() for why greedy is
+    # exact here and what happens to a remainder.
+    ladder = gold_denominations()
+    if ladder:
+        contents.extend(make_change(gold_amount, ladder))
+    else:
+        # NO LADDER AT ALL means a data file with no currency in it. The old
+        # two-id behaviour is kept as the floor so a bag still pays out.
+        threshold = int(CONSTANTS.get("large_gold_threshold", 100))
+        gold_id = (
+            CONSTANTS.get("gold_large_id", "largeamountofgold")
+            if gold_amount >= threshold
+            else CONSTANTS.get("gold_small_id", "smallamountofgold")
+        )
+        if has_item(gold_id):
+            contents.append({"item_id": gold_id, "quantity": gold_amount})
 
     slot_fill_chance = float(enemy.get("slot_fill_chance", 0.0))
     for _ in range(int(enemy.get("max_item_slots", 0))):

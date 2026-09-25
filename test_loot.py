@@ -243,6 +243,195 @@ for pet in pets:
           % (pet, len(dropped_by[pet]), ", ".join(sorted(dropped_by[pet]))))
 
 
+# ---------------------------------------------------------------------------
+# A GOLD DROP IS PAID IN COINS
+#
+# It used to be one heap: roll an amount, pick one of two ids by a threshold,
+# and put THAT MANY in the bag - so a tier 8 kill paid out thirty thousand of
+# a thing called "A Few Coins". Now the amount is broken down a coin ladder.
+#
+# THE ONE THING THAT MUST NEVER BE WRONG is the total. A decomposition that
+# comes up short is gold that was rolled and never arrived, and it would be
+# invisible - the player cannot know what the dice said. So the check below is
+# not "does it look sensible", it is "does it add up", across the whole range
+# a drop can land in.
+# ---------------------------------------------------------------------------
+print("\n--- gold drops are paid in coins ---")
+
+ladder = gamedata.gold_denominations()
+check("there is a coin ladder at all", len(ladder) >= 2, str(ladder))
+check("it is ordered biggest first",
+      all(ladder[i][1] > ladder[i + 1][1] for i in range(len(ladder) - 1)),
+      str(ladder))
+check("every step divides evenly into the one above - what makes greedy exact",
+      all(ladder[i][1] % ladder[i + 1][1] == 0 for i in range(len(ladder) - 1)),
+      str(ladder))
+check("the smallest coin is one gold, so any amount is payable exactly",
+      ladder[-1][1] == 1, str(ladder[-1]))
+check("every coin on the ladder is a real item",
+      all(gamedata.has_item(i) for i, _v in ladder),
+      str([i for i, _v in ladder if not gamedata.has_item(i)]))
+check("and lusions are NOT on it - a premium currency is not change",
+      not any(i == "lusions" for i, _v in ladder), str(ladder))
+
+short = []
+for amount in list(range(1, 400)) + [999, 1000, 1001, 4999, 24999, 25000,
+                                     31000, 99999, 100001, 250000]:
+    coins = gamedata.make_change(amount, ladder)
+    if gamedata.change_total(coins, ladder) != amount:
+        short.append((amount, gamedata.change_total(coins, ladder)))
+check("every amount from 1 to 400 and beyond decomposes to EXACTLY itself",
+      not short, str(short[:6]))
+
+coins = gamedata.make_change(31000, ladder)
+check("a big drop pays in big coins, not thirty thousand coppers",
+      all(int(c["quantity"]) < 100 for c in coins), str(coins))
+check("a one-gold drop is a single copper",
+      gamedata.make_change(1, ladder) == [{"item_id": ladder[-1][0], "quantity": 1}],
+      str(gamedata.make_change(1, ladder)))
+check("nothing at all comes out of nothing",
+      gamedata.make_change(0, ladder) == [], "should be empty")
+
+# AND A REAL ROLLED BAG CARRIES THEM. The checks above exercise the function;
+# this one exercises the thing that calls it.
+paid = 0
+mixed = False
+for _try in range(40):
+    bag = gamedata.roll_loot_for("slime") if hasattr(gamedata, "roll_loot_for") else None
+    if bag is None:
+        break
+    got = [c for c in bag if any(c["item_id"] == i for i, _v in ladder)]
+    if got:
+        paid += 1
+        if len(got) > 1:
+            mixed = True
+if paid:
+    check("a rolled bag pays in ladder coins", paid > 0, paid)
+    check("and sometimes in more than one denomination", mixed, "40 rolls")
+
+
+# ---------------------------------------------------------------------------
+# THE JACKPOT DICE
+#
+# The ordinary roll tops out at unit * spread, which at the highest loot tier
+# in the game is a few thousand gold - so the top of the coin ladder was
+# priced, named, drawn and impossible to drop. Five dice now ride on every
+# gold drop and the number of sixes picks a multiplier.
+#
+# TWO THINGS MUST HOLD, and they pull against each other:
+#   - the big coins have to be REACHABLE, or they are decoration
+#   - they have to be reachable ONLY from the top of the game, and only
+#     rarely, or they say nothing about what you beat
+#
+# And the starting area is barred outright: a new player whose third slime
+# pays a gold coin has been handed the first area's economy before meeting it.
+# ---------------------------------------------------------------------------
+print("\n--- the jackpot dice ---")
+
+dice = int(gamedata.CONSTANTS.get("gold_jackpot_dice", 0) or 0)
+table = gamedata.CONSTANTS.get("gold_jackpot_multipliers") or []
+floor = int(gamedata.CONSTANTS.get("gold_jackpot_min_tier", 0) or 0)
+
+check("there are dice to roll", dice > 0, dice)
+check("the multiplier table covers every possible number of sixes",
+      len(table) == dice + 1, "%d dice, %d entries" % (dice, len(table)))
+check("a poor roll multiplies by one, not zero",
+      table and int(table[0]) == 1, str(table))
+check("the table never goes backwards",
+      all(int(table[i]) <= int(table[i + 1]) for i in range(len(table) - 1)),
+      str(table))
+check("all sixes is the best it gets",
+      int(table[-1]) == max(int(t) for t in table), str(table))
+check("and all sixes is genuinely rare - one roll in %d" % (6 ** dice),
+      6 ** dice >= 1000, 6 ** dice)
+
+check("the starting tier is barred", not gamedata.jackpot_allowed(floor - 1))
+check("and the tier above it is not", gamedata.jackpot_allowed(floor))
+check("a missing tier is barred rather than waved through",
+      not gamedata.jackpot_allowed(None))
+
+# NO DICE ARE ROLLED BELOW THE FLOOR, not dice whose result is thrown away.
+# The difference is the random stream: rolling and discarding would shift
+# every subsequent draw, so adding this feature would have silently changed
+# what the starting area drops.
+#
+# CHECKED WITH A DIE THAT COUNTS ITSELF rather than by seeding. gamedata._rng
+# is a SystemRandom, which ignores seed() by design - the obvious version of
+# this test reseeds and compares, and it can never pass no matter how correct
+# the code is. Handing in a die and asking whether it was touched answers the
+# actual question.
+class _CountingDie:
+    def __init__(self, value=1):
+        self.rolls = 0
+        self.value = value
+
+    def randint(self, _low, _high):
+        self.rolls += 1
+        return self.value
+
+
+_die = _CountingDie()
+_barred = [gamedata.roll_gold_jackpot(floor - 1, _die) for _ in range(5)]
+check("a barred tier never touches the dice", _die.rolls == 0, _die.rolls)
+check("and reports no jackpot", all(m == (0, 1) for m in _barred), str(_barred))
+
+_die = _CountingDie()
+gamedata.roll_gold_jackpot(floor, _die)
+check("a permitted tier rolls every die once", _die.rolls == dice, _die.rolls)
+
+# A LOADED DIE PROVES THE TABLE IS REALLY BEING READ.
+_all_sixes = _CountingDie(int(gamedata.CONSTANTS.get("gold_jackpot_faces", 6)))
+_sixes, _mult = gamedata.roll_gold_jackpot(floor, _all_sixes)
+check("all sixes is read as all sixes", _sixes == dice, _sixes)
+check("and pays the top multiplier", _mult == int(table[-1]),
+      "%d, expected %s" % (_mult, table[-1]))
+
+_no_sixes = _CountingDie(1)
+_sixes, _mult = gamedata.roll_gold_jackpot(floor, _no_sixes)
+check("and a cold roll pays nothing extra", _sixes == 0 and _mult == 1,
+      "%d sixes, x%d" % (_sixes, _mult))
+
+# WHAT EACH TIER CAN ACTUALLY PAY. Enough rolls that a 1-in-7776 shows up.
+_order = [i for i, _v in gamedata.gold_denominations()]
+_top_coin = _order[0]
+
+def _best_coin(tier, rolls):
+    enemy = {"max_loot_tier": tier, "slot_fill_chance": 0.0, "max_item_slots": 0}
+    best = len(_order)
+    biggest = 0
+    for _ in range(rolls):
+        bag = gamedata.build_bag_contents(enemy)
+        biggest = max(biggest, gamedata.change_total(bag))
+        for coin in bag:
+            if coin["item_id"] in _order:
+                best = min(best, _order.index(coin["item_id"]))
+    return (_order[best] if best < len(_order) else ""), biggest
+
+_low_coin, _low_max = _best_coin(floor - 1, 60000)
+check("the starting tier never pays a big coin - no jackpot reaches it",
+      _order.index(_low_coin) >= _order.index("silvercoin"),
+      "best was %s (%d gold)" % (_low_coin, _low_max))
+check("and never a platinum coin", _low_coin != _top_coin, _low_coin)
+
+_top_tier = max(int(e.get("max_loot_tier", 0)) for e in gamedata.ENEMIES.values()) \
+    if isinstance(gamedata.ENEMIES, dict) else 6
+_hi_coin, _hi_max = _best_coin(_top_tier, 200000)
+check("the top tier CAN reach the top of the ladder - it is not decoration",
+      _hi_coin == _top_coin, "best was %s (%d gold)" % (_hi_coin, _hi_max))
+
+# AND A JACKPOT STILL MAKES EXACT CHANGE. A multiplier is just a bigger
+# number going into make_change, but "bigger number" is where an off-by-one
+# in the ladder would first show.
+_short = []
+for _mult in table:
+    for _base in (1, 7, 49, 137, 1370, 2975):
+        _amount = _base * int(_mult)
+        _coins = gamedata.make_change(_amount)
+        if gamedata.change_total(_coins) != _amount:
+            _short.append((_amount, gamedata.change_total(_coins)))
+check("every multiplied amount still decomposes exactly", not _short, str(_short[:4]))
+
+
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))
 if failures:

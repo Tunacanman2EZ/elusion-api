@@ -15,17 +15,44 @@ import os
 import re
 import sys
 import threading
+import math
+import smtplib
+import hashlib
+import io
+import ipaddress
+import socket
+import urllib.error
+import urllib.parse
+import urllib.request
+from email.message import EmailMessage
 from functools import wraps
+
+# PILLOW IS OPTIONAL AND THE SERVER STARTS WITHOUT IT. It is needed only to
+# relay pictures into chat; everything else works untouched. An install that
+# has not run `pip install Pillow` gets a clear refusal on that one route
+# rather than a server that will not boot.
+try:
+    from PIL import Image, ImageSequence
+    PILLOW_AVAILABLE = True
+except ImportError:
+    Image = None
+    ImageSequence = None
+    PILLOW_AVAILABLE = False
 
 app = Flask(__name__)
 
 # HARD BODY-SIZE CAP. A save can carry ~64 KB per explored area (see
-# MAX_EXPLORED_BYTES), so 4 MiB sits far above any legitimate request while
+# MAX_EXPLORED_BYTES), so this sits far above any legitimate request while
 # still refusing the multi-megabyte bodies whose only purpose is to exhaust
 # memory before the JSON is even parsed. Werkzeug returns a clean 413 on its
-# own once this is set - no handler ever sees an oversized body. Raise it if a
-# real save ever legitimately approaches the cap.
-app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024
+# own once this is set - no handler ever sees an oversized body.
+#
+# DELIBERATELY ONE MEGABYTE ABOVE IMAGE_MAX_BYTES. Pictures are the only thing
+# here that is legitimately large, and a request just over the picture limit
+# should be refused BY THE PICTURE ROUTE, in its own words, naming the real
+# number - not by Werkzeug, which cuts the connection before any handler runs
+# and can only say "too large". The headroom is what buys that sentence.
+app.config["MAX_CONTENT_LENGTH"] = 9 * 1024 * 1024
 
 app.config["SWAGGER"] = {
     "title": "Elusion RPG API",
@@ -608,6 +635,20 @@ def _security_headers(resp):
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
     resp.headers.setdefault("X-Frame-Options", "DENY")
     return resp
+
+
+@app.errorhandler(413)
+def _handle_too_large(_exc):
+    # WERKZEUG'S OWN 413 IS AN HTML PAGE, and the game parses JSON. Before
+    # pictures this never came up - every other body here is a few hundred
+    # bytes of JSON - but a player dragging a phone photo into chat will hit
+    # it, and "Parse JSON failed" is a useless thing to show them. The number
+    # is stated because the only useful thing to say is how much too big.
+    return {
+        "error": "Payload Too Large",
+        "message": "That file is bigger than %d MB." % (
+            app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024)),
+    }, 413
 
 
 @app.errorhandler(Exception)
@@ -1217,6 +1258,28 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_gold_ledger_reason
             ON gold_ledger(reason, at);
 
+        -- THE TWO THE KINGDOM BOARD READS, AND THEY ARE PARTIAL ON PURPOSE.
+        --
+        -- The board only ever asks about gold that was DESTROYED, so every one
+        -- of its queries carries `WHERE delta < 0`. The two indexes above are
+        -- ordered by `at`, which none of those queries want, so each one was
+        -- reading the whole table.
+        --
+        -- `WHERE delta < 0` on the index itself keeps the positive rows out of
+        -- it entirely - and the positive rows are the majority, because most
+        -- ledger events are loot being minted. `(user_id, delta)` and
+        -- `(reason, delta)` then COVER the queries: SQLite answers them from
+        -- the index pages without touching the table at all.
+        --
+        -- MEASURED, NOT ASSUMED. On 500 players and two million rows, the
+        -- board's remaining two queries went from 229ms and 484ms to 70ms and
+        -- 66ms. The indexes cost about 29 MB at that size and roughly a second
+        -- to build once.
+        CREATE INDEX IF NOT EXISTS idx_gold_ledger_spent_user
+            ON gold_ledger(user_id, delta) WHERE delta < 0;
+        CREATE INDEX IF NOT EXISTS idx_gold_ledger_spent_reason
+            ON gold_ledger(reason, delta) WHERE delta < 0;
+
         -- A TRADE IN PROGRESS. Two characters, what each is putting up, and
         -- whether each has said yes to what the other is showing.
         --
@@ -1268,6 +1331,285 @@ def init_db():
             FOREIGN KEY (trade_id) REFERENCES trades(trade_id) ON DELETE CASCADE
         );
 
+        -- SERVER-WIDE SETTINGS THAT OUTLIVE A RESTART.
+        --
+        -- WHY A TABLE AND NOT A CONSTANT: the maintenance switch is thrown
+        -- from the owner's HUD while the server is running. A constant would
+        -- need a file edit and a redeploy, which is precisely what you cannot
+        -- do when the reason you are closing the server is that you are about
+        -- to redeploy it. It also has to survive the restart it announces -
+        -- a switch that forgets itself on boot reopens the server in the
+        -- middle of the update it was closed for.
+        --
+        -- KEY-VALUE rather than a column per setting, because the alternative
+        -- is a migration every time the owner needs one more switch.
+        CREATE TABLE IF NOT EXISTS server_settings (
+            key        TEXT    PRIMARY KEY,
+            value      TEXT    NOT NULL,
+            updated_by TEXT    NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL DEFAULT 0
+        );
+
+        -- WHAT THE SERVER SAYS TO EVERYONE.
+        --
+        -- Not a chat table. There is deliberately no player-to-player message
+        -- here yet: this is the SERVER talking, so there is no moderation
+        -- surface, no mute, no flood to police. Player chat can grow out of it
+        -- later by adding an author and a gate; nothing here forecloses that.
+        --
+        -- WHY AN AUTOINCREMENT id AND NOT A TIMESTAMP CURSOR. Clients poll with
+        -- "give me everything after N". Two broadcasts posted in the same second
+        -- share a created_at, so a timestamp cursor either repeats one or drops
+        -- one. A monotonic id cannot do either.
+        CREATE TABLE IF NOT EXISTS broadcasts (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind       TEXT    NOT NULL DEFAULT 'system',
+            body       TEXT    NOT NULL,
+            created_by TEXT    NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_broadcasts_id ON broadcasts(id);
+
+        -- WHAT THE PLAYERS SAY TO EACH OTHER.
+        --
+        -- The sibling the broadcasts comment above predicted. It is a separate
+        -- table rather than an author column on broadcasts because the two are
+        -- not the same kind of thing: a broadcast is the server speaking and
+        -- can never be wrong, while this is a public surface that needs a
+        -- length cap, a flood bucket and a way for a mod to take a line back
+        -- down. Keeping them apart also keeps the kill switch's notice out of
+        -- reach of anything a player can do to the chat table.
+        --
+        -- USERNAME AND ROLE ARE COPIED IN, not joined. A message is a record of
+        -- what was said and who said it AT THAT MOMENT: promoting someone to
+        -- dev should not retroactively re-badge every line they have ever
+        -- written, and renaming an account should not rewrite its history. It
+        -- also keeps the hottest poll in the game off a join.
+        --
+        -- Same AUTOINCREMENT cursor as broadcasts, for the same reason.
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER NOT NULL,
+            username   TEXT    NOT NULL,
+            role       TEXT    NOT NULL DEFAULT 'player',
+            body       TEXT    NOT NULL,
+            created_at INTEGER NOT NULL,
+            -- WHICH CONVERSATION THIS LINE BELONGS TO.
+            --
+            -- ONE TABLE, NOT ONE PER CHANNEL. Every channel wants the same
+            -- columns, the same flood bucket, the same "take that line down"
+            -- and the same cursor; four tables would be four copies of all of
+            -- it, and the fourth would be the one that forgot the moderation.
+            --
+            -- target_id IS READ DIFFERENTLY PER CHANNEL, which is the only
+            -- awkward part of that choice and is worth the trade:
+            --   world     unused, 0
+            --   private   the account this was said TO
+            --   friends   unused, 0 - the audience is the author's friend list
+            --   guild     the guild, once guilds exist
+            channel    TEXT    NOT NULL DEFAULT 'world',
+            target_id  INTEGER NOT NULL DEFAULT 0,
+            -- A RELAYED PICTURE, by id into chat_images. Empty for a line that
+            -- is only words, which is nearly all of them.
+            image_id   TEXT    NOT NULL DEFAULT '',
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_chat_id ON chat_messages(id);
+
+        -- Every read is "this channel, after this id", and for a private
+        -- conversation it is also "between these two accounts".
+        CREATE INDEX IF NOT EXISTS idx_chat_channel ON chat_messages(channel, id);
+        CREATE INDEX IF NOT EXISTS idx_chat_private
+            ON chat_messages(channel, user_id, target_id, id);
+
+        -- PICTURES, FETCHED BY THE SERVER AND RE-SERVED BY IT.
+        --
+        -- WHY THE SERVER HOLDS THE BYTES instead of clients loading the URL a
+        -- player pasted. A link in a chat window is a fetch every client in
+        -- the channel performs on command: whoever posted it learns the IP of
+        -- everyone who saw it, and can change what is behind the link after
+        -- it has been moderated. Relaying costs one fetch, by the server,
+        -- once - and what players receive is a picture this server has
+        -- already decoded and knows is a picture.
+        --
+        -- KEYED BY THE HASH OF THE BYTES, so the same image posted twice is
+        -- stored once and the id is not guessable from the URL.
+        --
+        -- ANIMATION IS FLATTENED TO A SPRITESHEET on the way in. Godot has no
+        -- GIF decoder; it does have AnimatedTexture and has been drawing
+        -- spritesheets since the first enemy. Decoding where Pillow already
+        -- lives and shipping the client something it can already play is the
+        -- difference between animated pictures working and not.
+        CREATE TABLE IF NOT EXISTS chat_images (
+            id         TEXT    PRIMARY KEY,
+            kind       TEXT    NOT NULL DEFAULT 'still',
+            width      INTEGER NOT NULL,
+            height     INTEGER NOT NULL,
+            frames     INTEGER NOT NULL DEFAULT 1,
+            columns    INTEGER NOT NULL DEFAULT 1,
+            frame_ms   INTEGER NOT NULL DEFAULT 0,
+            bytes      INTEGER NOT NULL,
+            source     TEXT    NOT NULL DEFAULT '',
+            created_by TEXT    NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            format     TEXT    NOT NULL DEFAULT 'png',
+            data       BLOB    NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_chat_images_age
+            ON chat_images(created_at);
+
+        -- WHO KNOWS WHO.
+        --
+        -- ONE ROW PER PAIR, and the key is directional on purpose: which way
+        -- round it is stored is the record of who asked. A friendship is an
+        -- accepted row read from either side, so the answer to "are we
+        -- friends" is one lookup in each direction and never two rows that can
+        -- disagree with each other.
+        --
+        -- WHY 'pending' IS A STATE AND NOT A SEPARATE TABLE. A request and a
+        -- friendship are the same relationship at two moments in its life.
+        -- Split across two tables, accepting means a delete and an insert that
+        -- have to succeed together, and the pair can exist in both at once.
+        --
+        -- A DECLINE DELETES THE ROW rather than recording a refusal. Storing
+        -- 'declined' would be a list of everyone who ever said no to you, kept
+        -- on the server, readable by whoever eventually breaks in - and it
+        -- would have to expire anyway, because a no today is not a no forever.
+        -- Re-asking is instead policed by MAX_PENDING_SENT.
+        CREATE TABLE IF NOT EXISTS friends (
+            requester_id INTEGER NOT NULL,
+            addressee_id INTEGER NOT NULL,
+            state        TEXT    NOT NULL DEFAULT 'pending'
+                         CHECK (state IN ('pending', 'accepted')),
+            created_at   INTEGER NOT NULL,
+            decided_at   INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (requester_id, addressee_id),
+            FOREIGN KEY (requester_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (addressee_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        -- Both directions are queried on every /api/friends call, and the
+        -- primary key only covers one of them.
+        CREATE INDEX IF NOT EXISTS idx_friends_addressee
+            ON friends(addressee_id, state);
+        CREATE INDEX IF NOT EXISTS idx_friends_requester
+            ON friends(requester_id, state);
+
+        -- A GUILD, AND WHO IS IN IT.
+        --
+        -- THREE TABLES, AND THE SHAPE IS THE RULE. guild_members has user_id
+        -- as its PRIMARY KEY, which is not a detail - it is how "one guild per
+        -- player" is enforced. Expressed as a column with a uniqueness check
+        -- in Python instead, the second guild somebody joined would depend on
+        -- two requests not overlapping, and they eventually do.
+        --
+        -- `folded` is the name lowercased, with its own unique index, so
+        -- "The Crowned" and "the crowned" cannot both exist. The display name
+        -- keeps whatever capitals the founder typed.
+        CREATE TABLE IF NOT EXISTS guilds (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            name       TEXT    NOT NULL,
+            folded     TEXT    NOT NULL,
+            founded_by TEXT    NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_guilds_folded
+            ON guilds(folded);
+
+        CREATE TABLE IF NOT EXISTS guild_members (
+            user_id   INTEGER PRIMARY KEY,
+            guild_id  INTEGER NOT NULL,
+            rank      TEXT    NOT NULL DEFAULT 'member'
+                      CHECK (rank IN ('leader', 'officer', 'member')),
+            joined_at INTEGER NOT NULL,
+            FOREIGN KEY (user_id)  REFERENCES users(id)  ON DELETE CASCADE,
+            FOREIGN KEY (guild_id) REFERENCES guilds(id) ON DELETE CASCADE
+        );
+
+        -- The roster read is "everyone in guild N", which the primary key on
+        -- user_id does not answer.
+        CREATE INDEX IF NOT EXISTS idx_guild_members_guild
+            ON guild_members(guild_id, rank);
+
+        -- AN INVITATION WAITING FOR AN ANSWER, exactly like a friend request
+        -- and for the same reason: being put in a guild without being asked
+        -- means being given a rank, a chat channel and a name beside yours
+        -- that somebody else chose.
+        CREATE TABLE IF NOT EXISTS guild_invites (
+            guild_id   INTEGER NOT NULL,
+            user_id    INTEGER NOT NULL,
+            invited_by TEXT    NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, user_id),
+            FOREIGN KEY (guild_id) REFERENCES guilds(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id)  REFERENCES users(id)  ON DELETE CASCADE
+        );
+
+        -- "What have I been invited to" is the common read, and the primary
+        -- key leads with guild_id.
+        CREATE INDEX IF NOT EXISTS idx_guild_invites_user
+            ON guild_invites(user_id);
+
+        -- A MOVE WAITING TO BE COLLECTED.
+        --
+        -- ONE PER PLAYER, enforced by the primary key: issuing a second
+        -- teleport replaces the first rather than queueing behind it. Two
+        -- pending destinations for one player is a question with no good
+        -- answer.
+        --
+        -- WHY IT IS A QUEUE AND NOT A PUSH. The server has no socket to the
+        -- game; the client asks. So a teleport is recorded here and collected
+        -- on the next poll, which also means it survives the player being
+        -- offline at the moment it was issued - they arrive where they were
+        -- sent, whenever they next turn up.
+        --
+        -- slot_index and group_size are how the spacing is agreed. Every
+        -- client computes the same offset from the same pair, so a group
+        -- teleport lands as a ring and not a pile.
+        CREATE TABLE IF NOT EXISTS pending_teleports (
+            id         INTEGER NOT NULL,
+            user_id    INTEGER PRIMARY KEY,
+            area       TEXT    NOT NULL,
+            x          REAL    NOT NULL DEFAULT 0,
+            y          REAL    NOT NULL DEFAULT 0,
+            slot_index INTEGER NOT NULL DEFAULT 0,
+            group_size INTEGER NOT NULL DEFAULT 1,
+            issued_by  TEXT    NOT NULL DEFAULT '',
+            issued_at  INTEGER NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        -- SHORT-LIVED CODES EMAILED TO A PLAYER.
+        --
+        -- ONE LIVE CODE PER (ACCOUNT, PURPOSE), enforced by the primary key:
+        -- asking for a new code REPLACES the old one rather than adding a
+        -- second. Two valid codes at once doubles the guessing surface and
+        -- means revoking one leaves the other working.
+        --
+        -- code_hash, NOT code. A six digit code is a password with a fifteen
+        -- minute life, and it is stored the same way one is - scrypt, via
+        -- generate_password_hash. A database that leaks must not hand over
+        -- working reset codes along with everything else.
+        --
+        -- attempts is what makes six digits safe. A million possibilities is
+        -- nothing to a script, so the code burns after RESET_MAX_ATTEMPTS
+        -- wrong guesses; the ceiling, not the length, is the defence.
+        CREATE TABLE IF NOT EXISTS auth_codes (
+            user_id    INTEGER NOT NULL,
+            purpose    TEXT    NOT NULL,
+            code_hash  TEXT    NOT NULL,
+            target     TEXT    NOT NULL DEFAULT '',
+            expires_at INTEGER NOT NULL,
+            attempts   INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (user_id, purpose),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
         -- DB-LEVEL FLOOR ON CARRIED GOLD. accounts.bank_gold already carries
         -- CHECK (bank_gold >= 0); saves.gold did not - an asymmetry that let a
         -- bug, or any path that bypasses gold_delta, write a negative purse, and
@@ -1306,6 +1648,19 @@ def init_db():
     # /api/skill/train. 0 means never, which the endpoint reads as "clamp the
     # first report to the elapsed budget" rather than handing it the whole 1970.
     _migrate_add_column(db, "saves", "last_train_at", "INTEGER NOT NULL DEFAULT 0")
+
+    # THE RECOVERY ADDRESS. Added by migration, not only in CREATE TABLE,
+    # because elusion.db already holds real accounts - a column that appears
+    # only for new databases is how the two halves of this project drift apart.
+    #
+    # Empty string rather than NULL so every comparison in this file can stay a
+    # plain `=` and no caller has to remember which of the two "no email" is.
+    _migrate_add_column(db, "users", "email", "TEXT NOT NULL DEFAULT ''")
+
+    # AN UNVERIFIED ADDRESS IS NOT A RECOVERY ADDRESS. Someone who typos their
+    # email at signup would otherwise have handed their account to whoever owns
+    # the address they actually typed. Only a 1 here can receive a reset code.
+    _migrate_add_column(db, "users", "email_verified", "INTEGER NOT NULL DEFAULT 0")
 
     # WHAT DEATH HAS COST THIS ACCOUNT, cumulatively, and the only number in
     # the game that is supposed to go up when you lose.
@@ -1363,6 +1718,57 @@ def init_db():
     # reads as offline until their client's next heartbeat - the truthful
     # default for a row nobody has vouched for yet.
     _migrate_add_column(db, "sessions", "last_seen_at", "INTEGER NOT NULL DEFAULT 0")
+
+    # THE CHAT FLOOD BUCKET, on the account rather than on a character.
+    #
+    # Deliberately NOT sharing the kill or cast buckets: those are per-character
+    # and per-activity for the reason written above them, and a player who has
+    # been fighting hard should not arrive in chat already throttled. Starting
+    # full means a returning account can say hello immediately; the bucket only
+    # ever matters to someone sending faster than CHAT_TOKENS_PER_SECOND.
+    _migrate_add_column(db, "users", "last_chat_at", "INTEGER NOT NULL DEFAULT 0")
+    _migrate_add_column(db, "users", "chat_tokens", "REAL NOT NULL DEFAULT 8.0")
+
+    # CHANNELS. World chat shipped before there was more than one channel, so
+    # every line already in the table was said in the world one - which is
+    # exactly what the default says, so the existing history stays readable
+    # rather than becoming a pile of messages belonging to nowhere.
+    _migrate_add_column(db, "chat_messages", "channel", "TEXT NOT NULL DEFAULT 'world'")
+    _migrate_add_column(db, "chat_messages", "target_id", "INTEGER NOT NULL DEFAULT 0")
+    _migrate_add_column(db, "chat_messages", "image_id", "TEXT NOT NULL DEFAULT ''")
+
+    # DEFAULTS TO png, WHICH IS WHAT EVERY EXISTING ROW REALLY IS. Stills are
+    # now kept as WebP when WebP is smaller, and it usually is by a lot - a
+    # photograph that arrives as 265 KB was being stored and re-served as a
+    # 1.7 MB PNG, which every single person in the channel then downloaded.
+    _migrate_add_column(db, "chat_images", "format", "TEXT NOT NULL DEFAULT 'png'")
+
+    # SEPARATE FROM last_image_at, which every upload stamps whatever channel
+    # it ends up in. This one only moves when a picture actually reaches world
+    # chat, so whispering a picture to a friend does not spend the half hour.
+    _migrate_add_column(db, "users", "last_world_image_at", "INTEGER NOT NULL DEFAULT 0")
+
+    # HOW MANY TIMES THIS ACCOUNT HAS DIED.
+    #
+    # A COUNTER, NOT A TABLE OF EVENTS, and that is a deliberate departure from
+    # how this project records everything else. Gold has a ledger because gold
+    # must be conservable - you have to be able to re-derive every balance from
+    # the rows and catch a mint that went around the rules. A death conserves
+    # nothing: there is no invariant it could violate, nobody can forge one
+    # into existence for profit, and the only question anybody asks is "how
+    # many". A row per death would be a table growing forever to answer a
+    # question one integer answers.
+    #
+    # ON users, NOT ON saves. It is an account's lifetime figure, so deleting
+    # a character cannot reset it - which it could if the count lived with the
+    # character that earned it.
+    _migrate_add_column(db, "users", "deaths", "INTEGER NOT NULL DEFAULT 0")
+
+    # RELAYING A PICTURE IS NOT SENDING A MESSAGE. It costs the server an
+    # outbound fetch of up to IMAGE_MAX_BYTES and a decode, so it gets a
+    # cooldown of its own rather than riding the chat bucket - eight messages
+    # in a burst is a conversation, eight four-megabyte fetches is not.
+    _migrate_add_column(db, "users", "last_image_at", "INTEGER NOT NULL DEFAULT 0")
 
     # LOGIN THROTTLE state. failed_logins counts consecutive misses; lockout_until
     # is a unix time before which login is refused. Both default 0 so every
@@ -1802,6 +2208,7 @@ def user_for_token(token):
         """
         SELECT u.id, u.username, u.role,
                u.is_banned, u.ban_expires_at, u.ban_reason, u.banned_by, u.banned_at,
+               u.email_verified,
                s.expires_at
         FROM sessions s
         JOIN users u ON u.id = s.user_id
@@ -2422,6 +2829,1234 @@ def _moderation_target(payload):
     return target, None
 
 
+# =============================================================================
+# MAINTENANCE - THE OWNER'S KILL SWITCH
+# =============================================================================
+#
+# Closing the server is TWO events, not one, and the gap between them is the
+# whole design:
+#
+#   1. THE DOOR SHUTS. New logins are refused immediately with a message the
+#      player can read. Nobody new arrives.
+#   2. THE ROOM EMPTIES. Players already in the world keep their session for a
+#      grace window, then are signed out on their next request.
+#
+# WHY THE GAP EXISTS: the client is still the thing that knows what just
+# happened to a character. characterdata.gd debounces its writes, so at any
+# instant there is up to a couple of seconds of real progress - gold picked up,
+# xp earned - that the server has not been told about yet. Deleting sessions
+# the moment the switch is thrown throws that away, and the player experiences
+# it as "the update ate my loot".
+#
+# So the grace window is not politeness, it is correctness: it is the time the
+# client uses to flush. GET /api/auth/session is the heartbeat, it runs more
+# often than ONLINE_WINDOW_SECONDS, and it now carries the maintenance notice -
+# so every client that is actually playing learns the server is closing and
+# saves, well before its session is taken away.
+#
+# THE OWNER IS NEVER LOCKED OUT BY THEIR OWN SWITCH. Someone has to be able to
+# get in and turn it off; if that someone could be shut out, the only remaining
+# fix would be a shell on the server.
+
+MAINTENANCE_KEY = "maintenance"
+
+MAINTENANCE_DEFAULT_MESSAGE = "Update in progress - please come back later."
+
+# Long enough that every client actually in the world gets at least one
+# heartbeat inside the window, which is what makes "everyone saved" true rather
+# than hopeful. ONLINE_WINDOW_SECONDS is the yardstick for "is anyone there".
+MAINTENANCE_DEFAULT_GRACE_SECONDS = 60
+
+# A grace window is a promise to wait, and an hour is the longest promise this
+# endpoint will make. Past that the owner wants a scheduled restart, not a
+# switch someone will forget is on.
+MAINTENANCE_MAX_GRACE_SECONDS = 3600
+
+MAINTENANCE_OFF = {
+    "on": False, "message": "", "back_at": None, "kick_at": 0, "by": "", "at": 0,
+}
+
+
+def get_server_setting(key, default=None):
+    """Read one setting, tolerating a database that predates the table."""
+    try:
+        row = get_db().execute(
+            "SELECT value FROM server_settings WHERE key = ?", (key,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        # A server that cannot read the switch must behave as though it is OFF.
+        # FAILING OPEN IS DELIBERATE HERE and it is the opposite of the usual
+        # rule: failing closed would mean a missing table locks every player
+        # out of a perfectly healthy server, which is a self-inflicted outage.
+        return default
+    return default if row is None else row["value"]
+
+
+def set_server_setting(key, value, by=""):
+    """Write one setting. Caller commits - this runs inside their transaction."""
+    get_db().execute(
+        """
+        INSERT INTO server_settings (key, value, updated_by, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+            value      = excluded.value,
+            updated_by = excluded.updated_by,
+            updated_at = excluded.updated_at
+        """,
+        (key, value, by, int(time.time())),
+    )
+
+
+def maintenance_state():
+    """
+    The switch, normalised. Always returns the full shape, so no caller has to
+    guess whether a key is missing - anything unreadable reads as OFF.
+    """
+    raw = get_server_setting(MAINTENANCE_KEY)
+    if not raw:
+        return dict(MAINTENANCE_OFF)
+    try:
+        stored = json.loads(raw)
+    except (ValueError, TypeError):
+        return dict(MAINTENANCE_OFF)
+    if not isinstance(stored, dict) or not stored.get("on"):
+        return dict(MAINTENANCE_OFF)
+    state = dict(MAINTENANCE_OFF)
+    state.update({
+        "on": True,
+        "message": str(stored.get("message") or MAINTENANCE_DEFAULT_MESSAGE),
+        "back_at": stored.get("back_at"),
+        "kick_at": int(stored.get("kick_at") or 0),
+        "by": str(stored.get("by") or ""),
+        "at": int(stored.get("at") or 0),
+    })
+    return state
+
+
+def maintenance_seconds_left(state=None):
+    """Seconds until sessions start ending. 0 once the grace window is spent."""
+    if state is None:
+        state = maintenance_state()
+    if not state["on"]:
+        return 0
+    return max(0, int(state["kick_at"]) - int(time.time()))
+
+
+def maintenance_public(state=None):
+    """What a client is told. None when the server is open."""
+    if state is None:
+        state = maintenance_state()
+    if not state["on"]:
+        return None
+    return {
+        "on": True,
+        "message": state["message"],
+        "back_at": state["back_at"],
+        "seconds_left": maintenance_seconds_left(state),
+    }
+
+
+def maintenance_refusal(username):
+    """
+    The front door. Returns a 503 response tuple while the server is closed, or
+    None to let this login through.
+
+    503 AND NOT 403: the credentials were never the problem, and a client that
+    reads this as "wrong password" would send the player to reset one.
+    """
+    state = maintenance_state()
+    if not state["on"] or is_owner(username):
+        return None
+    return {
+        "error": "Service Unavailable",
+        "message": state["message"],
+        "maintenance": True,
+        "back_at": state["back_at"],
+    }, 503
+
+
+def maintenance_disconnect(user):
+    """
+    The room emptying. Returns a 401 response tuple once this session's grace
+    window is spent, or None to let the request through.
+
+    INSIDE THE WINDOW EVERY REQUEST PASSES, and that is the point - the save
+    the client is racing to flush goes through this same decorator. A gate that
+    refused writes during the grace window would guarantee the data loss the
+    window exists to prevent.
+
+    401, so it lands in the client's existing kicked-or-banned path: the
+    heartbeat reads it as a revoked session and returns the player to the login
+    screen, where /api/status explains why.
+    """
+    state = maintenance_state()
+    if not state["on"] or is_owner(user["username"]):
+        return None
+    if int(time.time()) < int(state["kick_at"]):
+        return None
+
+    db = get_db()
+    db.execute("DELETE FROM sessions WHERE token = ?", (bearer_token(),))
+    db.commit()
+    return {
+        "error": "Unauthorized",
+        "message": state["message"],
+        "maintenance": True,
+    }, 401
+
+
+def _end_all_player_sessions(db):
+    """
+    Sign out everyone but the owner. Only used when the switch is thrown with
+    no grace window at all, which means the caller has accepted the loss.
+    """
+    owner_row = _user_by_name(OWNER_USERNAME) if OWNER_USERNAME else None
+    owner_id = owner_row["id"] if owner_row is not None else -1
+    cursor = db.execute("DELETE FROM sessions WHERE user_id != ?", (owner_id,))
+    return max(0, int(cursor.rowcount or 0))
+
+
+# =============================================================================
+# BROADCASTS - THE SERVER'S VOICE
+# =============================================================================
+#
+# One-way announcements from the server to everyone playing. This exists now,
+# ahead of any player chat, because the kill switch needed it: a server that
+# closes in sixty seconds has to be able to SAY SO to the people in the world,
+# and until this there was no channel that could reach them at all.
+#
+# NOT THE CHAT SYSTEM. That is the section below, and it ended up a separate
+# table rather than an author column here, for the reasons written over
+# chat_messages in init_db(). What this still is, and what chat must never
+# become, is the one channel that cannot be flooded, muted or argued with:
+# nobody but the owner can post to it, so a restart notice always lands.
+
+# Long enough for a real notice, short enough that it cannot be used to push
+# anything else off a player's screen.
+MAX_BROADCAST_LENGTH = 200
+
+# Announcements are ephemeral by nature - a restart notice from last Tuesday
+# helps nobody. Pruned on write so the table cannot grow without bound and no
+# separate cleanup job has to exist.
+BROADCAST_RETENTION_SECONDS = 7 * 24 * 60 * 60
+
+# The most a single poll will return, so a client that has been away for a week
+# cannot ask for the entire table in one response.
+BROADCAST_PAGE_LIMIT = 50
+
+
+def post_broadcast(body, kind="system", by=""):
+    """
+    Record one announcement. Caller commits - this runs inside their
+    transaction, so the kill switch's notice cannot land without the switch
+    itself also landing.
+    """
+    text = str(body or "").strip()[:MAX_BROADCAST_LENGTH]
+    if text == "":
+        return None
+
+    db = get_db()
+    now = int(time.time())
+    cursor = db.execute(
+        "INSERT INTO broadcasts (kind, body, created_by, created_at) VALUES (?, ?, ?, ?)",
+        (str(kind or "system")[:24], text, str(by or "")[:64], now),
+    )
+    db.execute(
+        "DELETE FROM broadcasts WHERE created_at < ?",
+        (now - BROADCAST_RETENTION_SECONDS,),
+    )
+    return cursor.lastrowid
+
+
+# =============================================================================
+# WORLD CHAT - WHAT THE PLAYERS SAY
+# =============================================================================
+#
+# One public channel that everybody logged in can read and write. The three
+# things that make chat expensive - a length cap, a flood limit, and a way to
+# take a line back down - are all here, because a chat channel without them is
+# a megaphone handed to whoever types fastest.
+#
+# THE CLIENT POLLS IT exactly the way it polls broadcasts, with the same
+# "everything after id N" cursor, so the two feeds merge into one window on the
+# client without either one having to know about the other.
+
+
+# The same 200 as a broadcast. Long enough for a sentence, short enough that no
+# single message can push everything else off a player's screen.
+MAX_CHAT_LENGTH = 200
+
+# A day. Chat is a conversation, not a record: scrollback from last Tuesday is
+# of no use to anyone reading now, and keeping it is keeping a transcript of
+# everything every player has ever said. Pruned on write, like broadcasts.
+CHAT_RETENTION_SECONDS = 24 * 60 * 60
+
+# The most one poll returns. A client that has been away all day gets the tail
+# of the conversation, not the whole day of it.
+CHAT_PAGE_LIMIT = 50
+
+# THE FLOOD BUCKET. Eight messages in hand, refilling at one every two seconds.
+#
+# The burst matters as much as the rate: a real person answering three people
+# at once types three lines in a few seconds and must not be throttled for it,
+# while a script holding the channel open needs a sustained rate, and half a
+# message per second is not one. See _spend_chat_token().
+CHAT_BUCKET_CAPACITY = 8.0
+CHAT_TOKENS_PER_SECOND = 0.5
+
+
+def _spend_chat_token(user_id):
+    """
+    Take one token from this account's chat bucket, refilling it first.
+
+    Returns None when the message may go ahead, or a response tuple when it may
+    not. The caller commits; on the refusal path there is nothing to commit.
+    """
+    db = get_db()
+    row = db.execute(
+        "SELECT last_chat_at, chat_tokens FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    if row is None:
+        # The token authenticated against a row that has since been deleted.
+        return {"error": "Unauthorized", "message": "No such account."}, 401
+
+    now_ms = int(time.time() * 1000)
+
+    # Refill first, then spend - same shape as the kill bucket, including the
+    # min() that stops a never-used account arriving with decades of credit.
+    elapsed_seconds = max(now_ms - int(row["last_chat_at"] or 0), 0) / 1000.0
+    tokens = min(
+        CHAT_BUCKET_CAPACITY,
+        float(row["chat_tokens"]) + elapsed_seconds * CHAT_TOKENS_PER_SECOND,
+    )
+
+    if tokens < 1.0:
+        # 429 and a Retry-After, not a 400: nothing is wrong with the message,
+        # it simply arrived too soon, and an honest client can wait and resend.
+        wait = int((1.0 - tokens) / CHAT_TOKENS_PER_SECOND) + 1
+        return (
+            {
+                "error": "Too Many Requests",
+                "message": "Messages are arriving faster than one every %g seconds."
+                           % (1.0 / CHAT_TOKENS_PER_SECOND),
+            },
+            429,
+            {"Retry-After": str(wait)},
+        )
+
+    db.execute(
+        "UPDATE users SET chat_tokens = ?, last_chat_at = ? WHERE id = ?",
+        (tokens - 1.0, now_ms, user_id),
+    )
+    return None
+
+
+def post_chat(user_row, body, channel="world", target_id=0, image_id=""):
+    """
+    Record one player message. Caller commits, like post_broadcast().
+
+    Returns the new row id, or None when there was nothing to say - which now
+    means neither words NOR a picture, because a picture on its own is a
+    perfectly good message.
+    """
+    text = str(body or "").strip()[:MAX_CHAT_LENGTH]
+    if text == "" and not image_id:
+        return None
+
+    db = get_db()
+    now = int(time.time())
+    cursor = db.execute(
+        "INSERT INTO chat_messages"
+        " (user_id, username, role, body, created_at, channel, target_id, image_id)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (int(user_row["id"]), user_row["username"], role_for(user_row), text, now,
+         channel, int(target_id or 0), str(image_id or "")),
+    )
+    _prune_chat(db, channel)
+    return cursor.lastrowid
+
+
+def chat_message_dict(row):
+    """One row as the client reads it. Same field names as a broadcast."""
+    keys = row.keys()
+    return {
+        "id": int(row["id"]),
+        "by": row["username"],
+        "role": row["role"],
+        "body": row["body"],
+        "at": int(row["created_at"]),
+        "channel": row["channel"] if "channel" in keys else "world",
+        # Empty for a line that is only words, which is nearly all of them.
+        "image": row["image_id"] if "image_id" in keys else "",
+    }
+
+
+# =============================================================================
+# CHANNELS
+# =============================================================================
+#
+# FOUR NAMES, ONE TABLE. What separates them is who may write to a channel and
+# who may read it back, and those two questions are answered in exactly two
+# places - chat_write_check() and the SELECT in read_chat(). Nothing else in
+# the chat code knows there is more than one channel.
+
+# =============================================================================
+# GUILDS
+# =============================================================================
+# A guild is a name, a roster and a chat channel. What it is NOT, deliberately,
+# is a second place a player's identity lives: the users table still decides
+# who you are and what rank you hold on the server, and guild rank is a
+# separate ladder that means nothing outside the guild.
+#
+# ONE GUILD PER PLAYER, enforced by guild_members' primary key rather than by
+# a check in a route - see the note over the table.
+#
+# INVITED AND ACCEPTED, never simply added. Same argument as the friends list:
+# joining a guild attaches somebody's chosen name to yours and puts you in a
+# channel, and doing that without being asked is not a thing to make easy.
+
+# 3 to 24 characters, starting with a letter or a number. Spaces, apostrophes
+# and hyphens are allowed inside so real names work - "The Crowned", "Dave's
+# Lads" - and nothing else is, so a guild name cannot carry BBCode into a chat
+# line or look like another player's username.
+GUILD_NAME_PATTERN = r"[A-Za-z0-9][A-Za-z0-9 '\-]{2,23}"
+MAX_GUILD_NAME = 24
+
+# FIFTY, which is a number to revisit once there are guilds to watch. The read
+# that matters - the roster - is one indexed query and returns every member, so
+# this is really a cap on how big that answer gets.
+MAX_GUILD_MEMBERS = 50
+
+# How many invitations a guild may have outstanding. Without a cap, inviting
+# every account on the server is one loop.
+MAX_GUILD_INVITES = 40
+
+# WHAT IT COSTS TO FOUND ONE, and it is DESTROYED rather than paid to anybody
+# - the same sink the Kingdom Tax is, and it lands in the same ledger so the
+# supply invariant still holds. The point is not the gold: it is that thirty
+# empty guilds squatting good names should cost something.
+GUILD_FOUND_COST = 5000
+
+# Lowest first. Used by guild_rank_at_least(), and the order is the meaning.
+GUILD_RANKS = ("member", "officer", "leader")
+
+
+def guild_rank_at_least(rank, minimum):
+    """True when `rank` sits at or above `minimum` in GUILD_RANKS.
+
+    An unrecognised rank sorts as the lowest, never the highest - the same
+    rule role_at_least() follows for staff, and for the same reason.
+    """
+    if rank not in GUILD_RANKS or minimum not in GUILD_RANKS:
+        return False
+    return GUILD_RANKS.index(rank) >= GUILD_RANKS.index(minimum)
+
+
+def guild_membership(user_id):
+    """The caller's guild_members row, or None. Never raises on a stranger."""
+    return get_db().execute(
+        "SELECT * FROM guild_members WHERE user_id = ?", (user_id,)).fetchone()
+
+
+def guild_by_id(guild_id):
+    return get_db().execute(
+        "SELECT * FROM guilds WHERE id = ?", (guild_id,)).fetchone()
+
+
+def guild_by_name(name):
+    return get_db().execute(
+        "SELECT * FROM guilds WHERE folded = ?",
+        (str(name).strip().lower(),)).fetchone()
+
+
+def guild_member_ids(db, guild_id):
+    """Every account in this guild, as a set of ids. Empty for no guild."""
+    if not guild_id:
+        return set()
+    rows = db.execute(
+        "SELECT user_id FROM guild_members WHERE guild_id = ?",
+        (guild_id,)).fetchall()
+    return set(int(r["user_id"]) for r in rows)
+
+
+def guild_roster(db, guild_id, now=None):
+    """The roster as the panel draws it: name, rank, and whether they are on.
+
+    ONLINE IS THE SAME TEST THE FRIENDS LIST USES, from the same column, so
+    the two panels cannot disagree about who is playing.
+    """
+    if now is None:
+        now = int(time.time())
+    rows = db.execute(
+        "SELECT u.id, u.username, u.role, m.rank, m.joined_at,"
+        "       COALESCE(MAX(s.last_seen_at), 0) AS last_seen_at"
+        "  FROM guild_members m"
+        "  JOIN users u ON u.id = m.user_id"
+        "  LEFT JOIN sessions s ON s.user_id = u.id"
+        " WHERE m.guild_id = ?"
+        " GROUP BY u.id"
+        " ORDER BY CASE m.rank WHEN 'leader' THEN 0 WHEN 'officer' THEN 1"
+        "                      ELSE 2 END, u.username",
+        (guild_id,)).fetchall()
+
+    out = []
+    for row in rows:
+        seen = int(row["last_seen_at"] or 0)
+        out.append({
+            "username": row["username"],
+            "role": role_for(row),
+            "rank": row["rank"],
+            "joined_at": int(row["joined_at"] or 0),
+            "last_seen_at": seen,
+            "online": bool(seen and now - seen <= ONLINE_WINDOW_SECONDS),
+        })
+    return out
+
+
+def guild_dict(db, guild_row, now=None):
+    """A guild as any route returns it."""
+    if guild_row is None:
+        return {}
+    roster = guild_roster(db, int(guild_row["id"]), now)
+    return {
+        "name": guild_row["name"],
+        "founded_by": guild_row["founded_by"],
+        "created_at": int(guild_row["created_at"] or 0),
+        "members": roster,
+        "size": len(roster),
+        "capacity": MAX_GUILD_MEMBERS,
+    }
+
+
+# 'guild' IS DECLARED AND REFUSED. Guilds are not built yet, and leaving the
+# name out until they are would mean every client, every cursor and every tab
+# needing a change on the day they arrive. Declared now, it is one branch in
+# chat_write_check() that stops saying no.
+CHAT_CHANNELS = ("world", "private", "friends", "guild")
+CHAT_DEFAULT_CHANNEL = "world"
+
+# THE TAIL KEPT PER CHANNEL, on top of the 24 hours. A world channel on a busy
+# night and a private conversation nobody has opened in a week are very
+# different amounts of rows, and a single global cap would let the first one
+# push the second out of the table.
+CHAT_KEEP_PER_CHANNEL = 400
+
+
+def chat_write_check(channel, target_row):
+    """
+    May the caller say something here? Returns None, or a refusal to return.
+
+    THE ONE PLACE THAT DECIDES. Every channel's rule is on this screen, which
+    is the only way to be sure a new one has been given a rule at all.
+    """
+    if channel == "world":
+        return None
+
+    if channel == "friends":
+        # No target: a line here goes to whoever has accepted you, which the
+        # read side works out from the friends table at the time of reading.
+        return None
+
+    if channel == "private":
+        if target_row is None:
+            return bad_request("private messages need a 'to' account")
+        if int(target_row["id"]) == int(g.user["id"]):
+            return bad_request("you cannot message yourself")
+        return None
+
+    if channel == "guild":
+        # IN A GUILD, OR THERE IS NOWHERE FOR IT TO GO. Still a 409 rather
+        # than a 404 or a 403: the channel is real and the client is right to
+        # ask about it - what is missing is a guild, which is a thing the
+        # player can go and fix.
+        if guild_membership(g.user["id"]) is None:
+            return {
+                "error": "Conflict",
+                "message": "You are not in a guild.",
+            }, 409
+        return None
+
+    return bad_request("unknown channel")
+
+
+def _friend_ids(db, user_id):
+    """The accounts that have accepted this one, as a set of ids."""
+    rows = db.execute(
+        "SELECT requester_id, addressee_id FROM friends"
+        " WHERE state = 'accepted' AND (requester_id = ? OR addressee_id = ?)",
+        (user_id, user_id),
+    ).fetchall()
+    out = set()
+    for row in rows:
+        other = int(row["addressee_id"]) if int(row["requester_id"]) == user_id \
+            else int(row["requester_id"])
+        out.add(other)
+    return out
+
+
+def _prune_chat(db, channel):
+    """
+    Keep the channel's tail, and drop anything past the day.
+
+    Pruned on write, like broadcasts: no sweeper job to forget to run, and the
+    cost lands on the account that is filling the table.
+    """
+    now = int(time.time())
+    db.execute(
+        "DELETE FROM chat_messages WHERE created_at < ?",
+        (now - CHAT_RETENTION_SECONDS,),
+    )
+    db.execute(
+        "DELETE FROM chat_messages WHERE channel = ? AND id NOT IN ("
+        "  SELECT id FROM chat_messages WHERE channel = ?"
+        "  ORDER BY id DESC LIMIT ?)",
+        (channel, channel, CHAT_KEEP_PER_CHANNEL),
+    )
+
+
+# =============================================================================
+# PICTURES IN CHAT - THE RELAY
+# =============================================================================
+#
+# A player pastes a link; the SERVER fetches it, decides whether it is really
+# a picture, and stores the bytes. Everyone else is shown the server's copy.
+#
+# WHAT THAT BUYS, and it is the whole reason this exists rather than the two
+# lines it would take to put the raw URL in the message body:
+#
+#   - NOBODY'S IP GOES ANYWHERE. A link rendered client-side is a fetch every
+#     viewer performs on command, and the person who posted it is holding the
+#     log. One relay, by the server, once.
+#   - WHAT WAS MODERATED IS WHAT STAYS. A URL can serve one picture to the mod
+#     who approved it and another to everyone afterwards. A stored copy cannot.
+#   - IT IS ACTUALLY A PICTURE. Pillow decodes it here, so a client is never
+#     handed bytes that merely claimed to be an image.
+#   - ANIMATION WORKS AT ALL. See _sheet_from_animation().
+#
+# WHAT IT DOES NOT BUY: this is not a content filter. It stops a link being a
+# weapon; it does not stop somebody posting something unpleasant. That is what
+# /api/chat/delete and a ban are for.
+
+# Eight megabytes in, which is a long GIF or a photograph straight off a
+# phone, and past which somebody is not sharing a picture.
+#
+# THIS IS THE INPUT CAP, NOT THE STORED SIZE. What is kept is bounded far
+# harder and separately - IMAGE_MAX_SIDE for a still, IMAGE_MAX_FRAMES and
+# IMAGE_MAX_FRAME_SIDE for an animation - so raising this costs decode time
+# and buffered memory, not disk. It went up from four because four was
+# refusing ordinary GIFs, and a picture that bounces is worse than one that
+# takes an extra second.
+IMAGE_MAX_BYTES = 8 * 1024 * 1024
+
+# The longest side a stored still may have. Anything bigger is scaled down:
+# chat draws these a couple of hundred pixels wide and storing a 6000px
+# original would be paying for detail nobody will ever see.
+IMAGE_MAX_SIDE = 1024
+
+# Animation is bounded harder, because the cost is per frame in both storage
+# and the size of the spritesheet the client has to hold.
+IMAGE_MAX_FRAMES = 48
+IMAGE_MAX_FRAME_SIDE = 256
+IMAGE_SHEET_COLUMNS = 8
+
+# A decompression bomb is a 200-byte file that decodes to a billion pixels.
+# Pillow has a ceiling of its own; this one is ours and is far lower.
+IMAGE_MAX_DECODED_PIXELS = 40 * 1024 * 1024
+
+# How long the fetch is allowed to take, and how many hops it may be moved
+# through. Redirects are followed by hand so that EVERY hop is checked - an
+# allowed host that 302s to 127.0.0.1 is the oldest trick there is.
+IMAGE_FETCH_TIMEOUT = 6.0
+IMAGE_MAX_REDIRECTS = 3
+
+# One relay per account per this many seconds. This is the anti-flood limit on
+# the act of handing the server a picture at all, and it applies everywhere.
+IMAGE_COOLDOWN_SECONDS = 8
+
+# =============================================================================
+# ONE PICTURE IN WORLD CHAT PER HALF HOUR
+# =============================================================================
+# A DIFFERENT KIND OF LIMIT FROM THE ONE ABOVE, which is why it is a second
+# number rather than a bigger version of the first. IMAGE_COOLDOWN_SECONDS is
+# about load: it stops one account making the server fetch and decode twenty
+# files at once. This is about the room: world chat is every player at once,
+# and a picture there is unskippable for all of them in a way a line of text
+# is not.
+#
+# WHERE IT IS CHECKED MATTERS. Not at upload - that route does not know which
+# channel the picture is headed for, and somebody uploading a picture to
+# whisper to one friend has done nothing to world. It is checked and stamped
+# in /api/chat/send, where the channel is finally known.
+#
+# ONLY THE OWNER IS EXEMPT. Not mods, not dev: a rate limit that staff can
+# ignore is one players notice, and the exemption exists so the person running
+# the server can post an announcement or check that pictures still work
+# without waiting half an hour, not as a rank perk.
+WORLD_IMAGE_COOLDOWN_SECONDS = 30 * 60
+
+# The whole store. Oldest out first when it is reached, so a chat that has
+# been running for a year cannot fill the disk.
+IMAGE_STORE_MAX_BYTES = 128 * 1024 * 1024
+
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Hands redirects back to the caller instead of following them."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _address_is_public(host):
+    """
+    False for anything that resolves to a machine on this network.
+
+    THE POINT OF THE WHOLE FUNCTION is that the server is inside a network the
+    internet is not. Left unchecked, "post a picture" is an invitation to read
+    http://127.0.0.1:5000/api/..., a router's admin page, or a cloud
+    provider's metadata service, with the server's own credentials and from
+    the server's own address.
+    """
+    if not host:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False
+    if not infos:
+        return False
+
+    # EVERY ADDRESS, not the first. A name can resolve to a public address and
+    # a private one, and picking one at random is picking wrong half the time.
+    for info in infos:
+        try:
+            address = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if (address.is_private or address.is_loopback or address.is_link_local
+                or address.is_multicast or address.is_reserved
+                or address.is_unspecified):
+            return False
+    return True
+
+
+def _image_url_ok(url):
+    """(parsed, None) if this is a URL worth fetching, or (None, reason)."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return None, "that is not a link"
+
+    if parsed.scheme not in ("http", "https"):
+        # file:// and ftp:// both read things this server should not read.
+        return None, "only http and https links can be posted"
+    if not parsed.hostname:
+        return None, "that link has no host"
+    if not _address_is_public(parsed.hostname):
+        return None, "that link points inside the server's own network"
+    return parsed, None
+
+
+def _fetch_image_bytes(url):
+    """
+    (raw, None) or (None, reason). Follows redirects by hand, checking each.
+    """
+    seen = url
+    for _hop in range(IMAGE_MAX_REDIRECTS + 1):
+        parsed, why = _image_url_ok(seen)
+        if parsed is None:
+            return None, why
+
+        request_obj = urllib.request.Request(seen, headers={
+            "User-Agent": "ElusionRPG/1.0 (+chat image relay)",
+            "Accept": "image/*",
+        })
+        opener = urllib.request.build_opener(_NoRedirects)
+        try:
+            with opener.open(request_obj, timeout=IMAGE_FETCH_TIMEOUT) as answer:
+                kind = str(answer.headers.get("Content-Type", "")).split(";")[0].strip()
+                if not kind.lower().startswith("image/"):
+                    return None, "that link is not a picture"
+
+                declared = answer.headers.get("Content-Length")
+                if declared and int(declared) > IMAGE_MAX_BYTES:
+                    return None, "that picture is bigger than %d MB" % (
+                        IMAGE_MAX_BYTES // (1024 * 1024))
+
+                # ONE BYTE PAST THE LIMIT, so a server that lies about (or
+                # omits) Content-Length is still stopped by the read itself.
+                raw = answer.read(IMAGE_MAX_BYTES + 1)
+                if len(raw) > IMAGE_MAX_BYTES:
+                    return None, "that picture is bigger than %d MB" % (
+                        IMAGE_MAX_BYTES // (1024 * 1024))
+                if not raw:
+                    return None, "there was nothing at that link"
+                return raw, None
+        except urllib.error.HTTPError as error:
+            if error.code in (301, 302, 303, 307, 308):
+                target = error.headers.get("Location")
+                if not target:
+                    return None, "that link redirects to nowhere"
+                seen = urllib.parse.urljoin(seen, target)
+                continue
+            return None, "that link answered %d" % error.code
+        except (urllib.error.URLError, socket.timeout, TimeoutError, OSError):
+            return None, "that link could not be reached"
+        except ValueError:
+            return None, "that is not a link"
+
+    return None, "that link redirects too many times"
+
+
+def _sheet_from_animation(source):
+    """
+    Flatten an animation into one PNG spritesheet plus how to play it.
+
+    GODOT CANNOT DECODE A GIF. It can play a spritesheet, and has been doing
+    that for every enemy in the game since the beginning - so the animation is
+    taken apart here, where Pillow already is, and the client is handed
+    something it already knows what to do with.
+    """
+    frames = []
+    delay_ms = 0
+    for frame in ImageSequence.Iterator(source):
+        delay_ms = max(delay_ms, int(frame.info.get("duration", 0) or 0))
+        picture = frame.convert("RGBA")
+        picture.thumbnail((IMAGE_MAX_FRAME_SIDE, IMAGE_MAX_FRAME_SIDE))
+        frames.append(picture)
+        if len(frames) >= IMAGE_MAX_FRAMES:
+            break
+
+    if not frames:
+        return None
+
+    # EVERY CELL THE SAME SIZE, taken from the first frame. A GIF may hand back
+    # frames of different sizes (partial-update frames are a real thing), and a
+    # grid whose cells vary is not a grid.
+    cell_w, cell_h = frames[0].size
+    columns = min(IMAGE_SHEET_COLUMNS, len(frames))
+    rows = (len(frames) + columns - 1) // columns
+
+    sheet = Image.new("RGBA", (cell_w * columns, cell_h * rows), (0, 0, 0, 0))
+    for index, picture in enumerate(frames):
+        if picture.size != (cell_w, cell_h):
+            fitted = Image.new("RGBA", (cell_w, cell_h), (0, 0, 0, 0))
+            fitted.paste(picture, (0, 0))
+            picture = fitted
+        sheet.paste(picture, ((index % columns) * cell_w, (index // columns) * cell_h))
+
+    return {
+        "sheet": sheet,
+        "kind": "animated",
+        "width": cell_w,
+        "height": cell_h,
+        "frames": len(frames),
+        "columns": columns,
+        # 100ms is what a browser uses for a GIF that does not say, and a GIF
+        # that does not say is usually an old one that assumed it.
+        "frame_ms": delay_ms if delay_ms > 0 else 100,
+    }
+
+
+def decode_relayed_image(raw):
+    """(record, None) or (None, reason). Never trusts what the bytes claim."""
+    if not PILLOW_AVAILABLE:
+        return None, "this server cannot handle pictures (Pillow is not installed)"
+
+    # A CEILING BEFORE ANY DECODING HAPPENS. Pillow has one of its own that is
+    # far higher; this is the one that matters for a 200-byte file claiming to
+    # be forty thousand pixels square.
+    Image.MAX_IMAGE_PIXELS = IMAGE_MAX_DECODED_PIXELS
+
+    try:
+        # verify() is a structural check and it CONSUMES the object, which is
+        # why the bytes are opened twice. Cheap, and it rejects a truncated or
+        # hand-made file before any pixels are read.
+        Image.open(io.BytesIO(raw)).verify()
+        source = Image.open(io.BytesIO(raw))
+    except Exception:
+        return None, "that file is not a picture this server can read"
+
+    try:
+        if source.width * source.height > IMAGE_MAX_DECODED_PIXELS:
+            return None, "that picture is too large to open"
+
+        if getattr(source, "n_frames", 1) > 1:
+            record = _sheet_from_animation(source)
+            if record is None:
+                return None, "that animation had no frames"
+        else:
+            still = source.convert("RGBA")
+            still.thumbnail((IMAGE_MAX_SIDE, IMAGE_MAX_SIDE))
+            record = {
+                "sheet": still,
+                "kind": "still",
+                "width": still.width,
+                "height": still.height,
+                "frames": 1,
+                "columns": 1,
+                "frame_ms": 0,
+            }
+    except Exception:
+        return None, "that picture could not be decoded"
+
+    # RE-ENCODED, ALWAYS. What leaves here is a file this server wrote, not
+    # the one that arrived - so whatever else was in it (a comment block, a
+    # second image, a payload for some other program's parser) is gone.
+    #
+    # PNG FOR ANIMATION, THE SMALLER OF THE TWO FOR A STILL. The frames of an
+    # animation are capped at 256px and are usually flat or pixel art, which
+    # is what PNG is best at and what lossy compression is worst at; a still
+    # is as likely to be a photograph, where PNG is several times larger than
+    # it needs to be. Measured per picture rather than guessed, because the
+    # guess is wrong often enough to matter - see the same argument on the
+    # client, which does this before sending.
+    sheet = record["sheet"]
+    del record["sheet"]
+
+    buffer = io.BytesIO()
+    sheet.save(buffer, format="PNG", optimize=True)
+    record["data"] = buffer.getvalue()
+    record["format"] = "png"
+
+    if record["kind"] == "still":
+        try:
+            lossy = io.BytesIO()
+            sheet.save(lossy, format="WEBP", quality=88, method=4)
+            if 0 < lossy.tell() < len(record["data"]):
+                record["data"] = lossy.getvalue()
+                record["format"] = "webp"
+        except Exception:
+            # No WebP in this Pillow build, or it refused this picture. PNG
+            # stands - a bigger file is not a failure.
+            pass
+
+    record["bytes"] = len(record["data"])
+    record["id"] = hashlib.sha256(record["data"]).hexdigest()
+    return record, None
+
+
+def store_relayed_image(record, source_url, by):
+    """Keep it, evicting the oldest while the store is over its cap."""
+    db = get_db()
+    now = int(time.time())
+    db.execute(
+        "INSERT OR IGNORE INTO chat_images"
+        " (id, kind, width, height, frames, columns, frame_ms, bytes,"
+        "  source, created_by, created_at, format, data)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (record["id"], record["kind"], record["width"], record["height"],
+         record["frames"], record["columns"], record["frame_ms"], record["bytes"],
+         str(source_url)[:400], str(by)[:64], now,
+         record.get("format", "png"), record["data"]),
+    )
+
+    # OLDEST OUT UNTIL IT FITS. A loop rather than one DELETE, because "enough
+    # rows to get under a byte total" is not something SQL answers in one go.
+    for _ in range(64):
+        total = db.execute(
+            "SELECT COALESCE(SUM(bytes), 0) AS n FROM chat_images").fetchone()["n"]
+        if int(total or 0) <= IMAGE_STORE_MAX_BYTES:
+            break
+        oldest = db.execute(
+            "SELECT id FROM chat_images ORDER BY created_at ASC LIMIT 1").fetchone()
+        if oldest is None:
+            break
+        db.execute("DELETE FROM chat_images WHERE id = ?", (oldest["id"],))
+
+
+def chat_image_cooldown(now):
+    """None when the caller may post a picture, or the 429 saying they may not.
+
+    STAMPS AS IT PASSES. The cooldown has to start when the attempt begins,
+    not when it finishes: a fetch can take six seconds and an upload can take
+    longer, and a cooldown that only starts on success is an invitation to run
+    twenty at once. Shared by the link relay and the direct upload so the two
+    cannot drift into being two different limits.
+    """
+    db = get_db()
+    row = db.execute(
+        "SELECT last_image_at FROM users WHERE id = ?", (g.user["id"],)).fetchone()
+    waited = now - int(row["last_image_at"] or 0) if row is not None else now
+    if waited < IMAGE_COOLDOWN_SECONDS:
+        return ({
+            "error": "Too Many Requests",
+            "message": "One picture every %d seconds." % IMAGE_COOLDOWN_SECONDS,
+        }, 429, {"Retry-After": str(IMAGE_COOLDOWN_SECONDS - waited)})
+
+    db.execute("UPDATE users SET last_image_at = ? WHERE id = ?", (now, g.user["id"]))
+    db.commit()
+    return None
+
+
+def world_image_wait(user, now=None):
+    """Seconds this account must still wait before a picture may go to world.
+
+    0 when they may post one now. The owner is never made to wait - see the
+    note over WORLD_IMAGE_COOLDOWN_SECONDS for why that exemption stops there.
+
+    READ-ONLY. Stamping is a separate call, because this is asked twice for
+    every send - once by the poll so the client can say so in advance, and
+    once by the send itself - and an "ask" that quietly spends something is a
+    trap for the next person to call it.
+    """
+    if now is None:
+        now = int(time.time())
+
+    # THE OWNER IS ANSWERED WITHOUT A QUERY, which is both the exemption and
+    # the cheap path for the only account that polls while also being the one
+    # most likely to be testing pictures.
+    if is_owner(user["username"]):
+        return 0
+
+    # READ FROM THE TABLE, NOT FROM g.user. user_for_token() selects a short
+    # list of columns - id, username, role, the ban fields - and not this one,
+    # so asking the row directly returned 0 forever and the limit silently did
+    # nothing. Its own lookup on the primary key, exactly like the upload
+    # cooldown beside it does for last_image_at.
+    row = get_db().execute(
+        "SELECT last_world_image_at FROM users WHERE id = ?",
+        (user["id"],)).fetchone()
+    if row is None:
+        return 0
+
+    last = int(row["last_world_image_at"] or 0)
+    if last <= 0:
+        return 0
+    return max(0, WORLD_IMAGE_COOLDOWN_SECONDS - (now - last))
+
+
+def stamp_world_image(user_id, now=None):
+    """Start the half hour. Called only once a picture is really in world."""
+    if now is None:
+        now = int(time.time())
+    get_db().execute(
+        "UPDATE users SET last_world_image_at = ? WHERE id = ?", (now, user_id))
+
+
+def describe_wait(seconds):
+    """"22 minutes", "40 seconds" - the sentence a person can act on."""
+    seconds = max(0, int(seconds))
+    if seconds >= 120:
+        return "%d minutes" % ((seconds + 59) // 60)
+    if seconds >= 60:
+        return "a minute"
+    return "%d seconds" % seconds
+
+
+def keep_relayed_image(raw, source):
+    """Decode, store and describe bytes that claim to be a picture.
+
+    The one place bytes become a stored picture, whichever door they came in
+    by. A link fetched from the internet and a file dragged off somebody's
+    desktop get identical treatment from here on: verified, re-encoded from
+    scratch, capped, and given an id that is the hash of what we wrote - so a
+    file cannot smuggle anything past by being uploaded instead of linked.
+    """
+    record, why = decode_relayed_image(raw)
+    if record is None:
+        return bad_request(why)
+
+    store_relayed_image(record, source, g.user["username"])
+    get_db().commit()
+
+    answer = relayed_image_dict({
+        "id": record["id"], "kind": record["kind"],
+        "width": record["width"], "height": record["height"],
+        "frames": record["frames"], "columns": record["columns"],
+        "frame_ms": record["frame_ms"],
+    })
+    answer["bytes"] = record["bytes"]
+    return answer, 200
+
+
+def relayed_image_dict(row):
+    """The metadata a client needs in order to draw it."""
+    return {
+        "id": row["id"],
+        "kind": row["kind"],
+        "width": int(row["width"]),
+        "height": int(row["height"]),
+        "frames": int(row["frames"]),
+        "columns": int(row["columns"]),
+        "frame_ms": int(row["frame_ms"]),
+    }
+
+
+# =============================================================================
+# FRIENDS
+# =============================================================================
+#
+# A request has to be accepted before either side appears on the other's list.
+# The alternative - adding someone the moment you type their name - means
+# anyone who knows your name can watch when you are online, and there is no
+# point in a friends list that you cannot refuse entry to.
+#
+# ONE ROW PER PAIR, stored in the direction it was asked. See the comment over
+# the friends table in init_db() for why it is one table and not two.
+
+
+# A list, not an address book. The cap is here so that neither the presence
+# query nor the client's panel has to cope with an unbounded list, and 100 is
+# far past what anyone will reach honestly.
+MAX_FRIENDS = 100
+
+# THE ANTI-NUISANCE NUMBER. Declining deletes the row, which means a request
+# can always be sent again - so the thing that has to be bounded is how many
+# can be outstanding at once. Twenty-five pending requests is someone asking
+# everyone they can see, and they cannot ask anybody else until some are
+# answered or withdrawn.
+MAX_PENDING_SENT = 25
+
+
+def _friend_link(db, a_id, b_id):
+    """The row between two accounts, whichever way round it was made."""
+    return db.execute(
+        "SELECT * FROM friends"
+        " WHERE (requester_id = ? AND addressee_id = ?)"
+        "    OR (requester_id = ? AND addressee_id = ?)",
+        (a_id, b_id, b_id, a_id),
+    ).fetchone()
+
+
+def _presence_for(db, user_ids):
+    """
+    {user_id: last_seen_at} for a set of accounts, in ONE query.
+
+    Same shape as the staff account list, and for the same reason: a friends
+    panel refreshing every few seconds must not turn into one query per friend.
+    MAX() because one account can hold several live sessions.
+    """
+    if not user_ids:
+        return {}
+
+    now = int(time.time())
+    marks = ",".join("?" for _ in user_ids)
+    rows = db.execute(
+        "SELECT user_id, MAX(last_seen_at) AS last_seen FROM sessions"
+        " WHERE expires_at > ? AND user_id IN (%s) GROUP BY user_id" % marks,
+        tuple([now] + list(user_ids)),
+    ).fetchall()
+    return {int(r["user_id"]): int(r["last_seen"] or 0) for r in rows}
+
+
+def friend_entry(row, presence, now):
+    """One account as a friends panel reads it."""
+    last_seen = int(presence.get(int(row["id"]), 0))
+    return {
+        "username": row["username"],
+        "role": role_for(row),
+        "online": last_seen > 0 and now - last_seen <= ONLINE_WINDOW_SECONDS,
+        "last_seen_at": last_seen,
+    }
+
+
+# =============================================================================
+# TELEPORT
+# =============================================================================
+#
+# Moving one player, or everybody, to a place.
+#
+# THE SERVER DOES THE SPACING, not the clients. Sending a hundred players to
+# one coordinate and hoping collision sorts it out is how you get a pile that
+# shoves itself apart over several seconds, flinging people through walls on
+# the way. Instead each target is given a SLOT, and the slot decides an offset
+# on a hex ring around the destination. Every client computes the same answer
+# from the same slot, so the group lands already spread out.
+#
+# HEX RINGS, NOT A SQUARE GRID. Ring r holds exactly 6r slots, and every slot
+# is the same distance from its neighbours - which is the densest arrangement
+# where nobody is closer to anyone else than TELEPORT_SPACING. A square grid
+# puts diagonal neighbours 1.41x further apart than orthogonal ones, so it
+# wastes space to guarantee the same minimum gap.
+#
+#   ring 0:  1 slot   (the destination itself)
+#   ring 1:  6 slots  at 1x spacing
+#   ring 2: 12 slots  at 2x spacing        ... 1 + 3r(r+1) slots up to ring r
+
+# Far enough apart that two bodies cannot overlap - the player's collision
+# circle is radius 7 - with room to spare so nobody is nudged on arrival.
+TELEPORT_SPACING = 48.0
+
+
+def teleport_ring_for_slot(index):
+    """Which hex ring a slot falls on. Slot 0 is the centre, ring 0."""
+    index = max(0, int(index))
+    if index == 0:
+        return 0
+    ring = 1
+    while 1 + 3 * ring * (ring + 1) <= index:
+        ring += 1
+    return ring
+
+
+def teleport_offset(index):
+    """
+    (dx, dy) for one slot, in pixels from the destination.
+
+    Pure arithmetic on purpose: no database, no state, no randomness. The same
+    slot always gives the same offset, which is what lets the server hand out
+    slots and every client agree about where everyone stands.
+    """
+    index = max(0, int(index))
+    if index == 0:
+        return 0.0, 0.0
+
+    ring = teleport_ring_for_slot(index)
+    first_in_ring = 1 + 3 * ring * (ring - 1)
+    position_in_ring = index - first_in_ring
+    slots_in_ring = 6 * ring
+
+    angle = (2.0 * math.pi * position_in_ring) / slots_in_ring
+    radius = ring * TELEPORT_SPACING
+    return round(radius * math.cos(angle), 2), round(radius * math.sin(angle), 2)
+
+
+def queue_teleport(db, user_id, area, x, y, slot_index, group_size, by, now):
+    """Record one pending move, replacing anything already waiting for them."""
+    db.execute(
+        """
+        INSERT INTO pending_teleports
+               (id, user_id, area, x, y, slot_index, group_size, issued_by, issued_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            id         = excluded.id,
+            area       = excluded.area,
+            x          = excluded.x,
+            y          = excluded.y,
+            slot_index = excluded.slot_index,
+            group_size = excluded.group_size,
+            issued_by  = excluded.issued_by,
+            issued_at  = excluded.issued_at
+        """,
+        (now, user_id, area, float(x), float(y), int(slot_index), int(group_size), by, now),
+    )
+
+
+def pending_teleport_for(user_id):
+    """What this player should be told to do, or None. Shaped for the client."""
+    try:
+        row = get_db().execute(
+            "SELECT * FROM pending_teleports WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None:
+        return None
+
+    dx, dy = teleport_offset(_row_int(row, "slot_index"))
+    return {
+        "id": _row_int(row, "id"),
+        "area": row["area"],
+        # WHERE THIS PLAYER LANDS, already spaced. The client does not repeat
+        # the arithmetic and cannot disagree with it.
+        "x": round(float(row["x"]) + dx, 2),
+        "y": round(float(row["y"]) + dy, 2),
+        "slot": _row_int(row, "slot_index"),
+        "of": _row_int(row, "group_size"),
+        "by": row["issued_by"],
+    }
+
+
 def require_role(minimum):
     """
     Decorator for a route that needs a rank. Sits inside @require_auth, which
@@ -2441,6 +4076,13 @@ def require_role(minimum):
                 # which tells someone exactly where to push.
                 return {"error": "Not Found", "message": "Not found."}, 404
             return view(*args, **kwargs)
+
+        # TAGGED SO THE RULE CAN BE READ BACK. /api/staff/powers reports what
+        # each rank may do, and the only way that list can be trusted is if it
+        # is the DECORATORS talking rather than a copy someone maintains by
+        # hand. functools.wraps copies __dict__ outward, so this survives being
+        # wrapped again by require_auth above it.
+        wrapped._elusion_min_role = minimum
         return wrapped
     return decorator
 
@@ -2459,6 +4101,7 @@ def require_owner(view):
             return {"error": "Not Found", "message": "Not found."}, 404
         return view(*args, **kwargs)
 
+    wrapped._elusion_min_role = "owner"
     return wrapped
 
 
@@ -2476,8 +4119,18 @@ def require_auth(view):
                 "message": "Missing, invalid or expired token.",
             }, 401
         g.user = user
+
+        # THE KILL SWITCH, second half. One choke point for every
+        # authenticated route, so a closed server cannot be outlasted by
+        # whichever endpoint somebody forgot to gate. Passes straight
+        # through while the server is open, and for the owner always.
+        closing = maintenance_disconnect(user)
+        if closing is not None:
+            return closing
+
         return view(*args, **kwargs)
 
+    wrapped._elusion_needs_auth = True
     return wrapped
 
 
@@ -2577,6 +4230,13 @@ def register():
         return {"error": "Bad Request", "message": errors}, 400
 
     username = data["username"]
+
+    # A CLOSED SERVER TAKES NO NEW ACCOUNTS EITHER. Registering is a login
+    # that creates its own account first - letting it through would be a
+    # way in while the front door is shut.
+    closed = maintenance_refusal(username)
+    if closed is not None:
+        return closed
 
     db = get_db()
     ip = client_ip()
@@ -2695,6 +4355,11 @@ def register():
         "is_owner": is_owner(username),
         "token": token,
         "expires_at": expires_at,
+        # Always true here: an account one second old cannot have confirmed
+        # an address yet. Sent anyway rather than left out, so the client
+        # reads the same key on register as it does on login.
+        "email_verified": False,
+        "needs_email": True,
     }, 201
 
 
@@ -2751,6 +4416,13 @@ def login():
     is_valid, errors = validate_credentials(data)
     if not is_valid:
         return {"error": "Bad Request", "message": errors}, 400
+
+    # THE DOOR. Before the throttle, before the user lookup, before any
+    # hashing: a closed server should cost one indexed read and say so. The
+    # owner is exempt, or the switch could lock its own operator out.
+    closed = maintenance_refusal(data["username"])
+    if closed is not None:
+        return closed
 
     db = get_db()
     ip = client_ip()
@@ -2872,6 +4544,11 @@ def login():
         "is_owner": is_owner(row["username"]),
         "token": token,
         "expires_at": expires_at,
+        # THE PROMPT SWITCH. The client shows the "secure your account" step
+        # when this is true, which is how every existing account picks up a
+        # recovery address without anybody having to go and ask them.
+        "email_verified": not needs_recovery_email(row),
+        "needs_email": needs_recovery_email(row),
     }, 200
 
 
@@ -2926,12 +4603,20 @@ def session_info():
     )
     db.commit()
 
+    # THE CLOSING NOTICE RIDES THE HEARTBEAT. This is the only call every
+    # client in the world makes on a timer, which makes it the one place
+    # that can tell everyone at once that the server is closing - and it is
+    # how the client knows to flush its save while it still has a session.
+    # None while the server is open, so the client can just test for it.
     return {
         "user_id": g.user["id"],
         "username": g.user["username"],
         "role": role_for(g.user),
         "is_owner": is_owner(g.user["username"]),
         "expires_at": g.user["expires_at"],
+        "maintenance": maintenance_public(),
+        "email_verified": not needs_recovery_email(g.user),
+        "needs_email": needs_recovery_email(g.user),
     }, 200
 
 
@@ -3148,6 +4833,616 @@ def change_password():
     )
 
     return {"token": token, "expires_at": expires_at, "revoked": revoked}, 200
+
+
+# =============================================================================
+# ACCOUNT RECOVERY
+# =============================================================================
+#
+# "I forgot my password" is the single most attacked endpoint in any game
+# backend, because it is the one door that opens WITHOUT the password. Every
+# rule below exists to stop it being easier than the front door.
+#
+# THE SHAPE: the player asks with their email, the server emails a six digit
+# code, the player types it in and chooses a new password. The code is the only
+# thing that unlocks the change.
+#
+# WHY A CODE AND NOT A LINK. A link needs a web page to land on, that page needs
+# to reach the API from a browser, and the flow leaves the game to finish
+# somewhere else. A code is typed straight into the client, so the whole thing
+# happens on the login screen and there is no second surface to secure.
+#
+# THE FIVE THINGS THAT MAKE IT SAFE
+#   1. It never says whether an address is on an account. Same answer, always.
+#   2. The code is stored hashed, like a password, and expires in fifteen
+#      minutes.
+#   3. Five wrong guesses burns it. Six digits is only a million, so the
+#      attempt ceiling is the real lock, not the length.
+#   4. Only a VERIFIED address can receive one, so a typo at signup cannot
+#      hand the account to a stranger.
+#   5. A completed reset destroys every session on the account. If someone is
+#      already inside, recovering the password throws them out - which is the
+#      main reason a player reaches for this in the first place.
+
+# Fifteen minutes: long enough to go and find the email, short enough that a
+# code sitting in an inbox is not a standing key to the account.
+RESET_CODE_TTL_SECONDS = 15 * 60
+
+# Six digits is 1,000,000 possibilities. THIS is what makes that enough.
+RESET_MAX_ATTEMPTS = 5
+
+# One code per account per minute, so this endpoint cannot be used to bomb
+# somebody's inbox, and per address so it cannot be used as a timing oracle.
+RESET_REQUEST_COOLDOWN_SECONDS = 60
+
+# And a ceiling per address for the same reason at a different scale: one
+# machine working down a list of leaked emails.
+RESET_MAX_REQUESTS_PER_IP = 10
+RESET_IP_WINDOW_SECONDS = 15 * 60
+
+# Deliberately loose. Address validity is proved by a code arriving at it, not
+# by a regex - every strict email pattern ever written rejects somebody's real
+# address, and this one only has to catch a typo like a missing @.
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+MAX_EMAIL_LENGTH = 254
+
+# The one answer /api/auth/recover ever gives. See the header: a different
+# reply for "no such address" turns this into an account enumerator.
+def needs_recovery_email(row):
+    """
+    True when this account has no CONFIRMED recovery address.
+
+    This is the one question the login screen asks before letting somebody into
+    the world, and it is answered on every login, register and heartbeat so the
+    client never has to go and ask separately.
+
+    UNVERIFIED COUNTS AS NONE. A typed address nobody has proved they own is
+    not a way back in, so it does not satisfy the prompt either - otherwise a
+    typo would quietly leave the account unrecoverable, which is the exact
+    situation the prompt exists to prevent.
+    """
+    if row is None:
+        return True
+    try:
+        return not bool(_row_int(row, "email_verified"))
+    except (KeyError, IndexError):
+        # A row selected without the column: say yes rather than guess. Being
+        # asked for an email you already gave is a nuisance; being skipped when
+        # you have none is an unrecoverable account.
+        return True
+
+
+RECOVER_GENERIC_MESSAGE = (
+    "If that address is on an account, a code is on its way. "
+    "It expires in %d minutes." % (RESET_CODE_TTL_SECONDS // 60)
+)
+
+
+# =============================================================================
+# SENDING MAIL
+# =============================================================================
+# Configured entirely from the environment so no provider is baked in and no
+# credential is in the repo. Set these beside ELUSION_OWNER in .env:
+#
+#   ELUSION_SMTP_HOST      smtp.gmail.com, smtp.sendgrid.net, ...
+#   ELUSION_SMTP_PORT      587 for STARTTLS (the default), 465 for SSL
+#   ELUSION_SMTP_USER      the login for that server
+#   ELUSION_SMTP_PASSWORD  its password or API key
+#   ELUSION_MAIL_FROM      the address players will see it come from
+#
+# WITH NOTHING SET, MAIL DOES NOT SEND. That is the correct default: a server
+# that silently swallows reset codes looks identical to one that works until a
+# player needs it. ELUSION_MAIL_CONSOLE=1 prints the code to the server log
+# instead, which is how you exercise the whole flow with no provider signed up.
+#
+# THAT SETTING IS FOR YOUR MACHINE ONLY. A printed code is a working key to an
+# account sitting in a log file, so it is opt-in by name rather than tied to a
+# debug flag somebody could leave on.
+SMTP_HOST = os.environ.get("ELUSION_SMTP_HOST", "").strip()
+SMTP_PORT = int(os.environ.get("ELUSION_SMTP_PORT", "587") or 587)
+SMTP_USER = os.environ.get("ELUSION_SMTP_USER", "").strip()
+SMTP_PASSWORD = os.environ.get("ELUSION_SMTP_PASSWORD", "")
+MAIL_FROM = os.environ.get("ELUSION_MAIL_FROM", "").strip()
+MAIL_CONSOLE = os.environ.get("ELUSION_MAIL_CONSOLE", "").strip() == "1"
+
+
+def send_mail(to_address, subject, body):
+    """
+    Deliver one message. Returns True if it left the building.
+
+    NEVER RAISES. A mail server that is down must not turn into a 500 on an
+    endpoint whose whole contract is to answer identically every time - the
+    error goes to the log, and the caller still tells the player the same
+    sentence it always does.
+    """
+    if MAIL_CONSOLE:
+        app.logger.warning("[MAIL - console fallback] to=%s | %s | %s",
+                           to_address, subject, body)
+        return True
+
+    if not SMTP_HOST or not MAIL_FROM:
+        app.logger.error(
+            "mail NOT sent to %s: ELUSION_SMTP_HOST/ELUSION_MAIL_FROM are unset. "
+            "Set them, or ELUSION_MAIL_CONSOLE=1 for local testing.", to_address)
+        return False
+
+    message = EmailMessage()
+    message["From"] = MAIL_FROM
+    message["To"] = to_address
+    message["Subject"] = subject
+    message.set_content(body)
+
+    try:
+        if SMTP_PORT == 465:
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15)
+        else:
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15)
+            server.starttls()
+        with server:
+            if SMTP_USER:
+                server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(message)
+        return True
+    except Exception as error:
+        # Deliberately broad: smtplib raises a dozen different things and every
+        # one of them means the same thing here.
+        app.logger.error("mail to %s failed: %s", to_address, error)
+        return False
+
+
+def send_mail_async(to_address, subject, body):
+    """
+    Hand the message to a background thread and return at once.
+
+    THIS IS A SECURITY FIX, NOT A SPEED ONE. A real SMTP round trip - connect,
+    STARTTLS, authenticate, send, quit - takes seconds. Done inside the request,
+    /api/auth/recover answers in about four seconds when the address HAS an
+    account and about a tenth of a second when it does not, because the second
+    path has no mail to send. That gap is readable with a stopwatch, and it
+    turns the endpoint into precisely the account enumerator that its identical
+    wording, and the dummy hash beside it, exist to prevent. Same answer, same
+    body, and now the same TIME.
+    (Measured on a live server: 4505 ms with an account, ~100 ms without.)
+
+    Fire and forget is correct here. The caller cannot act on a failure anyway -
+    every one of these endpoints must answer identically whether or not mail
+    went out - so a failure belongs in the log, which is where send_mail puts
+    it. Nothing in the thread touches the database or the request context, so
+    there is no app context to push and nothing to race.
+    """
+    threading.Thread(
+        target=send_mail, args=(to_address, subject, body),
+        name="elusion-mail", daemon=True,
+    ).start()
+    return True
+
+
+# =============================================================================
+# CODE HELPERS
+# =============================================================================
+
+def _new_code():
+    """Six digits from the cryptographic generator, never `random`."""
+    return "%06d" % secrets.randbelow(1000000)
+
+
+def _store_code(db, user_id, purpose, code, target, now):
+    """One live code per (account, purpose) - this replaces any previous one."""
+    db.execute(
+        """
+        INSERT INTO auth_codes (user_id, purpose, code_hash, target,
+                                expires_at, attempts, created_at)
+        VALUES (?, ?, ?, ?, ?, 0, ?)
+        ON CONFLICT(user_id, purpose) DO UPDATE SET
+            code_hash  = excluded.code_hash,
+            target     = excluded.target,
+            expires_at = excluded.expires_at,
+            attempts   = 0,
+            created_at = excluded.created_at
+        """,
+        (user_id, purpose, generate_password_hash(code), target,
+         now + RESET_CODE_TTL_SECONDS, now),
+    )
+
+
+def _consume_code(db, user_id, purpose, code, now):
+    """
+    Check a code and spend it. Returns (ok, reason).
+
+    Every failure reads the same to the caller on purpose - "wrong" and
+    "expired" and "never asked" are one answer, because telling them apart
+    tells an attacker which accounts have a code outstanding.
+    """
+    row = db.execute(
+        "SELECT * FROM auth_codes WHERE user_id = ? AND purpose = ?",
+        (user_id, purpose),
+    ).fetchone()
+    if row is None:
+        return False, "no-code"
+
+    if _row_int(row, "expires_at") <= now:
+        db.execute("DELETE FROM auth_codes WHERE user_id = ? AND purpose = ?",
+                   (user_id, purpose))
+        return False, "expired"
+
+    if _row_int(row, "attempts") >= RESET_MAX_ATTEMPTS:
+        db.execute("DELETE FROM auth_codes WHERE user_id = ? AND purpose = ?",
+                   (user_id, purpose))
+        return False, "burned"
+
+    if not check_password_hash(row["code_hash"], str(code)):
+        db.execute(
+            "UPDATE auth_codes SET attempts = attempts + 1 "
+            "WHERE user_id = ? AND purpose = ?",
+            (user_id, purpose),
+        )
+        # The LAST allowed miss burns it rather than leaving one more try.
+        if _row_int(row, "attempts") + 1 >= RESET_MAX_ATTEMPTS:
+            db.execute("DELETE FROM auth_codes WHERE user_id = ? AND purpose = ?",
+                       (user_id, purpose))
+        return False, "wrong"
+
+    # SPENT ON SUCCESS. A code that still works after it has been used is a
+    # second key left in the door.
+    db.execute("DELETE FROM auth_codes WHERE user_id = ? AND purpose = ?",
+               (user_id, purpose))
+    return True, "ok"
+
+
+def _clean_email(raw):
+    """Normalised, or "" if it is not an address. Stored lowercase so lookups
+    are a plain = against however the player capitalised it today."""
+    address = str(raw or "").strip().lower()
+    if len(address) > MAX_EMAIL_LENGTH or EMAIL_PATTERN.match(address) is None:
+        return ""
+    return address
+
+
+def _mask_email(address):
+    """t****n@example.com - enough for a player to recognise their own address,
+    not enough for anyone else to learn it from a screenshot."""
+    address = str(address or "")
+    if "@" not in address:
+        return ""
+    name, domain = address.split("@", 1)
+    if len(name) <= 2:
+        return "%s@%s" % ("*" * len(name), domain)
+    return "%s%s%s@%s" % (name[0], "*" * (len(name) - 2), name[-1], domain)
+
+
+@app.get("/api/account/email")
+@require_auth
+def get_account_email():
+    """
+    The recovery address on this account, masked
+    ---
+    tags:
+      - Account
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+    responses:
+      200:
+        description: Masked address and whether it has been verified
+      401:
+        description: Missing, invalid or expired token
+    """
+    row = get_db().execute(
+        "SELECT email, email_verified FROM users WHERE id = ?", (g.user["id"],)
+    ).fetchone()
+    address = "" if row is None else str(row["email"] or "")
+    return {
+        "email": _mask_email(address),
+        "has_email": address != "",
+        "verified": bool(row is not None and _row_int(row, "email_verified")),
+    }, 200
+
+
+@app.post("/api/account/email")
+@require_auth
+def set_account_email():
+    """
+    Set or change the recovery address (needs the current password)
+    ---
+    tags:
+      - Account
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [email, password]
+          properties:
+            email:    {type: string}
+            password: {type: string, description: "the account's current password"}
+    responses:
+      200:
+        description: Saved, unverified, and a code is on its way to it
+      400:
+        description: Not an address
+      401:
+        description: Wrong password, or no token
+    """
+    payload = request.get_json(silent=True) or {}
+    address = _clean_email(payload.get("email"))
+    if address == "":
+        return bad_request("That does not look like an email address.")
+
+    password = payload.get("password")
+    if not isinstance(password, str) or password == "":
+        return bad_request("password is required to change the recovery address.")
+
+    db = get_db()
+    now = int(time.time())
+    row = db.execute("SELECT * FROM users WHERE id = ?", (g.user["id"],)).fetchone()
+    if row is None:
+        return {"error": "Unauthorized", "message": "No such account."}, 401
+
+    # THE CURRENT PASSWORD IS THE WHOLE POINT, and this is the most important
+    # line in the recovery feature.
+    #
+    # The recovery address is a key to the account. If a stolen SESSION could
+    # change it, an attacker with a token would point recovery at their own
+    # inbox, reset the password, and lock the real owner out permanently -
+    # turning a temporary theft into a permanent one. Knowing the password is
+    # the one thing a session thief does not have, so it is what this asks for.
+    if not check_password_hash(row["password_hash"], password):
+        _record_login_attempt(db, row["username"], client_ip(), False, "bad-password-on-email")
+        db.commit()
+        return {"error": "Unauthorized", "message": "That password is not correct."}, 401
+
+    # UNVERIFIED UNTIL A CODE COMES BACK FROM IT. Until then this address
+    # cannot receive a reset, so a typo here costs a re-entry, not an account.
+    db.execute("UPDATE users SET email = ?, email_verified = 0 WHERE id = ?",
+               (address, row["id"]))
+
+    code = _new_code()
+    _store_code(db, row["id"], "verify", code, address, now)
+    db.commit()
+
+    send_mail_async(address, "Elusion RPG - confirm your recovery address",
+              "Your confirmation code is %s\n\n"
+              "It expires in %d minutes. If you did not ask for this, you can "
+              "ignore it - nothing has changed on your account."
+              % (code, RESET_CODE_TTL_SECONDS // 60))
+
+    return {"email": _mask_email(address), "verified": False,
+            "message": "Check that inbox for a confirmation code."}, 200
+
+
+@app.post("/api/account/email/verify")
+@require_auth
+def verify_account_email():
+    """
+    Confirm the recovery address with the emailed code
+    ---
+    tags:
+      - Account
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [code]
+          properties:
+            code: {type: string}
+    responses:
+      200:
+        description: Verified - this address can now recover the account
+      400:
+        description: Wrong or expired code
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+    code = str(payload.get("code", "")).strip()
+    if code == "":
+        return bad_request("code is required.")
+
+    db = get_db()
+    ok, _reason = _consume_code(db, g.user["id"], "verify", code, int(time.time()))
+    if not ok:
+        db.commit()
+        return bad_request("That code is wrong or has expired.")
+
+    db.execute("UPDATE users SET email_verified = 1 WHERE id = ?", (g.user["id"],))
+    db.commit()
+    return {"verified": True, "message": "Recovery address confirmed."}, 200
+
+
+@app.post("/api/auth/recover")
+def request_recovery():
+    """
+    Ask for a reset code by email
+    ---
+    tags:
+      - Auth
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [email]
+          properties:
+            email: {type: string}
+    responses:
+      200:
+        description: Always the same answer, whether or not that address exists
+      429:
+        description: Too many requests from this address
+    """
+    payload = request.get_json(silent=True) or {}
+    address = _clean_email(payload.get("email"))
+
+    db = get_db()
+    now = int(time.time())
+    ip = client_ip()
+
+    # A CEILING PER ADDRESS, so this cannot be pointed at a list of leaked
+    # emails, or used to bomb one inbox from one machine. Counted before
+    # anything else, because a throttled caller should cost one indexed read.
+    recent = int(db.execute(
+        "SELECT COUNT(*) AS n FROM login_attempts "
+        "WHERE ip = ? AND reason = 'recover-request' AND at > ?",
+        (ip, now - RESET_IP_WINDOW_SECONDS),
+    ).fetchone()["n"] or 0)
+    if recent >= RESET_MAX_REQUESTS_PER_IP:
+        return {
+            "error": "Too Many Requests",
+            "message": "Too many recovery requests from this address. Try again later.",
+        }, 429
+
+    _record_login_attempt(db, "", ip, True, "recover-request")
+
+    row = None
+    if address != "":
+        # VERIFIED ONLY. An address nobody has proved they own is not a way in.
+        row = db.execute(
+            "SELECT * FROM users WHERE email = ? AND email_verified = 1", (address,)
+        ).fetchone()
+
+    if row is None:
+        # SAME WORK, SAME ANSWER. Hashing a throwaway code here costs what the
+        # real path costs, so the reply cannot be timed to learn whether the
+        # address is on an account - the same trick _TIMING_DUMMY_HASH plays on
+        # /login, for the same reason.
+        generate_password_hash(_new_code())
+        db.commit()
+        return {"ok": True, "message": RECOVER_GENERIC_MESSAGE}, 200
+
+    # ONE CODE A MINUTE PER ACCOUNT. Silently, because saying "you already have
+    # one" would confirm the address exists.
+    existing = db.execute(
+        "SELECT created_at FROM auth_codes WHERE user_id = ? AND purpose = 'reset'",
+        (row["id"],),
+    ).fetchone()
+    if existing is not None and _row_int(existing, "created_at") > now - RESET_REQUEST_COOLDOWN_SECONDS:
+        db.commit()
+        return {"ok": True, "message": RECOVER_GENERIC_MESSAGE}, 200
+
+    code = _new_code()
+    _store_code(db, row["id"], "reset", code, address, now)
+    db.commit()
+
+    send_mail_async(address, "Elusion RPG - your password reset code",
+              "Someone asked to reset the password for %s.\n\n"
+              "Your code is %s\n\n"
+              "It expires in %d minutes and can be used once. If this was not "
+              "you, ignore this email - your password has not changed."
+              % (row["username"], code, RESET_CODE_TTL_SECONDS // 60))
+
+    return {"ok": True, "message": RECOVER_GENERIC_MESSAGE}, 200
+
+
+@app.post("/api/auth/reset")
+def complete_recovery():
+    """
+    Set a new password using the emailed code
+    ---
+    tags:
+      - Auth
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [email, code, new_password]
+          properties:
+            email:        {type: string}
+            code:         {type: string}
+            new_password: {type: string}
+    responses:
+      200:
+        description: Password replaced, every session on the account destroyed
+      400:
+        description: Wrong or expired code, or a password that fails the rules
+      429:
+        description: Too many attempts from this address
+    """
+    payload = request.get_json(silent=True) or {}
+    address = _clean_email(payload.get("email"))
+    code = str(payload.get("code", "")).strip()
+    new = payload.get("new_password")
+
+    if not isinstance(new, str) or len(new) < MIN_PASSWORD_LENGTH:
+        return bad_request(
+            "Field 'new_password' must be at least %d characters." % MIN_PASSWORD_LENGTH)
+
+    db = get_db()
+    now = int(time.time())
+    ip = client_ip()
+
+    # The login throttle covers this too: it is a place to guess a code, and an
+    # unthrottled one would be a million tries from a loop.
+    ip_state = _ip_throttle_state(db, ip, now)
+    if ip_state is not None:
+        reason, retry = ip_state
+        _record_login_attempt(db, "", ip, False, reason)
+        db.commit()
+        return {
+            "error": "Too Many Requests",
+            "message": "Too many failed attempts from this address. Try again in %d seconds." % retry,
+        }, 429
+
+    row = None
+    if address != "" and code != "":
+        row = db.execute(
+            "SELECT * FROM users WHERE email = ? AND email_verified = 1", (address,)
+        ).fetchone()
+
+    if row is None:
+        check_password_hash(_TIMING_DUMMY_HASH, code)
+        _record_login_attempt(db, "", ip, False, "reset-bad-code")
+        db.commit()
+        return bad_request("That code is wrong or has expired.")
+
+    ok, _reason = _consume_code(db, row["id"], "reset", code, now)
+    if not ok:
+        _record_login_attempt(db, row["username"], ip, False, "reset-bad-code")
+        db.commit()
+        # ONE MESSAGE FOR EVERY FAILURE. Separating "wrong" from "expired" from
+        # "you have run out of tries" tells an attacker how close they are.
+        return bad_request("That code is wrong or has expired.")
+
+    # EVERY SESSION GOES. This is the half that makes recovery worth having:
+    # the player reaching for it usually believes somebody else is already in
+    # their account, and a new password that left the intruder's token alive
+    # would not have removed them.
+    db.execute(
+        "UPDATE users SET password_hash = ?, failed_logins = 0, lockout_until = 0 "
+        "WHERE id = ?",
+        (generate_password_hash(new), row["id"]),
+    )
+    cursor = db.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+    revoked = cursor.rowcount
+    _record_login_attempt(db, row["username"], ip, True, "password-reset")
+    db.commit()
+
+    app.logger.warning("password RESET by email  user=%r  ip=%s  sessions_revoked=%d",
+                       row["username"], ip or "?", revoked)
+
+    send_mail_async(address, "Elusion RPG - your password was changed",
+              "The password for %s was just reset using a code sent to this "
+              "address, and every device signed in to it has been signed out.\n\n"
+              "If that was not you, change your password again immediately."
+              % row["username"])
+
+    return {"ok": True, "revoked": revoked,
+            "message": "Password updated. You can sign in now."}, 200
 
 
 # =============================================================================
@@ -3506,7 +5801,24 @@ def write_save():
     # has. Taking it from the client here would have left an open door beside
     # the one /api/player/status just closed.
     level = 1
-    area = str(payload.get("area", "elusion")).strip() or "elusion"
+    # OMITTED means "leave it alone", exactly like active_pet_id below.
+    #
+    # THIS USED TO DEFAULT TO "elusion" ON EVERY WRITE, which meant any caller
+    # that did not happen to send an area silently moved the character back to
+    # the starting zone. Nothing noticed for a long time because nothing on the
+    # client set the field at all - every character in the game just read
+    # "elusion" forever. The moment the client started reporting where it
+    # actually was, a single save from a slot loaded before the field existed
+    # would have yanked that character home.
+    #
+    # "elusion" now applies only to a brand new character, through VALUES.
+    area_key_sent = "area" in payload
+    area = str(payload.get("area", "")).strip() if area_key_sent else ""
+    if not area:
+        area = "elusion"
+        area_key_sent = False
+    if len(area) > 64:
+        return bad_request("area must be 64 characters or fewer")
 
     # OMITTED means "leave it alone", not "clear it".
     #
@@ -3615,7 +5927,8 @@ def write_save():
             -- server granted through /api/combat/kill; the 1 in VALUES only
             -- ever applies to a brand new character.
             level         = saves.level,
-            area          = excluded.area,
+            area          = CASE WHEN ? THEN excluded.area
+                                 ELSE saves.area END,
             active_pet_id = CASE WHEN ? THEN excluded.active_pet_id
                                  ELSE saves.active_pet_id END,
             equipment     = CASE WHEN ? THEN excluded.equipment
@@ -3629,6 +5942,7 @@ def write_save():
         (g.user["id"], slot, class_id, name, level, area, active_pet_id,
          json.dumps(equipment), json.dumps(hotbar or [""] * HOTBAR_SIZE),
          json.dumps(explored), now,
+         1 if area_key_sent else 0,
          1 if pet_key_sent else 0,
          equip_key_sent,
          1 if hotbar_key_sent else 0,
@@ -3809,6 +6123,51 @@ STAT_CEILING = 1_000_000_000
 # Read from gamedata so the authored source stays baseenemy.gd's constants.
 CONSTANTS_GOLD_SMALL = gamedata.CONSTANTS.get("gold_small_id", "smallamountofgold")
 CONSTANTS_GOLD_LARGE = gamedata.CONSTANTS.get("gold_large_id", "largeamountofgold")
+
+
+# WHAT ONE LUSION IS WORTH IN GOLD.
+#
+# Needed the moment two currencies are added into one number - the score - and
+# stated once here rather than inlined at the place that adds them, because
+# the day it is tuned it must move everywhere at once.
+#
+# WHERE 1000 COMES FROM. It is one gold coin on the denomination ladder, which
+# makes the premium currency legible against the thing players actually count:
+# a lusion is a gold coin. It also lands the two revive paths near each other
+# in cost - the lusion revive is 20 lusions, so 20,000 gold, and the gold
+# revive takes 80% of what you hold, which is the same bill for somebody
+# carrying about 25,000. A player choosing between them is making a real
+# choice rather than an obvious one.
+#
+# IT IS NOT AN EXCHANGE RATE PLAYERS CAN TRADE AT, and nothing here lets them.
+# It is the weight used when one number has to describe both.
+LUSION_GOLD_VALUE = int(gamedata.CONSTANTS.get("lusion_gold_value", 1000))
+
+
+def gold_item_value(item_id):
+    """What one of this coin is worth, or 0 if it is not a gold coin at all.
+
+    THE ONE PLACE THAT ANSWERS "IS THIS GOLD, AND HOW MUCH". Loot used to
+    credit the QUANTITY as gold, which was right only while every gold item
+    was worth exactly 1. With a real ladder - a platinum coin is a hundred
+    thousand - crediting the count would pay out a hundred thousandth of the
+    drop. The client already multiplied by value; this is the server catching
+    up to it, and the two now agree by doing the same arithmetic.
+    """
+    premium = gamedata.CONSTANTS.get("lusions_item_id", LUSIONS_ITEM_ID)
+    if item_id == premium:
+        return 0
+    record = gamedata.ITEMS.get(item_id) or {}
+    if str(record.get("type_name", "")) != "CURRENCY":
+        # The two legacy ids are still honoured by name even if a data file
+        # ever stops labelling them, because old bags and old saves hold them.
+        if item_id in (CONSTANTS_GOLD_SMALL, CONSTANTS_GOLD_LARGE):
+            return 1
+        return 0
+    try:
+        return max(0, int(record.get("value", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
 
 # GOLD IS IN THIS LIST AND ITS ABSENCE WAS A HOLE STRAIGHT THROUGH THE ECONOMY.
 #
@@ -4446,6 +6805,24 @@ def write_player_status():
         for field, value in healed.items():
             merged[field] = value
             updates[field] = value
+
+        # A DEATH IS A TRANSITION, NOT A STATE, and counting it as a state is
+        # the bug worth not writing. A dead client keeps reporting its status
+        # while the death screen is up, so "hp is 0" is true over and over for
+        # as long as the player sits there deciding whether to pay. Counting
+        # that would let anybody run their death total to a million by leaving
+        # the screen open, and would make the figure meaningless for everybody
+        # who did not.
+        #
+        # So: the STORED row still had hp above zero and the merged one does
+        # not. That happens exactly once per death.
+        #
+        # AFTER _reconcile_heals(), because the reconciler can correct the hp
+        # the client sent, and the corrected figure is the one that gets
+        # stored - reading before it would count a death the save never
+        # recorded.
+        if "hp" in updates and int(row["hp"]) > 0 and int(updates["hp"]) <= 0:
+            db.execute("UPDATE users SET deaths = deaths + 1 WHERE id = ?", (user_id,))
 
         assignments = ", ".join("%s = ?" % f for f in updates)
         values = list(updates.values()) + [int(time.time()), user_id, slot]
@@ -5864,6 +8241,124 @@ def set_account_role():
     return {"username": target["username"], "role": new_role, "was": was}, 200
 
 
+# How much gold one debug grant may mint, and how much it may take away. A
+# ceiling rather than no limit: a typo in a box should cost a re-press, not
+# make the Kingdom Tax board meaningless forever.
+DEBUG_GOLD_MAX = 1000000
+
+
+@app.post("/api/staff/gold")
+@require_auth
+@require_owner
+def staff_gold():
+    """
+    Give yourself gold for testing (owner only)
+    ---
+    tags:
+      - Staff
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: grant
+        schema:
+          type: object
+          required: [slot, amount]
+          properties:
+            slot:   {type: integer, example: 0}
+            amount: {type: integer, example: 5000}
+            bank:   {type: boolean, description: "Put it in the bank instead"}
+    responses:
+      200:
+        description: The new balances
+      400:
+        description: Bad slot, bad amount, or it would take you below zero
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: Not the owner, or no character in that slot
+    """
+    # WHY THIS EXISTS AT ALL, stated plainly: a server nobody can put gold on
+    # is a server whose shops, trades, bank, revive cost and guild founding
+    # cannot be tested by the person who wrote them. The debug keys did this
+    # job, but they are gated on OS.is_debug_build() and so disappear the
+    # moment the game is exported - which is exactly when it most needs
+    # exercising.
+    #
+    # OWNER ONLY, NOT MOD. Granting an item is a test fixture; minting the
+    # currency is the economy itself, and the Kingdom Tax board is built on
+    # the assumption that gold is scarce. One person can be trusted with that
+    # because it is their server.
+    #
+    # THROUGH THE LEDGER, LIKE EVERYTHING ELSE. A bare UPDATE would mint gold
+    # the supply invariant cannot see, and /api/economy/supply would start
+    # reporting drift that is not drift. The row says 'staff_gold', so every
+    # coin conjured for a test is visible as exactly that forever.
+    payload = request.get_json(silent=True) or {}
+    user_id = g.user["id"]
+
+    slot = parse_slot(payload.get("slot"))
+    if slot is None:
+        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+    if not _slot_exists(user_id, slot):
+        return {"error": "Not Found",
+                "message": "No character in slot %d." % slot}, 404
+
+    raw = payload.get("amount", 0)
+    if isinstance(raw, bool):
+        return bad_request("amount must be a whole number")
+    try:
+        amount = int(raw)
+    except (TypeError, ValueError):
+        return bad_request("amount must be a whole number")
+    if amount == 0:
+        return bad_request("amount must not be zero")
+    if abs(amount) > DEBUG_GOLD_MAX:
+        return bad_request("one grant is at most %d gold" % DEBUG_GOLD_MAX)
+
+    db = get_db()
+    to_bank = bool(payload.get("bank", False))
+    detail = "owner debug grant"
+
+    # THE ACCOUNTS ROW HAS TO EXIST FIRST, and this line is here because the
+    # first version did not have it. accounts rows are created lazily, on the
+    # first time somebody banks anything - so an owner who has never used the
+    # bank has no row, bank_gold_delta's UPDATE matched nothing, and it
+    # returned None rather than raising. The grant reported success, wrote no
+    # ledger row, and moved no gold. Silent, and the supply invariant stayed
+    # balanced throughout because nothing had happened at all.
+    _ensure_account(user_id)
+
+    try:
+        if to_bank:
+            if bank_gold_delta(db, user_id, amount, "staff_gold", detail) is None:
+                db.rollback()
+                return bad_request("that bank grant did not go through")
+        else:
+            if gold_delta(db, user_id, slot, amount, "staff_gold", detail) is None:
+                return {"error": "Not Found",
+                        "message": "No character in slot %d." % slot}, 404
+    except InsufficientGold:
+        db.rollback()
+        return bad_request("that would take the balance below zero")
+
+    db.commit()
+
+    account = _ensure_account(user_id)
+    purse = db.execute("SELECT gold FROM saves WHERE user_id = ? AND slot = ?",
+                       (user_id, slot)).fetchone()
+    return {
+        "slot": slot,
+        "granted": amount,
+        "where": "bank" if to_bank else "carried",
+        "gold": int(purse["gold"] or 0) if purse is not None else 0,
+        "bank_gold": int(account["bank_gold"] or 0),
+    }, 200
+
+
 @app.post("/api/staff/grant")
 @require_auth
 @require_role("mod")
@@ -5974,6 +8469,254 @@ def staff_grant():
         "granted_quantity": quantity,
         "carry_positions": written,
         "inventory": inventory_payload(user_id, slot),
+    }, 200
+
+
+@app.post("/api/staff/teleport")
+@require_auth
+@require_role("dev")
+def staff_teleport():
+    """
+    Move a player, or everyone, to a place
+    ---
+    tags:
+      - Moderation
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          properties:
+            username: {type: string, description: "who to move; omit when everyone is true"}
+            everyone: {type: boolean, description: "move every account - owner only"}
+            area:     {type: string, description: "destination area; defaults to yours"}
+            x:        {type: number}
+            y:        {type: number}
+    responses:
+      200:
+        description: How many moves were queued, and where
+      400:
+        description: Neither a username nor everyone
+      403:
+        description: Only the owner may move everyone
+      404:
+        description: No such account, one you may not act on, or not staff
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+    everyone = bool(payload.get("everyone", False))
+
+    db = get_db()
+    now = int(time.time())
+
+    # WHERE. Defaults to the caller's own area, because "come here" is the
+    # thing a dev wants nine times out of ten and typing your own location is
+    # a step with nothing to gain.
+    mine = db.execute("SELECT area FROM saves WHERE user_id = ? LIMIT 1", (g.user["id"],)).fetchone()
+    area = str(payload.get("area", "") or (mine["area"] if mine is not None else "elusion")).strip()
+    if area == "":
+        area = "elusion"
+
+    try:
+        x = float(payload.get("x", 0) or 0)
+        y = float(payload.get("y", 0) or 0)
+    except (TypeError, ValueError):
+        return bad_request("x and y must be numbers")
+
+    # ---------------------------------------------------------------- everyone
+    if everyone:
+        # MOVING THE WHOLE SERVER IS AN OWNER'S ACT. A dev may reach for one
+        # player; emptying the world into one spot is the kind of thing that
+        # wants the narrowest rank in the game behind it.
+        if not is_owner(g.user["username"]):
+            return {
+                "error": "Forbidden",
+                "message": "Only the owner may teleport everyone.",
+            }, 403
+
+        rows = db.execute("SELECT id, username FROM users ORDER BY id").fetchall()
+        total = len(rows)
+        for slot, row in enumerate(rows):
+            queue_teleport(db, row["id"], area, x, y, slot, total, g.user["username"], now)
+
+        log_staff_action(g.user, "teleport", "everyone", None,
+                         "%d players -> %s (%.0f, %.0f)" % (total, area, x, y))
+        post_broadcast("Everyone has been moved to %s." % area, "system", g.user["username"])
+        db.commit()
+
+        return {
+            "moved": total, "area": area, "x": x, "y": y,
+            "everyone": True, "spacing": TELEPORT_SPACING,
+        }, 200
+
+    # ------------------------------------------------------------ one player
+    username = str(payload.get("username", "")).strip()
+    if username == "":
+        return bad_request('send {"username": "..."} or {"everyone": true}')
+
+    # can_act_on via the same helper every sanction uses, so a mod cannot move
+    # somebody who outranks them and nobody can move the owner.
+    target, refusal = _moderation_target({"username": username})
+    if refusal is not None:
+        return refusal
+
+    queue_teleport(db, target["id"], area, x, y, 0, 1, g.user["username"], now)
+    log_staff_action(g.user, "teleport", target["username"], target["id"],
+                     "-> %s (%.0f, %.0f)" % (area, x, y))
+    db.commit()
+
+    return {
+        "moved": 1, "username": target["username"], "area": area,
+        "x": x, "y": y, "everyone": False,
+    }, 200
+
+
+@app.post("/api/teleport/ack")
+@require_auth
+def acknowledge_teleport():
+    """
+    Confirm a pending teleport was carried out
+    ---
+    tags:
+      - Status
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [id]
+          properties:
+            id: {type: integer, description: "the id the poll handed you"}
+    responses:
+      200:
+        description: Cleared, or already gone
+      401:
+        description: Missing, invalid or expired token
+    """
+    # THE CLIENT CLEARS IT, NOT THE SERVER ON DELIVERY. A teleport removed the
+    # moment it was handed out is a teleport lost if the client never applied
+    # it - the window closed, the game crashed, the player alt-tabbed into a
+    # scene change. It stays queued until somebody says they actually moved.
+    #
+    # Matched on id so a stale ack cannot clear a NEWER teleport issued in the
+    # meantime, which would strand the player where they were sent from.
+    payload = request.get_json(silent=True) or {}
+    try:
+        teleport_id = int(payload.get("id", 0))
+    except (TypeError, ValueError):
+        return bad_request("id must be a whole number")
+
+    db = get_db()
+    cursor = db.execute(
+        "DELETE FROM pending_teleports WHERE user_id = ? AND id = ?",
+        (g.user["id"], teleport_id),
+    )
+    db.commit()
+    return {"cleared": cursor.rowcount > 0}, 200
+
+
+@app.get("/api/staff/powers")
+@require_auth
+@require_role("mod")
+def staff_powers():
+    """
+    What each rank may actually do, read from the live routes
+    ---
+    tags:
+      - Moderation
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+    responses:
+      200:
+        description: The rank ladder, and every gated route grouped under the rank that unlocks it
+      404:
+        description: Not staff
+      401:
+        description: Missing, invalid or expired token
+    """
+    # DERIVED, NEVER WRITTEN DOWN. Every entry below comes from the decorators
+    # on the routes themselves - see the tags set in require_role/require_owner.
+    # A hand-maintained list of "what a mod can do" is wrong the first time
+    # somebody adds a route and forgets to update it, and wrong in the most
+    # expensive direction: the owner believes a rank is narrower than it is.
+    #
+    # THIS IS ALSO WHY IT IS SAFE TO SHOW. It lists paths and the rank each one
+    # needs; it grants nothing, and every one of those routes still checks the
+    # caller itself on the way in.
+    buckets = {name: [] for name in ROLES}
+    for rule in app.url_map.iter_rules():
+        view = app.view_functions.get(rule.endpoint)
+        if view is None:
+            continue
+
+        minimum = getattr(view, "_elusion_min_role", None)
+        if minimum is None:
+            # Not rank-gated. Logged-in-only routes are the ordinary business
+            # of playing the game, so they are not powers and are left out.
+            continue
+        if minimum not in buckets:
+            continue
+
+        methods = sorted(m for m in rule.methods if m in ("GET", "POST", "PUT", "DELETE", "PATCH"))
+        buckets[minimum].append({
+            "method": methods[0] if methods else "GET",
+            "path": str(rule.rule),
+            "what": (view.__doc__ or "").strip().splitlines()[0].strip() if view.__doc__ else "",
+        })
+
+    for name in buckets:
+        buckets[name].sort(key=lambda row: row["path"])
+
+    # THE THINGS THAT ARE NOT ROUTES. A rank is more than the endpoints it
+    # opens, and these three are the ones that would surprise an owner handing
+    # the rank out. Pulled from the constants that enforce them rather than
+    # retyped, so the numbers cannot drift either.
+    extras = {
+        "player": [],
+        "mod": [
+            "Ban for at most %d days - a longer or permanent ban is refused." % MAX_MOD_BAN_DAYS,
+            "Exempt from the anti-cheat clamps on skill level and backpack contents.",
+            "May use the in-game debug item keys.",
+        ],
+        "dev": [
+            "Ban permanently, and for any number of days.",
+        ],
+        "owner": [
+            "Cannot be granted or revoked - it comes from ELUSION_OWNER in the server's environment.",
+            "Exempt from the maintenance switch: never locked out or disconnected by it.",
+        ],
+    }
+
+    ladder = []
+    for index, name in enumerate(ROLES):
+        ladder.append({
+            "rank": name,
+            "level": index,
+            "grantable": name in SETTABLE_ROLES,
+            "routes": buckets.get(name, []),
+            "notes": extras.get(name, []),
+        })
+
+    return {
+        "ladder": ladder,
+        "you_are": role_for(g.user),
+        # Mirrors the rule in PUT /api/staff/role: you may not grant a rank at
+        # or above your own.
+        "you_may_grant": [r for r in SETTABLE_ROLES if ROLES.index(r) < ROLES.index(role_for(g.user))],
     }, 200
 
 
@@ -6287,17 +9030,837 @@ def server_status():
     # A reachable /api/status also means a scheduled restart can ANNOUNCE
     # itself rather than surfacing as an error. Downtime the player was warned
     # about is maintenance; the same downtime unannounced is a broken game.
+    # NO LONGER SET BY HAND. The owner throws the switch from the HUD and it
+    # lives in server_settings, so a closed server announces itself to every
+    # client that asks - including one sitting on the login screen that has
+    # never logged in and has no token to ask with.
+    state = maintenance_state()
     return {
         "online": True,
         "gamedata_schema": gamedata.EXPECTED_SCHEMA,
         "items": len(gamedata.ITEMS),
         "enemies": len(gamedata.ENEMIES),
-        # Set these by hand before a planned restart. back_at is an RFC3339
-        # timestamp the client can render in the player's own timezone; null
-        # means no downtime is planned.
-        "message": "",
-        "back_at": None,
+        "maintenance": state["on"],
+        "message": state["message"] if state["on"] else "",
+        "back_at": state["back_at"],
+        "seconds_left": maintenance_seconds_left(state),
     }, 200
+
+
+@app.post("/api/server/maintenance")
+@require_auth
+@require_owner
+def set_maintenance():
+    """
+    Close or reopen the server (owner only)
+    ---
+    tags:
+      - Status
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [on]
+          properties:
+            on:            {type: boolean, description: "true closes the server"}
+            message:       {type: string,  description: "what players are told"}
+            back_at:       {type: string,  description: "RFC3339, or null"}
+            grace_seconds: {type: integer, description: "seconds players get to save before being signed out"}
+    responses:
+      200:
+        description: The switch as it now stands
+      400:
+        description: Malformed body
+      404:
+        description: Not the owner (the same 404 every owner route gives)
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+    if "on" not in payload:
+        return bad_request('send {"on": true} to close the server, or {"on": false} to reopen it')
+
+    db = get_db()
+    now = int(time.time())
+
+    # ------------------------------------------------------------------ open
+    if not bool(payload.get("on")):
+        # Written as an explicit {"on": false} rather than deleting the row, so
+        # server_settings keeps a record of who reopened it and when.
+        set_server_setting(MAINTENANCE_KEY, json.dumps({"on": False}), g.user["username"])
+        post_broadcast("The server is open again.", "system", g.user["username"])
+        log_staff_action(g.user, "maintenance", "server", None, "reopened")
+        db.commit()
+        return {
+            "maintenance": False, "message": "", "back_at": None,
+            "seconds_left": 0, "sessions_ended": 0,
+        }, 200
+
+    # ----------------------------------------------------------------- close
+    message = str(payload.get("message", "")).strip()[:200] or MAINTENANCE_DEFAULT_MESSAGE
+
+    back_at = payload.get("back_at")
+    if back_at is not None:
+        back_at = str(back_at).strip()[:64] or None
+
+    grace = payload.get("grace_seconds", MAINTENANCE_DEFAULT_GRACE_SECONDS)
+    try:
+        grace = int(grace)
+    except (TypeError, ValueError):
+        return bad_request("grace_seconds must be a whole number of seconds")
+    grace = max(0, min(grace, MAINTENANCE_MAX_GRACE_SECONDS))
+
+    set_server_setting(MAINTENANCE_KEY, json.dumps({
+        "on": True,
+        "message": message,
+        "back_at": back_at,
+        # THE ONE NUMBER THAT MATTERS. Stored as an absolute time, not a
+        # duration, because every later request has to answer "is the window
+        # spent" without knowing when the switch was thrown.
+        "kick_at": now + grace,
+        "by": g.user["username"],
+        "at": now,
+    }), g.user["username"])
+
+    # WHO IS ACTUALLY IN THE WORLD, not who holds a session - a token lasts
+    # thirty days, so counting sessions would report a crowd that went home
+    # weeks ago. This is the number the owner is really asking for: how many
+    # people is the grace window for.
+    online = int(db.execute(
+        "SELECT COUNT(*) AS n FROM sessions WHERE last_seen_at > ?",
+        (now - ONLINE_WINDOW_SECONDS,),
+    ).fetchone()["n"] or 0)
+
+    # NO GRACE MEANS NO SAVE, and it is spelled out here rather than hidden
+    # behind a default. Asking for zero is asking to drop whatever the clients
+    # had not sent yet; every other value lets the heartbeat carry the notice
+    # and the clients flush first.
+    # SAID OUT LOUD, IN THE WORLD. The login screen only reaches people who
+    # are not playing yet; this is the half that reaches the ones who are.
+    # Posted before the sessions are ended so it is already in the table when
+    # the last poll before disconnection asks for it.
+    if grace > 0:
+        post_broadcast(
+            "%s (closing in %ds - your progress is being saved)" % (message, grace),
+            "system", g.user["username"])
+    else:
+        post_broadcast("%s (closing now)" % message, "system", g.user["username"])
+
+    ended = _end_all_player_sessions(db) if grace == 0 else 0
+
+    log_staff_action(
+        g.user, "maintenance", "server", None,
+        "closed, %ds grace, %d online%s" % (
+            grace, online, ", %d signed out now" % ended if ended else ""),
+    )
+    db.commit()
+
+    return {
+        "maintenance": True,
+        "message": message,
+        "back_at": back_at,
+        "grace_seconds": grace,
+        "disconnect_at": now + grace,
+        "seconds_left": grace,
+        "online_now": online,
+        "sessions_ended": ended,
+    }, 200
+
+
+@app.post("/api/server/broadcast")
+@require_auth
+@require_owner
+def send_broadcast():
+    """
+    Say something to everyone playing (owner only)
+    ---
+    tags:
+      - Status
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [body]
+          properties:
+            body: {type: string, description: "the announcement, max 200 chars"}
+            kind: {type: string, description: "system (default) or shout"}
+    responses:
+      200:
+        description: The announcement as stored
+      400:
+        description: Empty or missing body
+      404:
+        description: Not the owner
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+    text = str(payload.get("body", "")).strip()
+    if text == "":
+        return bad_request("body must be a non-empty message")
+
+    kind = str(payload.get("kind", "system")).strip().lower() or "system"
+    if kind not in ("system", "shout"):
+        return bad_request("kind must be 'system' or 'shout'")
+
+    db = get_db()
+    new_id = post_broadcast(text, kind, g.user["username"])
+    db.commit()
+
+    return {
+        "id": new_id,
+        "kind": kind,
+        "body": text[:MAX_BROADCAST_LENGTH],
+        "by": g.user["username"],
+    }, 200
+
+
+@app.get("/api/server/broadcasts")
+@require_auth
+def read_broadcasts():
+    """
+    Everything the server has said since a given message id
+    ---
+    tags:
+      - Status
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: query
+        name: since
+        type: integer
+        description: "Return messages with an id greater than this. 0 for the recent tail."
+    responses:
+      200:
+        description: Messages in id order, oldest first, plus the newest id
+      401:
+        description: Missing, invalid or expired token
+    """
+    # THIS DOUBLES AS THE HEARTBEAT and that is not an accident. It is the call
+    # a client in the world makes on a timer, so it is already the thing that
+    # finds out about a kick, a ban, or a closed server - @require_auth answers
+    # 401 for all three, which is exactly the signal the client already knows
+    # how to read. One poll, two jobs, no second timer to keep in step.
+    raw_since = request.args.get("since", "0")
+    try:
+        since = max(0, int(raw_since))
+    except (TypeError, ValueError):
+        return bad_request("since must be a whole number")
+
+    db = get_db()
+
+    # A FIRST POLL ASKS FOR THE TAIL, NOT THE WHOLE TABLE. since=0 means "I just
+    # got here" - answering that with a week of restart notices would scroll the
+    # useful ones off screen before the player read them.
+    if since == 0:
+        rows = db.execute(
+            "SELECT * FROM broadcasts ORDER BY id DESC LIMIT ?",
+            (BROADCAST_PAGE_LIMIT,),
+        ).fetchall()
+        rows = list(reversed(rows))
+    else:
+        rows = db.execute(
+            "SELECT * FROM broadcasts WHERE id > ? ORDER BY id ASC LIMIT ?",
+            (since, BROADCAST_PAGE_LIMIT),
+        ).fetchall()
+
+    messages = [{
+        "id": int(r["id"]),
+        "kind": r["kind"],
+        "body": r["body"],
+        "by": r["created_by"],
+        "at": int(r["created_at"]),
+    } for r in rows]
+
+    # The newest id IN THE TABLE, not in this page: a client that was handed a
+    # truncated page still needs to know there is more, and comparing its cursor
+    # to this is how it finds out.
+    newest = db.execute("SELECT MAX(id) AS n FROM broadcasts").fetchone()["n"]
+
+    return {
+        "messages": messages,
+        "latest_id": int(newest or 0),
+        "maintenance": maintenance_public(),
+        # Rides the same poll as everything else. None when there is nowhere
+        # to be; the client applies it and then acks it away.
+        "teleport": pending_teleport_for(g.user["id"]),
+    }, 200
+
+
+@app.post("/api/chat/send")
+@require_auth
+def chat_send():
+    """
+    Say something in world chat
+    ---
+    tags:
+      - Chat
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: message
+        schema:
+          type: object
+          required: [body]
+          properties:
+            body:
+              type: string
+              description: "The message, trimmed and capped at 200 characters"
+    responses:
+      200:
+        description: The message as everyone else will read it
+      400:
+        description: Empty message
+      401:
+        description: Missing, invalid or expired token
+      429:
+        description: Sending faster than the flood bucket allows
+    """
+    payload = request.get_json(silent=True) or {}
+    text = str(payload.get("body", "")).strip()
+    image_id = str(payload.get("image", "")).strip()
+
+    channel = str(payload.get("channel", CHAT_DEFAULT_CHANNEL)).strip().lower()
+    if channel not in CHAT_CHANNELS:
+        return bad_request("channel must be one of: %s" % ", ".join(CHAT_CHANNELS))
+
+    # A PICTURE ON ITS OWN IS A MESSAGE. Demanding words alongside it would be
+    # demanding a caption nobody writes.
+    if text == "" and image_id == "":
+        return bad_request("body must be a non-empty message")
+
+    db = get_db()
+
+    # THE PICTURE MUST ALREADY HAVE BEEN RELAYED. A client cannot name an id
+    # this server has not fetched and decoded for itself - which is what stops
+    # the field being a way to point everyone at an arbitrary URL after all.
+    if image_id != "":
+        held = db.execute(
+            "SELECT id FROM chat_images WHERE id = ?", (image_id,)).fetchone()
+        if held is None:
+            return bad_request("that picture is not on this server")
+
+    target_row = None
+    to_name = str(payload.get("to", "")).strip()
+    if to_name != "":
+        target_row = _user_by_name(to_name)
+        if target_row is None:
+            return {"error": "Not Found", "message": "No such account."}, 404
+
+    refusal = chat_write_check(channel, target_row)
+    if refusal is not None:
+        return refusal
+
+    # ONE PICTURE IN WORLD PER HALF HOUR, checked here because here is where
+    # the channel is finally known. Before the token spend below, so being
+    # refused for this does not also cost a message allowance.
+    now = int(time.time())
+    if channel == "world" and image_id != "":
+        waiting = world_image_wait(g.user, now)
+        if waiting > 0:
+            return ({
+                "error": "Too Many Requests",
+                "message": "One picture in world chat every %d minutes."
+                           " Try again in %s." % (
+                               WORLD_IMAGE_COOLDOWN_SECONDS // 60,
+                               describe_wait(waiting)),
+            }, 429, {"Retry-After": str(waiting)})
+
+    # THROTTLE BEFORE WRITING, not after. Checking afterwards would mean the
+    # flood is already in the table by the time it is refused.
+    refusal = _spend_chat_token(g.user["id"])
+    if refusal is not None:
+        return refusal
+
+    target_id = int(target_row["id"]) if target_row is not None else 0
+
+    # A GUILD LINE CARRIES ITS GUILD. target_id is the "who else does this
+    # line concern" column - a person for a whisper, a guild here - and
+    # writing it at post time is what makes the read above leak-proof.
+    if channel == "guild":
+        seat = guild_membership(g.user["id"])
+        if seat is None:
+            return {"error": "Conflict",
+                    "message": "You are not in a guild."}, 409
+        target_id = int(seat["guild_id"])
+
+    new_id = post_chat(g.user, text, channel, target_id, image_id)
+
+    # STAMPED ONLY ONCE THE PICTURE IS REALLY IN THE TABLE, and only for
+    # world. A send that was refused above, or one to a friend, leaves the
+    # half hour untouched.
+    if channel == "world" and image_id != "":
+        stamp_world_image(g.user["id"], now)
+
+    # ONE COMMIT FOR ALL OF IT. The spent token, the message it paid for and
+    # the prune land together, so a crash between them cannot give a message
+    # away free.
+    db.commit()
+
+    return {
+        "id": int(new_id or 0),
+        "by": g.user["username"],
+        "role": role_for(g.user),
+        "body": text[:MAX_CHAT_LENGTH],
+        "channel": channel,
+        "image": image_id,
+        "to": target_row["username"] if target_row is not None else "",
+    }, 200
+
+
+@app.get("/api/chat")
+@require_auth
+def read_chat():
+    """
+    Everything said in world chat since a given message id
+    ---
+    tags:
+      - Chat
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: query
+        name: since
+        type: integer
+        description: "Return messages with an id greater than this. 0 for the recent tail."
+    responses:
+      200:
+        description: Messages in id order, oldest first, plus the newest id
+      400:
+        description: since was not a whole number
+      401:
+        description: Missing, invalid or expired token
+    """
+    raw_since = request.args.get("since", "0")
+    try:
+        since = max(0, int(raw_since))
+    except (TypeError, ValueError):
+        return bad_request("since must be a whole number")
+
+    channel = str(request.args.get("channel", CHAT_DEFAULT_CHANNEL)).strip().lower()
+    if channel not in CHAT_CHANNELS:
+        return bad_request("channel must be one of: %s" % ", ".join(CHAT_CHANNELS))
+
+    db = get_db()
+    me = int(g.user["id"])
+
+    # WHO MAY READ WHAT, built as a WHERE clause rather than filtered in
+    # Python afterwards. A read that fetches everything and then hides some of
+    # it is one forgotten line away from hiding none of it.
+    where = "channel = ?"
+    params = [channel]
+    partner = ""
+
+    if channel == "private":
+        with_name = str(request.args.get("with", "")).strip()
+        if with_name == "":
+            return bad_request("a private conversation needs a 'with' account")
+        other = _user_by_name(with_name)
+        if other is None:
+            return {"error": "Not Found", "message": "No such account."}, 404
+        partner = other["username"]
+        them = int(other["id"])
+        # BOTH DIRECTIONS, AND ONLY THESE TWO. Reading someone else's
+        # conversation is the failure this clause exists to make impossible.
+        where += (" AND ((user_id = ? AND target_id = ?)"
+                  "   OR (user_id = ? AND target_id = ?))")
+        params += [me, them, them, me]
+
+    elif channel == "friends":
+        # YOU AND THE PEOPLE WHO ACCEPTED YOU. Worked out at read time from
+        # the friends table, so removing somebody stops their lines appearing
+        # without anything having to go back and rewrite history.
+        allowed = _friend_ids(db, me)
+        allowed.add(me)
+        marks = ",".join("?" for _ in allowed)
+        where += " AND user_id IN (%s)" % marks
+        params += sorted(allowed)
+
+    elif channel == "guild":
+        seat = guild_membership(me)
+        if seat is None:
+            # No guild, nothing to read, and saying so plainly beats an empty
+            # list the client has to guess the meaning of.
+            return {
+                "messages": [],
+                "latest_id": 0,
+                "now": int(time.time()),
+                "channel": channel,
+                "available": False,
+                "notice": "You are not in a guild yet.",
+                # Present here too. A field that exists on most answers and
+                # vanishes on one is how a client ends up with a stale value
+                # it believes is current.
+                "world_image_wait": world_image_wait(g.user),
+            }, 200
+
+        # BY THE GUILD THE LINE WAS SENT TO, not by who is in the guild now.
+        #
+        # The obvious version filters on "authors who are currently in my
+        # guild", the way the friends channel does - and it leaks. Somebody
+        # who leaves guild A and joins guild B would carry every line they
+        # ever said in A into B's window, because they are a current member
+        # and their old messages match. Stamping the guild on the line at
+        # post time means a message belongs to the room it was said in, for
+        # good, whoever moves afterwards.
+        where += " AND target_id = ?"
+        params += [int(seat["guild_id"])]
+
+    # Same two-shaped read as broadcasts: a first poll wants the tail of the
+    # conversation, a returning poll wants only what it has not seen.
+    if since == 0:
+        rows = db.execute(
+            "SELECT * FROM chat_messages WHERE %s ORDER BY id DESC LIMIT ?" % where,
+            tuple(params + [CHAT_PAGE_LIMIT]),
+        ).fetchall()
+        rows = list(reversed(rows))
+    else:
+        rows = db.execute(
+            "SELECT * FROM chat_messages WHERE %s AND id > ? ORDER BY id ASC LIMIT ?"
+            % where,
+            tuple(params + [since, CHAT_PAGE_LIMIT]),
+        ).fetchall()
+
+    # THE NEWEST ID IN THIS CHANNEL, not in the table. A cursor taken from the
+    # whole table would skip past everything said in the channel the client is
+    # actually reading while another one was busy.
+    newest = db.execute(
+        "SELECT MAX(id) AS n FROM chat_messages WHERE %s" % where,
+        tuple(params),
+    ).fetchone()["n"]
+
+    # The pictures those lines point at, in one query rather than one each.
+    wanted = sorted({r["image_id"] for r in rows if r["image_id"]})
+    pictures = {}
+    if wanted:
+        marks = ",".join("?" for _ in wanted)
+        for row in db.execute(
+            "SELECT id, kind, width, height, frames, columns, frame_ms"
+            " FROM chat_images WHERE id IN (%s)" % marks, tuple(wanted)
+        ).fetchall():
+            pictures[row["id"]] = relayed_image_dict(row)
+
+    return {
+        "messages": [chat_message_dict(r) for r in rows],
+        "latest_id": int(newest or 0),
+        # The server's clock, so the client can age a message without trusting
+        # the machine it is running on. Same reason the staff list returns it.
+        "now": int(time.time()),
+        "channel": channel,
+        "with": partner,
+        "available": True,
+        "images": pictures,
+        # HOW LONG BEFORE A PICTURE MAY GO TO WORLD, so the client can say so
+        # BEFORE somebody picks a file, compresses it and uploads it, rather
+        # than after. Always sent, on every channel, because the answer does
+        # not depend on which channel is being read and a client that has just
+        # switched tabs should not have a stale one.
+        "world_image_wait": world_image_wait(g.user),
+    }, 200
+
+
+@app.post("/api/chat/image")
+@require_auth
+def chat_relay_image():
+    """
+    Hand the server a link and get back a picture it has stored
+    ---
+    tags:
+      - Chat
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: link
+        schema:
+          type: object
+          required: [url]
+          properties:
+            url:
+              type: string
+              description: "An http or https link to an image or a GIF"
+    responses:
+      200:
+        description: The stored picture's id and how to draw it
+      400:
+        description: Not a link, not a picture, too big, or pointing inside the network
+      401:
+        description: Missing, invalid or expired token
+      429:
+        description: Relaying faster than the cooldown allows
+      503:
+        description: This server has no image support installed
+    """
+    if not PILLOW_AVAILABLE:
+        return {
+            "error": "Service Unavailable",
+            "message": "This server cannot handle pictures yet. Run: pip install Pillow",
+        }, 503
+
+    payload = request.get_json(silent=True) or {}
+    url = str(payload.get("url", "")).strip()
+    if url == "":
+        return bad_request("url is required")
+    if len(url) > 2000:
+        return bad_request("that link is too long")
+
+    refused = chat_image_cooldown(int(time.time()))
+    if refused is not None:
+        return refused
+
+    raw, why = _fetch_image_bytes(url)
+    if raw is None:
+        return bad_request(why)
+
+    return keep_relayed_image(raw, url)
+
+
+# NOT /api/chat/image/upload, AND THE REASON IS WORTH KEEPING.
+#
+# It was that, and it produced a 405 that took a while to read. The path
+# matched `/api/chat/image/<image_id>` - "upload" is a perfectly good value
+# for image_id - and that rule is GET only, so a POST to it came back 405
+# Method Not Allowed. Werkzeug does prefer the static rule once BOTH exist, so
+# this worked the moment the new route was loaded; what it could not survive
+# was a server that had not been restarted. Then the only rule matching that
+# path was the GET one, and the client was told "method not allowed" for a
+# route that simply was not there yet.
+#
+# 405 and 404 are very different messages to the person reading them. 404
+# already says "restart the server, or something else has the port" - the
+# exact diagnosis - and 405 says nothing at all. Sitting outside the
+# `/api/chat/image/` prefix means a stale server gives the useful one.
+#
+# THE OLD PATH IS STILL REGISTERED, deliberately. Once a server HAS the route,
+# Werkzeug prefers the static rule and the old path works fine - the collision
+# only ever bit a server that had not been restarted. Keeping it means a game
+# build from before this move still posts pictures successfully against a
+# current server, which costs one line and removes any window where the two
+# halves have to be updated together.
+@app.post("/api/chat/upload")
+@app.post("/api/chat/image/upload")
+@require_auth
+def chat_upload_image():
+    """
+    Send a picture straight from the player's machine
+    ---
+    tags:
+      - Chat
+    consumes:
+      - application/octet-stream
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: header
+        name: X-Picture-Name
+        type: string
+        required: false
+        description: "The original filename, kept only so a moderator can see where it came from"
+      - in: body
+        name: picture
+        required: true
+        schema:
+          type: string
+          format: binary
+          description: "The file itself as the raw request body - not JSON, not base64"
+    responses:
+      200:
+        description: The stored picture's id and how to draw it
+      400:
+        description: Empty body, too big, or not a picture this server can read
+      401:
+        description: Missing, invalid or expired token
+      413:
+        description: Body over the server's hard request ceiling
+      429:
+        description: Uploading faster than the cooldown allows
+      503:
+        description: This server has no image support installed
+    """
+    # RAW BYTES, NOT BASE64, and that is the whole reason this is not just
+    # another JSON route. Base64 inflates by a third, so a four-megabyte photo
+    # arrives as five and a half and Werkzeug refuses it before this function
+    # is ever called - the player would see "too big" for a file that is not.
+    # Binary costs nothing and fits the limit that is actually written down.
+    if not PILLOW_AVAILABLE:
+        return {
+            "error": "Service Unavailable",
+            "message": "This server cannot handle pictures yet. Run: pip install Pillow",
+        }, 503
+
+    raw = request.get_data(cache=False)
+    if not raw:
+        return bad_request("send the picture as the body of the request")
+    if len(raw) > IMAGE_MAX_BYTES:
+        return bad_request("that picture is over %d MB" % (
+            IMAGE_MAX_BYTES // (1024 * 1024)))
+
+    refused = chat_image_cooldown(int(time.time()))
+    if refused is not None:
+        return refused
+
+    # THE NAME IS A LABEL, NEVER A PATH. It is written to the `source` column
+    # so a moderator looking at a reported picture can see it was "upload:
+    # screenshot.png" rather than a link, and it is used for nothing else -
+    # not to open anything, not to decide the format. What the file claims to
+    # be has no bearing on what decode_relayed_image() makes of the bytes.
+    name = str(request.headers.get("X-Picture-Name", "")).strip()
+    name = re.sub(r"[^A-Za-z0-9._ -]", "", name)
+    # Runs of dots collapsed and leading ones dropped, so "../../etc/passwd"
+    # cannot survive as "......etcpasswd". Nothing opens this string, so that
+    # is cosmetic rather than a defence - but a moderator reading the source
+    # column should not have to work out whether what they are looking at was
+    # an attack, and a label that still looks like one invites somebody to
+    # later "helpfully" use it as a path.
+    name = re.sub(r"\.{2,}", ".", name).lstrip(". ")[:120]
+    return keep_relayed_image(raw, "upload:" + name if name else "upload")
+
+
+@app.get("/api/chat/image/<image_id>")
+@require_auth
+def chat_read_image(image_id):
+    """
+    The bytes of a relayed picture
+    ---
+    tags:
+      - Chat
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: path
+        name: image_id
+        type: string
+        required: true
+    responses:
+      200:
+        description: A PNG - one frame, or a spritesheet if it was animated
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: No such picture
+    """
+    # SIGNED IN TO LOOK, which keeps this from being a public file host run by
+    # accident. The client already holds a token and sends it on every other
+    # call; this is no different.
+    clean = str(image_id or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", clean):
+        return {"error": "Not Found", "message": "No such picture."}, 404
+
+    row = get_db().execute(
+        "SELECT data, format FROM chat_images WHERE id = ?", (clean,)).fetchone()
+    if row is None:
+        return {"error": "Not Found", "message": "No such picture."}, 404
+
+    # THE TYPE IS WHAT WAS STORED, and the column defaults to png so every row
+    # written before stills could be WebP still describes itself correctly.
+    # Not sniffed from the bytes: nosniff is set below precisely so the
+    # browser does not guess, and it would be odd to guess here instead.
+    kind = "webp" if str(row["format"] or "png") == "webp" else "png"
+
+    # IMMUTABLE, AND IT REALLY IS: the id is the hash of these exact bytes, so
+    # a client that has one can keep it forever.
+    return bytes(row["data"]), 200, {
+        "Content-Type": "image/%s" % kind,
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "Content-Disposition": "inline",
+        "X-Content-Type-Options": "nosniff",
+    }
+
+
+@app.post("/api/chat/delete")
+@require_auth
+@require_role("mod")
+def chat_delete():
+    """
+    Take a chat message back down
+    ---
+    tags:
+      - Chat
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: target
+        schema:
+          type: object
+          required: [id]
+          properties:
+            id:
+              type: integer
+    responses:
+      200:
+        description: The message is gone
+      400:
+        description: id was missing or not a whole number
+      404:
+        description: No such message, or the caller is not staff
+    """
+    payload = request.get_json(silent=True) or {}
+    try:
+        message_id = int(payload.get("id", 0))
+    except (TypeError, ValueError):
+        return bad_request("id must be a whole number")
+    if message_id <= 0:
+        return bad_request("id must be a whole number")
+
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM chat_messages WHERE id = ?", (message_id,)
+    ).fetchone()
+    if row is None:
+        return {"error": "Not Found", "message": "No such message."}, 404
+
+    # STAFF CANNOT DELETE ABOVE THEMSELVES. A mod taking down the owner's line
+    # is the same permission question as a mod banning the owner, and the same
+    # helper answers it. Deleting your own is allowed explicitly, because
+    # can_act_on() is strictly-greater and so refuses it.
+    author = _user_by_name(row["username"])
+    if author is not None and int(author["id"]) != int(g.user["id"]):
+        if not can_act_on(g.user, author):
+            return {"error": "Not Found", "message": "No such message."}, 404
+
+    db.execute("DELETE FROM chat_messages WHERE id = ?", (message_id,))
+    log_staff_action(g.user, "chat_delete", row["username"], row["user_id"],
+                     row["body"][:120])
+    db.commit()
+
+    return {"id": message_id, "deleted": True}, 200
 
 
 # =============================================================================
@@ -7406,6 +10969,55 @@ def trade_cancel():
 # day the number of accounts starts with a comma.
 KINGDOM_BOARD_SIZE = 200
 
+# HOW LONG THE BOARD'S SHARED HALF IS ALLOWED TO BE STALE.
+#
+# THE PROBLEM THIS SOLVES IS THE MULTIPLIER, NOT THE QUERY. Even after the
+# partial indexes, one board read is a pass over every destroyed-gold row in
+# the ledger. The panel refreshes itself every thirty seconds, so the cost is
+# paid once per open panel per thirty seconds - ten players with it open is ten
+# full passes, fifty is fifty, and the work is identical every time because the
+# figures are the same for everybody.
+#
+# So it is computed at most once per window and handed to everyone who asks
+# inside it. Ten panels and one panel now cost the same.
+#
+# FIFTEEN, NOT THIRTY, and the reason is that the two clocks are independent: a
+# panel that refreshes just after a window opens would otherwise show figures
+# nearly thirty seconds older than the ones the next panel sees. Half the
+# refresh interval bounds the staleness at something smaller than the refresh
+# itself, which is the point where nobody can notice.
+#
+# WHAT IS NOT CACHED IS YOUR OWN LINE. `you` is different for every caller and
+# is built per request from the cached list, so the number a player checks for
+# themselves is never served from somebody else's snapshot.
+KINGDOM_BOARD_CACHE_SECONDS = 15
+
+# {"at": unix_seconds, "payload": {...}} - the shared half of the last board.
+# A plain module global: one process, one board, and a dict that holds a few
+# hundred rows. Nothing here is worth a cache library.
+_kingdom_cache = {"at": 0, "payload": None}
+
+
+def _kingdom_cache_read(now):
+    """The last board if it is still inside the window, otherwise None."""
+    payload = _kingdom_cache.get("payload")
+    if payload is None:
+        return None
+    if now - int(_kingdom_cache.get("at", 0)) >= KINGDOM_BOARD_CACHE_SECONDS:
+        return None
+    return payload
+
+
+def _kingdom_cache_clear():
+    """Drop the snapshot.
+
+    FOR TESTS, which move gold and then read the board expecting to see it. A
+    fifteen second window is invisible to a player and fatal to a test that
+    asserts a trade moved the total, so the suites call this between the two.
+    """
+    _kingdom_cache["at"] = 0
+    _kingdom_cache["payload"] = None
+
 
 # The most names the nearby list will return. A cap rather than paging: this
 # feeds a panel you glance at to find somebody to trade with, and a list longer
@@ -7505,6 +11117,1019 @@ def players_nearby():
     }, 200
 
 
+# =============================================================================
+# FRIENDS - THE ROUTES
+# =============================================================================
+#
+# Four of them, and between them they cover the whole life of a friendship:
+# ask, answer, list, end. There is no separate "withdraw" - removing somebody
+# deletes the row whatever state it is in, which is the same action from the
+# requester's side of a pending row.
+
+
+def _friend_counts(db, user_id):
+    """(accepted friends, requests this account has outstanding)."""
+    accepted = db.execute(
+        "SELECT COUNT(*) AS n FROM friends"
+        " WHERE state = 'accepted' AND (requester_id = ? OR addressee_id = ?)",
+        (user_id, user_id),
+    ).fetchone()["n"]
+    pending_sent = db.execute(
+        "SELECT COUNT(*) AS n FROM friends"
+        " WHERE state = 'pending' AND requester_id = ?",
+        (user_id,),
+    ).fetchone()["n"]
+    return int(accepted or 0), int(pending_sent or 0)
+
+
+def _friend_target(payload):
+    """
+    Resolve the account a friends route is aimed at.
+
+    Returns (row, None) or (None, response). Names are matched by the users
+    table's own NOCASE collation, so the caller does not have to know or fix
+    the casing - typing "tunacan" finds Tunacan.
+    """
+    name = str(payload.get("username", "")).strip()
+    if name == "":
+        return None, bad_request("username is required")
+
+    row = _user_by_name(name)
+    if row is None:
+        return None, ({"error": "Not Found", "message": "No such account."}, 404)
+
+    if int(row["id"]) == int(g.user["id"]):
+        return None, bad_request("you cannot add yourself")
+
+    return row, None
+
+
+@app.get("/api/friends")
+@require_auth
+def friends_list():
+    """
+    Your friends, who is online, and any requests waiting
+    ---
+    tags:
+      - Friends
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+    responses:
+      200:
+        description: Friends, incoming requests, outgoing requests, and the server clock
+      401:
+        description: Missing, invalid or expired token
+    """
+    db = get_db()
+    me = int(g.user["id"])
+    now = int(time.time())
+
+    rows = db.execute(
+        "SELECT * FROM friends WHERE requester_id = ? OR addressee_id = ?",
+        (me, me),
+    ).fetchall()
+
+    # THREE LISTS OUT OF ONE READ. Which list a row belongs in is decided by
+    # its state and which end of it this account is on, so asking the database
+    # three separate questions would be three round trips for one answer.
+    buckets = {"friends": [], "incoming": [], "outgoing": []}
+    other_of = {}
+    for row in rows:
+        other = int(row["addressee_id"]) if int(row["requester_id"]) == me \
+            else int(row["requester_id"])
+        other_of[other] = row
+        if row["state"] == "accepted":
+            buckets["friends"].append(other)
+        elif int(row["requester_id"]) == me:
+            buckets["outgoing"].append(other)
+        else:
+            buckets["incoming"].append(other)
+
+    ids = list(other_of.keys())
+    people = {}
+    if ids:
+        marks = ",".join("?" for _ in ids)
+        # NAMED COLUMNS, NOT SELECT *. Nothing that leaves the server should be
+        # able to carry a password hash out with it by accident.
+        for row in db.execute(
+            "SELECT id, username, role FROM users WHERE id IN (%s)" % marks,
+            tuple(ids),
+        ).fetchall():
+            people[int(row["id"])] = row
+
+    presence = _presence_for(db, ids)
+
+    out = {}
+    for key, id_list in buckets.items():
+        entries = []
+        for other in id_list:
+            row = people.get(other)
+            if row is None:
+                # The account was deleted between the two reads. ON DELETE
+                # CASCADE will have taken the link too; skip it rather than
+                # showing a nameless row.
+                continue
+            entry = friend_entry(row, presence, now)
+            entry["since"] = int(other_of[other]["decided_at"] or
+                                 other_of[other]["created_at"])
+            entries.append(entry)
+        # Online first, then by name, so the useful half of the list is at the
+        # top without the client having to sort it.
+        entries.sort(key=lambda e: (not e["online"], e["username"].casefold()))
+        out[key] = entries
+
+    accepted, pending_sent = _friend_counts(db, me)
+    out["now"] = now
+    out["limits"] = {
+        "friends": MAX_FRIENDS,
+        "pending_sent": MAX_PENDING_SENT,
+        "friends_used": accepted,
+        "pending_sent_used": pending_sent,
+    }
+    return out, 200
+
+
+@app.post("/api/friends/request")
+@require_auth
+def friends_request():
+    """
+    Ask somebody to be friends
+    ---
+    tags:
+      - Friends
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: target
+        schema:
+          type: object
+          required: [username]
+          properties:
+            username:
+              type: string
+    responses:
+      200:
+        description: Request sent, or accepted if they had already asked you
+      400:
+        description: Missing username, or aimed at yourself
+      404:
+        description: No such account
+      409:
+        description: Already friends, or already asked
+    """
+    payload = request.get_json(silent=True) or {}
+    target, refusal = _friend_target(payload)
+    if refusal is not None:
+        return refusal
+
+    db = get_db()
+    me = int(g.user["id"])
+    them = int(target["id"])
+    now = int(time.time())
+
+    link = _friend_link(db, me, them)
+    if link is not None:
+        if link["state"] == "accepted":
+            return {"error": "Conflict",
+                    "message": "You are already friends."}, 409
+        if int(link["requester_id"]) == me:
+            return {"error": "Conflict",
+                    "message": "You have already asked them."}, 409
+
+        # THEY ASKED FIRST AND THIS IS THE ANSWER. Two people who add each
+        # other at the same time should end up friends, not deadlocked with a
+        # pending request pointing each way that neither one can see a button
+        # for. Accepting here is what the second person meant anyway.
+        db.execute(
+            "UPDATE friends SET state = 'accepted', decided_at = ?"
+            " WHERE requester_id = ? AND addressee_id = ?",
+            (now, them, me),
+        )
+        db.commit()
+        return {"username": target["username"], "state": "accepted"}, 200
+
+    accepted, pending_sent = _friend_counts(db, me)
+    if accepted >= MAX_FRIENDS:
+        return bad_request("your friends list is full (%d)" % MAX_FRIENDS)
+    if pending_sent >= MAX_PENDING_SENT:
+        return bad_request(
+            "you have %d requests waiting for an answer; that is the limit"
+            % MAX_PENDING_SENT)
+
+    their_accepted, _ = _friend_counts(db, them)
+    if their_accepted >= MAX_FRIENDS:
+        # THEIR limit, said plainly. Refusing without saying whose list is full
+        # reads as the request silently failing.
+        return bad_request("their friends list is full")
+
+    db.execute(
+        "INSERT INTO friends (requester_id, addressee_id, state, created_at)"
+        " VALUES (?, ?, 'pending', ?)",
+        (me, them, now),
+    )
+    db.commit()
+    return {"username": target["username"], "state": "pending"}, 200
+
+
+@app.post("/api/friends/respond")
+@require_auth
+def friends_respond():
+    """
+    Accept or decline a request somebody sent you
+    ---
+    tags:
+      - Friends
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: answer
+        schema:
+          type: object
+          required: [username, accept]
+          properties:
+            username:
+              type: string
+            accept:
+              type: boolean
+    responses:
+      200:
+        description: Accepted, or declined and the request removed
+      400:
+        description: Missing username, or aimed at yourself
+      404:
+        description: No such account, or no request from them
+    """
+    payload = request.get_json(silent=True) or {}
+    target, refusal = _friend_target(payload)
+    if refusal is not None:
+        return refusal
+
+    db = get_db()
+    me = int(g.user["id"])
+    them = int(target["id"])
+    now = int(time.time())
+
+    # ONLY A REQUEST AIMED AT ME. Answering my own outgoing request would be
+    # accepting on the other person's behalf, so the direction is part of the
+    # lookup rather than something checked afterwards.
+    link = db.execute(
+        "SELECT * FROM friends"
+        " WHERE requester_id = ? AND addressee_id = ? AND state = 'pending'",
+        (them, me),
+    ).fetchone()
+    if link is None:
+        return {"error": "Not Found",
+                "message": "No request from that account."}, 404
+
+    if not bool(payload.get("accept", False)):
+        db.execute(
+            "DELETE FROM friends WHERE requester_id = ? AND addressee_id = ?",
+            (them, me),
+        )
+        db.commit()
+        # The requester is not told. A decline that sends a notification is a
+        # decline most people will not send.
+        return {"username": target["username"], "state": "declined"}, 200
+
+    accepted, _ = _friend_counts(db, me)
+    if accepted >= MAX_FRIENDS:
+        return bad_request("your friends list is full (%d)" % MAX_FRIENDS)
+
+    db.execute(
+        "UPDATE friends SET state = 'accepted', decided_at = ?"
+        " WHERE requester_id = ? AND addressee_id = ?",
+        (now, them, me),
+    )
+    db.commit()
+    return {"username": target["username"], "state": "accepted"}, 200
+
+
+@app.post("/api/friends/remove")
+@require_auth
+def friends_remove():
+    """
+    Remove a friend, or withdraw a request you sent
+    ---
+    tags:
+      - Friends
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: target
+        schema:
+          type: object
+          required: [username]
+          properties:
+            username:
+              type: string
+    responses:
+      200:
+        description: The link between the two accounts is gone
+      400:
+        description: Missing username, or aimed at yourself
+      404:
+        description: No such account, or no link to remove
+    """
+    payload = request.get_json(silent=True) or {}
+    target, refusal = _friend_target(payload)
+    if refusal is not None:
+        return refusal
+
+    db = get_db()
+    me = int(g.user["id"])
+    them = int(target["id"])
+
+    link = _friend_link(db, me, them)
+    if link is None:
+        return {"error": "Not Found",
+                "message": "You are not connected to that account."}, 404
+
+    # BOTH DIRECTIONS IN ONE DELETE. The row could have been made either way
+    # round, and after this call neither side should still be holding one.
+    db.execute(
+        "DELETE FROM friends"
+        " WHERE (requester_id = ? AND addressee_id = ?)"
+        "    OR (requester_id = ? AND addressee_id = ?)",
+        (me, them, them, me),
+    )
+    db.commit()
+    return {"username": target["username"], "state": "none"}, 200
+
+
+# =============================================================================
+# GUILD ROUTES
+# =============================================================================
+# EVERY ROUTE HERE ANSWERS "WHO ARE YOU IN THIS GUILD" FIRST. That is one
+# lookup - guild_membership() - and the rank it returns decides the rest. The
+# alternative, each route working it out from the request, is how one of them
+# ends up trusting a guild name the caller sent.
+#
+# A REFUSAL IS A 404 WHEN IT WOULD OTHERWISE CONFIRM SOMETHING. "No such
+# guild" and "you are not allowed to touch that guild" read the same from
+# outside, exactly as the staff routes already do.
+
+def _guild_seat():
+    """(membership_row, guild_row, rank) for the caller, or (None, None, "")."""
+    seat = guild_membership(g.user["id"])
+    if seat is None:
+        return None, None, ""
+    return seat, guild_by_id(int(seat["guild_id"])), str(seat["rank"])
+
+
+@app.get("/api/guild")
+@require_auth
+def guild_read():
+    """
+    Your guild, its roster, and any invitation waiting for you
+    ---
+    tags:
+      - Guilds
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+    responses:
+      200:
+        description: The guild you are in (or none), your rank, and your invites
+      401:
+        description: Missing, invalid or expired token
+    """
+    db = get_db()
+    now = int(time.time())
+    seat, guild, rank = _guild_seat()
+
+    # INVITATIONS ARE ANSWERED WHETHER OR NOT YOU ARE IN A GUILD, because
+    # somebody who has just left should still see the one they were sent
+    # yesterday rather than having it vanish silently.
+    invites = []
+    for row in db.execute(
+        "SELECT i.invited_by, i.created_at, gl.name"
+        "  FROM guild_invites i JOIN guilds gl ON gl.id = i.guild_id"
+        " WHERE i.user_id = ? ORDER BY i.created_at",
+        (g.user["id"],)
+    ).fetchall():
+        invites.append({
+            "guild": row["name"],
+            "by": row["invited_by"],
+            "at": int(row["created_at"] or 0),
+        })
+
+    answer = {
+        "in_guild": guild is not None,
+        "rank": rank,
+        "invites": invites,
+        "now": now,
+        "cost": GUILD_FOUND_COST,
+        "capacity": MAX_GUILD_MEMBERS,
+    }
+    if guild is not None:
+        answer["guild"] = guild_dict(db, guild, now)
+    return answer, 200
+
+
+@app.post("/api/guild/create")
+@require_auth
+def guild_create():
+    """
+    Found a guild, paying the founding cost
+    ---
+    tags:
+      - Guilds
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: guild
+        schema:
+          type: object
+          required: [name, slot]
+          properties:
+            name: {type: string, example: "The Crowned"}
+            slot: {type: integer, example: 0}
+    responses:
+      200:
+        description: The new guild, with you as its leader
+      400:
+        description: Bad name, bad slot, already taken, or not enough gold
+      401:
+        description: Missing, invalid or expired token
+      409:
+        description: You are already in a guild
+    """
+    payload = request.get_json(silent=True) or {}
+    name = str(payload.get("name", "")).strip()
+
+    if not re.fullmatch(GUILD_NAME_PATTERN, name):
+        return bad_request(
+            "a guild name is 3 to %d characters: letters, numbers, spaces,"
+            " apostrophes and hyphens, starting with a letter or number"
+            % MAX_GUILD_NAME)
+
+    slot = parse_slot(payload.get("slot"))
+    if slot is None:
+        return bad_request("slot must be a whole number")
+
+    db = get_db()
+    seat, _existing, _rank = _guild_seat()
+    if seat is not None:
+        return {
+            "error": "Conflict",
+            "message": "You are already in a guild. Leave it first.",
+        }, 409
+
+    if guild_by_name(name) is not None:
+        return bad_request("a guild by that name already exists")
+
+    # WHAT THEY ACTUALLY HAVE, read before anything is spent - both piles.
+    purse = db.execute(
+        "SELECT gold FROM saves WHERE user_id = ? AND slot = ?",
+        (g.user["id"], slot)).fetchone()
+    if purse is None:
+        return {"error": "Not Found", "message": "That slot is empty."}, 404
+
+    account = _ensure_account(g.user["id"])
+    carry_gold = int(purse["gold"] or 0)
+    bank_gold = int(account["bank_gold"] or 0)
+
+    # CARRY FIRST, THEN BANK - the same order reviving uses, and for the same
+    # reason: gold in the bank is gold you deliberately put somewhere safe, so
+    # it is spent last.
+    #
+    # THE FIRST VERSION LOOKED ONLY AT THE CARRIED PILE, which meant somebody
+    # with 9000 in the bank and 40 in their pocket was told they could not
+    # afford a guild. Their gold is their gold; where they are keeping it is
+    # not a rule anybody was told about.
+    if carry_gold + bank_gold < GUILD_FOUND_COST:
+        # AND IT SAYS THE NUMBERS. "It costs 5000 gold" on its own is the one
+        # answer nobody can act on - it does not say how short they are, and
+        # it does not say which pile was looked in, which is exactly the
+        # question somebody staring at a full bank is asking.
+        return bad_request(
+            "founding a guild costs %d gold. You have %d carried and %d in"
+            " the bank." % (GUILD_FOUND_COST, carry_gold, bank_gold))
+
+    # DESTROYED, NOT MOVED. Through gold_delta() and bank_gold_delta() so the
+    # burn lands in the ledger in the same transaction as the balance - a bare
+    # UPDATE here would break the supply invariant on the first guild anybody
+    # founded.
+    from_carry = min(carry_gold, GUILD_FOUND_COST)
+    from_bank = GUILD_FOUND_COST - from_carry
+    detail = "founded %s" % name[:60]
+
+    left = carry_gold
+    try:
+        if from_carry:
+            left = gold_delta(db, g.user["id"], slot, -from_carry,
+                              "guild_found", detail)
+        if from_bank:
+            bank_gold_delta(db, g.user["id"], -from_bank, "guild_found", detail)
+    except InsufficientGold:
+        # The balance moved between the read above and the write - somebody
+        # spending in two windows at once. Nothing has been committed, so
+        # saying so and stopping is the whole recovery.
+        db.rollback()
+        return bad_request(
+            "your gold changed while that was going through - try again")
+
+    now = int(time.time())
+    cur = db.execute(
+        "INSERT INTO guilds (name, folded, founded_by, created_at)"
+        " VALUES (?, ?, ?, ?)",
+        (name, name.lower(), g.user["username"], now))
+    guild_id = int(cur.lastrowid)
+
+    db.execute(
+        "INSERT INTO guild_members (user_id, guild_id, rank, joined_at)"
+        " VALUES (?, ?, 'leader', ?)",
+        (g.user["id"], guild_id, now))
+
+    # ANY INVITATION THEY WERE HOLDING IS GONE. They are in a guild now, and a
+    # pending invite to a different one is an offer that can no longer be
+    # accepted - leaving it would show an Accept button that always refuses.
+    db.execute("DELETE FROM guild_invites WHERE user_id = ?", (g.user["id"],))
+    db.commit()
+
+    return {
+        "guild": guild_dict(db, guild_by_id(guild_id), now),
+        "rank": "leader",
+        "gold": left,
+        "paid": GUILD_FOUND_COST,
+        "from_carried": from_carry,
+        "from_bank": from_bank,
+    }, 200
+
+
+@app.post("/api/guild/invite")
+@require_auth
+def guild_invite():
+    """
+    Invite somebody to your guild (officer or leader)
+    ---
+    tags:
+      - Guilds
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: who
+        schema:
+          type: object
+          required: [username]
+          properties:
+            username: {type: string}
+    responses:
+      200:
+        description: The invitation is waiting for them
+      400:
+        description: Already invited, already in a guild, or the guild is full
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: No such account, or you are not an officer
+    """
+    payload = request.get_json(silent=True) or {}
+    who = str(payload.get("username", "")).strip()
+    if who == "":
+        return bad_request("username is required")
+
+    seat, guild, rank = _guild_seat()
+    if guild is None or not guild_rank_at_least(rank, "officer"):
+        return {"error": "Not Found", "message": "Not found."}, 404
+
+    target = _user_by_name(who)
+    if target is None:
+        return {"error": "Not Found", "message": "No such account."}, 404
+    if int(target["id"]) == int(g.user["id"]):
+        return bad_request("you are already in it")
+
+    db = get_db()
+    guild_id = int(guild["id"])
+
+    if guild_membership(int(target["id"])) is not None:
+        return bad_request("%s is already in a guild" % target["username"])
+
+    roster_size = len(guild_member_ids(db, guild_id))
+    if roster_size >= MAX_GUILD_MEMBERS:
+        return bad_request("a guild holds %d people" % MAX_GUILD_MEMBERS)
+
+    waiting = db.execute(
+        "SELECT COUNT(*) AS n FROM guild_invites WHERE guild_id = ?",
+        (guild_id,)).fetchone()["n"]
+    if int(waiting or 0) >= MAX_GUILD_INVITES:
+        return bad_request(
+            "there are already %d invitations waiting" % MAX_GUILD_INVITES)
+
+    # INSERT OR IGNORE: inviting somebody twice is not an error, it just does
+    # not make a second invitation.
+    db.execute(
+        "INSERT OR IGNORE INTO guild_invites"
+        " (guild_id, user_id, invited_by, created_at) VALUES (?, ?, ?, ?)",
+        (guild_id, int(target["id"]), g.user["username"], int(time.time())))
+    db.commit()
+
+    return {"username": target["username"], "guild": guild["name"],
+            "state": "invited"}, 200
+
+
+@app.post("/api/guild/respond")
+@require_auth
+def guild_respond():
+    """
+    Accept or turn down an invitation
+    ---
+    tags:
+      - Guilds
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: answer
+        schema:
+          type: object
+          required: [guild, accept]
+          properties:
+            guild:  {type: string}
+            accept: {type: boolean}
+    responses:
+      200:
+        description: Joined, or the invitation is gone
+      400:
+        description: You are already in a guild, or that one is full
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: No invitation from that guild
+    """
+    payload = request.get_json(silent=True) or {}
+    wanted = str(payload.get("guild", "")).strip()
+    accept = bool(payload.get("accept", False))
+    if wanted == "":
+        return bad_request("guild is required")
+
+    db = get_db()
+    guild = guild_by_name(wanted)
+    if guild is None:
+        return {"error": "Not Found", "message": "No such guild."}, 404
+
+    invite = db.execute(
+        "SELECT * FROM guild_invites WHERE guild_id = ? AND user_id = ?",
+        (int(guild["id"]), g.user["id"])).fetchone()
+    if invite is None:
+        return {"error": "Not Found",
+                "message": "No invitation from that guild."}, 404
+
+    if not accept:
+        # TURNED DOWN SILENTLY. The guild is not told, for the same reason a
+        # declined friend request is not - being refused is not news somebody
+        # is owed, and telling them invites a second try.
+        db.execute("DELETE FROM guild_invites WHERE guild_id = ? AND user_id = ?",
+                   (int(guild["id"]), g.user["id"]))
+        db.commit()
+        return {"guild": guild["name"], "state": "declined"}, 200
+
+    if guild_membership(g.user["id"]) is not None:
+        return bad_request("you are already in a guild")
+
+    if len(guild_member_ids(db, int(guild["id"]))) >= MAX_GUILD_MEMBERS:
+        return bad_request("that guild is full")
+
+    now = int(time.time())
+    db.execute(
+        "INSERT INTO guild_members (user_id, guild_id, rank, joined_at)"
+        " VALUES (?, ?, 'member', ?)",
+        (g.user["id"], int(guild["id"]), now))
+    # EVERY OTHER INVITATION GOES TOO, not just this one. They are in a guild
+    # now and none of the others can be accepted.
+    db.execute("DELETE FROM guild_invites WHERE user_id = ?", (g.user["id"],))
+    db.commit()
+
+    return {"guild": guild_dict(db, guild, now), "rank": "member",
+            "state": "joined"}, 200
+
+
+@app.post("/api/guild/leave")
+@require_auth
+def guild_leave():
+    """
+    Leave your guild
+    ---
+    tags:
+      - Guilds
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+    responses:
+      200:
+        description: You are out
+      400:
+        description: The leader must hand the guild on or disband it
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: You are not in a guild
+    """
+    seat, guild, rank = _guild_seat()
+    if guild is None:
+        return {"error": "Not Found", "message": "You are not in a guild."}, 404
+
+    db = get_db()
+    if rank == "leader" and len(guild_member_ids(db, int(guild["id"]))) > 1:
+        # A GUILD WITHOUT A LEADER CANNOT PROMOTE ANYBODY, so walking out and
+        # leaving one behind would strand every member in a guild nobody can
+        # invite to, rank or disband. Hand it on, or disband it on the way out.
+        return bad_request(
+            "make somebody else the leader first, or disband the guild")
+
+    db.execute("DELETE FROM guild_members WHERE user_id = ?", (g.user["id"],))
+
+    # THE LAST ONE OUT TAKES THE GUILD WITH THEM. An empty guild is a name
+    # nobody can use and nobody can reclaim.
+    remaining = len(guild_member_ids(db, int(guild["id"])))
+    folded = remaining == 0
+    if folded:
+        db.execute("DELETE FROM guilds WHERE id = ?", (int(guild["id"]),))
+    db.commit()
+
+    return {"guild": guild["name"], "state": "left", "disbanded": folded}, 200
+
+
+@app.post("/api/guild/kick")
+@require_auth
+def guild_kick():
+    """
+    Remove somebody from your guild (officer or leader)
+    ---
+    tags:
+      - Guilds
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: who
+        schema:
+          type: object
+          required: [username]
+          properties:
+            username: {type: string}
+    responses:
+      200:
+        description: They are out
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: Not in your guild, or not yours to remove
+    """
+    payload = request.get_json(silent=True) or {}
+    who = str(payload.get("username", "")).strip()
+    if who == "":
+        return bad_request("username is required")
+
+    seat, guild, rank = _guild_seat()
+    if guild is None or not guild_rank_at_least(rank, "officer"):
+        return {"error": "Not Found", "message": "Not found."}, 404
+
+    target = _user_by_name(who)
+    if target is None:
+        return {"error": "Not Found", "message": "Not found."}, 404
+    if int(target["id"]) == int(g.user["id"]):
+        return bad_request("use leave to remove yourself")
+
+    db = get_db()
+    their_seat = guild_membership(int(target["id"]))
+    if their_seat is None or int(their_seat["guild_id"]) != int(guild["id"]):
+        return {"error": "Not Found", "message": "Not found."}, 404
+
+    # STRICTLY ABOVE, the same rule can_act_on() applies to staff. An officer
+    # cannot remove another officer, and nobody can remove the leader.
+    if GUILD_RANKS.index(str(their_seat["rank"])) >= GUILD_RANKS.index(rank):
+        return {"error": "Not Found", "message": "Not found."}, 404
+
+    db.execute("DELETE FROM guild_members WHERE user_id = ?", (int(target["id"]),))
+    db.commit()
+    return {"username": target["username"], "state": "removed"}, 200
+
+
+@app.post("/api/guild/rank")
+@require_auth
+def guild_set_rank():
+    """
+    Change somebody's guild rank (leader only)
+    ---
+    tags:
+      - Guilds
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: change
+        schema:
+          type: object
+          required: [username, rank]
+          properties:
+            username: {type: string}
+            rank:     {type: string, example: "officer"}
+    responses:
+      200:
+        description: Their new rank
+      400:
+        description: Unknown rank
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: Not in your guild, or you are not the leader
+    """
+    payload = request.get_json(silent=True) or {}
+    who = str(payload.get("username", "")).strip()
+    wanted = str(payload.get("rank", "")).strip().lower()
+    if who == "":
+        return bad_request("username is required")
+    if wanted not in GUILD_RANKS:
+        return bad_request("rank must be one of: %s" % ", ".join(GUILD_RANKS))
+
+    seat, guild, rank = _guild_seat()
+    if guild is None or rank != "leader":
+        return {"error": "Not Found", "message": "Not found."}, 404
+
+    target = _user_by_name(who)
+    if target is None:
+        return {"error": "Not Found", "message": "Not found."}, 404
+    if int(target["id"]) == int(g.user["id"]):
+        return bad_request("you are the leader")
+
+    db = get_db()
+    their_seat = guild_membership(int(target["id"]))
+    if their_seat is None or int(their_seat["guild_id"]) != int(guild["id"]):
+        return {"error": "Not Found", "message": "Not found."}, 404
+
+    now = int(time.time())
+    if wanted == "leader":
+        # HANDING IT ON, WHICH IS A SWAP, NOT A PROMOTION. Two leaders is a
+        # guild where either can remove the other, so the old leader steps
+        # down in the same transaction.
+        db.execute("UPDATE guild_members SET rank = 'leader' WHERE user_id = ?",
+                   (int(target["id"]),))
+        db.execute("UPDATE guild_members SET rank = 'officer' WHERE user_id = ?",
+                   (g.user["id"],))
+        db.commit()
+        return {"username": target["username"], "rank": "leader",
+                "you": "officer",
+                "guild": guild_dict(db, guild, now)}, 200
+
+    db.execute("UPDATE guild_members SET rank = ? WHERE user_id = ?",
+               (wanted, int(target["id"])))
+    db.commit()
+    return {"username": target["username"], "rank": wanted,
+            "guild": guild_dict(db, guild, now)}, 200
+
+
+@app.post("/api/guild/disband")
+@require_auth
+def guild_disband():
+    """
+    Take a guild down - your own as its leader, or any of them as the owner
+    ---
+    tags:
+      - Guilds
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: which
+        schema:
+          type: object
+          properties:
+            name:
+              type: string
+              description: "Owner only. Omit to disband the guild you lead."
+    responses:
+      200:
+        description: The guild is gone, and everybody in it is out
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: No such guild, or not yours to take down
+    """
+    payload = request.get_json(silent=True) or {}
+    named = str(payload.get("name", "")).strip()
+    db = get_db()
+
+    if named != "":
+        # NAMING A GUILD IS AN OWNER'S POWER. Anyone else naming one - even
+        # their own - gets the same 404 a stranger does, so the route never
+        # confirms which guilds exist to somebody who may not ask.
+        if not is_owner(g.user["username"]):
+            return {"error": "Not Found", "message": "Not found."}, 404
+        guild = guild_by_name(named)
+        if guild is None:
+            return {"error": "Not Found", "message": "No such guild."}, 404
+    else:
+        seat, guild, rank = _guild_seat()
+        if guild is None or rank != "leader":
+            return {"error": "Not Found", "message": "Not found."}, 404
+
+    guild_id = int(guild["id"])
+    emptied = len(guild_member_ids(db, guild_id))
+
+    # THE MEMBERS AND THE INVITATIONS GO WITH IT. Both tables cascade on the
+    # guild row, but SQLite only enforces foreign keys when the pragma is on,
+    # and a guild that leaves orphaned rows behind is a player stuck in a
+    # guild that no longer exists. Deleted explicitly, in order.
+    db.execute("DELETE FROM guild_members WHERE guild_id = ?", (guild_id,))
+    db.execute("DELETE FROM guild_invites WHERE guild_id = ?", (guild_id,))
+    db.execute("DELETE FROM guilds WHERE id = ?", (guild_id,))
+    db.commit()
+
+    return {"guild": guild["name"], "state": "disbanded",
+            "members_removed": emptied}, 200
+
+
+@app.get("/api/guild/list")
+@require_auth
+@require_role("mod")
+def guild_list():
+    """
+    Every guild on the server, for staff
+    ---
+    tags:
+      - Guilds
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+    responses:
+      200:
+        description: Each guild with its size and who founded it
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: Not staff
+    """
+    # STAFF CAN SEE THEM; ONLY THE OWNER CAN TAKE ONE DOWN. Two different
+    # questions, and a mod being able to find a guild by name is what makes
+    # reporting one to the owner possible.
+    db = get_db()
+    now = int(time.time())
+    out = []
+    for row in db.execute(
+        "SELECT gl.*, COUNT(m.user_id) AS size"
+        "  FROM guilds gl LEFT JOIN guild_members m ON m.guild_id = gl.id"
+        " GROUP BY gl.id ORDER BY gl.name"
+    ).fetchall():
+        leader = db.execute(
+            "SELECT u.username FROM guild_members m JOIN users u ON u.id = m.user_id"
+            " WHERE m.guild_id = ? AND m.rank = 'leader'", (row["id"],)).fetchone()
+        out.append({
+            "name": row["name"],
+            "founded_by": row["founded_by"],
+            "created_at": int(row["created_at"] or 0),
+            "size": int(row["size"] or 0),
+            "leader": leader["username"] if leader is not None else "",
+        })
+    return {"guilds": out, "now": now,
+            "may_disband": is_owner(g.user["username"])}, 200
+
+
 @app.get("/api/economy/kingdom")
 @require_auth
 def economy_kingdom():
@@ -7539,15 +12164,71 @@ def economy_kingdom():
     db = get_db()
     user_id = g.user["id"]
 
+    now = int(time.time())
+    shared = _kingdom_cache_read(now)
+    if shared is None:
+        shared = _kingdom_board_shared(db)
+        _kingdom_cache["at"] = now
+        _kingdom_cache["payload"] = shared
+    board = shared["board"]
+
+    # THE CALLER'S OWN LINE, ALWAYS, AND NEVER FROM THE CACHE. The shared
+    # figures are the same for everybody and can be a few seconds old; this one
+    # is personal, so it is rebuilt on every request.
+    #
+    # A board that shows only the top ten tells everybody else they are not on
+    # it; the whole point of the rule is that ordinary play adds to the total,
+    # so ordinary play has to be able to see itself in it.
+    me = g.user["username"]
+    my_row = db.execute("SELECT deaths FROM users WHERE id = ?",
+                        (user_id,)).fetchone()
+    mine = {"username": me, "contributed": 0, "lusions": 0,
+            "deaths": int(my_row["deaths"]) if my_row else 0, "rank": None}
+    for entry in board:
+        if entry["username"] == me:
+            # entry["rank"], not the loop index: those differ the moment two
+            # players are tied above you, and the number a player checks for
+            # themselves is the one that most needs to be right.
+            mine = dict(entry)
+            break
+
+    return {
+        "total": shared["total"],
+        "total_lusions": shared["total_lusions"],
+        "total_taxed": shared["total_taxed"],
+        "total_deaths": shared["total_deaths"],
+        "by_reason": shared["by_reason"],
+        "lusions_by_reason": shared["lusions_by_reason"],
+        "contributors": len(board),
+        "top": board[:KINGDOM_BOARD_SIZE],
+        "you": mine,
+    }, 200
+
+
+def _kingdom_board_shared(db):
+    """Everything on the board that is the same for every reader.
+
+    SPLIT OUT SO IT CAN BE CACHED. The totals, the breakdown and the ranked
+    list do not depend on who is asking, so they are computed once per window
+    and handed to everybody; what stays in the endpoint is the one block that
+    is personal."""
     # CONTRIBUTION IS EVERY GOLD DESTROYED, not only the trade tax, and that is
     # a deliberate reading of "what have I given the kingdom". A player who
     # never trades but keeps the potion shop in business has still taken gold
     # out of the world, and a board that ignored them would say their spending
     # did not count. The breakdown below keeps the trade tax visible on its own
     # so nothing is hidden by the aggregate.
+    # users.deaths COMES ALONG FOR NOTHING. The join is already here to turn a
+    # user_id into a name, so the counter is one more column off a row that was
+    # being read anyway - no second query, no second pass over the ledger.
+    #
+    # It is a bare column under a GROUP BY, which is legal in SQLite and
+    # deterministic here: the grouping key is gold_ledger.user_id and the join
+    # is on users.id, so every row in a group carries the same users row.
     rows = db.execute(
         """
         SELECT users.username AS username,
+               users.deaths   AS deaths,
                -SUM(gold_ledger.delta) AS given
           FROM gold_ledger
           JOIN users ON users.id = gold_ledger.user_id
@@ -7557,8 +12238,23 @@ def economy_kingdom():
         """
     ).fetchall()
 
-    board = [{"username": r["username"], "contributed": int(r["given"]), "lusions": 0}
+    board = [{"username": r["username"], "contributed": int(r["given"]),
+              "lusions": 0, "deaths": int(r["deaths"] or 0)}
              for r in rows]
+
+    # THE COLUMN THAT USED TO BE HERE WAS THE TRADE TAX, PER PLAYER, AND IT WAS
+    # MEASURED OUT OF THE BOARD.
+    #
+    # It was a second GROUP BY over every negative row in the ledger, filtered
+    # to one reason. On a year of play - 500 players, two million rows - it
+    # timed at 303ms of the board's 427ms, on the request thread, on a panel
+    # that refreshes itself every thirty seconds. Ten people with it open was a
+    # third of the server's time; fifty was more time than there is.
+    #
+    # The tax total for the whole realm survives in by_reason below, which is
+    # one cheap pass and was always going to be computed anyway. What is gone
+    # is the per-player breakdown, and deaths took the column - a counter on a
+    # row this query already reads, which costs nothing at any scale.
 
     # LUSIONS GIVEN, FROM THEIR OWN LEDGER.
     #
@@ -7587,7 +12283,14 @@ def economy_kingdom():
     # and leaving them out would be a scoreboard that forgot the players who
     # paid in the rarer currency.
     for username, given in by_user_lusions.items():
-        board.append({"username": username, "contributed": 0, "lusions": given})
+        # Their death count is not in `rows` - they are here because they gave
+        # lusions and never destroyed a coin - so it takes one small lookup.
+        # Bounded by how many players have ONLY ever paid in lusions, which is
+        # a handful, not a scan.
+        solo = db.execute("SELECT deaths FROM users WHERE username = ?",
+                          (username,)).fetchone()
+        board.append({"username": username, "contributed": 0, "lusions": given,
+                      "deaths": int(solo["deaths"]) if solo else 0})
 
     # Ranked by gold, with lusions breaking the tie. Gold leads because it is
     # what the coffers are measured in; lusions decide who sits higher among
@@ -7633,29 +12336,37 @@ def economy_kingdom():
     ).fetchall():
         lusions_by_reason[row["reason"]] = int(row["given"])
 
-    # THE CALLER'S OWN LINE, ALWAYS, even at rank 4000. A board that shows only
-    # the top ten tells everybody else they are not on it; the whole point of
-    # the rule is that ordinary play adds to the total, so ordinary play has to
-    # be able to see itself in it.
-    me = g.user["username"]
-    mine = {"username": me, "contributed": 0, "lusions": 0, "rank": None}
-    for entry in board:
-        if entry["username"] == me:
-            # entry["rank"], not the loop index: those differ the moment two
-            # players are tied above you, and the number a player checks for
-            # themselves is the one that most needs to be right.
-            mine = dict(entry)
-            break
+    # ALL GOLD THE TRADE TAX HAS DESTROYED, promoted out of by_reason to a
+    # field of its own.
+    #
+    # It was already in the response - by_reason["kingdom_tax"] - but only as
+    # one line of a dictionary the client renders as a run-on breakdown, which
+    # is not the same as a figure anybody can find. The board's whole claim is
+    # that the tax is a contribution rather than a deduction, and that claim
+    # needs a number at the top of the screen, not a clause in the middle of
+    # one.
+    #
+    # READ OFF by_reason RATHER THAN QUERIED AGAIN: one SELECT, one truth. A
+    # second query would be a second chance to disagree.
+    total_taxed = int(by_reason.get("kingdom_tax", 0))
 
+    # EVERY DEATH ON THE SERVER, which is one sum over one integer column and
+    # does not touch the ledger at all.
+    total_deaths = int(db.execute(
+        "SELECT COALESCE(SUM(deaths), 0) FROM users").fetchone()[0] or 0)
+
+    # THE WHOLE LIST, NOT THE TOP SLICE. The endpoint cuts it to
+    # KINGDOM_BOARD_SIZE for the wire, but it needs the full thing first to
+    # find the caller's own row - a player at rank 4,000 still gets a line.
     return {
+        "board": board,
         "total": total,
         "total_lusions": total_lusions,
+        "total_taxed": total_taxed,
+        "total_deaths": total_deaths,
         "by_reason": by_reason,
         "lusions_by_reason": lusions_by_reason,
-        "contributors": len(board),
-        "top": board[:KINGDOM_BOARD_SIZE],
-        "you": mine,
-    }, 200
+    }
 
 
 @app.get("/api/economy/supply")
@@ -8570,15 +13281,33 @@ def character_revive():
     bank_gold = int(account["bank_gold"])
 
     if method == "gold":
-        # A SHARE OF EVERYTHING, not a price - see GameConstants.REVIVE_GOLD_RATE
-        # for why a flat figure cannot sting the same at level 3 and level 30.
-        cost = gamedata.revive_gold_cost(carry_gold + bank_gold)
+        # A SHARE OF EVERYTHING WITH A FLOOR UNDER IT - see
+        # GameConstants.REVIVE_GOLD_RATE for why a flat figure cannot sting the
+        # same at level 3 and level 30, and revive_gold_cost() for why the share
+        # alone left the bottom of the curve too cheap to matter.
+        held = carry_gold + bank_gold
+        cost = gamedata.revive_gold_cost(held)
         if cost <= 0:
             return {
                 "error": "Payment Required",
                 "message": "You have no gold to pay with.",
                 "cost": 0,
                 "gold": 0,
+            }, 402
+        if cost > held:
+            # THE FLOOR BIT, and the message says so rather than reporting a
+            # generic shortfall. A player who is told "reviving costs 100 gold;
+            # you have 40" can work out what to do; one told "not enough gold"
+            # against a percentage they cannot see is being asked to guess.
+            #
+            # BOTH NUMBERS GO BACK, like the lusion branch below, because the
+            # death screen draws the shortfall rather than recomputing it.
+            return {
+                "error": "Payment Required",
+                "message": "Reviving costs at least %d gold; you have %d."
+                           % (cost, held),
+                "cost": cost,
+                "gold": held,
             }, 402
     else:
         cost = int(gamedata.CONSTANTS.get("revive_cost", 20))
@@ -8634,19 +13363,29 @@ def character_revive():
     # carrying; the gold revive burns 80% of what you hold. They cost very
     # different things and both are a price paid for dying, so both score.
     #
-    # LUSIONS AND GOLD ARE COUNTED 1:1, and that is a decision rather than an
-    # oversight - they are different currencies and this adds them into one
-    # figure. It is the simplest rule that is not arbitrary, and if the two
-    # should ever weigh differently this is the single line to change. Naming
-    # it here because an unweighted sum of two currencies is exactly the kind
-    # of thing that later reads as a bug nobody noticed.
+    # THEY ARE NO LONGER ADDED 1:1, AND THAT WAS THE BUG.
+    #
+    # The comment that used to sit here said the unweighted sum was "a
+    # decision rather than an oversight" and that it was "the single line to
+    # change" if the two should ever weigh differently. They always weighed
+    # differently - a lusion is the premium currency and a gold piece is a
+    # gold piece - and the sum was quietly claiming that dying with 20 lusions
+    # and dying with 20 gold cost the same. With gold now counted in real
+    # denominations, where a single platinum coin is a hundred thousand, an
+    # unweighted total stopped meaning anything at all.
+    #
+    # THE SCORE IS DENOMINATED IN GOLD, because gold is the currency with a
+    # ladder and a ledger behind it. Lusions are converted at the published
+    # rate; see LUSION_GOLD_VALUE for where that number comes from and why it
+    # is one constant rather than a figure inlined here.
     #
     # IN THE SAME TRANSACTION as the payment above and the heal below, so a
     # crash cannot bank the score for a revive that did not happen or take the
     # payment for one that scored nothing.
+    scored = int(cost) if method == "gold" else int(cost) * LUSION_GOLD_VALUE
     db.execute(
         "UPDATE accounts SET score = score + ? WHERE user_id = ?",
-        (int(cost), user_id),
+        (scored, user_id),
     )
 
     db.execute(
@@ -9171,17 +13910,24 @@ def take_loot():
         # CURRENCY RESOLVES INTO A BALANCE RATHER THAN A BACKPACK CELL. This is
         # the whole point of the exercise: gold entering the game now goes
         # through a statement the server wrote, against a bag the server rolled.
-        if granted_id in (CONSTANTS_GOLD_SMALL, CONSTANTS_GOLD_LARGE):
+        coin_value = gold_item_value(granted_id)
+        if coin_value > 0:
+            # QUANTITY TIMES VALUE, not the quantity. Ten silver coins at 50
+            # each is 500 gold; crediting 10 would be the bug this line exists
+            # to not have. See gold_item_value() above.
+            credited = granted_qty * coin_value
+
             # THE ONLY PLACE GOLD IS CREATED. Through gold_delta() rather than a
             # bare UPDATE so the mint lands in the ledger in the same
             # transaction as the balance - see gold_ledger in init_db(). If a
             # second mint site is ever added it goes through here too, or the
             # invariant stops meaning anything.
             gold_delta(
-                db, user_id, slot, granted_qty,
+                db, user_id, slot, credited,
                 "loot", "%s x%d from bag %s" % (granted_id, granted_qty, bag_id),
             )
             result["credited"] = "gold"
+            result["gold_amount"] = credited
         else:
             # Lusions, and anything else account-scoped that shows up later.
             #

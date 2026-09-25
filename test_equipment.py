@@ -701,10 +701,10 @@ check("a potion says what it restores",
 check("and has no slot, damage or armour row",
       not {"Slot", "Damage", "Armour"} & set(potion), sorted(potion))
 check("a stack prices the whole stack",
-      rows("tinyhealthpotion", 16)["Value"][0] == "25 gold  (400)",
+      rows("tinyhealthpotion", 16)["Value"][0] == "50 gold  (800)",
       rows("tinyhealthpotion", 16).get("Value"))
 check("a single one does not",
-      potion["Value"][0] == "25 gold", potion.get("Value"))
+      potion["Value"][0] == "50 gold", potion.get("Value"))
 
 trophy = rows("bushamulet")
 check("the bush amulet now prints a slot like any other gear",

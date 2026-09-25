@@ -136,6 +136,35 @@ balanced("bootstrap")
 # pile out of a bag the server rolled. If a second mint site ever appears
 # without going through gold_delta(), the invariant below is what says so.
 
+# ---------------------------------------------------------------------------
+# THE SERVER PRICES A COIN THE WAY THE CLIENT DOES
+#
+# Loot used to credit the QUANTITY as gold, which was right only while every
+# gold item was worth exactly 1. With a real ladder - a platinum coin is a
+# hundred thousand - crediting the count would pay out a hundred thousandth of
+# the drop, and the client (which always multiplied by value) would disagree
+# with the server about how much money the player had.
+# ---------------------------------------------------------------------------
+print("\nwhat the server thinks a coin is worth")
+
+for _item_id, _value in app_module.gamedata.gold_denominations():
+    check("%s is priced at %d" % (_item_id, _value),
+          app_module.gold_item_value(_item_id) == _value,
+          app_module.gold_item_value(_item_id))
+
+check("lusions are not priced as gold",
+      app_module.gold_item_value("lusions") == 0)
+check("and neither is an ordinary item",
+      all(app_module.gold_item_value(i) == 0
+          for i, rec in app_module.gamedata.ITEMS.items()
+          if str(rec.get("type_name", "")) != "CURRENCY"))
+check("the two legacy heap ids are still worth 1, so old bags still pay out",
+      app_module.gold_item_value("smallamountofgold") == 1
+      and app_module.gold_item_value("largeamountofgold") == 1,
+      "%s / %s" % (app_module.gold_item_value("smallamountofgold"),
+                   app_module.gold_item_value("largeamountofgold")))
+
+
 print("\nminting through /api/loot/take")
 
 H = account("ledgerplayer")
@@ -190,9 +219,21 @@ if found:
     check("the server credited it as gold", body and body.get("credited") == "gold", body)
 
     after = supply()
-    check("minted exactly the pile", after["minted"] - before["minted"] == quantity,
-          "pile=%d minted delta=%d" % (quantity, after["minted"] - before["minted"]))
-    check("held rose by the same amount", after["held"] - before["held"] == quantity,
+    # QUANTITY TIMES VALUE, not the quantity.
+    #
+    # THIS USED TO READ `== quantity` and was right only while every gold item
+    # was worth exactly 1. Coins now have real denominations - a gold coin is
+    # a thousand - so two of them mint two thousand, and the old assertion
+    # would fail on correct behaviour. What is being checked has not changed:
+    # the ledger and the balance move by the same number, and that number is
+    # what the coins are worth.
+    worth = quantity * app_module.gold_item_value(pile["item_id"])
+    check("minted exactly what the coins are worth",
+          after["minted"] - before["minted"] == worth,
+          "%d x %s = %d, minted delta=%d" % (
+              quantity, pile["item_id"], worth,
+              after["minted"] - before["minted"]))
+    check("held rose by the same amount", after["held"] - before["held"] == worth,
           "held delta=%d" % (after["held"] - before["held"]))
     check("nothing was burned", after["burned"] == before["burned"])
 
@@ -201,7 +242,8 @@ if found:
         "SELECT reason, delta FROM gold_ledger ORDER BY id DESC LIMIT 1").fetchone()
     conn.close()
     check("the mint was recorded with reason 'loot'",
-          row and row["reason"] == "loot" and int(row["delta"]) == quantity, dict(row) if row else None)
+          row and row["reason"] == "loot" and int(row["delta"]) == worth,
+          dict(row) if row else None)
 
 balanced("a mint")
 
@@ -368,13 +410,13 @@ body = status("buy 3 tiny health potions", client.post(
     json={"slot": 0, "shop_id": "generalstore",
           "item_id": "tinyhealthpotion", "quantity": 3}), 200)
 
-check("the server priced it itself", body and body.get("unit_price") == 25, body)
-check("total is unit x quantity", body and body.get("total_paid") == 75, body)
+check("the server priced it itself", body and body.get("unit_price") == 50, body)
+check("total is unit x quantity", body and body.get("total_paid") == 150, body)
 
 after = supply()
-check("burned exactly what was paid", after["burned"] - before["burned"] == 75,
+check("burned exactly what was paid", after["burned"] - before["burned"] == 150,
       "burned delta=%d" % (after["burned"] - before["burned"]))
-check("held fell by the same amount", before["held"] - after["held"] == 75,
+check("held fell by the same amount", before["held"] - after["held"] == 150,
       "held delta=%d" % (before["held"] - after["held"]))
 check("nothing was minted by a purchase", after["minted"] == before["minted"])
 
@@ -383,7 +425,7 @@ row = conn.execute(
     "SELECT reason, delta FROM gold_ledger ORDER BY id DESC LIMIT 1").fetchone()
 conn.close()
 check("the burn was recorded with reason 'shop_buy'",
-      row and row["reason"] == "shop_buy" and int(row["delta"]) == -75,
+      row and row["reason"] == "shop_buy" and int(row["delta"]) == -150,
       dict(row) if row else None)
 
 balanced("a purchase")
@@ -813,14 +855,27 @@ status("clear it before the next case", client.post("/api/trade/cancel", headers
 # direct query rather than a figure written here, because a board checked
 # against a constant stops being checked the moment the suite above changes.
 
+def kingdom(headers):
+    """Read the board, defeating the cache first.
+
+    THE BOARD IS CACHED FOR KINGDOM_BOARD_CACHE_SECONDS, because recomputing it
+    per open panel does not scale - see the note on that constant. Fifteen
+    seconds is invisible to a player and fatal to a test, which moves gold and
+    then asks the board about it in the same millisecond. Clearing the snapshot
+    here is the test saying "pretend the window just expired"; it does not
+    change what the endpoint computes, only when.
+    """
+    app_module._kingdom_cache_clear()
+    return client.get("/api/economy/kingdom", headers=headers)
+
+
 print("\nkingdom tax board")
 
 status("no token", client.get("/api/economy/kingdom"), 401)
 
 # OPEN TO EVERY PLAYER, unlike /api/economy/supply which 404s for one. If this
 # ever starts 404ing, somebody has stacked require_role on it by habit.
-body = status("an ordinary player may read it", client.get(
-    "/api/economy/kingdom", headers=P1), 200)
+body = status("an ordinary player may read it", kingdom(P1), 200)
 
 conn = db_conn()
 burned_total = -int(conn.execute(
@@ -861,8 +916,7 @@ check("the board is capped at the board size",
 # SOMEBODY WHO HAS NEVER PAID ANYTHING still gets a line. A board that omitted
 # them would tell most of the playerbase they are not in the game.
 fresh = account("kingdomnobody")
-body = status("a player who has contributed nothing", client.get(
-    "/api/economy/kingdom", headers=fresh), 200)
+body = status("a player who has contributed nothing", kingdom(fresh), 200)
 check("they see zero rather than nothing",
       body and body["you"]["contributed"] == 0 and body["you"]["rank"] is None,
       body.get("you"))
@@ -870,7 +924,7 @@ check("and they still see the realm's total", body and body["total"] == burned_t
 
 # THE BOARD MOVES WHEN A TRADE IS TAXED, which is the whole point of it.
 give("tradealice", "ironsword", 1)
-before = status("read before", client.get("/api/economy/kingdom", headers=P1), 200)
+before = status("read before", kingdom(P1), 200)
 status("open", client.post("/api/trade/offer", headers=P1,
                            json={"slot": 0, "username": "tradebob"}), 200)
 status("sword up", client.post("/api/trade/update", headers=P1,
@@ -878,7 +932,7 @@ status("sword up", client.post("/api/trade/update", headers=P1,
 status("gold up", client.post("/api/trade/update", headers=P2, json={"gold": 200}), 200)
 status("alice confirms", client.post("/api/trade/confirm", headers=P1, json={}), 200)
 result = status("bob confirms", client.post("/api/trade/confirm", headers=P2, json={}), 200)
-after = status("read after", client.get("/api/economy/kingdom", headers=P1), 200)
+after = status("read after", kingdom(P1), 200)
 
 check("the realm's total rose by exactly this trade's take",
       before and after and result
@@ -892,6 +946,122 @@ check("and alice's own line rose by her share",
                             if (before and after) else -1,
                             result["tax_paid"]["a"] if result else -1))
 balanced("reading the board")
+
+
+# =============================================================================
+# THE TAX, ON ITS OWN, PER PLAYER
+# =============================================================================
+# DEATHS, PER PLAYER
+# =============================================================================
+# THE COLUMN THAT USED TO BE HERE WAS THE TRADE TAX PER PLAYER, and it came out
+# because it did not scale: a second GROUP BY over every destroyed-gold row in
+# the ledger, on a panel that refreshes itself every thirty seconds. At a
+# year's worth of play it was the slowest thing on the board by a factor of
+# four. The realm's tax total survives in by_reason, which was always being
+# computed anyway.
+#
+# Deaths took the column because a counter costs nothing to read at any size.
+# The failure mode worth guarding is the one a counter has and a sum does not:
+# counting the STATE instead of the TRANSITION. A dead client keeps reporting
+# hp 0 while the death screen is up, so a naive increment would let anybody run
+# their total to a million by sitting there.
+
+print("\nper-player deaths")
+
+
+def deaths_of(username):
+    conn = db_conn()
+    row = conn.execute("SELECT deaths FROM users WHERE username = ?",
+                       (username,)).fetchone()
+    conn.close()
+    return int(row[0]) if row else -1
+
+
+def die(headers, slot=0):
+    """Report hp 0, the way a client does when the character is killed."""
+    return client.put("/api/player/status", headers=headers,
+                      json={"slot": slot, "hp": 0})
+
+
+def heal_up(headers, slot=0):
+    hp = client.get("/api/player/status?slot=%d" % slot,
+                    headers=headers).get_json()["max_hp"]
+    return client.put("/api/player/status", headers=headers,
+                      json={"slot": slot, "hp": hp})
+
+
+start_deaths = deaths_of("tradealice")
+
+status("alice dies", die(P1), 200)
+check("a death is counted", deaths_of("tradealice"), start_deaths + 1)
+
+# THE ASSERTION THE WHOLE DESIGN TURNS ON. Reporting hp 0 again is what a
+# client does every tick while the death screen is up. It is not a second
+# death.
+for _ in range(5):
+    die(P1)
+check("staying dead is not five more deaths", deaths_of("tradealice"),
+      start_deaths + 1)
+
+# Up and down again is a second one, because that IS a second death.
+status("alice is revived", heal_up(P1), 200)
+check("healing up does not count as anything", deaths_of("tradealice"),
+      start_deaths + 1)
+status("and dies again", die(P1), 200)
+check("the second death counts", deaths_of("tradealice"), start_deaths + 2)
+heal_up(P1)
+
+board = status("read the board", kingdom(P1), 200)
+
+check("your own line carries your deaths",
+      board and "deaths" in board["you"],
+      sorted(board["you"].keys()) if board else None)
+check("and it matches the counter",
+      board and board["you"]["deaths"] == deaths_of("tradealice"),
+      "board=%r db=%d" % (board["you"].get("deaths") if board else None,
+                          deaths_of("tradealice")))
+check("every row on the board carries one",
+      board and all("deaths" in row for row in board["top"]),
+      [sorted(r.keys()) for r in board["top"][:2]] if board else None)
+check("nobody has a negative death count",
+      board and all(row["deaths"] >= 0 for row in board["top"]),
+      [(r["username"], r["deaths"]) for r in board["top"]
+       if r["deaths"] < 0] if board else None)
+
+# The realm total is a sum over one integer column, not over the ledger.
+conn = db_conn()
+all_deaths = int(conn.execute("SELECT COALESCE(SUM(deaths), 0) FROM users").fetchone()[0])
+conn.close()
+check("the realm's death total is its own field",
+      board and "total_deaths" in board, sorted(board.keys()) if board else None)
+check("and it is every account added up",
+      board and board["total_deaths"] == all_deaths,
+      "board=%r db=%d" % (board.get("total_deaths") if board else None, all_deaths))
+check("which is at least as many as any one player",
+      board and board["total_deaths"] >= board["you"]["deaths"],
+      "%r vs %r" % (board.get("total_deaths") if board else None,
+                    board["you"].get("deaths") if board else None))
+
+# THE PER-PLAYER TAX FIGURE IS GONE ON PURPOSE. If it ever comes back it will
+# be because somebody re-added the query this section exists to have removed.
+check("the per-player tax column is gone",
+      board and "taxed" not in board["you"],
+      sorted(board["you"].keys()) if board else None)
+check("but the realm's tax total is still there",
+      board and board["total_taxed"] == board["by_reason"].get("kingdom_tax", 0),
+      "total_taxed=%r by_reason=%r"
+      % ((board.get("total_taxed"), board["by_reason"].get("kingdom_tax"))
+         if board else None))
+
+# A player who has never died sees a zero, not a missing key.
+fresh2 = account("kingdomnodeaths")
+body = status("a player who has never died", kingdom(fresh2), 200)
+check("sees zero deaths rather than a missing field",
+      body and body["you"].get("deaths") == 0,
+      body.get("you") if body else None)
+
+# A DEATH MOVES NO GOLD. The counter is beside the economy, not in it.
+balanced("counting deaths")
 
 
 # =============================================================================
@@ -1156,8 +1326,7 @@ _conn.executemany(
 _conn.commit()
 _conn.close()
 
-body = status("the board with a crowd on it", client.get(
-    "/api/economy/kingdom", headers=P1), 200)
+body = status("the board with a crowd on it", kingdom(P1), 200)
 
 check("it returns exactly the cap, not everybody",
       len(body["top"]) == app_module.KINGDOM_BOARD_SIZE,
@@ -1199,8 +1368,7 @@ for name, amount in _tied:
 _conn.commit()
 _conn.close()
 
-body = status("the board with ties on it", client.get(
-    "/api/economy/kingdom", headers=P1), 200)
+body = status("the board with ties on it", kingdom(P1), 200)
 
 _by_name = {e["username"]: e for e in body["top"]}
 check("every row carries a rank from the server",
@@ -1243,8 +1411,7 @@ _conn.execute("UPDATE users SET username = ? WHERE id = ?", ("tinygiver", _last_
 _conn.commit()
 _conn.close()
 _tiny = account("tinygiver_unused")      # a token for someone else entirely
-body = status("read as a player outside the cap", client.get(
-    "/api/economy/kingdom", headers=_tiny), 200)
+body = status("read as a player outside the cap", kingdom(_tiny), 200)
 check("a player outside the cap still gets their own line",
       "you" in body and body["you"]["username"] == "tinygiver_unused", body.get("you"))
 check("and both currencies are on it",

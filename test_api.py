@@ -711,9 +711,15 @@ check("it says what it did with it", body.get("credited") in ("gold", "lusions",
 # Every bag contains gold, and gold resolves into the balance rather than a
 # backpack cell - which is the whole point of this endpoint existing.
 if body.get("credited") == "gold":
+    # WHAT THE COINS ARE WORTH, not how many there are. Gold now comes in
+    # denominations - a gold coin is worth a thousand - so the purse rises by
+    # quantity x value. The route says so itself in `gold_amount`, which is
+    # the number to check against rather than one recomputed here.
+    credited = int(body.get("gold_amount", FIRST["quantity"]))
     check("gold went into the purse, not a bag slot",
-          body["status"]["gold"] == GOLD_BEFORE + FIRST["quantity"],
-          [GOLD_BEFORE, FIRST["quantity"], body["status"]["gold"]])
+          body["status"]["gold"] == GOLD_BEFORE + credited,
+          [GOLD_BEFORE, FIRST["item_id"], FIRST["quantity"], credited,
+           body["status"]["gold"]])
 else:
     check("a non-currency item landed in the backpack",
           bool(body.get("carry_positions"))

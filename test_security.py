@@ -1620,6 +1620,112 @@ check("and it came out of the bank",
 ok, sums = supply_balanced()
 check("supply still balances after a bank-only burn", ok, sums)
 
+# =============================================================================
+# THE FLOOR UNDER THE GOLD REVIVE
+# =============================================================================
+# A pure 80% share got CHEAPER the less you had: dying with thirty gold cost
+# twenty-four, so after a bad death the cheapest way home was another death.
+# REVIVE_GOLD_MINIMUM puts a floor under it, and gives up - deliberately - the
+# old guarantee that the gold route could always be paid.
+#
+# The three cases that matter are the three sides of that floor: below it,
+# exactly on it, and far above it where nothing should have changed at all.
+
+FLOOR = int(gamedata.CONSTANTS.get("revive_gold_minimum", 0))
+check("the contract carries a floor at all", FLOOR > 0, FLOOR)
+
+# BELOW THE FLOOR: refused, not discounted.
+broke = register("floorbroke")
+make_char(broke)
+bank_and_carry("floorbroke", 40, 0)
+kill("floorbroke")
+_before_burn = supply_balanced()[1]
+r = client.post("/api/character/revive", headers=broke, json={"slot": 0, "pay": "gold"})
+_body = r.get_json()
+check("holding less than the floor -> 402", r.status_code == 402, r.status_code)
+check("and the refusal quotes the floor, not a percentage",
+      _body and int(_body.get("cost", -1)) == FLOOR, _body)
+check("and it says what they actually have",
+      _body and int(_body.get("gold", -1)) == 40, _body)
+check("the message names the minimum",
+      _body and "at least" in str(_body.get("message", "")), _body)
+check("they are still dead", hp_of(broke) == 0, hp_of(broke))
+check("and not one coin was taken", purses("floorbroke") == (40, 0), purses("floorbroke"))
+ok, sums = supply_balanced()
+check("a refused revive burns nothing", ok, sums)
+
+# ON THE FLOOR: 80% of 125 is exactly 100, so this is the last balance where
+# the share and the floor agree. If the comparison is ever written > instead of
+# >=, or the ceiling drifts, this is the case that moves.
+edge = register("flooredge")
+make_char(edge)
+bank_and_carry("flooredge", 125, 0)
+kill("flooredge")
+r = client.post("/api/character/revive", headers=edge, json={"slot": 0, "pay": "gold"})
+_body = r.get_json()
+check("exactly on the floor revives", r.status_code == 200, r.status_code)
+check("for exactly the floor", _body and int(_body.get("cost", -1)) == FLOOR, _body)
+check("leaving the change", purses("flooredge") == (25, 0), purses("flooredge"))
+
+# THE CASE THE FLOOR IS FOR: affordable, but the share alone would have been
+# cheaper. 80% of 120 is 96; the floor makes it 100.
+low = register("floorlow")
+make_char(low)
+bank_and_carry("floorlow", 120, 0)
+kill("floorlow")
+r = client.post("/api/character/revive", headers=low, json={"slot": 0, "pay": "gold"})
+_body = r.get_json()
+check("a balance just over the floor still revives", r.status_code == 200, r.status_code)
+check("and pays the floor rather than the smaller share",
+      _body and int(_body.get("cost", -1)) == FLOOR,
+      [_body.get("cost") if _body else None, FLOOR, _math.ceil(120 * RATE)])
+check("which is more than the share would have been",
+      FLOOR > _math.ceil(120 * RATE), [FLOOR, _math.ceil(120 * RATE)])
+check("and the change is what the floor left", purses("floorlow") == (20, 0),
+      purses("floorlow"))
+ok, sums = supply_balanced()
+check("supply balances after a floored revive", ok, sums)
+
+# FAR ABOVE IT: the curve is untouched. This is the regression guard - a floor
+# written as a flat price instead of a minimum would break here and nowhere
+# else.
+plenty = register("floorplenty")
+make_char(plenty)
+bank_and_carry("floorplenty", 1000, 4000)
+kill("floorplenty")
+r = client.post("/api/character/revive", headers=plenty, json={"slot": 0, "pay": "gold"})
+_body = r.get_json()
+_share = _math.ceil(5000 * RATE)
+check("a rich player pays the share, not the floor",
+      r.status_code == 200 and _body and int(_body.get("cost", -1)) == _share,
+      [_body.get("cost") if _body else None, _share])
+check("and the floor never entered the arithmetic", _share > FLOOR, [_share, FLOOR])
+
+# AN EMPTY ACCOUNT IS STILL ITS OWN ANSWER. Zero in, zero out - the floor must
+# not turn "you have nothing" into "you need 100", because those are different
+# sentences and only one of them is worth reading twice.
+nothing = register("floornothing")
+make_char(nothing)
+bank_and_carry("floornothing", 0, 0)
+kill("floornothing")
+r = client.post("/api/character/revive", headers=nothing, json={"slot": 0, "pay": "gold"})
+_body = r.get_json()
+check("nothing at all -> 402", r.status_code == 402, r.status_code)
+check("and the message is the empty-purse one, not the floor one",
+      _body and int(_body.get("cost", -1)) == 0
+      and "at least" not in str(_body.get("message", "")), _body)
+
+# The floor is a gold rule and must not have leaked into the lusion route.
+lus = register("floorlusion")
+make_char(lus)
+bank_and_carry("floorlusion", 0, 0)
+give_lusions("floorlusion", REVIVE_COST)
+kill("floorlusion")
+r = revive(lus)
+check("the lusion route is untouched by the gold floor", r.status_code == 200,
+      r.status_code)
+
+
 r = client.post("/api/character/revive", headers=rich, json={"slot": 0, "pay": "doubloons"})
 check("an unknown currency -> 400", r.status_code == 400, r.status_code)
 
@@ -1890,8 +1996,17 @@ second = int(r.get_json().get("cost", 0))
 check("a second death adds to the score rather than replacing it",
       score_of(rich) == expected + second, [score_of(rich), expected, second])
 
-# THE LUSION ROUTE SCORES TOO, at 1:1 with gold - a decision, not an accident,
-# and app.py says so at the line that does it.
+# THE LUSION ROUTE SCORES TOO, AT ITS WORTH IN GOLD.
+#
+# THIS USED TO ASSERT 1:1, matching a comment in app.py that called the
+# unweighted sum "a decision, not an accident". It was an accident by the time
+# gold had real denominations: the score is one number describing two
+# currencies, and adding 20 lusions to a gold total as 20 said that dying with
+# 20 lusions and dying with 20 copper cost the same thing.
+#
+# The rate is published once, as LUSION_GOLD_VALUE, and this reads it rather
+# than repeating the number - a test that hardcodes 1000 passes for a while
+# and then silently stops testing anything when the constant is tuned.
 lus = register("scorer")
 make_char(lus)
 give_lusions("scorer", 100)
@@ -1899,9 +2014,12 @@ before = score_of(lus)
 kill("scorer")
 r = revive(lus)
 check("the lusion revive succeeds", r.status_code == 200, r.status_code)
-check("and scores the lusions it cost",
-      score_of(lus) == before + int(r.get_json().get("cost", 0)),
-      [score_of(lus), before, r.get_json().get("cost")])
+spent = int(r.get_json().get("cost", 0))
+check("and scores what those lusions were worth in gold",
+      score_of(lus) == before + spent * app_module.LUSION_GOLD_VALUE,
+      [score_of(lus), before, spent, app_module.LUSION_GOLD_VALUE])
+check("which is more than the bare count - the two are not 1:1",
+      app_module.LUSION_GOLD_VALUE > 1, app_module.LUSION_GOLD_VALUE)
 
 # A REFUSED REVIVE MUST NOT SCORE. The payment and the score are one
 # transaction; a 402 that still moved the number would be the worse half of it.
