@@ -12836,11 +12836,27 @@ def write_skills():
 
         parsed.append((user_id, slot, name, level, xp))
 
-    # SKILL CEILING. Skills have no server-side grant path yet, so the server
-    # cannot prove a level was earned - but it can refuse an impossible one. A
-    # non-staff claim over the cap is clamped rather than rejected, so a single
-    # over-cap skill never discards the whole (otherwise honest) sync. Staff are
-    # exempt for the same reason as the backpack. See SECURITY_NOTES.md (E-2).
+    # SKILL CEILING. A non-staff claim over the cap is clamped rather than
+    # rejected, so a single over-cap skill never discards the whole (otherwise
+    # honest) sync. Staff are exempt for the same reason as the backpack.
+    #
+    # ITS OPENING LINE USED TO SAY "skills have no server-side grant path yet",
+    # AND THAT HAS NOT BEEN TRUE SINCE E-2 CLOSED. All six are granted
+    # server-side now, so nothing this clamp produces ever reaches the database -
+    # the drop filter below empties `parsed` unconditionally, because
+    # VALID_SKILLS and SERVER_OWNED_SKILLS are the same six.
+    #
+    # THE CLAMP STAYS ANYWAY, and the reasoning is worth keeping because the
+    # obvious move is to delete it. It is not wrong, it is not a duplicate of a
+    # rule that lives somewhere better, and it is not stale - it is GENERIC code
+    # with nothing to do today. The day a seventh skill is the client's to grant,
+    # the filter below stops catching everything and this clamp is the thing
+    # standing between a modified client and a level of 2^31. Deleting a
+    # guardrail because it currently has nothing to guard is how you find out
+    # what it was for.
+    #
+    # The ceiling that IS load-bearing today is in _grant_skill_xp(), which caps
+    # every server grant. That one is on the path everything actually takes.
     if not role_at_least(g.user, "mod"):
         capped, hits = [], []
         for (uid, s, name, level, xp) in parsed:
@@ -12854,19 +12870,31 @@ def write_skills():
                   % (g.user["username"], slot, ", ".join(sorted(hits))))
         parsed = capped
 
-    # THE SERVER OWNS FISHING AND COOKING NOW - the client does not get to
-    # replace them.
+    # THE SERVER OWNS ALL SIX NOW, so this line empties `parsed` every time and
+    # this route writes nothing at all.
     #
-    # This endpoint replaces the whole skill set with whatever arrives, which is
-    # fine for the four skills the client still grants. It is fatal for the two
-    # it does not: /api/fishing/catch and /api/cooking/cook write those rows
-    # against items the server consumed, and the client's very next sync would
-    # overwrite that with its own stale figure. The grant would survive exactly
-    # until the player picked up a potion.
+    # It said "fine for the four skills the client still grants" until somebody
+    # counted them. There are none: attack is granted at the kill, fishing and
+    # cooking against items the server consumed, defense/agility/magic through
+    # /api/skill/train. VALID_SKILLS and SERVER_OWNED_SKILLS are the same set.
     #
-    # Dropped silently rather than refused. A client that has not been updated
-    # still sends all six every save, and 400-ing an otherwise honest sync over
-    # a field it is not allowed to set would break saving entirely.
+    # WHY THE ROUTE IS STILL HERE, doing a full parse and answering 200 for a
+    # body it throws away. An un-updated client still sends all six on every
+    # save, and 400-ing an otherwise honest sync over a field it may no longer
+    # set would break saving for that build entirely. Dropped silently is the
+    # same posture PUT /api/player/status takes with level and xp, and for the
+    # same reason. The Godot client stopped sending them (see
+    # serverstorage.gd::_push_slot), which removes the round trip for anyone on
+    # a current build without stranding anybody on an old one.
+    #
+    # The 400s below it are contract and are tested - an unknown skill name, a
+    # level of 0 and a non-object all still refuse. Validating a body and then
+    # discarding it looks odd and is correct: the shape of the request is still
+    # part of the promise even when its contents are not.
+    #
+    # THE DELETE AND THE INSERT BELOW ARE GENERIC, not dead. They are what makes
+    # this route work again, correctly, the day a skill becomes the client's to
+    # grant. See the clamp above for the same argument at more length.
     parsed = [row for row in parsed if row[2] not in SERVER_OWNED_SKILLS]
 
     db = get_db()
