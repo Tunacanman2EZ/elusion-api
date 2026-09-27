@@ -8,6 +8,13 @@ derived stat maxima, every loot roll, and loot bags. `docs/apicontract.md` in
 the game repo is the agreement between the two — change that first, then both
 sides.
 
+**The security model is one page: [SECURITY.md](SECURITY.md).** Read it before
+changing anything that touches authentication, ranks, the economy or chat
+moderation. Every promise on it names the test that holds it, and
+`test_security_doc.py` fails if a suite it names has gone or a check it quotes has
+been renamed — so the page cannot quietly drift out of date the way two comments
+in this repository already did.
+
 ## How to work in here
 
 **Run the tests before and after. Every time.**
@@ -102,6 +109,57 @@ The consequence of content addressing that nobody had written down: **a whispere
 picture is only as private as its bytes are rare.** Post the same image in world
 chat and it is the same row and the same id, so the whisper was never private.
 That is the right trade for a game chat — it should just be a known one.
+
+### A feed that can only grow cannot be moderated
+
+The same idea one layer up, and the bigger half of it. `GET /api/chat` answers
+*"messages with an id greater than `since`"*. That is the right question for a
+growing log and it **cannot express the opposite one**: something you were already
+given is no longer true.
+
+So `/api/chat/delete` removed the row, the message stopped reaching anybody who
+had not read it yet, and it did nothing at all about the people who had.
+`chatpanel.gd` was append-only — `_poll()` only ever called `_add_line()`, and a
+line left only by `pop_front()` at `LINES_KEPT`. A mod took a line down and it
+stayed on every screen that already had it until a hundred more lines pushed it
+off, or the player closed the game. **That is exactly the set of players the
+deletion was for.**
+
+The poll now returns `removed`, and three decisions in it are worth keeping:
+
+- **A separate `chat_deletions` table, not a `deleted_at` column.** A tombstone
+  column means every existing read has to learn `AND deleted_at = 0` — a dozen
+  places to forget one, and forgetting it shows the deleted line again. A separate
+  table is additive: nothing that reads `chat_messages` changes, because the row
+  really is gone.
+- **It stores the deleted line's own `channel`, `user_id` and `target_id`** — the
+  three columns the read builds its permission clause from — so the poll filters
+  deletions with **the very same `where` and `params`** it filtered messages with.
+  Not a second permission rule to keep in step: the same one. The property falls
+  out for free — a line you could never have read cannot produce a deletion you
+  are told about, and nobody has to remember that. Without it, world chat carries
+  the ids of deleted whispers to everyone; no content in an id, but still the fact
+  that a line existed between two people and was taken down.
+- **By time, not by id, and no second cursor.** The deleted message is almost
+  always *below* the client's cursor, where `since` can never reach, so deletions
+  are reported by when they happened — anything inside
+  `CHAT_DELETION_WINDOW_SECONDS` (120). That window is only sufficient because of
+  something the client already did: `chatpanel.gd` starts from the **tail** rather
+  than a stored cursor when the window opens, so a client away longer than the
+  window is not holding the line anyway. Pruned on write, like `_prune_chat()`.
+
+On the Godot side `_remove_lines()` does the work, and the case that makes it
+worth building properly is **the open viewer**. `_sweep_pictures()` deliberately
+*spares* `_viewing` — correctly, for its own job — so sweeping first would keep
+the picture alive and leave the overlay up in front of the one player most needing
+it gone. `close_viewer()` runs **before** the sweep. After that the existing sweep
+does the rest unchanged, because it rebuilds the live set from whatever the feeds
+still hold.
+
+Two smaller ones, both sabotage-tested: removals run **after** additions, or a
+line posted and deleted inside one three-second poll would survive; and an id of
+**0** must match nothing, because a system notice carries no server id and `0` is
+what `line.get("id", 0)` returns for one.
 
 ### Tests that assert magic numbers rot
 

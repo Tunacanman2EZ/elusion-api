@@ -1461,6 +1461,53 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_chat_images_age
             ON chat_images(created_at);
 
+        -- A DELETION IS AN EVENT, AND THE FEED HAD NO WAY TO CARRY ONE.
+        --
+        -- GET /api/chat answers "messages with id greater than `since`", which is
+        -- the right question for a growing log and cannot express the opposite
+        -- one: something you were already given is no longer true. So deleting a
+        -- message removed the row, the message stopped appearing in FUTURE polls,
+        -- and every client already holding it kept it - on screen, and with the
+        -- picture decoded in memory. A mod took a line down and it stayed on
+        -- every screen that had already seen it, which is precisely the set of
+        -- people the deletion was for.
+        --
+        -- WHY A SEPARATE TABLE RATHER THAN A deleted_at COLUMN. A tombstone in
+        -- chat_messages would mean every existing read has to learn to say
+        -- "AND deleted_at = 0" - a dozen places to forget one, and forgetting it
+        -- shows the deleted line again. This table is additive: nothing that
+        -- reads chat_messages needs to change, because the row really is gone.
+        --
+        -- WHY IT STORES THE DELETED MESSAGE'S OWN channel, user_id AND target_id
+        -- RATHER THAN JUST THE ID. Those are the three columns GET /api/chat
+        -- builds its "who may read what" clause out of, so the poll can filter
+        -- deletions with THE VERY SAME CLAUSE it filters messages with. One rule,
+        -- one copy of it, and the property falls out for free: a message you were
+        -- never allowed to see cannot produce a deletion you are told about.
+        --
+        -- Without that, world chat would carry the ids of deleted whispers to
+        -- everybody. No content in an id, but still the fact that a line existed
+        -- between two people and was taken down. Three columns is the whole cost.
+        --
+        -- WHY THERE IS NO SECOND CURSOR, which is the part that makes this
+        -- small. `since` cannot find a deletion below a client's cursor, so the
+        -- poll reports deletions by WHEN THEY HAPPENED instead - anything in the
+        -- last CHAT_DELETION_WINDOW_SECONDS. That is only sufficient because of
+        -- something the client already does: chatpanel.gd starts from the TAIL
+        -- rather than from a stored cursor when the window opens, so a client
+        -- that was away longer than the window cannot be holding the line
+        -- anyway. The window covers exactly the clients that were watching.
+        CREATE TABLE IF NOT EXISTS chat_deletions (
+            message_id INTEGER PRIMARY KEY,
+            channel    TEXT    NOT NULL DEFAULT 'world',
+            user_id    INTEGER NOT NULL DEFAULT 0,
+            target_id  INTEGER NOT NULL DEFAULT 0,
+            deleted_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_chat_deletions_age
+            ON chat_deletions(deleted_at);
+
         -- WHO KNOWS WHO.
         --
         -- ONE ROW PER PAIR, and the key is directional on purpose: which way
@@ -3094,6 +3141,19 @@ CHAT_RETENTION_SECONDS = 24 * 60 * 60
 # The most one poll returns. A client that has been away all day gets the tail
 # of the conversation, not the whole day of it.
 CHAT_PAGE_LIMIT = 50
+
+# HOW LONG A DELETION KEEPS BEING ANNOUNCED. See the chat_deletions table.
+#
+# It has to cover the gap between one poll and the next with room to spare, and
+# it does not have to cover anything else: chatpanel.gd starts from the tail when
+# the window opens, so a client away longer than this is not holding the line it
+# would be told about. The chat poll is every 3 seconds, so two minutes is forty
+# polls of margin - enough for a stalled request, a paused game or a laptop lid,
+# and short enough that the table stays a handful of rows.
+#
+# BOUNDED BY DESIGN, not by a sweeper job: rows past the window are dropped on
+# the next delete, the same way _prune_chat() works.
+CHAT_DELETION_WINDOW_SECONDS = 120
 
 # THE FLOOD BUCKET. Eight messages in hand, refilling at one every two seconds.
 #
@@ -7958,8 +8018,14 @@ def combat_kill():
 # simply outranks you. A mod who could tell those apart could map out who is
 # above them by guessing names.
 
-# How long a mod may mute someone for. Anything longer, and anything permanent,
+# How long a mod may BAN someone for. Anything longer, and anything permanent,
 # needs a dev or the owner.
+#
+# (It said "mute" until somebody read it beside the sanction ladder. There is no
+# mute in this server - the ladder is kick, then a bounded ban, then a permanent
+# one - and a comment naming a feature nobody built is how SECURITY.md nearly
+# shipped a moderator power that does not exist. Same class of bug as api.gd's
+# "characterhud.gd answers it with an immediate heartbeat()".)
 #
 # The point is not that thirty days is special. It is that a permanent removal
 # and a timeout are different decisions, and the person having a bad night at
@@ -9505,7 +9571,11 @@ def read_chat():
         description: "Return messages with an id greater than this. 0 for the recent tail."
     responses:
       200:
-        description: Messages in id order, oldest first, plus the newest id
+        description: >
+          Messages in id order oldest first, plus the newest id, plus `removed` -
+          the ids of messages taken down in the last two minutes, filtered by the
+          same permission clause as the messages themselves. A client holding one
+          of those ids drops it from its own feed.
       400:
         description: since was not a whole number
       401:
@@ -9563,6 +9633,10 @@ def read_chat():
             # list the client has to guess the meaning of.
             return {
                 "messages": [],
+                # PRESENT HERE TOO, empty. Same rule as world_image_wait below:
+                # a field that exists on most answers and vanishes on one is how
+                # a client ends up reading a stale copy of it.
+                "removed": [],
                 "latest_id": 0,
                 "now": int(time.time()),
                 "channel": channel,
@@ -9620,8 +9694,27 @@ def read_chat():
         ).fetchall():
             pictures[row["id"]] = relayed_image_dict(row)
 
+    # WHAT HAS BEEN TAKEN BACK DOWN, for the clients that already have it.
+    #
+    # THE SAME `where` AND THE SAME `params` the messages were read with. That is
+    # the whole point of storing the deleted line's channel, user_id and
+    # target_id: filtering deletions is not a second permission rule to keep in
+    # step with the first one, it IS the first one. A line you could never have
+    # read cannot produce a deletion you are told about, and nobody has to
+    # remember that - it is the same SQL.
+    #
+    # BY TIME, NOT BY ID, because a deletion is an event and the message it
+    # refers to is almost always BELOW the client's cursor, where `since` can
+    # never reach. See CHAT_DELETION_WINDOW_SECONDS for why a window is enough.
+    removed_rows = db.execute(
+        "SELECT message_id FROM chat_deletions WHERE %s AND deleted_at >= ?"
+        " ORDER BY message_id" % where,
+        tuple(params + [int(time.time()) - CHAT_DELETION_WINDOW_SECONDS]),
+    ).fetchall()
+
     return {
         "messages": [chat_message_dict(r) for r in rows],
+        "removed": [int(r["message_id"]) for r in removed_rows],
         "latest_id": int(newest or 0),
         # The server's clock, so the client can age a message without trusting
         # the machine it is running on. Same reason the staff list returns it.
@@ -9912,6 +10005,26 @@ def chat_delete():
             return {"error": "Not Found", "message": "No such message."}, 404
 
     db.execute("DELETE FROM chat_messages WHERE id = ?", (message_id,))
+
+    # AND TELL THE CLIENTS THAT ALREADY HAVE IT.
+    #
+    # Removing the row stops the message reaching anybody who has not read it
+    # yet, which is the half that was working. The other half is everyone who
+    # HAS: their feed is append-only, so the line stays on screen until a
+    # hundred more push it off. See the chat_deletions table for why this is a
+    # separate row rather than a column, and why it needs no second cursor.
+    now = int(time.time())
+    db.execute(
+        "INSERT OR REPLACE INTO chat_deletions"
+        " (message_id, channel, user_id, target_id, deleted_at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (message_id, str(row["channel"] or CHAT_DEFAULT_CHANNEL),
+         int(row["user_id"] or 0), int(row["target_id"] or 0), now),
+    )
+    # Pruned on write, like _prune_chat: past the window nobody can still be
+    # holding the line, so the row has nothing left to tell anyone.
+    db.execute("DELETE FROM chat_deletions WHERE deleted_at < ?",
+               (now - CHAT_DELETION_WINDOW_SECONDS,))
 
     # AND THE PICTURE, IF NOTHING ELSE STILL SHOWS IT.
     #

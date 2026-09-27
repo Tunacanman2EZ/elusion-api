@@ -1,5 +1,11 @@
 # Security Notes — Elusion API
 
+> **Looking for the security model?** It is one page: **[SECURITY.md](SECURITY.md)**
+> — the premise, who is trusted with what, fifteen invariants each naming the test
+> that holds it, and the honest limits. This file is the *findings log* behind it:
+> every finding, what it let an attacker do, and what happened to it since. Long
+> on purpose, and not the place to start.
+
 This started as a self-audit: I attacked my own API as a logged-in player with a
 modified client, wrote down what I could get away with, and named five findings.
 This file is the record of that audit **and** of what happened to each finding
@@ -1234,14 +1240,49 @@ world chat and it is the same row and the same id, so the whisper was never
 private. That is inherent to deduplicating on a hash, it is the right trade for a
 game chat, and it should be a known one rather than a surprise.
 
+#### And the same idea one layer up: the feed could not be moderated
+
+`GET /api/chat` answers *"messages with an id greater than `since`"* — the right
+question for a growing log, and one that **cannot express the opposite**: something
+you were already given is no longer true.
+
+So deleting a message stopped it reaching anybody who had not read it yet and did
+nothing about the people who had. `chatpanel.gd` was append-only: `_poll()` only
+ever called `_add_line()`, and a line left only by `pop_front()` at 100. A mod took
+a line down and it stayed on every screen that already had it until a hundred more
+pushed it off, or the player closed the game — **exactly the set of players the
+deletion was for.** The picture revocation above has the same hole from the client
+side: the bytes 404 now, but a client that already decoded one holds the texture.
+
+Closed on both sides. The poll returns `removed`, and the decision that carries the
+security weight is that `chat_deletions` stores the deleted line's own `channel`,
+`user_id` and `target_id` — the three columns the read builds its permission clause
+from — so **deletions are filtered by the very same `where` and `params` as the
+messages.** Not a second permission rule to keep in step with the first: the same
+one. A line you could never have read cannot produce a deletion you are told about.
+
+Without that, world chat would carry the ids of deleted whispers to everybody. An
+id is not content, but it still says a line existed between two people and was
+taken down. Sabotage-tested: bypass the clause and O-6 goes red naming both the
+world leak and the third party who was never in the conversation.
+
+Reported by time rather than by id, because the deleted message is almost always
+*below* the client's cursor where `since` cannot reach — anything inside
+`CHAT_DELETION_WINDOW_SECONDS` (120). No second cursor, and the window is enough
+only because `chatpanel.gd` starts from the tail when the window opens, so a client
+away longer than that is not holding the line. Pruned on write.
+
 #### What holds it
 
-`test_ownership.py`, 64 checks, and the source-level half is the point: for every
+`test_ownership.py`, 79 checks, and the source-level half is the point: for every
 table carrying a `user_id`, every `UPDATE` and `DELETE` naming it must scope on
 that column or appear on an allowlist — ten entries, each with the reason it
 reaches past the caller (four retention sweeps, your own session by bearer token,
 the mod delete under `@require_role`, two guild-rank-gated writes, and the loot-bag
 deletes that are gated by the `SELECT` above them rather than in the statement).
+**That scan then caught the very next thing built in this repo** — `chat_deletions`
+carries a `user_id`, so its retention prune had to be justified on the allowlist in
+writing before the suite would go green again. Which is the job.
 **The allowlist is the most useful thing the suite produces:** it is the complete
 list of writes that legitimately touch somebody else's row. Anything not on it is
 the bug.

@@ -505,6 +505,12 @@ SWEEPS_ALLOWED = [
     ("loot_bags", "created_at <", "retention: bags past the pickup window"),
     ("kill_reports", "at <", "retention: the killwatch window"),
     ("chat_messages", "created_at <", "retention: the chat window"),
+    # ADDED BECAUSE THIS CHECK CAUGHT IT. chat_deletions carries the deleted
+    # line's user_id so the poll can filter deletions with the read's own WHERE
+    # clause - which makes it a per-user table, which made this scan demand a
+    # reason for the prune before the suite would go green again. Working as
+    # intended: the entry is the reason, written down.
+    ("chat_deletions", "deleted_at <", "retention: past CHAT_DELETION_WINDOW_SECONDS"),
     ("chat_messages", "id NOT IN", "the per-channel ring buffer trim"),
     ("sessions", "expires_at <", "expired sessions"),
     # your own row, addressed by a credential only you hold
@@ -560,6 +566,120 @@ flat_source = " ".join(source.split())
 check("the moderation target helper returns one answer for both cases",
       "a distinguishable answer would let a mod map out who outranks them" in flat_source,
       "_moderation_target's reason should still be written down")
+
+
+
+
+
+# =============================================================================
+section("O-6  A DELETION REACHES THE CLIENTS THAT ALREADY HAVE THE LINE")
+# =============================================================================
+# THE GENERAL SHAPE OF "DELETE IS NOT REVOKE", ONE LAYER UP FROM O-4.
+#
+# GET /api/chat answers "messages with an id greater than `since`". That is the
+# right question for a growing log and it cannot express the opposite one:
+# something you were already given is no longer true. So deleting a message
+# stopped it reaching anybody who had not read it yet and did nothing at all
+# about the people who had - their feed is append-only, so the line sat on screen
+# until a hundred more pushed it off. The players who kept seeing it were exactly
+# the players the deletion was for.
+#
+# The poll now carries `removed`, and the property that matters is not that the
+# list exists - it is that it is filtered by THE SAME permission clause as the
+# messages, because chat_deletions stores the deleted line's own channel, user_id
+# and target_id. One rule, one copy of it.
+
+def say(headers, body, channel="world", to=""):
+    payload = {"body": body}
+    if channel != "world":
+        payload["channel"] = channel
+    if to:
+        payload["to"] = to
+    return client.post("/api/chat/send", headers=headers, json=payload)
+
+
+def read(headers, channel="world", since=0, with_name=""):
+    path = "/api/chat?channel=%s&since=%d" % (channel, since)
+    if with_name:
+        path += "&with=" + with_name
+    return client.get(path, headers=headers).get_json() or {}
+
+check("the poll reports a removed list at all", "removed" in read(alice), read(alice).keys())
+
+say(alice, "a line that stays")
+say(alice, "a line that goes")
+feed = read(bob)
+doomed = [m["id"] for m in feed["messages"] if m["body"] == "a line that goes"]
+check("bob can see both lines", len(doomed) == 1, feed["messages"])
+cursor = int(feed["latest_id"])
+doomed_id = doomed[0]
+
+res = client.post("/api/chat/delete", headers=mod, json={"id": doomed_id})
+check("the mod takes it down", res.status_code == 200, res.get_json())
+
+# THE WHOLE POINT: bob's cursor is already PAST that id, so `since` can never
+# reach it. A deletion is an event and has to be reported by when it happened.
+later = read(bob, since=cursor)
+check("bob hears about it even though his cursor is past it",
+      doomed_id in later.get("removed", []),
+      "cursor %d, removed %s - `since` cannot look backwards"
+      % (cursor, later.get("removed")))
+check("and no new messages came with it", later["messages"] == [], later["messages"])
+
+check("it keeps being announced, because a client may poll late",
+      doomed_id in read(bob, since=cursor).get("removed", []),
+      "one announcement would be a race against the poll interval")
+
+# SCOPED BY THE SAME CLAUSE AS THE MESSAGES. A whisper deletion must not appear
+# in world - an id carries no words, but it still says a line existed between two
+# people and was taken down.
+say(alice, "between us", channel="private", to="bob")
+whisper = read(bob, channel="private", with_name="alice")
+w_ids = [m["id"] for m in whisper["messages"]]
+check("bob can read the whisper", len(w_ids) >= 1, whisper["messages"])
+w_id = w_ids[-1]
+
+res = client.post("/api/chat/delete", headers=mod, json={"id": w_id})
+check("the mod takes the whisper down", res.status_code == 200, res.get_json())
+
+check("both people in the conversation hear about it",
+      w_id in read(bob, channel="private", with_name="alice").get("removed", [])
+      and w_id in read(alice, channel="private", with_name="bob").get("removed", []),
+      "the deletion has to reach the two screens holding it")
+check("WORLD CHAT DOES NOT", w_id not in read(bob, since=cursor).get("removed", []),
+      "an id is not content, but it still says a whisper existed and was removed")
+check("and neither does an unrelated conversation",
+      w_id not in read(carol, channel="private", with_name="alice").get("removed", []),
+      "carol was never in it - this falls out of reusing the read's own WHERE")
+
+# The guild channel answers early when you have no guild, and a field that exists
+# on most answers and vanishes on one is how a client reads a stale copy.
+no_guild = read(bob, channel="guild")
+check("the no-guild answer still carries the field", "removed" in no_guild, no_guild.keys())
+
+# BOUNDED. The window is the only thing keeping this table small, and it is only
+# sufficient because chatpanel.gd starts from the tail when the window opens.
+db = raw_db()
+rows = db.execute("SELECT COUNT(*) AS n FROM chat_deletions").fetchone()["n"]
+db.execute("UPDATE chat_deletions SET deleted_at = ?",
+           (int(time.time()) - app_module.CHAT_DELETION_WINDOW_SECONDS - 60,))
+db.commit()
+db.close()
+check("the deletions table has rows to age out", int(rows) >= 2, rows)
+check("an announcement past the window is not repeated for ever",
+      read(bob, since=cursor).get("removed", []) == [],
+      "a client away longer than the window is not holding the line anyway")
+
+say(alice, "something to delete, to trigger the prune")
+d = read(mod)
+last = d["messages"][-1]["id"]
+client.post("/api/chat/delete", headers=mod, json={"id": last})
+db = raw_db()
+stale = db.execute("SELECT COUNT(*) AS n FROM chat_deletions WHERE deleted_at < ?",
+                   (int(time.time()) - app_module.CHAT_DELETION_WINDOW_SECONDS,)).fetchone()["n"]
+db.close()
+check("and the stale rows are pruned on the next delete, not by a sweeper job",
+      int(stale) == 0, stale)
 
 
 print("\n" + "=" * 70)
