@@ -8977,7 +8977,13 @@ def staff_read_user(username):
 
     characters = []
     for save in db.execute(
-        "SELECT slot, class_id, name, level, area, updated_at FROM saves"
+        # x AND y JOINED THIS LIST for the owner panel's "go to them", which
+        # has to land BESIDE a player rather than in their area's default spawn.
+        # The area was already here and is the same kind of fact; a position is
+        # where a character is standing in a game, not personal data about a
+        # person - unlike the addresses above, which is why those are gated
+        # higher and this is not.
+        "SELECT slot, class_id, name, level, area, x, y, updated_at FROM saves"
         " WHERE user_id = ? ORDER BY slot", (row["id"],)
     ).fetchall():
         characters.append({
@@ -8986,6 +8992,8 @@ def staff_read_user(username):
             "name": save["name"],
             "level": int(save["level"]),
             "area": save["area"],
+            "x": round(float(save["x"] or 0.0), 2),
+            "y": round(float(save["y"] or 0.0), 2),
             "updated_at": int(save["updated_at"] or 0),
         })
 
