@@ -8816,10 +8816,26 @@ def staff_powers():
         ],
         "dev": [
             "Ban permanently, and for any number of days.",
+            # CLIENT-SIDE, AND SAID SO. Everything else on this list is something
+            # the SERVER enforces; god mode is a switch in the game client, and a
+            # rank the client checks is only ever worth what an honest build is
+            # worth. It is here because an owner handing out `dev` deserves to
+            # know it comes with the ability to stop dying - the whole point of
+            # this route is that a rank never surprises the person granting it.
+            #
+            # It grants nothing: the client returns before the damage AND before
+            # the defense XP it would otherwise report to /api/skill/train, so an
+            # invincible character earns exactly what a stationary one does. And
+            # hp is client-written anyway (E-9), so a modified client could
+            # always refuse to die - this changes what an HONEST build can do.
+            "In-game god mode (client-side): takes no damage, and earns no"
+            " defense XP while it is on.",
         ],
         "owner": [
             "Cannot be granted or revoked - it comes from ELUSION_OWNER in the server's environment.",
             "Exempt from the maintenance switch: never locked out or disconnected by it.",
+            "The only rank the owner panel opens for - it also holds the"
+            " maintenance switch and the gold grant.",
         ],
     }
 
