@@ -179,19 +179,49 @@ check("the XP awarded matches the fish's own value",
       r.get_json()["xp"] == FISH[r.get_json()["item_id"]]["fishing_xp"],
       (r.get_json()["xp"], r.get_json()["item_id"]))
 
-# THE CLIENT CANNOT WRITE ANY SKILL BACK NOW. A normal client still syncs all
-# six on save; if that overwrote fishing, every grant would survive until the
-# next routine save and no further. With the E-2 close, defense/agility/magic
-# joined fishing/cooking/attack as server-owned, so the sync drops ALL of them -
-# fishing here, and defense right beside it.
+# THE CLIENT CANNOT WRITE THIS SKILL BACK. A normal client syncs all six skills
+# on save; if that overwrote fishing, every grant would survive until the next
+# routine save and no further.
 level_now = skill(angler, "fishing")["level"]
-client.put("/api/character/skills", headers=angler,
-           json={"slot": 0, "skills": {"fishing": {"level": 99, "xp": 0},
-                                       "defense": {"level": 5, "xp": 0}}})
+before_all = client.get("/api/character?slot=0", headers=angler).get_json()["skills"]
+res = client.put("/api/character/skills", headers=angler,
+                 json={"slot": 0, "skills": {"fishing": {"level": 99, "xp": 0},
+                                             "defense": {"level": 5, "xp": 0}}})
 check("a client claiming fishing 99 is ignored",
       skill(angler, "fishing")["level"] == level_now, skill(angler, "fishing"))
-check("and a claim of defense - now server-owned too - is dropped, not synced",
-      skill(angler, "defense")["level"] == 1, skill(angler, "defense"))
+
+# THIS CHECK USED TO ASSERT "but defense still syncs", AND IT WAS RIGHT WHEN IT
+# WAS WRITTEN. /api/skill/train shipped afterwards and put defense, agility and
+# magic under the server too, so there is no client-writable skill left to use as
+# the control - and the old check failed, correctly, on a server that had simply
+# moved on.
+#
+# So assert what is true now, and say the number out loud: VALID_SKILLS and
+# SERVER_OWNED_SKILLS are the SAME SIX. Every name the route accepts is a name it
+# then drops, which makes PUT /api/character/skills a write that provably writes
+# nothing - it validates a body, logs any over-cap claim, and returns the stored
+# state. That is safe and it is also dead weight, and the day a seventh skill
+# arrives that the client does grant, the drop filter and the DELETE below it
+# both need re-reading. This is the check that will say so.
+writable = app_module.VALID_SKILLS - app_module.SERVER_OWNED_SKILLS
+check("every skill the route accepts is a skill it drops", writable == set(),
+      "%s is client-writable now - re-read the drop filter and the DELETE beside it"
+      % sorted(writable))
+
+after_all = client.get("/api/character?slot=0", headers=angler).get_json()["skills"]
+check("so a full six-skill sync changes nothing at all", before_all == after_all,
+      (before_all, after_all))
+check("and it answers 200 with the stored state rather than refusing",
+      res.status_code == 200 and (res.get_json() or {}).get("skills") == after_all,
+      (res.status_code, res.get_json()))
+
+# Not even a deletion. The DELETE is "NOT IN (the six)", and the six are all of
+# them, so an empty payload cannot clear a row either.
+res = client.put("/api/character/skills", headers=angler, json={"slot": 0, "skills": {}})
+check("an empty payload deletes nothing",
+      res.status_code == 200
+      and client.get("/api/character?slot=0", headers=angler).get_json()["skills"] == after_all,
+      res.get_json())
 
 
 section("FISHING  -  THE ROD TIER IS A CEILING, NOT A SUGGESTION")

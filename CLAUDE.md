@@ -113,6 +113,62 @@ updating the maxima it implies.
 - **`/api/status` has no auth.** The login screen needs to ask "are you there?"
   before anyone has logged in, and a 401 is not an answer to that question.
 
+## Which refusal code, and why this file breaks the textbook
+
+The textbook is four sentences: authentication is who is asking, authorization is
+what they may do, 401 means authentication failed, 403 means authorization
+failed. This file obeys the first two and deliberately breaks the third, and a
+first read makes it look inconsistent — fifteen `403`s and twelve `404`s that are
+plainly authorization refusals. There is one rule underneath, and every one of
+those twenty-seven already follows it:
+
+> **The gate that decides whether the route is yours answers 404.
+> The check on what you asked for, inside a route already yours, answers 403.**
+
+Read it as a question about the caller: **does their own rank already admit them
+here?**
+
+- **No** → the refusal would *be* the disclosure. A 403 confirms the route
+  exists and that you are not allowed to use it, which tells someone exactly
+  where to push. So it is a 404 and it says nothing: `"Not found."`, no rank
+  named. This is `require_role`, `require_owner`, the guild officer/leader
+  pre-checks, and owner-only guild naming.
+- **Yes** → they are already inside, so the refusal tells them nothing they did
+  not know, and it may as well say why. `"A mod may ban for at most 30 days."`
+  is useful and leaks nothing, **because only a mod can read it.**
+
+That is why `/api/staff/ban` answers **404 to a player** and **403 to a mod who
+asked for a permanent one**. Same route, same gate, different question. Every
+403 in the file is a check on an *argument*: permanent vs temporary, which rank,
+everyone vs one player, level, class, bait, a fishing rod.
+
+The one 403 that is not about an argument is the **ban at login**, and it is
+deliberate twice over: it runs *after* the password check, so the route cannot be
+used to find out who is banned, and it includes the reason, because a banned
+player has every right to know and silence reads as the game being broken.
+
+**The 401s have no exceptions at all.** All eight are authentication: three are a
+token that resolved against a row since deleted (identity can no longer be
+established — late, but still authentication), the rest are a password that did
+not match. Which produces the fact the **client** depends on:
+
+> **A 401 is not a verdict on the session.**
+
+`/api/auth/password` and `/api/account/email` both require the *current*
+password and answer 401 when it is wrong, while the token stays perfectly live —
+a valid token is not proof of identity when the token may be the stolen thing. So
+a client that signs people out on any 401 signs them out for typos.
+`characterhud.gd::_on_unauthorized_seen()` asks `heartbeat()` instead of
+deciding, and `test_refusals.py` F-3 is what that handler is standing on.
+
+**`test_refusals.py` enforces all of this, 80 checks.** F-1 does not have a list
+of staff routes typed into it — it reads them off `_elusion_min_role`, the same
+tags `/api/staff/powers` reports from, so a route added without a rank decorator
+fails the suite instead of quietly working for everyone. Sabotage-proven: turn
+`require_role`'s 404 into a 403, let the 404 explain itself, add an ungated
+`/api/staff/` route, split the login 401, or drop sessions on a wrong current
+password, and it fails.
+
 ## Ranks
 
 Built. `owner > dev > mod > player`, as `users.role` - one ordered column, not a

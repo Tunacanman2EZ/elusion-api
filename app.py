@@ -4057,6 +4057,62 @@ def pending_teleport_for(user_id):
     }
 
 
+# =============================================================================
+# WHICH REFUSAL CODE - THE RULE THIS FILE FOLLOWS
+# =============================================================================
+#
+# The textbook is four sentences: authentication is who is asking, authorization
+# is what they may do, 401 means authentication failed, 403 means authorization
+# failed. This file obeys the first two and DELIBERATELY BREAKS THE THIRD, which
+# is why a first read finds fifteen 403s and twelve 404s that are plainly
+# authorization refusals and looks like a codebase that cannot make up its mind.
+#
+# It can. One rule, and all twenty-seven already follow it:
+#
+#     THE GATE THAT DECIDES WHETHER THE ROUTE IS YOURS ANSWERS 404.
+#     THE CHECK ON WHAT YOU ASKED FOR, INSIDE A ROUTE ALREADY YOURS, ANSWERS 403.
+#
+# Read it as a question about the caller: does their own rank already admit them
+# here?
+#
+#   NO   the refusal would BE the disclosure - it confirms a route, a rank ladder
+#        or a guild that they have no standing to learn about. So: 404, the word
+#        "Not found.", and no rank named anywhere in it. A 404 that explains
+#        itself un-hides exactly what the status code hid.
+#
+#   YES  they are already inside. The refusal tells them nothing they did not
+#        know, so it may as well say why. "A mod may ban for at most 30 days" is
+#        useful and leaks nothing, BECAUSE ONLY A MOD CAN READ IT.
+#
+# So /api/staff/ban answers 404 to a player and 403 to a mod who asked for a
+# permanent one. Same route, same gate, different question. Every 403 in this
+# file is a check on an ARGUMENT - permanent vs temporary, which rank, everyone
+# vs one player, level, class, bait, a rod.
+#
+# The one 403 that is not about an argument is the ban at /api/auth/login, and it
+# is deliberate twice: it runs AFTER the password check so the route cannot be
+# used to find out who is banned, and it includes the reason, because a banned
+# player has every right to know and silence reads as the game being broken.
+#
+# THE 401s HAVE NO EXCEPTIONS. All eight are authentication - three are a token
+# that resolved against a row since deleted (identity can no longer be
+# established: late, but still authentication), the rest are a password that did
+# not match. Which produces the fact the CLIENT depends on:
+#
+#     A 401 IS NOT A VERDICT ON THE SESSION.
+#
+# /api/auth/password and /api/account/email both require the CURRENT password and
+# answer 401 when it is wrong, while the token stays perfectly live - a valid
+# token is not proof of identity when the token may be the stolen thing. A client
+# that signs people out on any 401 signs them out for typos. The Godot client
+# asks /api/auth/session instead of deciding.
+#
+# test_refusals.py enforces every paragraph above, and F-1 reads the route list
+# off the _elusion_min_role tags below rather than having one typed into it - so
+# an /api/staff/ route added without a rank decorator fails the suite instead of
+# quietly working for everybody.
+
+
 def require_role(minimum):
     """
     Decorator for a route that needs a rank. Sits inside @require_auth, which
