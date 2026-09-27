@@ -2907,6 +2907,26 @@ def _moderation_target(payload):
 
 MAINTENANCE_KEY = "maintenance"
 
+# PVP. One row in server_settings, like the maintenance switch beside it, and on
+# the server for the same reason: it is a fact about the WORLD rather than about
+# one client, so every client has to be able to read the same answer.
+#
+# WHAT IT DOES TODAY, stated plainly so nobody has to guess from the name: it
+# says PvP is on, it is announced in chat when it changes, and it appears on
+# /api/status so every client sees it - including one sitting on the login
+# screen that has never logged in. IT DOES NOT MAKE ANYBODY DAMAGEABLE, because
+# nothing in this game can damage another player yet: there are no positions on
+# the server and no remote bodies in the client, which /api/players/nearby says
+# in its own comment. See CLAUDE.md, "Decided, not built: PvP and the world
+# boss", for the four steps between here and a world boss.
+#
+# IT IS STILL WORTH HAVING NOW RATHER THAN LATER, and the reason is where it
+# lives. When damage does arrive, the question "is PvP on" must be answered by
+# the SERVER - a flag in a client is a flag an attacker sets. Putting the switch
+# in the right place first means the damage path has an authority to ask, rather
+# than growing one in a hurry next to the thing that needed it.
+PVP_KEY = "pvp"
+
 MAINTENANCE_DEFAULT_MESSAGE = "Update in progress - please come back later."
 
 # Long enough that every client actually in the world gets at least one
@@ -2952,6 +2972,22 @@ def set_server_setting(key, value, by=""):
         """,
         (key, value, by, int(time.time())),
     )
+
+
+def pvp_enabled():
+    """True when the owner has PvP switched on. Anything unreadable reads OFF.
+
+    Fails toward off on purpose, the same way every unrecognised rank in this
+    file reads as `player`: a corrupt row must not be able to turn combat on.
+    """
+    raw = get_server_setting(PVP_KEY)
+    if not raw:
+        return False
+    try:
+        stored = json.loads(raw)
+    except (ValueError, TypeError):
+        return False
+    return bool(isinstance(stored, dict) and stored.get("on"))
 
 
 def maintenance_state():
@@ -8977,13 +9013,13 @@ def staff_read_user(username):
 
     characters = []
     for save in db.execute(
-        # x AND y JOINED THIS LIST for the owner panel's "go to them", which
-        # has to land BESIDE a player rather than in their area's default spawn.
-        # The area was already here and is the same kind of fact; a position is
-        # where a character is standing in a game, not personal data about a
-        # person - unlike the addresses above, which is why those are gated
-        # higher and this is not.
-        "SELECT slot, class_id, name, level, area, x, y, updated_at FROM saves"
+        # AREA, AND NOTHING FINER, because that is all `saves` holds. An earlier
+        # pass added "x, y" here for the owner panel's "go to them" and broke
+        # this route outright - there are no such columns. The x/y that do exist
+        # are on `pending_teleports`, which is where a teleport is going, not
+        # where a player is. /api/players/nearby says the same thing in words:
+        # "There is no position on the server and no heartbeat carrying one."
+        "SELECT slot, class_id, name, level, area, updated_at FROM saves"
         " WHERE user_id = ? ORDER BY slot", (row["id"],)
     ).fetchall():
         characters.append({
@@ -8992,8 +9028,6 @@ def staff_read_user(username):
             "name": save["name"],
             "level": int(save["level"]),
             "area": save["area"],
-            "x": round(float(save["x"] or 0.0), 2),
-            "y": round(float(save["y"] or 0.0), 2),
             "updated_at": int(save["updated_at"] or 0),
         })
 
@@ -9190,6 +9224,10 @@ def server_status():
         "message": state["message"] if state["on"] else "",
         "back_at": state["back_at"],
         "seconds_left": maintenance_seconds_left(state),
+        # ON THE UNAUTHENTICATED ROUTE, on purpose. "Is PvP on" is a fact about
+        # the world, not about an account, and the login screen is exactly where
+        # somebody wants to know before they walk in.
+        "pvp": pvp_enabled(),
     }, 200
 
 
@@ -9319,6 +9357,84 @@ def set_maintenance():
         "sessions_ended": ended,
     }, 200
 
+
+
+@app.post("/api/server/pvp")
+@require_auth
+@require_owner
+def set_pvp():
+    """
+    Turn player-versus-player on or off (owner only)
+    ---
+    tags:
+      - Status
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: switch
+        schema:
+          type: object
+          required: [on]
+          properties:
+            on: {type: boolean}
+    responses:
+      200:
+        description: The switch, as it now stands
+      400:
+        description: No 'on' field
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: Not the owner
+    """
+    # OWNER, LIKE THE MAINTENANCE SWITCH ABOVE IT, and for the same reason: this
+    # is a statement about the whole world rather than an action on one account.
+    # require_owner answers with a 404 rather than a 403 - see the refusal rule
+    # in SECURITY.md; a 403 would confirm the route exists to somebody who has
+    # no business knowing it does.
+    payload = request.get_json(silent=True) or {}
+    if "on" not in payload:
+        return bad_request('send {"on": true} or {"on": false}')
+
+    wanted = bool(payload.get("on"))
+    db = get_db()
+
+    # WRITTEN EVEN WHEN IT DOES NOT CHANGE, like the maintenance row, so
+    # server_settings keeps a record of who set it and when. An explicit
+    # {"on": false} rather than a deleted row, for the same reason.
+    set_server_setting(PVP_KEY, json.dumps({"on": wanted}), g.user["username"])
+
+    # ANNOUNCED, because a rule about whether other players may hurt you is not
+    # something to discover by being hurt. post_broadcast reaches everyone who
+    # is online; /api/status carries it for everyone who is not yet.
+    #
+    # NAMED, AND IN THE WORLD'S OWN VOICE. "PvP is now ON" is a settings screen
+    # talking; a world boss is a thing that HAPPENS to a world, and the line
+    # people should see is the one that reads like an event. The name is
+    # g.user["username"] - the server's own spelling of it, the same authority
+    # the login screen greets somebody by, so it matches the crown over the
+    # owner's head rather than whatever case was typed at a keyboard.
+    post_broadcast(
+        ("%s has gone hostile." % g.user["username"]) if wanted
+        else ("%s has cooled off - no longer hostile." % g.user["username"]),
+        "system", g.user["username"])
+    log_staff_action(g.user, "pvp", "server", None, "on" if wanted else "off")
+    db.commit()
+
+    return {
+        "pvp": wanted,
+        # SAID OUT LOUD ON EVERY ANSWER, so a panel written against this route
+        # cannot imply more than the switch does. Nothing can damage another
+        # player yet - there are no positions on the server and no remote bodies
+        # in the client. The flag is the authority the damage path will ask when
+        # it exists; today it is a flag and an announcement, and the button that
+        # sets it says so too.
+        "damage_implemented": False,
+    }, 200
 
 @app.post("/api/server/broadcast")
 @require_auth
@@ -11248,6 +11364,118 @@ def _kingdom_cache_clear():
 # than this is one nobody reads to the end of anyway.
 NEARBY_LIMIT = 20
 
+# The most the who-is-online menu returns. A cap rather than paging, like
+# NEARBY_LIMIT above: a list nobody can scroll to the end of has stopped being a
+# list, and at fifty concurrent players - the size this server is provisioned
+# for - it is not reached. If it ever is, that is a good problem and the fix is
+# paging rather than a bigger number.
+ONLINE_LIST_LIMIT = 60
+
+
+@app.get("/api/players/online")
+@require_auth
+def players_online():
+    """
+    Everyone playing right now, and where
+    ---
+    tags:
+      - Players
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+    responses:
+      200:
+        description: Who is online, their area, and which of them are with you
+      401:
+        description: Missing, invalid or expired token
+    """
+    # ANY LOGGED-IN PLAYER, no rank. This is the "who else is here" list every
+    # game has, and it is the honest version of presence available today: the
+    # server knows which AREA a character is in and nothing finer, which
+    # /api/players/nearby says in its own comment. When real positions arrive
+    # this route gains a distance and the client does not change shape.
+    #
+    # WHAT IT DISCLOSES, said plainly because it is a choice and not an
+    # oversight: every online player's account name, character name, level and
+    # area, to every other player. That is what a who-is-online list IS, and
+    # the friends panel already shows the same thing for friends. It does not
+    # disclose anything the game does not already put over a character's head.
+    user_id = g.user["id"]
+    now = int(time.time())
+    db = get_db()
+
+    # WHERE THE CALLER IS, so the list can be grouped into "here with you" and
+    # "elsewhere" without the client having to ask a second route for its own
+    # area. Read from the most recently saved slot: a player has up to four
+    # characters and only one of them is being played.
+    mine = db.execute(
+        "SELECT area FROM saves WHERE user_id = ? ORDER BY updated_at DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    my_area = str(mine["area"]) if mine is not None else ""
+
+    # BOTH CONDITIONS. last_seen_at says a client was there in the last 45
+    # seconds; expires_at says the session is still allowed to be. Either one
+    # alone is wrong in a different direction - see the longer note in
+    # players_nearby, which had exactly that bug for one test run.
+    rows = db.execute(
+        """
+        SELECT users.username                AS username,
+               users.role                    AS role,
+               MAX(sessions.last_seen_at)    AS seen,
+               saves.name                    AS name,
+               saves.level                   AS level,
+               saves.area                    AS area,
+               saves.updated_at              AS updated_at
+          FROM sessions
+          JOIN users ON users.id = sessions.user_id
+          LEFT JOIN saves ON saves.user_id = sessions.user_id
+         WHERE sessions.last_seen_at > ?
+           AND sessions.expires_at > ?
+      GROUP BY users.id, saves.slot
+      ORDER BY users.username ASC, saves.updated_at DESC
+         LIMIT ?
+        """,
+        (now - ONLINE_WINDOW_SECONDS, now, ONLINE_LIST_LIMIT * 4),
+    ).fetchall()
+
+    # ONE ENTRY PER ACCOUNT, and it is the character they most recently saved.
+    # The query cannot do it alone - a player has up to four slots and SQLite
+    # will happily hand back all of them - so the first row per username wins,
+    # which the ORDER BY has already arranged.
+    seen_accounts = set()
+    players = []
+    for row in rows:
+        name = row["username"]
+        if name in seen_accounts:
+            continue
+        seen_accounts.add(name)
+        players.append({
+            "username": name,
+            # THE RANK IS SHOWN, because the game already draws it over their
+            # head - see the nameplate colours in api.gd. A list that hid what
+            # the world shows would just be a worse list.
+            "role": role_for(row) if row["role"] is not None else DEFAULT_ROLE,
+            "name": row["name"] or "",
+            "level": int(row["level"] or 1),
+            "area": row["area"] or "",
+            "with_you": bool(row["area"] and row["area"] == my_area),
+        })
+        if len(players) >= ONLINE_LIST_LIMIT:
+            break
+
+    return {
+        "area": my_area,
+        "precision": "area",
+        "online": len(players),
+        "players": players,
+        # SO THE MENU CAN SAY SO. One list, one answer about the world's rules.
+        "pvp": pvp_enabled(),
+    }, 200
+
 
 @app.get("/api/players/nearby")
 @require_auth
@@ -11317,11 +11545,33 @@ def players_nearby():
           JOIN sessions ON sessions.user_id = saves.user_id
          WHERE saves.area = ?
            AND saves.user_id != ?
+           AND sessions.last_seen_at > ?
            AND sessions.expires_at > ?
       ORDER BY saves.level DESC, users.username ASC
          LIMIT ?
         """,
-        (area, user_id, int(time.time()), NEARBY_LIMIT),
+        # LAST SEEN **AND** STILL VALID. Both, and the first version of this fix
+        # had only one of them, which test_economy.py caught in one line.
+        #
+        # This filtered on sessions.expires_at > now, which is true for anybody
+        # holding an unexpired token - and a token lasts TOKEN_TTL, thirty days,
+        # surviving the game being closed. So "in this area with you" listed
+        # everyone who had logged in since last month and happened to save here.
+        #
+        # ONLINE_WINDOW_SECONDS is this file's own answer to "is anyone there",
+        # and its comment warns about exactly this mistake in exactly these
+        # words: "NOT 'has a live session'... a kick list sorted by it put last
+        # week's visitors at the top." The heartbeat stamps last_seen_at every
+        # 15 seconds, so 45 is three missed beats.
+        #
+        # AND THE EXPIRY STILL MATTERS. A beat within the window says the client
+        # was there; an unexpired token says it is still allowed to be. Dropping
+        # the second one meant a session that had been revoked or had run out
+        # went on being listed for its last 45 seconds - which is exactly what
+        # "an offline player is not listed as nearby" in test_economy.py exists
+        # to catch, and did.
+        (area, user_id, int(time.time()) - ONLINE_WINDOW_SECONDS,
+         int(time.time()), NEARBY_LIMIT),
     ).fetchall()
 
     return {
