@@ -9912,11 +9912,42 @@ def chat_delete():
             return {"error": "Not Found", "message": "No such message."}, 404
 
     db.execute("DELETE FROM chat_messages WHERE id = ?", (message_id,))
+
+    # AND THE PICTURE, IF NOTHING ELSE STILL SHOWS IT.
+    #
+    # Deleting the MESSAGE used to leave the image row in place, and that made
+    # this route the weaker half of a pair. /api/chat/image/<id> serves any row
+    # to any signed-in caller - which is sound, because the id is the SHA-256 of
+    # the bytes, so 256 unguessable bits ARE the permission and you cannot have
+    # one without having been shown it. What that argument cannot do is take a
+    # picture back: everyone who was in the channel when it was posted holds the
+    # id already, the response says Cache-Control: immutable with a one-year
+    # max-age, and the row was only ever removed by the 128MB eviction loop. So
+    # a mod deleted an offensive picture, the line vanished from the feed, and
+    # the bytes went on being served to everyone who had already seen it. The
+    # only thing that had actually happened was that it stopped being visible to
+    # the people who never saw it.
+    #
+    # REFERENCE COUNTED, and that is not optional. store_relayed_image() uses
+    # INSERT OR IGNORE on a content hash, so the same picture posted twice is ONE
+    # row addressed by two messages - deleting the row on the first message would
+    # blank the picture under a second, innocent line, possibly in another
+    # channel. Count what is left and only drop it at zero.
+    image_id = str(row["image_id"] or "")
+    image_dropped = False
+    if image_id != "":
+        still_shown = db.execute(
+            "SELECT COUNT(*) AS n FROM chat_messages WHERE image_id = ?", (image_id,)
+        ).fetchone()["n"]
+        if int(still_shown or 0) == 0:
+            db.execute("DELETE FROM chat_images WHERE id = ?", (image_id,))
+            image_dropped = True
+
     log_staff_action(g.user, "chat_delete", row["username"], row["user_id"],
                      row["body"][:120])
     db.commit()
 
-    return {"id": message_id, "deleted": True}, 200
+    return {"id": message_id, "deleted": True, "image_dropped": image_dropped}, 200
 
 
 # =============================================================================

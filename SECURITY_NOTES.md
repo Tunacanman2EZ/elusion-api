@@ -30,8 +30,9 @@ lives.
 | E-12 | The sanction ladder had only one rung | low (moderation) | **Closed** — a kick is not a ban | Staff had to ban someone to remove them, so the smallest available response was the harshest. | **New tool.** `POST /api/staff/kick` ends every session without banning, under the same rank rules and audit log as a ban. |
 | E-13 | **Four protections were unarmed against the shipped catalogue** | **high** | **Closed** — and it is the reason this table needed a footnote | Four fixes marked Closed were silently off in production, so everything they block was open with every test green. | **Deployment check.** `test_catalogue.py` asserts the shipped `gamedata.json` arms each protection, and the server logs an error at boot for any control running unarmed. |
 | E-14 | A kick or a ban never reached a game that was already running | medium (moderation) | **Closed** | A kicked or banned player keeps playing for as long as they leave the game open. | **Heartbeat.** The game re-checks its session every 15 seconds and on any 401, and a dead session sends it to the login screen — a kick lands in about a second. Only a 401 signs anyone out, so a server restart is never a mass kick. |
+| E-15 | Broken access control (IDOR) — can you name a row that is not yours? | critical if present | **Audited, nothing found** — one adjacent gap closed | A player sends somebody else's record id and edits, empties or deletes it. One Postman request, no modified client needed. | **Structural, two ways.** Every id a client may name is scoped inside the query, so "not yours" and "does not exist" are one 404; and the highest-value rows (trades) accept no id at all — every route resolves them from the caller. `test_ownership.py` runs the attack on every surface and enforces the convention on the source. The gap that was real: a deleted chat message left its picture being served. |
 
-Twelve closed, one partly, one open.
+Thirteen closed, one partly, one open, one audited clean.
 
 **The Fix column has a shape.** Five of the fourteen fixes are *server-side
 authority* — something the client could write, which the server now owns. The
@@ -1144,6 +1145,116 @@ the honest client that simply never found out.
 
 Twelve checks in `test_api.py` (presence, the heartbeat, the migration) and
 a STAFF PANEL section in the Godot suite, each mutation-tested.
+
+### E-15 — Broken access control · AUDITED, NOTHING FOUND · one adjacent gap closed
+
+Came from a school exercise: a shared board where anyone posts a card, then an
+"ownership layer" so only the creator can edit or delete theirs. The failure it
+teaches is the one Postman finds in a single request — a route that checks you are
+LOGGED IN and forgets to check the row is YOURS. Change the id, keep your own
+token, and you are editing someone else's record.
+
+So the attack was run here, against every place in this server where a client is
+allowed to name a record. **Nothing was found**, and the reason is worth more than
+the result, because this server answers the exercise in two ways and only one of
+them is the lesson's.
+
+**1. Scope the lookup, do not check afterwards.** One query names the caller:
+
+```sql
+SELECT slot, created_at FROM loot_bags WHERE bag_id = ? AND user_id = ?
+```
+
+so "not yours" and "does not exist" come back as the *same* 404. There is no
+window between finding the row and checking it, because there is no separate
+check. Loot bags, pending teleports, friend requests, guild invites, the bank,
+the backpack and skills all work this way.
+
+That last point is the half of a fix that usually survives broken. A route that
+finds the row, sees it belongs to somebody else and returns 403 has fixed the
+write and kept the oracle: the attacker now enumerates which ids exist by whether
+they get 403 or 404. `_moderation_target()` says the same thing in its own words —
+a distinguishable answer would let a mod map out who outranks them.
+
+**2. Better: do not let the client name the row at all.** A trade is the most
+valuable row in this database — it moves items and gold between two accounts —
+and **not one trade route accepts a `trade_id`.** Every one calls
+`_trade_find_open(db, g.user["id"])` and works on whatever comes back. An
+ownership bug needs an id to tamper with; these routes have none to offer.
+
+That is the stronger version of the exercise and it is not what the exercise
+teaches. Where it is available, prefer it: a check can be forgotten on the route
+added next month, and a missing parameter cannot.
+
+Even the owner's debug mint follows it. `POST /api/staff/gold` is owner-only and
+*still* will not name another account — it takes `slot` and `amount` and credits
+the caller. Passing `username` does nothing, which is a test in
+`test_ownership.py` rather than a claim here.
+
+#### The one route with no ownership check, and why that is sound
+
+`GET /api/chat/image/<image_id>` serves any stored picture to any signed-in
+caller. It is **capability-based**: the id is the SHA-256 of the bytes, so 256
+unguessable bits *are* the permission — you cannot hold an id without having been
+shown it, and the only way to be shown it is to have received the chat line
+carrying it. Being signed in is what keeps it from being a public file host run by
+accident.
+
+That argument rests entirely on properties of the id, so the properties are the
+test. If the ids ever become sequential, or the hash is truncated to something
+brute-forceable, this route turns into the exercise's flaw without a line of it
+changing. `test_ownership.py` O-3 asserts the id is 64 hex characters, is 256 bits
+rather than a truncation, and **equals the SHA-256 of the bytes actually served**.
+
+#### The gap that was real: delete was not revocation
+
+256 unguessable bits stop somebody *guessing* a picture. They do nothing about
+taking one back from the people who were already shown it — and everyone in the
+channel when it was posted holds the id.
+
+`POST /api/chat/delete` removed the `chat_messages` row and left `chat_images`
+untouched. The response for a picture carries
+`Cache-Control: public, max-age=31536000, immutable`, and the only thing that ever
+removed a row was the 128MB oldest-first eviction loop. So a mod deleted an
+offensive picture, the line vanished from the feed, and the bytes went on being
+served — for a year, cacheably — to everyone who had already seen it. The only
+thing that had actually happened was that it stopped being visible to the people
+who never saw it.
+
+**Fixed, and reference counted, which is not optional.** `store_relayed_image()`
+uses `INSERT OR IGNORE` on the content hash, so the same picture posted twice is
+ONE row addressed by two messages — possibly in two different channels. Dropping
+the row on the first delete would blank the picture under a second, innocent line.
+The route counts the remaining `chat_messages` rows naming that image and deletes
+it only at zero, reporting `image_dropped` either way.
+
+Worth stating because content addressing has a consequence nobody wrote down: a
+whispered picture is only as private as its bytes are rare. Post the same image in
+world chat and it is the same row and the same id, so the whisper was never
+private. That is inherent to deduplicating on a hash, it is the right trade for a
+game chat, and it should be a known one rather than a surprise.
+
+#### What holds it
+
+`test_ownership.py`, 64 checks, and the source-level half is the point: for every
+table carrying a `user_id`, every `UPDATE` and `DELETE` naming it must scope on
+that column or appear on an allowlist — ten entries, each with the reason it
+reaches past the caller (four retention sweeps, your own session by bearer token,
+the mod delete under `@require_role`, two guild-rank-gated writes, and the loot-bag
+deletes that are gated by the `SELECT` above them rather than in the statement).
+**The allowlist is the most useful thing the suite produces:** it is the complete
+list of writes that legitimately touch somebody else's row. Anything not on it is
+the bug.
+
+Sabotage-proven eight ways, and two are worth naming because they are the exercise
+exactly: drop `AND user_id = ?` from the loot bag lookup and Bob reads Alice's
+bag; drop it from `/api/loot/take` and Bob walks off with her potions.
+
+The first version of that source check reported five false alarms, all because
+Python concatenates adjacent string literals and the scanner read one at a time —
+so `"UPDATE saves SET gold = gold + ?" " WHERE user_id = ?"` looked like an UPDATE
+with no WHERE. A check that cries wolf five times is a check somebody switches
+off. It joins them now, the way the interpreter does.
 
 ### Already solid — credit where due
 

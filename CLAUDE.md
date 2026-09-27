@@ -78,6 +78,31 @@ the same twenty lines. There is now one validator, and a test asserting the bank
 and the backpack are bound by the same rule — because that is the failure a
 future change would otherwise reintroduce.
 
+### Deleting the row that points at a thing is not deleting the thing
+
+`POST /api/chat/delete` removed the `chat_messages` row and left `chat_images`
+alone. The picture went on being served — to everyone who was in the channel when
+it was posted, because they already hold the id — with
+`Cache-Control: max-age=31536000, immutable` on the response and nothing but the
+128MB eviction loop ever removing a row. A mod deleting an offensive picture only
+stopped it reaching the people who had never seen it.
+
+Two things to carry from it:
+
+- **Ask what a delete actually revokes.** "The line is gone from the feed" and
+  "the bytes are unreachable" are different claims, and the first one looks like
+  the second from the moderator's side.
+- **Reference count before you drop shared storage.** `store_relayed_image()` is
+  `INSERT OR IGNORE` on a content hash, so the same picture posted twice is ONE
+  row under two messages, possibly in two channels. Deleting the row on the first
+  message would blank the picture under a second, innocent line. Count what still
+  names it and drop at zero. The route reports `image_dropped` either way.
+
+The consequence of content addressing that nobody had written down: **a whispered
+picture is only as private as its bytes are rare.** Post the same image in world
+chat and it is the same row and the same id, so the whisper was never private.
+That is the right trade for a game chat — it should just be a known one.
+
 ### Tests that assert magic numbers rot
 
 Checks written against a hardcoded 180 HP or 500 gold break the moment the
@@ -98,7 +123,24 @@ updating the maxima it implies.
   bounded by `QUANTITY_CEILING` instead; known ones by their own `max_stack`.
 - **Every query scopes on `g.user["id"]` in the SQL itself**, rather than
   fetching and then checking ownership. "Not yours" and "does not exist" return
-  the same 404, so there is nothing to learn by asking.
+  the same 404, so there is nothing to learn by asking. (That last clause is the
+  half that usually survives broken: a route that finds the row, sees it is
+  somebody else's and answers 403 has fixed the write and kept the oracle —
+  the attacker now enumerates ids by 403-versus-404.)
+- **Better still, where it is available: do not let the client name the row.**
+  Not one trade route accepts a `trade_id` — every one calls
+  `_trade_find_open(db, g.user["id"])` and works on what comes back. An
+  ownership bug needs an id to tamper with, and these routes have none to offer.
+  A check can be forgotten on the route added next month; a missing parameter
+  cannot. `POST /api/staff/gold` is the same idea: owner-only and *still* unable
+  to name another account.
+- **`GET /api/chat/image/<image_id>` has no ownership check on purpose**, and it
+  is the only route that does not. The id is the SHA-256 of the bytes, so 256
+  unguessable bits *are* the permission. That argument rests entirely on
+  properties of the id, so `test_ownership.py` asserts them: 64 hex, 256 bits not
+  a truncation, and equal to the hash of the bytes served. Make the ids
+  sequential or truncate the hash and the route becomes a textbook IDOR without
+  a line of it changing.
 - **Login and unknown-username return byte-identical 401s.** A distinguishable
   answer turns the route into a username enumerator. There is a test asserting
   the two responses are equal.
