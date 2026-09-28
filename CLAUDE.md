@@ -20,11 +20,29 @@ in this repository already did.
 **Run the tests before and after. Every time.**
 
 ```
-.\venv\Scripts\python.exe test_api.py
+.\run_tests.ps1
 ```
 
-262 checks, exits non-zero on any failure, and it builds a throwaway database in
-your temp folder so it never touches `elusion.db`.
+It discovers every `test_*.py` beside it, runs them all, and exits non-zero if
+any one of them does. **The exit code is the source of truth**; the total it
+prints is scraped from each suite's own summary line, and it says so when a
+scrape misses rather than reporting a confident zero.
+
+One suite on its own:
+
+```
+.\venv\Scripts\python.exe test_economy.py
+```
+
+Every suite builds a throwaway database in your temp folder, so none of them
+ever touches `elusion.db`.
+
+**THERE IS NO CHECK COUNT WRITTEN DOWN HERE, AND THAT IS DELIBERATE.** This
+line used to say "262 checks" and the Layout below used to give a figure for
+each of five suites. There are twenty-six now, and every one of those numbers
+was wrong - `test_api.py` alone had gone from 262 to 454. A number in a comment
+cannot fail, so it stays wrong until somebody trusts it. `run_tests.ps1` counts;
+this file does not.
 
 **`elusion.db` holds real accounts and password hashes.** It is gitignored and
 must stay that way. Do not paste rows from it anywhere.
@@ -50,6 +68,77 @@ What makes this dangerous is that **151 tests passed while the live server was
 broken**. The suite builds a fresh database every run, and the fresh one got the
 new schema. If you change a table, add a migration test that starts from the old
 shape — the `MIGRATION` section exists for exactly that.
+
+### A counter added by migration starts at zero and looks broken
+
+`_migrate_add_column(db, "users", "deaths", "INTEGER NOT NULL DEFAULT 0")` gives
+every existing account a zero, and there is nothing to backfill it from — a
+death before that line existed left no row anywhere. So the first thing the
+kingdom board said after the column shipped was **"Nobody has died yet"**, on a
+world whose ledger plainly showed thousands of gold *paid to cheat death*.
+
+Both figures were right. The ledger is a LOG and had the history; the counter is
+a TALLY and started the day it was added. A tally and a log disagreeing about
+the past is not a bug, it is the difference between the two shapes — and it will
+happen again the next time a counter is added to a live database.
+
+**The distinction to hold on to: a counter can only ever describe the future.**
+If the history matters, derive the figure from the log instead (the kingdom
+total is derived for exactly this reason and says so), or accept that the
+counter has a birthday and say so on screen.
+
+`deathwatch.py` is the read-only script that tells these apart on a live
+database — deaths per account, the stored hp of every character, and every
+revive in both ledgers with its date. It is worth running before believing a
+counter is broken, because the answer is usually "the deaths are older than the
+column".
+
+### A screen with two exits is two migrations, and only one got done
+
+`POST /api/character/revive` was moved onto the server under a comment that
+begins **"THE SERVER DOES ALL THREE THINGS THAT USED TO HAPPEN HERE"**. The
+button next to it on the same screen - the one that pays nothing and loses
+everything carried - was left exactly as it was, writing full hp into the save
+slot on the client and zeroing the carry gold in the same local dictionary.
+
+Both halves were wrong, and in **opposite** directions, which is why neither
+was noticed:
+
+- **The heal was a client decision.** The next status push arrived as a rise
+  from hp 0 to hp 504 with nothing authorising it, and `_reconcile_heals()`
+  clamped it to what five seconds of regeneration could produce:
+
+      unexplained heal: hp +504 vs regen 53 + granted 0
+      heal clamped: hp 504 -> 52
+
+  Full bars on screen, a corpse on 52 hp after a relog. **The reconciler was
+  not the bug.** It was the only part of the system telling the truth, and the
+  log line named the missing piece precisely - `granted 0`, meaning no route
+  had authorised anything.
+
+- **The penalty was also a client decision, and it did nothing at all.** `gold`
+  is in `SERVER_OWNED_STATS`, so `PUT /api/player/status` ignores whatever
+  balance a client sends. The carry gold was zeroed locally, never destroyed
+  here, and came back in full on the next login. The empty inventory *did*
+  stick, because losing items is a loss and only gains are reconciled. So true
+  death took the items, refunded the gold, and left the character unplayable.
+
+`POST /api/character/respawn` is the other half of the migration. It refuses a
+living character (409, same as revive), burns the carry gold through
+`gold_delta()` under the reason `death`, empties `carry_items`, refills the
+three pools from the class curve, and writes a `consume_grants` row so the
+client's next sync is explained instead of clamped.
+
+**The lesson is about forks, not about death.** When a decision moves from the
+client to the server, the thing to grep for is not the function you moved - it
+is every other branch that reached the same state. Two buttons on one screen
+both ended with a character alive at full health; one of them was migrated and
+the other kept its own copy of the answer for months.
+
+**And: a clamp is a symptom report, not a failure.** `_reconcile_heals()` logs
+before it trims, with the numbers. Any `unexplained heal` line in a live log is
+either a cheat or a path that has not been migrated yet, and this one had been
+printing the answer every time somebody died.
 
 ### Routes below app.run() never register
 
@@ -339,16 +428,34 @@ Built. `POST /api/staff/ban`, `POST /api/staff/kick`, `POST /api/staff/unban`,
 `PUT /api/staff/role`, `GET /api/staff/users`. The game's Staff button (HUD,
 mods and up) drives all of them; the owner's backquote console still exists.
 
-**Kicks and bans reach a running game through the heartbeat.** Both delete the
-target's sessions, and the client calls `GET /api/auth/session` every 15
-seconds while a character is in the world - a 401 there sends it to the login
-screen. Only a 401: no answer, a 500 or a 404 says nothing about the login, and
-a server restart must not be a mass kick.
+**Kicks and bans reach a running game through the heartbeat, and the heartbeat
+is `GET /api/server/broadcasts`.** Both delete the target's sessions, and the
+client polls that route every 10 seconds while a character is in the world - a
+401 there sends it to the login screen. Only a 401: no answer, a 500 or a 404
+says nothing about the login, and a server restart must not be a mass kick.
 
-**Online means a heartbeat within `ONLINE_WINDOW_SECONDS` (45)**, stamped on
-`sessions.last_seen_at` by that same call. Not "holds a session" - sessions
-last thirty days and survive the game being closed. The heartbeat does not
-extend `expires_at`.
+**Online means a beat within `ONLINE_WINDOW_SECONDS` (45)**, stamped on
+`sessions.last_seen_at` by `stamp_presence()`. Not "holds a session" - sessions
+last thirty days and survive the game being closed. A beat does not extend
+`expires_at`.
+
+THIS PARAGRAPH USED TO NAME `GET /api/auth/session` AND SAY THE CLIENT CALLED
+IT EVERY 15 SECONDS. It does not and never did: `api.gd` declares
+`HEARTBEAT_SECONDS = 15`, `characterhud.gd`'s comment says the client beats on
+it, and the only caller of `Api.heartbeat()` in the whole project is the 401
+handler. So the stamp happened once, at login, and forty-five seconds later
+every presence surface in the game - the friends list, the guild roster,
+`/api/players/online`, `/api/players/nearby`, the staff panel - read every
+player as offline. **It was visible: a guild panel telling the only member of a
+guild "0 online of 1" while they sat there reading it.**
+
+Revocation always worked, because that rides the 401 and the poll was always
+running. Only presence was broken, which is why it survived - the half of the
+sentence that was load-bearing for security was true.
+
+`stamp_presence()` is one place both routes call, and the poll carries it now:
+that request already happens every 10 seconds and is already authenticated, so
+the beat costs one UPDATE instead of a whole extra round trip per player.
 
 **"staff" is not a fifth rank.** It is the set of ranks above player - mod, dev
 and owner - because all three use these routes and they need one word between
@@ -436,13 +543,31 @@ summon - stepping through is the consent, and it sorts the audience for free.
 app.py          every route, the schema, the migrations
 gamedata.py     loot rolls, XP curve, stat curves - the game's rules
 gamedata.json   exported from the Godot project, NOT hand-edited
-test_api.py        422 checks; read the header before adding to it
-test_economy.py    279 checks; the gold ledger and the supply invariant
-test_security.py   131 checks; server authority - inventory, skills, gold,
-                   lusions, item use, revive, unexplained healing
-test_throttle.py    44 checks; login defences, rate limits, credential rotation
-test_gathering.py   44 checks; fishing and cooking - the item-minting endpoints
+test_*.py       twenty-six suites, discovered and run by run_tests.ps1. No
+                counts here on purpose - see above. What each one is FOR:
+  api           the broad one; read its header before adding to it
+  economy       the gold ledger and the supply invariant
+  security      server authority - inventory, skills, gold, lusions, item
+                use, revive, unexplained healing, accepting death
+  ownership     no route lets you name somebody else's row
+  refusals      which code a refusal answers with, and why 404 not 403
+  revocation    bans, demotions and what a token stops buying
+  throttle      login defences, rate limits, credential rotation
+  gathering     fishing and cooking - the item-minting endpoints
+  loot          bags, rolls, and taking things out of them
+  equipment     what a worn item is worth, and what the tooltip says
+  chat/chatrooms  the feed, the channels, moderation and picture revocation
+  broadcast     the server's voice, and the poll that doubles as a heartbeat
+  maintenance   the kill switch and its countdown
+  guilds / friends / mail / map / teleport / recovery / settings /
+  healing / equipmove / skill_train / catalogue / killwatch
 set_role.py     sets an account's rank; --list shows every account
+canary.py       reads the LIVE database on a schedule: do the numbers add up
+killwatch.py    reads the LIVE database on a schedule: is anyone claiming kills
+                the world cannot produce
+deathwatch.py   read-only, run by hand: why the board's deaths column says what
+                it says - the counter, every character's stored hp, and every
+                revive in both ledgers with a date
 ```
 
 `set_role.py` talks to the database directly rather than through a route, and
@@ -501,12 +626,18 @@ rule.
 
 ## Known gaps
 
-- Three of the six skills - defense, agility, magic - still have no server-side
-  XP grant, so a client can claim any level up to `MAX_SKILL_LEVEL`. They are
-  the hard three: defense trains on damage taken and agility on distance moved,
-  so neither has a server-visible event to grant against, and a bound derived
-  from character level would clamp honest play. Attack, fishing and cooking are
-  server-owned; see SERVER_OWNED_SKILLS and its comment.
+- ~~Three of the six skills have no server-side XP grant.~~ **This is no longer
+  a gap and has not been since `/api/skill/train` landed.** All six are granted
+  server-side and `PUT /api/character/skills` drops every name it accepts, so a
+  client claim earns nothing. It is struck through rather than deleted because
+  the same stale fact was ALSO sitting in the comment above `MAX_SKILL_LEVEL`
+  and in the README's findings table, and a list headed "Known gaps" is the
+  worst place in the repository to leave one: a reader who checks anything here
+  checks it here first. Defense, agility and magic were the hard three —
+  defense trains on damage taken, agility on distance moved — and the answer was
+  to have the client report raw activity and the server clamp it to a generous
+  per-second ceiling times elapsed time, rather than to find an event that did
+  not exist.
 - The kill EVENT is asserted rather than verified. The server rolls the rewards
   and rate-limits the reports, so this caps the speed of the fraud, not its
   existence. It is now at least RECORDED - `kill_reports` logs every claim the

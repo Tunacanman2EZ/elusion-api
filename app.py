@@ -267,13 +267,26 @@ if TRUSTED_PROXY_HOPS > 0:
 # like attack, the number is now decided and recorded server-side. See E-2.
 SERVER_OWNED_SKILLS = {"fishing", "cooking", "attack", "defense", "agility", "magic"}
 
-# SKILL CEILING. The three skills above are granted server-side; the rest are
-# still the client's to compute and PUT back, so the server cannot prove those
-# were earned.
-# Until it can (see SECURITY_NOTES.md E-2), this cap is the guardrail: it stops
-# a modified client asserting an absurd level, which is both a power cheat and a
-# source of integer/DB nonsense. 99 matches the skill set's RuneScape lineage.
-# A legitimate client never reaches it, so capping costs honest players nothing.
+# SKILL CEILING.
+#
+# THIS COMMENT USED TO SAY "the three skills above are granted server-side; the
+# rest are still the client's to compute and PUT back" - directly above a line
+# naming SIX. It was written when the set was three and never revisited, so the
+# file contradicted itself by two lines, and the same stale fact had reached
+# CLAUDE.md's "Known gaps" and the README's findings table. E-2 has been CLOSED
+# since /api/skill/train landed; see SECURITY_NOTES.md.
+#
+# WHAT THE CAP IS FOR NOW. Nothing a client sends about a skill is stored -
+# write_skills() drops every name it accepts, because VALID_SKILLS and
+# SERVER_OWNED_SKILLS are the same six. So this ceiling guards no live path
+# today. It stays because it is GENERIC: 99 stops a modified client asserting an
+# absurd level, which is both a power cheat and a source of integer/DB nonsense,
+# and the day a seventh skill is the client's to grant it is the thing standing
+# there. The ceiling that IS load-bearing today is in _grant_skill_xp(), which
+# caps every server grant.
+#
+# 99 matches the skill set's RuneScape lineage. A legitimate client never
+# reaches it, so capping costs honest players nothing.
 MAX_SKILL_LEVEL = 99
 MAX_SKILL_XP = 200_000_000
 
@@ -1810,6 +1823,9 @@ def init_db():
     # a character cannot reset it - which it could if the count lived with the
     # character that earned it.
     _migrate_add_column(db, "users", "deaths", "INTEGER NOT NULL DEFAULT 0")
+    # The guild a line was said from. Old rows get "", which reads as "no
+    # guild" - correct, because before this column there was nothing to show.
+    _migrate_add_column(db, "chat_messages", "guild", "TEXT NOT NULL DEFAULT ''")
 
     # RELAYING A PICTURE IS NOT SENDING A MESSAGE. It costs the server an
     # outbound fetch of up to IMAGE_MAX_BYTES and a decode, so it gets a
@@ -2293,6 +2309,32 @@ def bearer_token():
     if not header.startswith("Bearer "):
         return None
     return header[7:].strip()
+
+
+def stamp_presence(db):
+    """Mark the calling session as alive, right now. Caller commits.
+
+    THIS IS WHAT "ONLINE" MEANS EVERYWHERE IN THE SERVER - the friends list,
+    the guild roster, /api/players/online, /api/players/nearby and the staff
+    panel all read `sessions.last_seen_at` against ONLINE_WINDOW_SECONDS. A
+    session lasts thirty days, so "holds a session" was never the same question.
+
+    IT USED TO LIVE ONLY IN GET /api/auth/session, AND NOTHING CALLED THAT ON A
+    TIMER. api.gd declares HEARTBEAT_SECONDS = 15 and characterhud.gd's comment
+    says the client beats on it; the only caller of Api.heartbeat() in the whole
+    project is the 401 handler. So the stamp happened at login and then never
+    again, and forty-five seconds later every presence surface in the game said
+    the player was offline - including, visibly, a guild panel reporting
+    "0 online of 1" to the one person in the guild, who was looking at it.
+
+    ONE UPDATE BY PRIMARY KEY. The token is the row, so this touches exactly the
+    session asking and nothing else. expires_at is NOT extended: a beat proves
+    the client is running, not that the login is fresher.
+    """
+    db.execute(
+        "UPDATE sessions SET last_seen_at = ? WHERE token = ?",
+        (int(time.time()), bearer_token()),
+    )
 
 
 def _row_int(row, key):
@@ -2990,6 +3032,35 @@ def pvp_enabled():
     return bool(isinstance(stored, dict) and stored.get("on"))
 
 
+def pvp_since():
+    """Unix seconds when the PvP switch was last written. 0 if never.
+
+    NO NEW COLUMN AND NO NEW WRITE. `server_settings` has recorded
+    `updated_at` on every key since the table was created, and
+    set_server_setting() has always stamped it - so the moment PvP was
+    switched has been stored all along and nothing was reading it.
+
+    THAT IS WHY THIS IS A READ AND NOT A FEATURE. The alternative was putting
+    an "at" inside the JSON blob in `value`, which would have been a SECOND
+    place the same fact lives, written by one path and not the other, and the
+    first disagreement between them would be unresolvable - exactly the
+    argument the kingdom total already makes for deriving instead of counting.
+
+    0 RATHER THAN None, because it crosses the wire to a Godot client that
+    parses every JSON number as a float and has no null to compare against.
+    The client reads 0 as "no time known" and shows the state without one.
+    """
+    try:
+        row = get_db().execute(
+            "SELECT updated_at FROM server_settings WHERE key = ?", (PVP_KEY,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        # Same posture as get_server_setting(): a table this build predates
+        # must not raise, and an unknown time is simply unknown.
+        return 0
+    return int(row["updated_at"] or 0) if row is not None else 0
+
+
 def maintenance_state():
     """
     The switch, normalised. Always returns the full shape, so no caller has to
@@ -3261,12 +3332,25 @@ def post_chat(user_row, body, channel="world", target_id=0, image_id=""):
 
     db = get_db()
     now = int(time.time())
+    # DENORMALISED, LIKE username AND role BESIDE IT, and for the same reasons
+    # this row already carries those: the read is a poll every three seconds and
+    # must not grow a join, and the line should still make sense after the
+    # author has left the guild - or after the guild is gone entirely.
+    #
+    # It is a SNAPSHOT, then: what they were flying when they said it, not what
+    # they fly now. That is the honest reading of a chat log and it is the rule
+    # the two columns next to it already follow.
+    said_from = db.execute(
+        "SELECT gl.name FROM guild_members m JOIN guilds gl ON gl.id = m.guild_id"
+        " WHERE m.user_id = ?", (int(user_row["id"]),)).fetchone()
+
     cursor = db.execute(
         "INSERT INTO chat_messages"
-        " (user_id, username, role, body, created_at, channel, target_id, image_id)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        " (user_id, username, role, body, created_at, channel, target_id, image_id, guild)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (int(user_row["id"]), user_row["username"], role_for(user_row), text, now,
-         channel, int(target_id or 0), str(image_id or "")),
+         channel, int(target_id or 0), str(image_id or ""),
+         said_from["name"] if said_from else ""),
     )
     _prune_chat(db, channel)
     return cursor.lastrowid
@@ -3284,6 +3368,10 @@ def chat_message_dict(row):
         "channel": row["channel"] if "channel" in keys else "world",
         # Empty for a line that is only words, which is nearly all of them.
         "image": row["image_id"] if "image_id" in keys else "",
+        # The guild they were in when they said it. "" for no guild, and for
+        # every line written before the column existed.
+        "guild": row["guild"] if "guild" in keys else "",
+        "guild_tag": guild_tag(row["guild"]) if "guild" in keys and row["guild"] else "",
     }
 
 
@@ -3311,12 +3399,42 @@ def chat_message_dict(row):
 # joining a guild attaches somebody's chosen name to yours and puts you in a
 # channel, and doing that without being asked is not a thing to make easy.
 
-# 3 to 24 characters, starting with a letter or a number. Spaces, apostrophes
+# 3 to 12 characters, starting with a letter or a number. Spaces, apostrophes
 # and hyphens are allowed inside so real names work - "The Crowned", "Dave's
 # Lads" - and nothing else is, so a guild name cannot carry BBCode into a chat
 # line or look like another player's username.
-GUILD_NAME_PATTERN = r"[A-Za-z0-9][A-Za-z0-9 '\-]{2,23}"
-MAX_GUILD_NAME = 24
+#
+# TWELVE, DOWN FROM TWENTY-FOUR, and the reason is the nameplate rather than
+# the database. The name is about to appear above every member's head, on every
+# chat line they write and on the kingdom board; at 24 characters that is a
+# banner following somebody around. Twelve fits.
+#
+# EXISTING LONGER NAMES KEEP WORKING. This pattern gates CREATION and RENAMING,
+# not reading - a guild founded under the old rule is not broken by the new one,
+# and guild_tag() bounds what it draws. Rename it and it comes under the cap.
+# Refusing to load them instead would be a migration that silently deletes
+# somebody's guild because a display decision changed.
+GUILD_NAME_PATTERN = r"[A-Za-z0-9][A-Za-z0-9 '\-]{2,11}"
+MAX_GUILD_NAME = 12
+
+
+def guild_tag(name):
+    """The guild as it appears above a head, in a chat line, on the board.
+
+    THE NAME, UPPERCASED, AND NOTHING ELSE INVENTED. A separate tag field was
+    the alternative and it is worse in the way that matters here: it is a
+    SECOND thing to moderate. Every rule about what a guild may be called would
+    need writing twice, a guild could be called one acceptable thing and tagged
+    another, and staff would have two fields to check instead of one. One name,
+    shown one way.
+
+    BOUNDED ANYWAY, at MAX_GUILD_NAME, because guilds founded before the cap
+    dropped to twelve still exist and their names are up to 24 characters long.
+    The cap is enforced on the way in for new names and here for old ones, so
+    nothing can put a banner over somebody's head whatever it is called.
+    """
+    text = str(name or "").strip().upper()
+    return text[:MAX_GUILD_NAME]
 
 # FIFTY, which is a number to revisit once there are guilds to watch. The read
 # that matters - the roster - is one indexed query and returns every member, so
@@ -3416,6 +3534,11 @@ def guild_dict(db, guild_row, now=None):
     roster = guild_roster(db, int(guild_row["id"]), now)
     return {
         "name": guild_row["name"],
+        # WHAT THE CLIENT DRAWS. Derived here rather than in Godot so the
+        # nameplate, the chat line and the board cannot disagree about how a
+        # guild is spelled - and so a rule change is one edit on this side
+        # instead of three on the other.
+        "tag": guild_tag(guild_row["name"]),
         "founded_by": guild_row["founded_by"],
         "created_at": int(guild_row["created_at"] or 0),
         "members": roster,
@@ -4749,10 +4872,7 @@ def session_info():
     # the session asking and nothing else. expires_at is NOT extended: a
     # heartbeat proves the client is running, not that the login is fresher.
     db = get_db()
-    db.execute(
-        "UPDATE sessions SET last_seen_at = ? WHERE token = ?",
-        (int(time.time()), bearer_token()),
-    )
+    stamp_presence(db)
     db.commit()
 
     # THE CLOSING NOTICE RIDES THE HEARTBEAT. This is the only call every
@@ -6508,6 +6628,12 @@ HEAL_EXPLAIN_WINDOW_SECONDS = 30
 # lives in the same table rather than in a second one somebody forgets to read.
 REVIVE_GRANT_ID = "__revive__"
 
+# And the same for the OTHER way out of the death screen - the one that pays
+# nothing and loses everything carried. It fills the same three pools, so it
+# explains a rise for exactly the same reason; it gets its own id only so the
+# log can say which of the two happened.
+RESPAWN_GRANT_ID = "__respawn__"
+
 # And the same for a level-up. player.gd::level_up() calls
 # _fill_all_resources(), so every level legitimately fills all three pools
 # at once - the one remaining client-side refill that is supposed to happen.
@@ -6728,11 +6854,11 @@ def _reconcile_heals(db, user_id, slot, before, after):
         "WHERE user_id = ? AND slot = ? AND at >= ?",
         (user_id, slot, since),
     ):
-        if row["item_id"] in (REVIVE_GRANT_ID, LEVELUP_GRANT_ID):
-            # Both fill every pool to its maximum, so either explains any rise
-            # in any of them. They are special cases rather than large amounts
-            # because "as much as you had room for" is not a number the server
-            # can write down in advance.
+        if row["item_id"] in (REVIVE_GRANT_ID, RESPAWN_GRANT_ID, LEVELUP_GRANT_ID):
+            # All three fill every pool to its maximum, so any of them explains
+            # any rise in any of them. They are special cases rather than large
+            # amounts because "as much as you had room for" is not a number the
+            # server can write down in advance.
             return {}
         target = str(row["target"] or "").lower()
         if target in granted:
@@ -9520,6 +9646,20 @@ def read_broadcasts():
     # finds out about a kick, a ban, or a closed server - @require_auth answers
     # 401 for all three, which is exactly the signal the client already knows
     # how to read. One poll, two jobs, no second timer to keep in step.
+    #
+    # AND IT DOES THE OTHER HALF OF THE HEARTBEAT NOW, which it had never done.
+    # The sentence above was true about REVOCATION and quietly false about
+    # PRESENCE: the stamp lived only in GET /api/auth/session, and nothing in
+    # the client called that on a timer. So this route was the heartbeat in the
+    # sense that mattered for kicks and not in the sense that mattered for "who
+    # is online", and every presence surface in the game read offline forty-five
+    # seconds after login. See stamp_presence().
+    #
+    # HERE RATHER THAN A SECOND TIMER IN THE CLIENT. This request already
+    # happens every BROADCAST_POLL_SECONDS and is already authenticated, so the
+    # stamp costs one UPDATE on a row already being looked up - against a whole
+    # extra round trip per player per fifteen seconds, which at a thousand
+    # players is 67 requests a second bought to learn nothing new.
     raw_since = request.args.get("since", "0")
     try:
         since = max(0, int(raw_since))
@@ -9527,6 +9667,11 @@ def read_broadcasts():
         return bad_request("since must be a whole number")
 
     db = get_db()
+    # AFTER THE VALIDATION, so a malformed request is answered rather than
+    # recorded as a beat - and committed with the read below rather than on its
+    # own, so this is one transaction, not two.
+    stamp_presence(db)
+    db.commit()
 
     # A FIRST POLL ASKS FOR THE TAIL, NOT THE WHOLE TABLE. since=0 means "I just
     # got here" - answering that with a week of restart notices would scroll the
@@ -9560,10 +9705,52 @@ def read_broadcasts():
         "messages": messages,
         "latest_id": int(newest or 0),
         "maintenance": maintenance_public(),
+        # RIDES THE SAME POLL AS THE MAINTENANCE NOTICE, and for the same
+        # reason: it is a fact about the world that the HUD has to keep on
+        # screen, and a second request every few seconds to learn one boolean
+        # would be a second request every few seconds.
+        "pvp": pvp_enabled(),
+        # WHEN IT WAS SWITCHED, because "PvP is ON" answers a different
+        # question from the one a player who just logged in is asking. See
+        # pvp_since(); 0 when it has never been touched.
+        "pvp_at": pvp_since(),
         # Rides the same poll as everything else. None when there is nowhere
         # to be; the client applies it and then acks it away.
         "teleport": pending_teleport_for(g.user["id"]),
+        # YOUR OWN GUILD, ON THE POLL THAT ALREADY KNOWS WHO YOU ARE.
+        #
+        # The client draws the tag over your head, and a nameplate is a thing
+        # that must be TRUE RIGHT NOW rather than true when you last opened a
+        # panel. GET /api/guild is the only other route that says this, and
+        # nothing calls it on a timer - so without this field the tag would
+        # appear when the guild panel happened to be opened and then go on being
+        # whatever it was, which is the shape of bug this project keeps finding:
+        # a display fed by something nobody schedules.
+        #
+        # IT ALSO MAKES REMOVAL VISIBLE. Being kicked, or a mod renaming or
+        # disbanding the guild, reaches the player within one poll instead of
+        # never. That is the same argument that put revocation on this route.
+        #
+        # ONE INDEXED LOOKUP on a request that has already fetched the session
+        # and is already writing a presence stamp. It is the cheapest place in
+        # the whole system to answer this, which is why it is answered here
+        # rather than by a second timer in the client.
+        **_own_guild(db, int(g.user["id"])),
     }, 200
+
+
+def _own_guild(db, user_id):
+    """{"guild": name, "guild_tag": TAG} for a caller, both "" when they have none.
+
+    A DICT RATHER THAN TWO CALLS so the two fields cannot disagree about
+    whether somebody is in a guild - one query, one answer, spread into the
+    response.
+    """
+    row = db.execute(
+        "SELECT gl.name FROM guild_members m JOIN guilds gl ON gl.id = m.guild_id"
+        " WHERE m.user_id = ?", (user_id,)).fetchone()
+    name = row["name"] if row else ""
+    return {"guild": name, "guild_tag": guild_tag(name) if name else ""}
 
 
 @app.post("/api/chat/send")
@@ -11429,10 +11616,16 @@ def players_online():
                saves.name                    AS name,
                saves.level                   AS level,
                saves.area                    AS area,
-               saves.updated_at              AS updated_at
+               saves.updated_at              AS updated_at,
+               guilds.name                   AS guild
           FROM sessions
           JOIN users ON users.id = sessions.user_id
           LEFT JOIN saves ON saves.user_id = sessions.user_id
+          -- THE GUILD RIDES THE JOIN THAT IS ALREADY HERE. Two LEFT JOINs on
+          -- indexed keys, against a list already capped at ONLINE_LIST_LIMIT
+          -- rows - not a second query, and not a lookup per player in Python.
+          LEFT JOIN guild_members ON guild_members.user_id = users.id
+          LEFT JOIN guilds ON guilds.id = guild_members.guild_id
          WHERE sessions.last_seen_at > ?
            AND sessions.expires_at > ?
       GROUP BY users.id, saves.slot
@@ -11462,6 +11655,10 @@ def players_online():
             "name": row["name"] or "",
             "level": int(row["level"] or 1),
             "area": row["area"] or "",
+            # WHO THEY RUN WITH. Empty for somebody in no guild, so the client
+            # has one thing to test rather than a null to remember.
+            "guild": row["guild"] or "",
+            "guild_tag": guild_tag(row["guild"]) if row["guild"] else "",
             "with_you": bool(row["area"] and row["area"] == my_area),
         })
         if len(players) >= ONLINE_LIST_LIMIT:
@@ -12550,9 +12747,140 @@ def guild_disband():
     db.execute("DELETE FROM guild_members WHERE guild_id = ?", (guild_id,))
     db.execute("DELETE FROM guild_invites WHERE guild_id = ?", (guild_id,))
     db.execute("DELETE FROM guilds WHERE id = ?", (guild_id,))
+
+    # AN OWNER TAKING DOWN SOMEBODY ELSE'S GUILD IS A STAFF ACTION, and it was
+    # not being recorded. A leader disbanding their own is not - that is a
+    # player doing something to a thing that is theirs, and logging it would
+    # fill the review log with ordinary play.
+    if named != "":
+        log_staff_action(g.user, "guild_disband", guild["name"],
+                         detail="%d member(s) removed" % emptied)
     db.commit()
 
     return {"guild": guild["name"], "state": "disbanded",
+            "members_removed": emptied}, 200
+
+
+@app.post("/api/staff/guild")
+@require_auth
+@require_role("mod")
+def staff_guild():
+    """
+    Rename or disband a guild whose name is a problem
+    ---
+    tags:
+      - Staff
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [guild, action, reason]
+          properties:
+            guild:  {type: string, example: "the first"}
+            action: {type: string, example: rename}
+            name:   {type: string, example: "The First"}
+            reason: {type: string, example: "name was a slur"}
+    responses:
+      200:
+        description: Renamed, or disbanded
+      400:
+        description: Unknown action, bad replacement name, or a missing reason
+      404:
+        description: No such guild
+      409:
+        description: A guild already holds the replacement name
+    """
+    # A NAME IS PUBLIC AND IT FOLLOWS PEOPLE AROUND. It is about to be drawn
+    # above every member's head, on every line they write in world chat and on
+    # the kingdom board, which is exactly why a guild is worth naming well and
+    # exactly why an unacceptable one needs a lever that is not "ban fifty
+    # players".
+    #
+    # WHY NOT A WORD FILTER. Because it loses. A list of forbidden strings is
+    # an invitation to find the spelling that gets through, it fires on
+    # innocent names that happen to contain one, and it has to be maintained by
+    # somebody in every language the server is played in. The mechanism that
+    # works is the one moderation already uses here: a human reads it, acts,
+    # and the action is on the record.
+    #
+    # RENAME BEFORE DISBAND. Disbanding takes a guild away from fifty people
+    # because one of them chose a word; renaming takes away the word. The
+    # smaller response exists so the harshest is not the only one - the same
+    # argument that put a kick next to the ban (E-12).
+    payload = request.get_json(silent=True) or {}
+    wanted = str(payload.get("guild", "")).strip()
+    action = str(payload.get("action", "")).strip().lower()
+    reason = str(payload.get("reason", "")).strip()
+
+    if wanted == "":
+        return bad_request("guild is required")
+    if action not in ("rename", "disband"):
+        return bad_request("action must be 'rename' or 'disband'")
+    # THE SAME RULE A BAN KEEPS, and for the same sentence: an action nobody
+    # can review later is one the person who took it cannot defend either.
+    if not reason or len(reason) > 500:
+        return bad_request("reason must be 1-500 characters")
+
+    db = get_db()
+    guild = guild_by_name(wanted)
+    if guild is None:
+        return {"error": "Not Found", "message": "No such guild."}, 404
+
+    guild_id = int(guild["id"])
+    old_name = guild["name"]
+
+    if action == "rename":
+        replacement = str(payload.get("name", "")).strip()
+        if not re.fullmatch(GUILD_NAME_PATTERN, replacement):
+            return bad_request(
+                "a guild name is 3 to %d characters: letters, numbers, spaces,"
+                " apostrophes and hyphens" % MAX_GUILD_NAME)
+        # CASE-INSENSITIVELY UNIQUE, the same test creation uses, so staff
+        # cannot make two guilds that look identical in a chat line.
+        clash = guild_by_name(replacement)
+        if clash is not None and int(clash["id"]) != guild_id:
+            return {"error": "Conflict",
+                    "message": "a guild by that name already exists"}, 409
+
+        # BOTH COLUMNS, AND THIS IS NOT OPTIONAL. `folded` is the name
+        # lowercased, it carries the unique index, and guild_by_name() looks
+        # the guild up BY IT rather than by `name`.
+        #
+        # The first version of this UPDATE set `name` alone. The rename
+        # "worked" - the table said the new name and the route returned it -
+        # and the guild went on answering to the OLD one while being
+        # unfindable by the new one. A staff member renaming a slur would have
+        # published a fix that changed nothing anybody could act on. Caught by
+        # a test that asked, through the route, whether the old name still
+        # resolved.
+        #
+        # One statement, so there is no instant where they disagree.
+        db.execute("UPDATE guilds SET name = ?, folded = ? WHERE id = ?",
+                   (replacement, replacement.strip().lower(), guild_id))
+        # CHAT LINES ARE LEFT ALONE. `chat_messages.guild` is a snapshot of
+        # what somebody was flying when they spoke; rewriting history to hide
+        # the old name would also rewrite the evidence of why it was renamed.
+        # The window is minutes long and prunes itself.
+        log_staff_action(g.user, "guild_rename", old_name,
+                         detail="-> %s: %s" % (replacement, reason))
+        db.commit()
+        return {"guild": replacement, "was": old_name, "state": "renamed"}, 200
+
+    emptied = len(guild_member_ids(db, guild_id))
+    db.execute("DELETE FROM guild_members WHERE guild_id = ?", (guild_id,))
+    db.execute("DELETE FROM guild_invites WHERE guild_id = ?", (guild_id,))
+    db.execute("DELETE FROM guilds WHERE id = ?", (guild_id,))
+    log_staff_action(g.user, "guild_disband", old_name,
+                     detail="%d member(s) removed: %s" % (emptied, reason))
+    db.commit()
+    return {"guild": old_name, "state": "disbanded",
             "members_removed": emptied}, 200
 
 
@@ -12656,8 +12984,17 @@ def economy_kingdom():
     me = g.user["username"]
     my_row = db.execute("SELECT deaths FROM users WHERE id = ?",
                         (user_id,)).fetchone()
+    # NEVER FROM THE CACHE, like the line below it. The shared half is the same
+    # for everybody and may be seconds old; which guild the CALLER is in is
+    # personal, and a player who joined one a moment ago should see their
+    # guild's line rather than somebody else's cached absence of it.
+    my_guild_row = db.execute(
+        "SELECT gl.name FROM guild_members m JOIN guilds gl ON gl.id = m.guild_id"
+        " WHERE m.user_id = ?", (user_id,)).fetchone()
+    my_guild = my_guild_row["name"] if my_guild_row else ""
     mine = {"username": me, "contributed": 0, "lusions": 0,
-            "deaths": int(my_row["deaths"]) if my_row else 0, "rank": None}
+            "deaths": int(my_row["deaths"]) if my_row else 0,
+            "lost": 0, "rank": None}
     for entry in board:
         if entry["username"] == me:
             # entry["rank"], not the loop index: those differ the moment two
@@ -12670,6 +13007,12 @@ def economy_kingdom():
         "total": shared["total"],
         "total_lusions": shared["total_lusions"],
         "total_taxed": shared["total_taxed"],
+        "total_lost": shared["total_lost"],
+        # THE TOP SLICE, like `top` below it. The whole list is built so the
+        # caller's own guild can be found in it; the wire gets the leaders.
+        "guilds": shared["guilds"][:KINGDOM_BOARD_SIZE],
+        "your_guild": next((dict(e) for e in shared["guilds"]
+                            if e["name"] == my_guild), None),
         "total_deaths": shared["total_deaths"],
         "by_reason": shared["by_reason"],
         "lusions_by_reason": shared["lusions_by_reason"],
@@ -12699,13 +13042,35 @@ def _kingdom_board_shared(db):
     # It is a bare column under a GROUP BY, which is legal in SQLite and
     # deterministic here: the grouping key is gold_ledger.user_id and the join
     # is on users.id, so every row in a group carries the same users row.
+    # `lost` IS A CASE IN THE SAME AGGREGATE, NOT A SECOND QUERY, and that is
+    # the whole reason it is affordable. The note below this block measured a
+    # per-player figure filtered to one reason at 303ms of the board's 427ms,
+    # because it was a SECOND GROUP BY over every negative row in the ledger.
+    # This is one more SUM over rows this scan already reads - the same trade
+    # `deaths` makes one line up, and it costs nothing at any size.
+    #
+    # WHAT IT IS FOR. Contribution counts every gold destroyed, and death now
+    # destroys gold, so dying climbs the board. That follows from the rule and
+    # it is kept - but a ranking whose top entry is mostly deaths is saying
+    # something different from one whose top entry is mostly spending, and the
+    # board should be able to tell the reader which it is looking at.
     rows = db.execute(
         """
         SELECT users.username AS username,
                users.deaths   AS deaths,
-               -SUM(gold_ledger.delta) AS given
+               guilds.name    AS guild,
+               -SUM(gold_ledger.delta) AS given,
+               -SUM(CASE WHEN gold_ledger.reason = 'death'
+                         THEN gold_ledger.delta ELSE 0 END) AS lost
           FROM gold_ledger
           JOIN users ON users.id = gold_ledger.user_id
+          -- THE GUILD COMES ALONG FOR NOTHING, exactly as users.deaths does.
+          -- Two LEFT JOINs on indexed keys onto a row this scan already reads.
+          -- It is deliberately NOT a second pass over the ledger: the note
+          -- below measured that shape at 303ms of the board's 427ms, and a
+          -- guild ranking is built from these rows in Python instead.
+          LEFT JOIN guild_members ON guild_members.user_id = users.id
+          LEFT JOIN guilds ON guilds.id = guild_members.guild_id
          WHERE gold_ledger.delta < 0
       GROUP BY gold_ledger.user_id
       ORDER BY given DESC
@@ -12713,7 +13078,9 @@ def _kingdom_board_shared(db):
     ).fetchall()
 
     board = [{"username": r["username"], "contributed": int(r["given"]),
-              "lusions": 0, "deaths": int(r["deaths"] or 0)}
+              "lusions": 0, "deaths": int(r["deaths"] or 0),
+              "lost": int(r["lost"] or 0), "guild": r["guild"] or "",
+              "guild_tag": guild_tag(r["guild"]) if r["guild"] else ""}
              for r in rows]
 
     # THE COLUMN THAT USED TO BE HERE WAS THE TRADE TAX, PER PLAYER, AND IT WAS
@@ -12761,10 +13128,18 @@ def _kingdom_board_shared(db):
         # lusions and never destroyed a coin - so it takes one small lookup.
         # Bounded by how many players have ONLY ever paid in lusions, which is
         # a handful, not a scan.
-        solo = db.execute("SELECT deaths FROM users WHERE username = ?",
-                          (username,)).fetchone()
+        solo = db.execute(
+            "SELECT u.deaths AS deaths, gl.name AS guild FROM users u"
+            "  LEFT JOIN guild_members m ON m.user_id = u.id"
+            "  LEFT JOIN guilds gl ON gl.id = m.guild_id"
+            " WHERE u.username = ?", (username,)).fetchone()
+        # `lost` IS 0 HERE AND IT IS NOT AN ASSUMPTION. These are players with
+        # no negative gold row at all; losing gold on death writes one, so
+        # anybody who ever has is in `rows` above rather than down here.
         board.append({"username": username, "contributed": 0, "lusions": given,
-                      "deaths": int(solo["deaths"]) if solo else 0})
+                      "deaths": int(solo["deaths"]) if solo else 0, "lost": 0,
+                      "guild": (solo["guild"] or "") if solo else "",
+                      "guild_tag": guild_tag(solo["guild"]) if solo and solo["guild"] else ""})
 
     # Ranked by gold, with lusions breaking the tie. Gold leads because it is
     # what the coffers are measured in; lusions decide who sits higher among
@@ -12796,6 +13171,53 @@ def _kingdom_board_shared(db):
     total = sum(entry["contributed"] for entry in board)
     total_lusions = sum(entry["lusions"] for entry in board)
 
+    # =========================================================================
+    # THE SAME BOARD, BY GUILD
+    # =========================================================================
+    # FROM THE ROWS ALREADY IN MEMORY. Not a query. The note above this function
+    # measured a second GROUP BY over the ledger at 303ms of the board's 427ms
+    # and deleted it; adding one back for guilds would be repeating that
+    # mistake with a different column. Every figure below is a sum over `board`,
+    # which is at most one entry per player who has ever destroyed a coin.
+    #
+    # WHY A GUILD BOARD IS WORTH HAVING AT ALL. A guild needs a reason to exist
+    # that is not a power bonus - a bonus is a balance problem and a new thing
+    # to make server-authoritative. A shared number to chase costs nothing to
+    # secure, because it is derived from a ledger that was already being kept
+    # honest for other reasons.
+    by_guild = {}
+    for entry in board:
+        name = entry["guild"]
+        if not name:
+            continue
+        slot = by_guild.setdefault(name, {
+            "name": name, "tag": entry["guild_tag"],
+            "contributed": 0, "lusions": 0, "deaths": 0, "members": 0,
+        })
+        slot["contributed"] += entry["contributed"]
+        slot["lusions"] += entry["lusions"]
+        slot["deaths"] += entry["deaths"]
+        slot["members"] += 1
+
+    # MEMBERS HERE MEANS "MEMBERS WHO HAVE GIVEN SOMETHING", not the roster
+    # size, and the field is named honestly rather than being a number that
+    # disagrees with the guild panel. A guild of fifty where two people have
+    # ever spent a coin contributes what those two gave.
+    guild_board = sorted(by_guild.values(),
+                         key=lambda e: (e["contributed"], e["lusions"]),
+                         reverse=True)
+
+    # Competition ranking, the same rule and the same reason as the player
+    # board below: a tie means neither beat the other.
+    grank = 0
+    previous = None
+    for index, entry in enumerate(guild_board):
+        key = (entry["contributed"], entry["lusions"])
+        if key != previous:
+            grank = index + 1
+            previous = key
+        entry["rank"] = grank
+
     by_reason = {}
     for row in db.execute(
         "SELECT reason, -SUM(delta) AS given FROM gold_ledger"
@@ -12824,6 +13246,12 @@ def _kingdom_board_shared(db):
     # second query would be a second chance to disagree.
     total_taxed = int(by_reason.get("kingdom_tax", 0))
 
+    # AND THE SAME TRICK FOR WHAT THE DEAD LEFT BEHIND. Read off by_reason for
+    # the same reason total_taxed is: one SELECT, one truth. A second query
+    # would be a second chance to disagree with the breakdown printed beside
+    # it.
+    total_lost = int(by_reason.get("death", 0))
+
     # EVERY DEATH ON THE SERVER, which is one sum over one integer column and
     # does not touch the ledger at all.
     total_deaths = int(db.execute(
@@ -12837,7 +13265,9 @@ def _kingdom_board_shared(db):
         "total": total,
         "total_lusions": total_lusions,
         "total_taxed": total_taxed,
+        "total_lost": total_lost,
         "total_deaths": total_deaths,
+        "guilds": guild_board,
         "by_reason": by_reason,
         "lusions_by_reason": lusions_by_reason,
     }
@@ -13916,6 +14346,142 @@ def character_revive():
         "cost": cost,
         "lusions": int(account_after["lusions"]),
         "bank_gold": int(account_after["bank_gold"]),
+        "status": status_payload(user_id, slot),
+    }, 200
+
+
+@app.post("/api/character/respawn")
+@require_auth
+def character_respawn():
+    """
+    Accept death: lose what was carried, come back at full health
+    ---
+    tags:
+      - Character
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [slot]
+          properties:
+            slot: {type: integer, example: 0}
+    responses:
+      200:
+        description: Carry gold and carry items destroyed, the three pools refilled
+      404:
+        description: No character in that slot
+      409:
+        description: That character is not dead
+    """
+    # THE OTHER HALF OF A MIGRATION THAT ONLY EVER GOT DONE ONCE.
+    #
+    # The death screen has two exits. /api/character/revive was moved onto the
+    # server with a comment beginning "THE SERVER DOES ALL THREE THINGS THAT
+    # USED TO HAPPEN HERE" - and the exit next to it, the one that pays nothing,
+    # was left exactly as it was: gameover.gd wrote full hp, full mana and full
+    # stamina into the save slot itself and zeroed the carry gold in the same
+    # dictionary.
+    #
+    # WHAT THAT ACTUALLY DID, both halves wrong in opposite directions:
+    #
+    #   THE HEAL WAS A CLIENT DECISION, so the next status push arrived as a
+    #   rise from hp 0 to hp 504 with nothing authorising it. _reconcile_heals()
+    #   did its job and clamped it to what five seconds of regeneration could
+    #   produce - 52. The player revived on screen, logged out, logged back in
+    #   and found a corpse with 52 hp. THE RECONCILER WAS NOT THE BUG. It was
+    #   the only thing in the system telling the truth.
+    #
+    #   THE PENALTY WAS ALSO A CLIENT DECISION, and that one silently did
+    #   NOTHING. `gold` is in SERVER_OWNED_STATS, so PUT /api/player/status
+    #   ignores whatever balance a client sends. The carry gold was zeroed in
+    #   the local slot, never destroyed here, and came back in full on the next
+    #   login. Meanwhile the empty inventory WAS accepted, because losing items
+    #   is a loss and only gains are reconciled. So true death took the items,
+    #   refunded the gold, and left the character on 52 hp.
+    #
+    # Both are the same rule, and it is the one in CLAUDE.md: the client sends
+    # what it DID, never what it now HAS. "I accepted death" is a fact about the
+    # player. "I have 504 hp and no gold" is two decisions, and both belong
+    # here.
+    payload = request.get_json(silent=True) or {}
+    slot = parse_slot(payload.get("slot"))
+    if slot is None:
+        return bad_request("slot must be an integer between 0 and %d" % (MAX_SLOTS - 1))
+
+    user_id = g.user["id"]
+    db = get_db()
+    row = db.execute(
+        "SELECT class_id, level, hp, gold FROM saves WHERE user_id = ? AND slot = ?",
+        (user_id, slot),
+    ).fetchone()
+    if row is None:
+        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
+
+    # ONLY THE DEAD RESPAWN, the same check and the same reason as revive:
+    # without it this route is "delete my carried gold and items for a free full
+    # heal", which is a strange trade but a real one, and it would be available
+    # at any moment rather than only after dying.
+    if int(row["hp"] or 0) > 0:
+        return {"error": "Conflict", "message": "That character is not dead."}, 409
+
+    derived = gamedata.max_stats_for(row["class_id"], int(row["level"]))
+    if derived is None:
+        app.logger.error("respawn: no stat curve for class '%s'", row["class_id"])
+        return {"error": "Conflict", "message": "That character cannot respawn."}, 409
+
+    # ---- everything above this line is validation; everything below commits --
+
+    # THROUGH THE LEDGER, NOT A BARE UPDATE. This is the single biggest gold
+    # sink in the game - everything a player was carrying when they died - and
+    # a bare `SET gold = 0` would break
+    #
+    #     SUM(gold_ledger.delta) == SUM(saves.gold) + SUM(accounts.bank_gold)
+    #
+    # on the first death anybody took. The kingdom board reads that ledger to
+    # say what the realm has been given; a death is exactly the kind of thing it
+    # should be able to say.
+    burned = int(row["gold"] or 0)
+    if burned > 0:
+        gold_delta(db, user_id, slot, -burned, "death",
+                   "carried gold lost on death in slot %d" % slot)
+
+    # THE CARRY BAG, SERVER SIDE. The client was already sending an empty
+    # inventory afterwards and the server was already accepting it - losing
+    # items is a loss, and only gains are reconciled - so this is not a new
+    # punishment. It is the same one, decided here, in the same transaction as
+    # the gold, so a crash between the two cannot take one and not the other.
+    db.execute("DELETE FROM carry_items WHERE user_id = ? AND slot = ?",
+               (user_id, slot))
+
+    db.execute(
+        "UPDATE saves SET hp = ?, mana = ?, stamina = ?, "
+        "max_hp = ?, max_mana = ?, max_stamina = ?, updated_at = ? "
+        "WHERE user_id = ? AND slot = ?",
+        (derived["max_hp"], derived["max_mana"], derived["max_stamina"],
+         derived["max_hp"], derived["max_mana"], derived["max_stamina"],
+         int(time.time()), user_id, slot),
+    )
+
+    # The marker _reconcile_heals() reads, exactly as the revive writes one. Its
+    # absence is what turned an honest respawn into a clamped one, and the log
+    # line said so in as many words: "granted 0".
+    db.execute(
+        "INSERT INTO consume_grants (user_id, slot, item_id, at) VALUES (?, ?, ?, ?)",
+        (user_id, slot, RESPAWN_GRANT_ID, int(time.time())),
+    )
+    db.commit()
+
+    return {
+        "slot": slot,
+        "respawned": True,
+        "gold_lost": burned,
         "status": status_payload(user_id, slot),
     }, 200
 

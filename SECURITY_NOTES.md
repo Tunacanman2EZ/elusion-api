@@ -1,7 +1,7 @@
 # Security Notes — Elusion API
 
 > **Looking for the security model?** It is one page: **[SECURITY.md](SECURITY.md)**
-> — the premise, who is trusted with what, fifteen invariants each naming the test
+> — the premise, who is trusted with what, sixteen invariants each naming the test
 > that holds it, and the honest limits. This file is the *findings log* behind it:
 > every finding, what it let an attacker do, and what happened to it since. Long
 > on purpose, and not the place to start.
@@ -37,10 +37,13 @@ lives.
 | E-13 | **Four protections were unarmed against the shipped catalogue** | **high** | **Closed** — and it is the reason this table needed a footnote | Four fixes marked Closed were silently off in production, so everything they block was open with every test green. | **Deployment check.** `test_catalogue.py` asserts the shipped `gamedata.json` arms each protection, and the server logs an error at boot for any control running unarmed. |
 | E-14 | A kick or a ban never reached a game that was already running | medium (moderation) | **Closed** | A kicked or banned player keeps playing for as long as they leave the game open. | **Heartbeat.** The game re-checks its session every 15 seconds and on any 401, and a dead session sends it to the login screen — a kick lands in about a second. Only a 401 signs anyone out, so a server restart is never a mass kick. |
 | E-15 | Broken access control (IDOR) — can you name a row that is not yours? | critical if present | **Audited, nothing found** — one adjacent gap closed | A player sends somebody else's record id and edits, empties or deletes it. One Postman request, no modified client needed. | **Structural, two ways.** Every id a client may name is scoped inside the query, so "not yours" and "does not exist" are one 404; and the highest-value rows (trades) accept no id at all — every route resolves them from the caller. `test_ownership.py` runs the attack on every surface and enforces the convention on the source. The gap that was real: a deleted chat message left its picture being served. |
+| E-16 | **The death screen's other exit was never migrated** | **high (balance + economy)** | **Closed** | Accepting death healed the character on the player's own machine and zeroed the carry gold locally — so the refill was unauthorised, and the penalty never reached the server at all. Death took your items, refunded your gold, and left you on 52 hp. | **Server-side authority.** `POST /api/character/respawn` refuses a living character, burns the carried gold through `gold_delta()` under the reason `death`, empties `carry_items`, refills the three pools from the class curve and writes the grant E-9's reconciler reads. Found by a player report, not by an audit — see below. |
 
-Thirteen closed, one partly, one open, one audited clean.
+Fifteen findings: fourteen closed, one open. Plus E-15, an audit that went
+looking and came back empty — kept, because a search that finds nothing is
+still a result and the reasoning is the point.
 
-**The Fix column has a shape.** Five of the fourteen fixes are *server-side
+**The Fix column has a shape.** Six of the sixteen fixes are *server-side
 authority* — something the client could write, which the server now owns. The
 rest are limits on rate, checks on what is plausible, and tooling for staff.
 Read down that column before reading anything else in this file.
@@ -1331,6 +1334,81 @@ Worth being explicit so the migration does not accidentally regress them:
 - **`.gitignore`** uses prefix patterns (`*.db.*`) precisely because a plain
   `*.db` once let a `.db.before-…` backup slip into a commit. That lesson is
   written into the file itself.
+
+### E-16 — The death screen's other exit was never migrated · CLOSED
+
+**Not found by an audit.** Found by dying: *"I died, came back with full health,
+logged out, logged back in and my hp was nearly empty."* 52 out of 504.
+
+The death screen has two exits. `POST /api/character/revive` was moved onto the
+server under a comment that begins *"THE SERVER DOES ALL THREE THINGS THAT USED
+TO HAPPEN HERE."* The button beside it — the one that pays nothing and loses
+everything carried — was left exactly as it was: `gameover.gd` wrote full hp,
+mana and stamina into the save slot itself, and zeroed the carry gold in the
+same local dictionary.
+
+Both halves were wrong, in **opposite** directions, which is why neither was
+noticed for months.
+
+**The heal was a client decision.** The next status push arrived as a rise from
+hp 0 to hp 504 with nothing authorising it, and `_reconcile_heals()` — E-9 —
+trimmed it to what five seconds of regeneration could produce. The log line had
+been printing the answer every single time anybody died:
+
+```
+unexplained heal: user=1 slot=0 elapsed=5.0s  hp +504 vs regen 53 + granted 0
+heal clamped: user=1 slot=0  hp 504 -> 52
+```
+
+`granted 0` is the whole diagnosis. No route had authorised anything, because no
+route was involved.
+
+**The penalty was also a client decision, and it did nothing at all.** `gold` is
+in `SERVER_OWNED_STATS`, so `PUT /api/player/status` ignores whatever balance a
+client sends — E-8's fix, working correctly. The carry gold was zeroed in the
+local slot, never destroyed here, and came back in full at the next login. The
+empty inventory *did* stick, because losing items is a loss and only gains are
+reconciled. So true death took the items, refunded the gold, and left the
+character unplayable.
+
+**What this says about the two findings above it.** E-9 and E-10 were marked
+Closed and both were accurate *about the endpoints they named*. Neither was a
+statement about every path that reaches the same state, and this was a second
+path. The word "closed" against a finding means the route is authoritative; it
+has never meant nobody can arrive at the outcome another way, and this entry is
+here so that distinction is not left implicit.
+
+It is also the clearest evidence yet for **why E-9 is filed as a bound and not a
+proof**. The clamp did exactly its job: it refused to store a heal it could not
+explain, and it wrote down that it had. It could not make the game stop asking.
+A control tells you the truth; it does not fix the thing that is lying.
+
+**And it says something about logs.** The tell was in production for however
+long this path existed. Nobody read it. A warning that is only ever read after a
+player complains is a warning that is not doing its job — the follow-on is
+`deathwatch.py` and whatever else makes a line like that arrive somewhere
+instead of waiting.
+
+**The fix.** `POST /api/character/respawn`, beside revive and shaped like it:
+refuses a living character with a 409 against the server's own stored hp; burns
+the carried gold through `gold_delta()` under the reason `death`, so the biggest
+sink in the game lands in the ledger rather than breaking the supply invariant
+on the first death anybody took; empties `carry_items` in the same transaction,
+so a crash cannot take one and not the other; refills the three pools from the
+class curve; and writes a `consume_grants` row under `RESPAWN_GRANT_ID` so the
+client's next sync is explained instead of clamped.
+
+`gameover.gd` calls it and applies the answer. `_clear_carry_on_death()` writes
+no hp at all any more, and a failed request does **not** fall back to the local
+restore — that fallback *is* the bug, and the Godot suite checks for its absence
+specifically.
+
+**21 checks in `test_economy.py`**, sabotage-proven four ways: a bare `UPDATE`
+instead of `gold_delta()` (the invariant goes red in four places), no grant row,
+no dead check, and leaving `carry_items` alone. One of those checks was itself
+wrong first time round — it measured the character whose only burn *was* the
+death, so a `lost` column summing every burn passed it; `tradealice`, who has
+spent and never respawned, is the control that separates them.
 
 ---
 

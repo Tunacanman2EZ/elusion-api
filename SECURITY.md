@@ -45,8 +45,12 @@ the backpack ledger is still whatever the client pushes.
 
 ## Invariants
 
-Ten promises, each anchored. The first three are structural — they cannot rot
-because there is nothing to change.
+Sixteen promises, each anchored. The first three are structural — they cannot
+rot because there is nothing to change.
+
+(It said "Ten" for a while after it had thirteen, which is the small version of
+exactly the failure this page exists to avoid. The count is not load-bearing;
+that it was wrong, in bold, on the security page, is the point.)
 
 **Structural**
 
@@ -116,6 +120,15 @@ because there is nothing to change.
     from the store entirely once no remaining line shows it.
     → Held by: `test_ownership.py` — "a delete is now a revocation, not a hide", "bob hears about it even though his cursor is past it"
     → and in the game: `src/tools/testrunner.gd` — `_test_chat_deletions_reach_the_client()`
+16. **A client cannot heal itself.** Every rise in hp, mana or stamina is
+    measured against what regeneration plus server-issued grants could have
+    produced and trimmed to it. **Both** exits from the death screen are server
+    routes — `/api/character/revive` and `/api/character/respawn` — so the
+    refill after dying is authorised rather than asserted, and the carried gold
+    a death destroys goes through the ledger like every other burn.
+    → Held by: `test_security.py` — "1 hp to full with no potion is logged"
+    → and: `test_economy.py` — "the respawn explains the rise instead of it being clamped", "the loss is in the ledger under its own reason"
+    → and in the game: `src/tools/testrunner.gd` — `_test_death_reaches_the_server()`
 
 ---
 

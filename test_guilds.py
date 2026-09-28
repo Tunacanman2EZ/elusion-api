@@ -29,6 +29,15 @@ import importlib.util
 import os
 import sqlite3
 import sys
+
+# GUILD NAMES IN HERE ARE 12 CHARACTERS OR FEWER, and two of them used to
+# be longer. MAX_GUILD_NAME dropped from 24 to 12 when the name started
+# being drawn above every member's head and on every chat line they write,
+# and "Exactly Enough" stopped fitting. The checks those two names appear
+# in are about the PRICE of founding a guild, not about its name, so they
+# were shortened rather than the cap being argued with. "  Spaced Out  "
+# is deliberately still long: it is testing that the name is stripped
+# before it is measured.
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -75,6 +84,22 @@ def register(name):
 def make_character(token, name):
     return client.put("/api/save", headers=auth(token),
                       json={"slot": 0, "class_id": "warrior", "name": name})
+
+
+def db_conn():
+    """A read connection, for checking what a route actually wrote."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def set_role(username, role):
+    """A rank, set from the machine holding the database - never over the
+    network, which is the property set_role.py exists to keep."""
+    conn = db_conn()
+    conn.execute("UPDATE users SET role = ? WHERE username = ?", (role, username))
+    conn.commit()
+    conn.close()
 
 
 def give_gold(username, amount):
@@ -310,7 +335,7 @@ client.post("/api/guild/disband", headers=auth(dan_token), json={})
 # Exactly enough, split across both, is enough.
 set_purse("dan", COST // 2, COST - COST // 2)
 check("exactly the price, split across both piles, works",
-      create(dan_token, "Exactly Enough").status_code == 200)
+      create(dan_token, "Exact Price").status_code == 200)
 client.post("/api/guild/disband", headers=auth(dan_token), json={})
 
 # One short is one short, wherever it is.
@@ -574,8 +599,15 @@ with app_module.app.app_context():
                        ).fetchone()
     if other is None:
         give_gold("dan", COST * 3)
-        create(dan_token, "Somewhere Else")
-        other = db.execute("SELECT id FROM guilds WHERE folded = 'somewhere else'"
+        create(dan_token, "Elsewhere")
+        # THE SAME QUERY AGAIN, not a second one naming the new guild. The
+        # question is "any guild that is not amy's", and asking it twice the
+        # same way is the only version that cannot go stale: the name used to
+        # be spelled out here and it still said "somewhere else" after the
+        # guild above was renamed - so this branch, if it had ever run, would
+        # have left `other` as None and died on other["id"], which in this
+        # harness aborts the section and still reports 0 failed.
+        other = db.execute("SELECT id FROM guilds WHERE folded != 'only one'"
                            ).fetchone()
     doubled = False
     try:
@@ -699,12 +731,146 @@ check("which makes the two revive paths comparable rather than absurd",
        * app_module.LUSION_GOLD_VALUE))
 
 
+print("\n--- twelve characters, and the tag that comes from them ---")
+#
+# THE NAME IS ABOUT TO BE DRAWN ABOVE EVERY MEMBER'S HEAD, on every chat line
+# they write and on the kingdom board. At 24 characters that is a banner
+# following somebody around; twelve fits.
+#
+# ONE FIELD, NOT TWO. The tag is the name, uppercased, rather than a second
+# thing a guild picks - because a separate tag is a second thing to moderate,
+# and a guild could be called one acceptable thing and tagged another.
+
+check("the cap is twelve", app_module.MAX_GUILD_NAME == 12,
+      app_module.MAX_GUILD_NAME)
+def funded(username):
+    """A registered, playable, solvent account - everything founding needs."""
+    token = register(username)
+    make_character(token, username[:8].title())
+    set_purse(username, COST, 0)
+    return token
+
+
+check("a twelve-character name is allowed",
+      create(funded("taglen"), "Twelve Chars").status_code == 200)
+# REFUSED BEFORE THE PRICE IS EVEN LOOKED AT, so this one needs no gold: a
+# name that cannot exist is not a payment problem.
+check("thirteen is not",
+      create(register("taglen2"), "Thirteen Char").status_code == 400)
+
+check("the tag is the name, uppercased",
+      app_module.guild_tag("the first") == "THE FIRST",
+      app_module.guild_tag("the first"))
+check("and nothing is invented that is not in the name",
+      app_module.guild_tag("Dave's Lads") == "DAVE'S LADS",
+      app_module.guild_tag("Dave's Lads"))
+check("an empty name makes an empty tag, not a crash",
+      app_module.guild_tag("") == "" and app_module.guild_tag(None) == "")
+
+# GUILDS FOUNDED UNDER THE OLD 24-CHARACTER RULE STILL EXIST. The pattern gates
+# creation and renaming, not reading - refusing to load them would be a
+# migration that deletes somebody's guild because a display decision changed.
+# guild_tag() is what stops one drawing a banner over a head.
+check("an old over-length name is still bounded when drawn",
+      len(app_module.guild_tag("A Very Long Old Name Here")) == 12,
+      app_module.guild_tag("A Very Long Old Name Here"))
+
+
+print("\n--- staff can take a name down without taking the guild ---")
+#
+# RENAME BEFORE DISBAND. Disbanding takes a guild away from fifty people
+# because one of them chose a word; renaming takes away the word. The smaller
+# response exists so the harshest is not the only one - the same argument that
+# put a kick next to the ban.
+
+mod_token = register("guildmod")
+set_role("guildmod", "mod")
+offender = funded("badnamer")
+check("a guild to act on", create(offender, "Rude Name").status_code == 200)
+
+
+def staff_guild(token, body):
+    return client.post("/api/staff/guild", headers=auth(token), json=body)
+
+
+res = staff_guild(offender, {"guild": "Rude Name", "action": "rename",
+                             "name": "Nice Name", "reason": "no"})
+check("a player cannot, and is not told the route exists",
+      res.status_code == 404, str(res.status_code))
+
+res = staff_guild(mod_token, {"guild": "Rude Name", "action": "rename",
+                              "name": "Nice Name"})
+check("a mod cannot either, without a reason", res.status_code == 400,
+      str(res.status_code))
+res = staff_guild(mod_token, {"guild": "Rude Name", "action": "explode",
+                              "reason": "why not"})
+check("and not with an action that does not exist", res.status_code == 400,
+      str(res.status_code))
+res = staff_guild(mod_token, {"guild": "No Such", "action": "rename",
+                              "name": "Nice Name", "reason": "x"})
+check("an unknown guild is a 404", res.status_code == 404, str(res.status_code))
+res = staff_guild(mod_token, {"guild": "Rude Name", "action": "rename",
+                              "name": "Way Too Long A Name", "reason": "x"})
+check("the replacement is held to the same rule as a new name",
+      res.status_code == 400, str(res.status_code))
+
+res = staff_guild(mod_token, {"guild": "Rude Name", "action": "rename",
+                              "name": "Nice Name", "reason": "name was a slur"})
+check("a mod renames it", res.status_code == 200, res.get_json())
+check("and the answer says what it was",
+      (res.get_json() or {}).get("was") == "Rude Name", res.get_json())
+# ASKED THROUGH THE ROUTE, not by calling guild_by_name() here. A helper
+# invoked outside a request runs on a connection with its own open read
+# snapshot, and it cheerfully answered with the pre-rename row while the table
+# held the new one - which would have made this check a test of the harness.
+# A refused rename changes nothing, so it is safe to ask twice.
+check("the old name is gone",
+      staff_guild(mod_token, {"guild": "Rude Name", "action": "rename",
+                              "name": "Other Name",
+                              "reason": "should not resolve"}).status_code == 404)
+
+conn = db_conn()
+logged = conn.execute(
+    "SELECT action, target_name, detail FROM staff_actions"
+    " WHERE action = 'guild_rename' ORDER BY id DESC LIMIT 1").fetchone()
+conn.close()
+check("and it is on the record", logged is not None, logged)
+check("naming what it was", logged and logged["target_name"] == "Rude Name",
+      dict(logged) if logged else None)
+check("what it became, and why",
+      logged and "Nice Name" in logged["detail"]
+      and "slur" in logged["detail"], dict(logged) if logged else None)
+
+# THE MEMBER IS STILL IN IT. That is the whole point of renaming rather than
+# disbanding - nobody loses their guild over somebody else's word.
+seat = client.get("/api/guild", headers=auth(offender)).get_json()
+check("the guild survived its rename", seat.get("in_guild") is True, seat)
+check("under the new name", seat.get("guild", {}).get("name") == "Nice Name",
+      seat.get("guild", {}).get("name"))
+check("and the tag followed it",
+      seat.get("guild", {}).get("tag") == "NICE NAME",
+      seat.get("guild", {}).get("tag"))
+
+res = staff_guild(mod_token, {"guild": "Nice Name", "action": "disband",
+                              "reason": "kept coming back"})
+check("and a mod can still disband when renaming is not enough",
+      res.status_code == 200, res.get_json())
+conn = db_conn()
+logged = conn.execute(
+    "SELECT detail FROM staff_actions WHERE action = 'guild_disband'"
+    " ORDER BY id DESC LIMIT 1").fetchone()
+conn.close()
+check("that is on the record too, with its reason",
+      logged and "kept coming back" in logged["detail"],
+      dict(logged) if logged else None)
+
+
 print("\n--- nothing without a token ---")
 for path in ["/api/guild", "/api/guild/list"]:
     check("%s needs one" % path, client.get(path).status_code == 401)
 for path in ["/api/guild/create", "/api/guild/invite", "/api/guild/respond",
              "/api/guild/leave", "/api/guild/kick", "/api/guild/rank",
-             "/api/guild/disband"]:
+             "/api/guild/disband", "/api/staff/guild"]:
     check("%s needs one" % path, client.post(path, json={}).status_code == 401)
 
 

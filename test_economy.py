@@ -1065,6 +1065,249 @@ balanced("counting deaths")
 
 
 # =============================================================================
+# ACCEPTING DEATH IS A SERVER DECISION, NOT A CLIENT ONE
+# =============================================================================
+# The death screen has two exits and only one of them was ever migrated.
+# /api/character/revive does everything on the server; the exit beside it - the
+# one that pays nothing and loses everything carried - was still gameover.gd
+# writing full hp into the save slot and zeroing the carry gold in the same
+# local dictionary.
+#
+# Both halves were wrong, in opposite directions:
+#
+#   The heal was unauthorised, so the next status push read as a rise from 0 to
+#   504 and _reconcile_heals() clamped it to what five seconds of regeneration
+#   could produce. The player came back on screen, logged out, logged in, and
+#   found a corpse on 52 hp. The reconciler was the only honest party involved.
+#
+#   The penalty did nothing at all, because `gold` is in SERVER_OWNED_STATS and
+#   PUT /api/player/status ignores it. True death took the inventory (a loss,
+#   so nothing reconciles it) and refunded the gold on the next login.
+
+print("\naccepting death")
+
+
+def respawn(headers, slot=0):
+    return client.post("/api/character/respawn", headers=headers, json={"slot": slot})
+
+
+R = account("deathaccepter")
+status("create a character", client.put(
+    "/api/save", headers=R,
+    json={"slot": 0, "class_id": "warrior", "name": "Accepter"}), 200)
+
+status("a living character cannot respawn", respawn(R), 409)
+status("neither can one that does not exist", respawn(R, slot=3), 404)
+check("and it needs a session",
+      client.post("/api/character/respawn", json={"slot": 0}).status_code == 401)
+
+# EARNED, NOT WRITTEN. A purse set directly in the database would break the
+# invariant before this section even ran, which is the whole point of it.
+def carry_rows(username):
+    conn = db_conn()
+    rows = conn.execute(
+        "SELECT COUNT(*) FROM carry_items JOIN users ON users.id = carry_items.user_id "
+        "WHERE users.username = ?", (username,)).fetchone()
+    conn.close()
+    return int(rows[0])
+
+
+got_gold = False
+got_item = False
+for _n in range(120):
+    if got_gold and got_item:
+        break
+    body = client.post("/api/combat/kill", headers=R,
+                       json={"slot": 0, "enemy_id": ROSTER[_n % len(ROSTER)]}).get_json() or {}
+    if not body.get("bag_id"):
+        continue
+    for entry in body.get("contents", []):
+        is_gold = app_module.gold_item_value(str(entry.get("item_id", ""))) > 0
+        if is_gold and got_gold:
+            continue
+        if not is_gold and got_item:
+            continue
+        taken = client.post("/api/loot/take", headers=R,
+                            json={"bag_id": body["bag_id"],
+                                  "position": entry["position"]})
+        if taken.status_code != 200:
+            continue
+        if is_gold:
+            got_gold = True
+        else:
+            got_item = True
+
+before_status = client.get("/api/player/status?slot=0", headers=R).get_json()
+carried = int(before_status["gold"])
+check("the character has gold to lose", carried > 0, carried)
+check("and something in the bag to lose with it", carry_rows("deathaccepter") > 0,
+      carry_rows("deathaccepter"))
+
+supply_before = supply()
+status("the character dies", die(R), 200)
+res = status("and accepts it", respawn(R), 200)
+
+check("the server says what it took", res and res.get("gold_lost") == carried,
+      "%r vs %d" % (res.get("gold_lost") if res else None, carried))
+
+after = client.get("/api/player/status?slot=0", headers=R).get_json()
+check("the carry purse is empty", int(after["gold"]) == 0, after["gold"])
+check("and the three pools are full",
+      after["hp"] == after["max_hp"] and after["mana"] == after["max_mana"]
+      and after["stamina"] == after["max_stamina"],
+      "%d/%d %d/%d %d/%d" % (after["hp"], after["max_hp"], after["mana"],
+                             after["max_mana"], after["stamina"], after["max_stamina"]))
+check("at the maxima the curve says, not at anything the client asked for",
+      after["max_hp"] == app_module.gamedata.max_stats_for("warrior", after["level"])["max_hp"],
+      after["max_hp"])
+
+# THE LEDGER RECORDED IT. This is the biggest gold sink in the game and a bare
+# `SET gold = 0` would have broken the invariant on the first death anybody
+# took - which is exactly what would have happened had the client's zero ever
+# been accepted.
+conn = db_conn()
+death_rows = conn.execute(
+    "SELECT delta FROM gold_ledger WHERE reason = 'death'").fetchall()
+conn.close()
+check("the loss is in the ledger under its own reason",
+      len(death_rows) == 1 and int(death_rows[0][0]) == -carried,
+      [int(r[0]) for r in death_rows])
+
+supply_after = supply()
+check("and the world is that much poorer",
+      supply_after["recorded"] == supply_before["recorded"] - carried,
+      "%d -> %d, expected -%d"
+      % (supply_before["recorded"], supply_after["recorded"], carried))
+balanced("accepting death")
+
+check("the carry bag was emptied server-side",
+      carry_rows("deathaccepter") == 0, carry_rows("deathaccepter"))
+
+# THE CHECK THE WHOLE THING EXISTS FOR. A respawn writes a grant, so the client
+# syncing its full bars a moment later is EXPLAINED rather than clamped.
+#
+# TWO THINGS HAD TO BE ARRANGED BEFORE IT MEANT ANYTHING, and the first version
+# had neither:
+#
+#   Take damage first. A push equal to what is already stored is not a rise at
+#   all, so it passes whatever the reconciler does.
+#
+#   Clear the OTHER grants. The farming loop above levels this character up
+#   repeatedly, and a level-up grant explains any rise in any pool for thirty
+#   seconds - so with them present this check passed with the respawn's own
+#   grant deleted. It was measuring the level-ups.
+conn = db_conn()
+respawn_grants = conn.execute(
+    "SELECT COUNT(*) FROM consume_grants JOIN users ON users.id = consume_grants.user_id "
+    "WHERE users.username = ? AND consume_grants.item_id = ?",
+    ("deathaccepter", app_module.RESPAWN_GRANT_ID)).fetchone()[0]
+conn.execute(
+    "DELETE FROM consume_grants WHERE item_id != ? AND user_id = "
+    "(SELECT id FROM users WHERE username = ?)",
+    (app_module.RESPAWN_GRANT_ID, "deathaccepter"))
+conn.commit()
+conn.close()
+check("the respawn left a grant of its own", int(respawn_grants) == 1, respawn_grants)
+
+hurt = {"slot": 0, "hp": 1}
+status("the character takes a beating", client.put(
+    "/api/player/status", headers=R, json=hurt), 200)
+status("and the client syncs its full bars", client.put(
+    "/api/player/status", headers=R,
+    json={"slot": 0, "hp": after["max_hp"], "mana": after["max_mana"],
+          "stamina": after["max_stamina"]}), 200)
+synced = client.get("/api/player/status?slot=0", headers=R).get_json()
+check("the respawn explains the rise instead of it being clamped",
+      synced["hp"] == after["max_hp"],
+      "hp %d of %d - clamped means the grant was not written or not read"
+      % (synced["hp"], after["max_hp"]))
+
+
+# =============================================================================
+# GIVEN AND LOST ARE DIFFERENT VERBS
+# =============================================================================
+# Contribution counts every gold destroyed, and death destroys gold, so dying
+# now climbs the board. That follows from the rule as written and it is kept -
+# but a ranking whose top entry is mostly deaths says something different from
+# one whose top entry is mostly spending, and the board has to be able to tell
+# a reader which it is looking at.
+#
+# `lost` IS A CASE INSIDE THE EXISTING AGGREGATE, not a second query. The note
+# in _kingdom_board_shared() measured a per-player figure filtered to one
+# reason at 303ms of the board's 427ms, because it was a second GROUP BY over
+# every negative row in the ledger. This is one more SUM over rows that scan
+# already reads.
+
+print("\ngiven, and lost")
+
+board = status("read the board", kingdom(R), 200)
+check("your own line carries what was lost",
+      board and "lost" in board["you"], sorted(board["you"].keys()) if board else None)
+check("and it is what the respawn actually took",
+      board and int(board["you"]["lost"]) == carried,
+      "%r vs %d" % (board["you"].get("lost") if board else None, carried))
+check("which is not the same as what you contributed",
+      board and int(board["you"]["contributed"]) >= int(board["you"]["lost"]),
+      "%r vs %r" % ((board["you"].get("contributed"), board["you"].get("lost"))
+                    if board else None))
+
+# THE CHECK THAT SEPARATES THE TWO NUMBERS, and the first version of this
+# section did not have it. deathaccepter's only burn IS the death, so `lost`
+# and `contributed` are equal for them - which means a `lost` column that
+# summed EVERY burn rather than only the death rows passed every check above.
+# It was proven by sabotage: replacing the CASE with a plain SUM went green.
+#
+# tradealice is the control. She has burned gold at the shop and through the
+# kingdom tax, and she has died without ever calling respawn - so her
+# contribution is real and her losses are zero, and only a `lost` that actually
+# filters on the reason can say so.
+alice = status("read alice's line", kingdom(P1), 200)
+check("a player who spent but never lost has given something",
+      alice and int(alice["you"]["contributed"]) > 0,
+      alice["you"].get("contributed") if alice else None)
+check("and lost nothing, because spending is not dying",
+      alice and int(alice["you"]["lost"]) == 0,
+      "%r of %r" % ((alice["you"].get("lost"), alice["you"].get("contributed"))
+                    if alice else None))
+check("every row on the board carries one",
+      board and all("lost" in row for row in board["top"]),
+      [sorted(r.keys()) for r in board["top"]] if board else None)
+check("and none of them is negative",
+      board and all(int(row["lost"]) >= 0 for row in board["top"]),
+      [(r["username"], r["lost"]) for r in board["top"]
+       if int(r["lost"]) < 0] if board else None)
+
+check("the realm has a total of its own",
+      board and "total_lost" in board, sorted(board.keys()) if board else None)
+# READ OFF by_reason RATHER THAN SUMMED AGAIN, the same way total_taxed is.
+# Two queries for one fact is two chances to disagree, and the breakdown is
+# printed right next to the figure.
+check("and it agrees with the breakdown beside it",
+      board and int(board["total_lost"]) == int(board["by_reason"].get("death", 0)),
+      "%r vs %r" % (board.get("total_lost") if board else None,
+                    board["by_reason"].get("death") if board else None))
+# THE FIRST VERSION OF THIS CHECK ENDED IN `or True` AND COULD NOT FAIL. It
+# was trying to say "a death is not the trade tax" and said nothing. What is
+# actually worth asserting is that the headline number CONTAINS both, because
+# that is the claim the panel makes when it prints one total and a breakdown
+# under it.
+check("the realm total contains both sinks rather than replacing one",
+      board and int(board["total"]) >= int(board["total_lost"]) + int(board["total_taxed"]),
+      "total=%r lost=%r taxed=%r" % ((board.get("total"), board.get("total_lost"),
+                                      board.get("total_taxed")) if board else None))
+
+# A PLAYER WHO HAS NEVER DIED SEES A ZERO, NOT A MISSING KEY - the same
+# contract every other figure on this board keeps.
+fresh3 = account("kingdomnolosses")
+body = status("a player who has never died", kingdom(fresh3), 200)
+check("sees zero lost rather than a missing field",
+      body and body["you"].get("lost") == 0,
+      body.get("you") if body else None)
+
+balanced("given and lost")
+
+
+# =============================================================================
 # THE TRADE PANEL'S CONTRACT
 # =============================================================================
 # tradepanel.gd reads specific keys out of these responses. A field that is
