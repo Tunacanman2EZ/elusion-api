@@ -15,11 +15,18 @@
 #
 # WHY THIS EXISTS, WHICH IS NOT "TYPING IS TEDIOUS"
 # ------------------------------------------------
-# There are TWELVE suites in this folder. The five that get run by hand are the
-# five that were written first - test_api, test_economy, test_security,
-# test_throttle, test_gathering - and the other seven, including the three that
-# close E-9 and E-13, have been green-by-assumption. A suite nobody runs is a
-# suite that is not protecting anything, and it looks exactly like one that is.
+# The suites that get run by hand are the five that were written first -
+# test_api, test_economy, test_security, test_throttle, test_gathering - and
+# the rest, including the ones that close E-9 and E-13, have been
+# green-by-assumption. A suite nobody runs is a suite that is not protecting
+# anything, and it looks exactly like one that is.
+#
+# NO COUNT IS WRITTEN IN THIS HEADER, and that is the same decision CLAUDE.md
+# makes about its own check totals. These sentences used to open with 'There
+# are TWELVE suites in this folder' and go on to say 'the other seven'. There
+# are twenty-six as this is written, so both numbers were wrong, and any number
+# put here would be wrong again by the next suite. A number in a comment cannot
+# fail. The script counts; the comment does not.
 #
 # So the list is DISCOVERED, not written down. Get-ChildItem test_*.py means a
 # new suite is in the run the moment the file exists, and cannot be forgotten

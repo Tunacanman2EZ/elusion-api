@@ -166,7 +166,7 @@ section("BAGS CONTAIN SOMETHING")
 # An enemy with a bag chance, item slots and a fill chance that never produces
 # a single item is a kill that looks rewarded and is not. Checked per enemy
 # because max_loot_tier differs: a tier the catalogue has no items for makes
-# pick_weighted_item_id() come back empty every time.
+# pick_loot_item() come back empty every time.
 
 for eid in sorted(REWARDING):
     enemy = REWARDING[eid]
@@ -187,8 +187,8 @@ for eid in sorted(REWARDING):
 section("EVERY LOOT TIER HAS SOMETHING IN IT")
 # =============================================================================
 # THE ASSERTION IS CUMULATIVE, NOT PER TIER, and the first version of this
-# was wrong about that. pick_weighted_item_id() skips anything ABOVE the
-# enemy's ceiling and keeps everything at or below it, so a single empty tier
+# was wrong about that. pick_loot_item() never goes ABOVE the enemy's
+# ceiling and steps down to the tiers under it, so a single empty tier
 # costs an enemy its rarest bracket and nothing else - the bag still fills from
 # the tiers underneath. Asserting per tier failed on tier 6 and claimed "every
 # bag rolling it comes back short", which is simply not what the function does.
@@ -431,6 +431,159 @@ for _mult in table:
             _short.append((_amount, gamedata.change_total(_coins)))
 check("every multiplied amount still decomposes exactly", not _short, str(_short[:4]))
 
+
+
+# =============================================================================
+section("THE TIER IS ROLLED FIRST, THEN THE ITEM")
+# =============================================================================
+# It used to be one weight per item, 2^(max_tier - tier), which let the
+# CATALOGUE set the odds: eleven iron pieces outvoted everything and 58% of a
+# boss bag was iron, while amethyst and ember gear came out at 1%. Now
+# EnemyData.tier_odds says what share of filled slots land on each tier, top
+# first, and an item is then picked evenly inside that tier.
+
+import random as _random
+_saved_rng = gamedata._rng
+gamedata._rng = _random.Random(20260929)
+
+
+def _tier_shares(enemy, rolls):
+    counts = defaultdict(int)
+    for _ in range(rolls):
+        counts[gamedata.roll_loot_tier(enemy)] += 1
+    return {t: counts[t] / rolls for t in counts}
+
+
+_normal = {"max_loot_tier": 3, "tier_odds": [0.15, 0.45, 0.40]}
+_shares = _tier_shares(_normal, 40000)
+check("a tier-3 enemy's slots land 15% / 45% / 40% on tiers 3 / 2 / 1",
+      abs(_shares.get(3, 0) - 0.15) < 0.01 and abs(_shares.get(2, 0) - 0.45) < 0.01
+      and abs(_shares.get(1, 0) - 0.40) < 0.01, _shares)
+
+_low = {"max_loot_tier": 1, "tier_odds": [0.15, 0.45, 0.40]}
+check("steps that would fall below iron land on iron",
+      set(_tier_shares(_low, 4000)) == {1}, _tier_shares(_low, 4000))
+
+_elite = {"max_loot_tier": 3, "tier_odds": [0.4, 0.6], "tier_up_chance": 1.0}
+check("a tier_up_chance hit rolls one tier ABOVE the enemy",
+      set(_tier_shares(_elite, 2000)) == {4}, _tier_shares(_elite, 2000))
+
+check("an enemy exported before the field existed gets the default odds",
+      abs(_tier_shares({"max_loot_tier": 3}, 40000).get(3, 0) - 0.15) < 0.01)
+
+# THE COUNT OF ITEMS IN A TIER NO LONGER MOVES THE ODDS. Tier 1 holds more
+# droppable things than tier 3 (potions, worms, rods); under the old weights
+# that alone tilted every bag toward it. Rolled at the same tier, each item in
+# a pool now comes up about equally often.
+_pool = gamedata.loot_pool(3)
+_hits = defaultdict(int)
+for _ in range(len(_pool) * 400):
+    _hits[gamedata.pick_loot_item(3)] += 1
+_expected = 400
+check("every item in a tier comes up about equally often",
+      _pool and all(abs(_hits[i] - _expected) < _expected * 0.35 for i in _pool),
+      {i: _hits[i] for i in _pool})
+
+check("a tier with nothing of that kind steps DOWN to the nearest that has some",
+      gamedata.pick_loot_item(6, "gear") in gamedata.loot_pool(5, "gear"),
+      gamedata.pick_loot_item(6, "gear"))
+check("and never up", gamedata.pick_loot_item(0) == "")
+
+
+# =============================================================================
+section("EVERY GEAR TIER CAN BE EARNED")
+# =============================================================================
+# The last two tiers were finished items - icons, stats, prices - marked not
+# droppable and not sold, so the best reachable gear was cobalt and a
+# playthrough ran out at level 10. The enemy's tier is what keeps them rare:
+# nothing drops above max_loot_tier, so a tier-2 slime still cannot hand out
+# ember.
+
+_gear_by_tier = defaultdict(list)
+for _item in ITEMS.values():
+    if _item["type_name"] in gamedata.LOOT_GEAR_TYPES:
+        _gear_by_tier[int(_item["tier"])].append(_item)
+for _t in sorted(_gear_by_tier):
+    _locked = sorted(i["item_id"] for i in _gear_by_tier[_t] if not i.get("droppable", True))
+    check("every tier-%d weapon and armour piece can drop" % _t, not _locked, _locked)
+
+_top_gear_tier = max(_gear_by_tier)
+_carriers = sorted(eid for eid, e in REWARDING.items()
+                   if int(e.get("max_loot_tier", 1)) >= _top_gear_tier
+                   and int(e.get("max_item_slots", 0)) > 0)
+check("and some enemy is tough enough to drop the top tier", bool(_carriers), _carriers)
+
+_low_tier = min(int(e.get("max_loot_tier", 1)) for e in REWARDING.values()
+                if int(e.get("max_item_slots", 0)) > 0)
+_leaked = set()
+_weakest = [e for e in REWARDING.values() if int(e.get("max_loot_tier", 1)) == _low_tier]
+for _ in range(20000):
+    for _entry in gamedata.build_bag_contents(_weakest[0]):
+        _it = ITEMS.get(_entry["item_id"], {})
+        if int(_it.get("tier", 1)) > _low_tier and _it.get("type_name") != "CURRENCY":
+            _leaked.add(_entry["item_id"])
+check("but the weakest enemy never drops above its own tier", not _leaked, sorted(_leaked)[:6])
+
+
+# =============================================================================
+section("A BOSS BAG IS ONE PIECE OF GEAR, AND SOMETIMES A POTION")
+# =============================================================================
+
+_bosses = sorted((eid, e) for eid, e in REWARDING.items() if e.get("slots_are_gear"))
+check("the bosses are marked gear-only", len(_bosses) >= 7, [b[0] for b in _bosses])
+_boss_items = 0
+_gear_slot_kinds = set()
+_potions = 0
+_iron = 0
+_bags = 0
+for _eid, _e in _bosses:
+    for _ in range(3000):
+        _contents = [c for c in gamedata.build_bag_contents(_e)
+                     if ITEMS[c["item_id"]]["type_name"] != "CURRENCY"]
+        _bags += 1
+        _boss_items += len(_contents)
+        if _contents:
+            _gear_slot_kinds.add(ITEMS[_contents[0]["item_id"]]["type_name"])
+        _potions += sum(1 for c in _contents[1:] if ITEMS[c["item_id"]]["type_name"] == "CONSUMABLE")
+        _iron += sum(1 for c in _contents if int(ITEMS[c["item_id"]]["tier"]) == 1)
+check("the guaranteed slot is always a weapon or armour",
+      _gear_slot_kinds <= gamedata.LOOT_GEAR_TYPES and bool(_gear_slot_kinds), _gear_slot_kinds)
+check("a boss bag holds about 1.5 items (was 3.6)",
+      1.4 < _boss_items / _bags < 1.6, round(_boss_items / _bags, 3))
+check("the extra item is a potion about half the time",
+      0.45 < _potions / _bags < 0.55, round(_potions / _bags, 3))
+check("and a boss never drops iron (was 58% of its bag)", _iron == 0, _iron)
+
+
+
+# =============================================================================
+section("THE RAREST THINGS COME FIRST IN THE BAG")
+# =============================================================================
+# Coins used to lead the bag because gold is rolled first, and the pet was
+# appended last - so when a bag ran past the panel's cells, the cut fell on the
+# pet. rarest_first() orders pet, then items, then coins.
+
+_first_bad = 0
+_order_bad = 0
+_saved_pet = {eid: e.get("pet_odds") for eid, e in ENEMIES.items()}
+try:
+    for _eid in [eid for eid, e in REWARDING.items() if e.get("pet_drop_id")][:6]:
+        ENEMIES[_eid]["pet_odds"] = 1
+        for _ in range(500):
+            _c = gamedata.roll_kill_rewards(_eid)["contents"]
+            _kinds = [ITEMS[x["item_id"]]["type_name"] for x in _c]
+            if not _kinds or _kinds[0] != "PET":
+                _first_bad += 1
+            _ranks = [0 if k == "PET" else (2 if k == "CURRENCY" else 1) for k in _kinds]
+            if _ranks != sorted(_ranks):
+                _order_bad += 1
+finally:
+    for _eid, _odds in _saved_pet.items():
+        ENEMIES[_eid]["pet_odds"] = _odds
+check("a pet, when one drops, is the first thing in the bag", _first_bad == 0, _first_bad)
+check("and coins always come after the items", _order_bad == 0, _order_bad)
+
+gamedata._rng = _saved_rng
 
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))

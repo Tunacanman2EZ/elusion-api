@@ -223,11 +223,16 @@ check("and says it is not available to you", answer.get("available") is False,
       answer)
 check("with something the client can show",
       "guild" in str(answer.get("notice", "")).lower(), answer)
+check("and says where to go about it, not only what is missing",
+      "open guild" in str(answer.get("notice", "")).lower(), answer.get("notice"))
 check("writing to it without one is refused",
       say(amy_token, "anyone there?", channel="guild").status_code == 409)
 refused = say(amy_token, "anyone?", channel="guild")
 check("writing to it is a 409, not an error", refused.status_code == 409,
       refused.status_code)
+check("and the refusal says the same sentence the tab does - one fact, one wording",
+      (refused.get_json() or {}).get("message") == answer.get("notice"),
+      ((refused.get_json() or {}).get("message"), answer.get("notice")))
 
 
 print("\n--- each channel has its own cursor ---")

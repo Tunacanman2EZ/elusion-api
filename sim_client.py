@@ -17,7 +17,6 @@ import json
 
 SLOT_ORDER = ["NONE", "WEAPON", "HELM", "CHEST", "LEGS", "BOOTS", "SHIELD",
               "RING", "AMULET"]
-HOTBAR_SIZE = 9
 
 _GD = json.load(open("gamedata.json"))
 ITEMS = {i["item_id"]: i for i in _GD["items"]}
@@ -119,11 +118,6 @@ def prune_equipment(equipment, inventory):
 
 # --- serverstorage.gd -----------------------------------------------------
 
-def string_array(value, size):
-    source = value if isinstance(value, list) else []
-    return [str(source[i]) if i < len(source) else "" for i in range(size)]
-
-
 def save_body(index, slot):
     body = {
         "slot": index,
@@ -134,8 +128,8 @@ def save_body(index, slot):
     }
     if "equipment" in slot:
         body["equipment"] = dict(slot["equipment"])
-    if "hotbar_assignments" in slot:
-        body["hotbar"] = string_array(slot["hotbar_assignments"], HOTBAR_SIZE)
+    # No hotbar. The keys hold real items now and travel with the inventory
+    # array, not as a list of ids on the save.
     return body
 
 
@@ -145,7 +139,6 @@ def slot_from_server(data):
         "character": str(data.get("class_id", "")),
         "active_pet_id": str(data.get("active_pet_id", "")),
         "equipment": dict(data.get("equipment", {})),
-        "hotbar_assignments": string_array(data.get("hotbar", []), HOTBAR_SIZE),
         "level": int(status.get("level", 1)),
         "inventory": data.get("inventory", []),
     }

@@ -332,6 +332,19 @@ SKILL_PROFICIENCY = {
 # their own server-observed events already.
 TRAINABLE_SKILLS = ("agility", "defense", "magic")
 
+
+def proficient_amount(class_id, skill_id, raw):
+    """XP after the class specialty: int(raw x SKILL_PROFICIENCY), never negative.
+
+    ONE RULE FOR BOTH GRANTS. /api/skill/train applied the table and
+    /api/combat/kill did not - and attack trains ONLY at the kill, so the
+    warrior's specialty was the one entry in this table nothing honoured. The
+    client applied it on screen, so a warrior watched attack climb half again
+    as fast as the server recorded and lost the difference at the next login.
+    """
+    factor = SKILL_PROFICIENCY.get(class_id, {}).get(skill_id, 1.0)
+    return int(max(0.0, float(raw)) * factor)
+
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 MIN_PASSWORD_LENGTH = 8
 
@@ -759,6 +772,83 @@ def _rate_limit():
     return None
 
 
+# THE ROUTES A REFUSED CLIENT MUST STILL REACH. /api/status is the whole reason
+# this list exists: it is how a client finds out it is too old, and gating it
+# would mean an outdated build got refused everywhere with no way to learn why -
+# a player seeing "something is broken" instead of "update the game". The docs
+# paths ride along for the same reason they are exempt from the rate limiter.
+#
+# NOTE WHAT IS NOT EXEMPT: login and register. An old build is refused at the
+# door rather than let in to fail on its next request, because being signed in
+# and then getting 426 on everything is a worse experience than being told at
+# the login screen, which is the one place the client already knows how to
+# display a refusal.
+_BUILD_EXEMPT = ("/api/status", "/apidocs", "/flasgger_static", "/apispec")
+
+
+@app.before_request
+def _refuse_outdated_client():
+    """Turn away a client older than the minimum, when there is one.
+
+    426 UPGRADE REQUIRED, and it is worth being exact about why not 403. A 403
+    says "you may not", which sends a player to check their account. This is not
+    about the account at all - the same credentials on a newer build walk
+    straight in. 426 is the one status that means "the thing you are speaking
+    is too old", which is precisely what happened. Same reasoning that made a
+    closed server answer 503 rather than 403.
+
+    DISARMED BY DEFAULT. min_client_build() is 0 until an owner sets it, and 0
+    lets everything through - so this hook costs one integer comparison per
+    request and changes nothing until the day it is needed.
+
+    IT STOPS AN HONEST OLD BUILD AND NOTHING ELSE, and that has to be said
+    plainly because the shape of it looks like a security control and is not.
+    The build number is a header, headers are client-controlled, and anyone who
+    can edit their client or type a curl command can claim to be any build they
+    like. The same posture as the debug-key gate in player.gd, written down for
+    the same reason: a defence whose limits are not stated gets relied on past
+    them.
+
+    What it is FOR is the protocol. It stops a build that predates a wire change
+    from half-working against a server that moved on, which is a correctness
+    problem rather than an adversarial one - the player running it is not
+    attacking anybody, they just never updated, and today they would get
+    confusing failures instead of an answer.
+
+    THAT LIMITATION IS ALSO THE WAY BACK IN. Because the gate runs before
+    authentication it has no idea who the owner is, so there is no exemption to
+    build - but an owner shut out by their own switch can send the header by
+    hand and disarm it:
+
+        curl -X POST https://host/api/server/minbuild \\
+             -H "Authorization: Bearer <owner-token>" \\
+             -H "X-Elusion-Build: 999" \\
+             -H "Content-Type: application/json" -d '{"build": 0}'
+
+    which needs no shell on the box. set_min_build() refuses a minimum above
+    CURRENT_CLIENT_BUILD as well, so reaching that state takes deliberate effort
+    rather than a typo.
+    """
+    minimum = min_client_build()
+    if minimum <= 0:
+        return None
+    if any(request.path.startswith(p) for p in _BUILD_EXEMPT):
+        return None
+    if client_build() >= minimum:
+        return None
+    return {
+        "error": "Upgrade Required",
+        "message": "This version of the game is too old to connect. "
+                   "Please update to keep playing.",
+        # NAMED, BOTH OF THEM. A player can read the numbers back to you and a
+        # support conversation becomes one line instead of twenty. Neither is a
+        # secret: the minimum is on /api/status already, and a client knows its
+        # own build.
+        "min_build": minimum,
+        "your_build": client_build(),
+    }, 426
+
+
 # =============================================================================
 # DATABASE
 # =============================================================================
@@ -880,6 +970,29 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_staff_actions_target
             ON staff_actions(target_name);
+
+        -- THE LOG'S OWN LOOKUPS. GET /api/staff/actions reads this table
+        -- newest-first, filtered by who it was about, who did it, or what was
+        -- done - and the table only ever grows. Every index here carries the
+        -- rowid (which IS id), so "about this account, newest first, before
+        -- id N" is one range walk rather than a sort of everything that
+        -- account ever had done to it.
+        --
+        -- NOCASE ON THE NAMES because usernames are NOCASE, and an index
+        -- only serves a comparison made in its own collation. The one above
+        -- is BINARY, which is why these are new indexes and not a change to
+        -- it: CREATE INDEX IF NOT EXISTS does nothing to an index that is
+        -- already there, the same trap as the tables.
+        CREATE INDEX IF NOT EXISTS idx_staff_actions_target_id
+            ON staff_actions(target_id);
+        CREATE INDEX IF NOT EXISTS idx_staff_actions_target_nc
+            ON staff_actions(target_name COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS idx_staff_actions_actor_id
+            ON staff_actions(actor_id);
+        CREATE INDEX IF NOT EXISTS idx_staff_actions_actor_nc
+            ON staff_actions(actor_name COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS idx_staff_actions_action
+            ON staff_actions(action);
 
         CREATE TABLE IF NOT EXISTS sessions (
             token        TEXT    PRIMARY KEY,
@@ -1099,22 +1212,22 @@ def init_db():
             -- every new pet the game adds needs a matching server deploy
             -- before it could be equipped. Same reasoning as bank item_ids.
             active_pet_id TEXT NOT NULL DEFAULT '',
-            -- WHAT THIS CHARACTER IS WEARING, and what is on its hotbar.
+            -- WHAT THIS CHARACTER IS WEARING, as a JSON object of item ids.
+            -- Here for the same reason active_pet_id is: a string the client
+            -- cannot keep for itself.
             --
-            -- Both are JSON objects of item ids, both default to '{}' / '[]',
-            -- and both are here for the same reason active_pet_id is: a string
-            -- the client cannot keep for itself. hotbar_assignments used to
-            -- live only in the local slot dictionary, which meant it survived
-            -- a scene change and not a re-login - the pet came back and the
-            -- hotbar did not, and nothing said why.
+            -- JSON IN A TEXT COLUMN, not eight columns. The server does not
+            -- query inside it; it stores it, hands it back, and refuses ids the
+            -- catalogue has never heard of. A column per equip slot would be a
+            -- schema change every time a slot is added, to buy a query nobody
+            -- writes.
             --
-            -- JSON IN A TEXT COLUMN, not eight columns and nine more. The
-            -- server does not query inside these; it stores them, hands them
-            -- back, and refuses ids the catalogue has never heard of. A column
-            -- per equip slot would be a schema change every time a slot is
-            -- added, to buy a query nobody writes.
+            -- There was a `hotbar` column beside this, holding which item id
+            -- each key pointed at. The hotbar holds real items now - they are
+            -- carry_items rows past the bag, see CARRY_CAPACITY - so the column
+            -- is gone from the schema. A database created before that still has
+            -- it, and nothing reads or writes it; it defaults to '[]'.
             equipment     TEXT NOT NULL DEFAULT '{}',
-            hotbar        TEXT NOT NULL DEFAULT '[]',
 
             -- WHERE THIS CHARACTER HAS BEEN, as WorldMap's compressed
             -- exploration bitmask per area. Opaque to this server by design:
@@ -1328,8 +1441,28 @@ def init_db():
 
         -- Finding a player's open trade is the single most common read here
         -- (the panel polls it), and it is asked from both directions.
-        CREATE INDEX IF NOT EXISTS idx_trades_a ON trades(a_user, state);
-        CREATE INDEX IF NOT EXISTS idx_trades_b ON trades(b_user, state);
+        --
+        -- updated_at ON THE END, so the same two indexes also answer "your
+        -- last ten trades" in order instead of sorting every trade somebody
+        -- has ever made. They replace idx_trades_a and idx_trades_b, which
+        -- were these without the last column - see the MIGRATION section.
+        CREATE INDEX IF NOT EXISTS idx_trades_a_recent ON trades(a_user, state, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_trades_b_recent ON trades(b_user, state, updated_at);
+
+        -- The prune of old cancelled trades asks by state and age and nothing
+        -- else. Without this it read every trade ever made, on every offer.
+        --
+        -- PARTIAL, ON PURPOSE, and the first version was not. A plain
+        -- (state, updated_at) index was picked by the planner for "find my
+        -- OPEN trade" - the read every trade window polls - because it
+        -- matches state = 'open' with an equality and the planner has no
+        -- statistics saying that is most of the table. That read went from
+        -- two index lookups by player to a scan of every open trade in the
+        -- world. test_trades.py caught it in the query plan. An index that
+        -- only holds cancelled rows cannot be chosen for anything but the
+        -- prune it exists for, and is smaller besides.
+        CREATE INDEX IF NOT EXISTS idx_trades_cancelled ON trades(updated_at)
+            WHERE state = 'cancelled';
 
         -- ONE ROW PER ITEM TYPE PER SIDE, not per backpack cell. The primary
         -- key does the merging: offering five arrows twice is one row of ten,
@@ -1614,6 +1747,33 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_guild_invites_user
             ON guild_invites(user_id);
 
+        -- WHAT HAPPENED IN A GUILD, for its own members: founded, joined,
+        -- left, invited, promoted, demoted, handed on, removed, renamed.
+        --
+        -- NAMES, NOT IDS, for the reason staff_actions gives: the line has to
+        -- read the same after somebody has left the guild or deleted their
+        -- account. It is the guild's history, not a join against who is in it
+        -- now.
+        --
+        -- NOT THE MODERATION LOG. staff_actions is what staff did and is read
+        -- by staff; this is what members did and is read by members. Staff
+        -- renaming a guild appears in both, because both audiences need it.
+        --
+        -- Bounded per guild - see GUILD_EVENTS_KEPT - and gone with the guild.
+        CREATE TABLE IF NOT EXISTS guild_events (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            at       INTEGER NOT NULL,
+            kind     TEXT    NOT NULL,
+            actor    TEXT    NOT NULL DEFAULT '',
+            target   TEXT    NOT NULL DEFAULT '',
+            detail   TEXT    NOT NULL DEFAULT '',
+            FOREIGN KEY (guild_id) REFERENCES guilds(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_guild_events_guild
+            ON guild_events(guild_id, id);
+
         -- A MOVE WAITING TO BE COLLECTED.
         --
         -- ONE PER PLAYER, enforced by the primary key: issuing a second
@@ -1692,7 +1852,6 @@ def init_db():
 
     _migrate_add_column(db, "saves", "active_pet_id", "TEXT NOT NULL DEFAULT ''")
     _migrate_add_column(db, "saves", "equipment", "TEXT NOT NULL DEFAULT '{}'")
-    _migrate_add_column(db, "saves", "hotbar", "TEXT NOT NULL DEFAULT '[]'")
     _migrate_add_column(db, "saves", "explored", "TEXT NOT NULL DEFAULT '{}'")
 
     # Millisecond timestamp of the last kill credited to this character, for the
@@ -1779,6 +1938,20 @@ def init_db():
     # default for a row nobody has vouched for yet.
     _migrate_add_column(db, "sessions", "last_seen_at", "INTEGER NOT NULL DEFAULT 0")
 
+    # "WHO IS ONLINE" IS A QUESTION ABOUT RECENT ROWS. Sessions last thirty
+    # days, so the table holds every login of the last month and the ones
+    # inside ONLINE_WINDOW_SECONDS are a sliver of it. Every presence read - the
+    # staff list's online filter, /api/players/online, the maintenance count -
+    # asks for last_seen_at past a cutoff, and without this each of them read
+    # the whole month to find the sliver. The price is one index update per
+    # heartbeat, on a write that is already happening.
+    #
+    # HERE AND NOT IN THE SCHEMA BLOCK: an index on a column has to come after
+    # the column. The schema block runs first, and on a database from before
+    # presence existed it would fail on "no such column" and take the boot with
+    # it - the MIGRATION section starts from exactly that shape.
+    db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_seen ON sessions(last_seen_at)")
+
     # THE CHAT FLOOD BUCKET, on the account rather than on a character.
     #
     # Deliberately NOT sharing the kill or cast buckets: those are per-character
@@ -1827,6 +2000,45 @@ def init_db():
     # guild" - correct, because before this column there was nothing to show.
     _migrate_add_column(db, "chat_messages", "guild", "TEXT NOT NULL DEFAULT ''")
 
+    # THE NAME COLOUR A PLAYER CHOSE, as a hue on the wheel, 0-359. NULL means
+    # they never chose one, and the client draws its default - which keeps the
+    # default in ONE place, settings.gd, rather than a copy here to drift.
+    #
+    # WHY IT IS ON THE SERVER AT ALL. It used to be a local setting, so the
+    # colour somebody picked was drawn over their own head and nowhere else:
+    # chat, the friends list, the players menu and the guild roster all painted
+    # names by rank. Stored here, it travels with every name the server sends.
+    #
+    # AND ON EACH CHAT LINE, as a snapshot, for the reason the `guild` column
+    # beside it gives: the read is a poll every three seconds and must not grow
+    # a join, and a line is what somebody looked like when they said it.
+    _migrate_add_column(db, "users", "name_hue", "INTEGER")
+    _migrate_add_column(db, "chat_messages", "name_hue", "INTEGER")
+
+    # TRADES, FOUR COLUMNS. See the PLAYER TRADE section for each in full.
+    #
+    # revision: bumped by every change to either side's offer. A confirm names
+    # the revision it saw, so "accept" can only ever mean the offer that was on
+    # the screen - not one that was swapped underneath the button.
+    _migrate_add_column(db, "trades", "revision", "INTEGER NOT NULL DEFAULT 0")
+    # What each side paid the kingdom, kept on the row. The ledger has it too,
+    # but only as text in a detail column; a history panel should not be
+    # parsing prose.
+    _migrate_add_column(db, "trades", "a_tax", "INTEGER NOT NULL DEFAULT 0")
+    _migrate_add_column(db, "trades", "b_tax", "INTEGER NOT NULL DEFAULT 0")
+    # The trade whose result this character's client has not been shown yet.
+    # NULL means in step. While it is set, a whole-bag write from that client
+    # is refused - it was built before the trade moved things.
+    _migrate_add_column(db, "saves", "resync_trade", "TEXT")
+    # Which character this session is playing, as the client last said on its
+    # poll. NULL until it has said - see _playing_slot().
+    _migrate_add_column(db, "sessions", "playing_slot", "INTEGER")
+    # SUPERSEDED by idx_trades_a_recent / idx_trades_b_recent, which are these
+    # with updated_at on the end. A prefix index beside its own extension is
+    # a second write on every trade for nothing.
+    db.execute("DROP INDEX IF EXISTS idx_trades_a")
+    db.execute("DROP INDEX IF EXISTS idx_trades_b")
+
     # RELAYING A PICTURE IS NOT SENDING A MESSAGE. It costs the server an
     # outbound fetch of up to IMAGE_MAX_BYTES and a decode, so it gets a
     # cooldown of its own rather than riding the chat bucket - eight messages
@@ -1841,9 +2053,39 @@ def init_db():
 
     _migrate_seed_gold_ledger(db)
     _migrate_seed_lusion_ledger(db)
+    _migrate_xp_to_next_from_curve(db)
 
     db.commit()
     db.close()
+
+
+def _migrate_xp_to_next_from_curve(db):
+    """
+    Rewrite every character's xp_to_next from the curve in gamedata.json.
+
+    The column is a display copy of a pure function of level, and the curve
+    moved (100 x 1.15 became 1,250 x 1.27). apply_xp() already derives the
+    real requirement, so nothing is mis-paid without this - but status reads
+    return the stored figure, and a level-10 character would be shown 351 when
+    the next level costs 10,749.
+
+    IDEMPOTENT, and cheap: one UPDATE per distinct level, only rows that
+    differ. Skipped when gamedata.json did not load, so a broken catalogue can
+    never rewrite saves with the fallback curve. xp is never touched - every
+    old requirement is below the new one, so nobody is pushed over a level.
+    """
+    if "xp_base" not in gamedata.CONSTANTS:
+        return
+    levels = [int(r[0]) for r in db.execute("SELECT DISTINCT level FROM saves")]
+    changed = 0
+    for level in levels:
+        cur = db.execute(
+            "UPDATE saves SET xp_to_next = ? WHERE level = ? AND xp_to_next != ?",
+            (gamedata.xp_needed_for_level(level), level, gamedata.xp_needed_for_level(level)),
+        )
+        changed += cur.rowcount or 0
+    if changed:
+        app.logger.info("[XP] xp_to_next rewritten from the curve on %d character(s)", changed)
 
 
 def _migrate_bank_to_account(db):
@@ -2271,7 +2513,7 @@ def user_for_token(token):
         """
         SELECT u.id, u.username, u.role,
                u.is_banned, u.ban_expires_at, u.ban_reason, u.banned_by, u.banned_at,
-               u.email_verified,
+               u.email_verified, u.name_hue,
                s.expires_at
         FROM sessions s
         JOIN users u ON u.id = s.user_id
@@ -2311,7 +2553,7 @@ def bearer_token():
     return header[7:].strip()
 
 
-def stamp_presence(db):
+def stamp_presence(db, slot=None):
     """Mark the calling session as alive, right now. Caller commits.
 
     THIS IS WHAT "ONLINE" MEANS EVERYWHERE IN THE SERVER - the friends list,
@@ -2330,10 +2572,24 @@ def stamp_presence(db):
     ONE UPDATE BY PRIMARY KEY. The token is the row, so this touches exactly the
     session asking and nothing else. expires_at is NOT extended: a beat proves
     the client is running, not that the login is fresher.
+
+    `slot` IS WHICH CHARACTER THE CLIENT IS PLAYING, when it says. Before this
+    the server guessed it from whichever save was written last, and a save is
+    only written when something changes - so for the first minute after
+    picking a character, the server believed you were still the one you
+    played yesterday, and a trade opened by typing your name went to her.
+    None leaves the column as it was: a caller that does not know is not
+    saying "nobody".
     """
+    if slot is None:
+        db.execute(
+            "UPDATE sessions SET last_seen_at = ? WHERE token = ?",
+            (int(time.time()), bearer_token()),
+        )
+        return
     db.execute(
-        "UPDATE sessions SET last_seen_at = ? WHERE token = ?",
-        (int(time.time()), bearer_token()),
+        "UPDATE sessions SET last_seen_at = ?, playing_slot = ? WHERE token = ?",
+        (int(time.time()), int(slot), bearer_token()),
     )
 
 
@@ -2840,6 +3096,28 @@ def can_act_on(actor, target):
     return ROLES.index(role_for(actor)) > ROLES.index(role_for(target))
 
 
+# THE NAME COLOUR IS A HUE, 0-359 - a position on the wheel, nothing more.
+# Saturation and brightness are fixed by the client (Settings.NAME_SATURATION
+# and NAME_VALUE) so that every choice is readable; storing a whole colour
+# would let a patched client store an unreadable one.
+NAME_HUE_MAX = 359
+
+
+def name_hue_of(row):
+    """The hue a user row chose, or None when they never chose one.
+
+    None rather than a default on purpose: the client owns the default, and a
+    second copy of it here is a second number to keep in step.
+    """
+    if row is None or "name_hue" not in row.keys():
+        return None
+    hue = row["name_hue"]
+    if hue is None:
+        return None
+    hue = int(hue)
+    return hue if 0 <= hue <= NAME_HUE_MAX else None
+
+
 def ban_state(user):
     """
     The live ban on a user row, or None when there is not one.
@@ -2969,6 +3247,42 @@ MAINTENANCE_KEY = "maintenance"
 # than growing one in a hurry next to the thing that needed it.
 PVP_KEY = "pvp"
 
+# THE CLIENT BUILD GATE. Third row in server_settings, same shape as the two
+# above, and here for a reason neither of them has: this one cannot be added
+# later without leaving a permanent hole.
+#
+# WHAT THE HOLE IS. Until now nothing in a request said which build sent it.
+# The server could not refuse a client with a known bug, could not tell a
+# player to update, and - worst of the three - a breaking change to the wire did
+# not FAIL on an old build, it half-worked. Silently, on exactly the copies
+# nobody can reach.
+#
+# WHY IT IS A DOOR RATHER THAN A TASK. The header can be added any time, and an
+# absent header can be read as "pre-versioning". That works. What does not come
+# back is the first cohort: every build shipped before the header exists is
+# permanently in the unknown bucket, and the unknown bucket is the oldest code,
+# which is the code you will most want to reason about. So it ships with the
+# first build or it never covers it.
+#
+# /api/status ALREADY VERSIONS THE DATA CONTRACT with gamedata_schema. This is
+# the same idea one layer up: that one says "we disagree about the roster", this
+# one says "we disagree about the protocol".
+MIN_BUILD_KEY = "min_client_build"
+
+# The header a client stamps its build on. X- prefix because it is not a
+# registered header name; nothing else in this API invents one.
+CLIENT_BUILD_HEADER = "X-Elusion-Build"
+
+# What the client shipped alongside this server reports. Served on /api/status
+# so an OLD client can tell it is old without the server having to refuse it -
+# which is the whole point of shipping the gate disarmed.
+#
+# MONOTONIC INTEGER, NOT A SEMVER STRING. The only question the gate asks is
+# "older than", and integers answer that without a parser. A display version
+# lives beside it in the client for humans; this is the one the server compares,
+# and it never needs to know how the humans are numbering things.
+CURRENT_CLIENT_BUILD = 1
+
 MAINTENANCE_DEFAULT_MESSAGE = "Update in progress - please come back later."
 
 # Long enough that every client actually in the world gets at least one
@@ -3030,6 +3344,61 @@ def pvp_enabled():
     except (ValueError, TypeError):
         return False
     return bool(isinstance(stored, dict) and stored.get("on"))
+
+
+def client_build():
+    """Which build sent this request. 0 when it did not say.
+
+    ZERO MEANS "FROM BEFORE ANY OF THIS EXISTED", and it is a real answer
+    rather than a missing one. Every build shipped before the header did will
+    never send it, so the absent case has to mean something specific and has to
+    keep meaning it. It sorts below every real build, which is exactly right:
+    the oldest code is the code most likely to need refusing.
+
+    ANYTHING UNREADABLE IS ALSO ZERO. A header of "banana", "1.0" or an empty
+    string is a client that does not know the protocol, which is the same
+    situation as one that never heard of it. No 400: refusing the request would
+    make a malformed header a way to learn that the gate exists, and the gate
+    is not a secret but it is also not worth a separate refusal path.
+    """
+    raw = (request.headers.get(CLIENT_BUILD_HEADER) or "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+def min_client_build():
+    """The oldest build allowed in. 0 disarms the gate entirely.
+
+    FAILS TOWARD DISARMED, the opposite direction from the maintenance switch
+    and deliberately so. A corrupt row in `server_settings` must not be able to
+    lock every player out of the game - the failure it could cause is the exact
+    failure this gate exists to make survivable, and a defence whose broken
+    state is an outage is not one. The same argument pvp_enabled() makes for
+    failing toward off: a row nobody can read must not be able to decide
+    something this large.
+
+    IT SHIPS AT 0 ON PURPOSE. The mechanism is the thing that cannot be added
+    later; the enforcement can be switched on at any moment from one owner
+    request. So the first cohort cannot be locked out by a number typed wrong
+    months before anyone met it.
+    """
+    raw = get_server_setting(MIN_BUILD_KEY)
+    if not raw:
+        return 0
+    try:
+        stored = json.loads(raw)
+    except (ValueError, TypeError):
+        return 0
+    if not isinstance(stored, dict):
+        return 0
+    try:
+        return max(0, int(stored.get("build", 0)))
+    except (TypeError, ValueError):
+        return 0
 
 
 def pvp_since():
@@ -3346,11 +3715,12 @@ def post_chat(user_row, body, channel="world", target_id=0, image_id=""):
 
     cursor = db.execute(
         "INSERT INTO chat_messages"
-        " (user_id, username, role, body, created_at, channel, target_id, image_id, guild)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " (user_id, username, role, body, created_at, channel, target_id, image_id, guild,"
+        "  name_hue)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (int(user_row["id"]), user_row["username"], role_for(user_row), text, now,
          channel, int(target_id or 0), str(image_id or ""),
-         said_from["name"] if said_from else ""),
+         said_from["name"] if said_from else "", name_hue_of(user_row)),
     )
     _prune_chat(db, channel)
     return cursor.lastrowid
@@ -3372,6 +3742,9 @@ def chat_message_dict(row):
         # every line written before the column existed.
         "guild": row["guild"] if "guild" in keys else "",
         "guild_tag": guild_tag(row["guild"]) if "guild" in keys and row["guild"] else "",
+        # The colour they had chosen when they said it. None for "never chose
+        # one", and for every line written before the column existed.
+        "name_hue": name_hue_of(row),
     }
 
 
@@ -3502,7 +3875,7 @@ def guild_roster(db, guild_id, now=None):
     if now is None:
         now = int(time.time())
     rows = db.execute(
-        "SELECT u.id, u.username, u.role, m.rank, m.joined_at,"
+        "SELECT u.id, u.username, u.role, u.name_hue, m.rank, m.joined_at,"
         "       COALESCE(MAX(s.last_seen_at), 0) AS last_seen_at"
         "  FROM guild_members m"
         "  JOIN users u ON u.id = m.user_id"
@@ -3513,18 +3886,98 @@ def guild_roster(db, guild_id, now=None):
         "                      ELSE 2 END, u.username",
         (guild_id,)).fetchall()
 
+    # WHO THEY ARE PLAYING, one query for the whole roster, by PLAYING_SLOT_SQL
+    # - the character their client says it is on, else the one saved last. The
+    # players menu and the trade window ask the same question the same way.
+    #
+    # IT USED TO BE "SAVED LAST" ALONE, via MAX(updated_at), and that is wrong
+    # in exactly the minute a guildmate switches character: the roster showed
+    # yesterday's warrior while they stood there as a mage. A member with no
+    # character yet still gets nothing rather than a guess.
+    playing = {}
+    ids = [int(row["id"]) for row in rows]
+    if ids:
+        marks = ",".join("?" * len(ids))
+        for save in db.execute(
+            "SELECT user_id, name, class_id, level, area FROM saves"
+            " WHERE user_id IN (%s) AND slot = %s"
+            % (marks, PLAYING_SLOT_SQL.format(user="saves.user_id")),
+            ids + [now - ONLINE_WINDOW_SECONDS, now],
+        ).fetchall():
+            playing[int(save["user_id"])] = save
+
     out = []
     for row in rows:
         seen = int(row["last_seen_at"] or 0)
+        save = playing.get(int(row["id"]))
         out.append({
             "username": row["username"],
             "role": role_for(row),
+            "name_hue": name_hue_of(row),
             "rank": row["rank"],
             "joined_at": int(row["joined_at"] or 0),
             "last_seen_at": seen,
             "online": bool(seen and now - seen <= ONLINE_WINDOW_SECONDS),
+            # AREA IS SENT WHETHER OR NOT THEY ARE ON, and the panel shows it
+            # only for somebody who is. Where a guildmate logged out is not a
+            # secret from their own guild, but "in Field" beside somebody who
+            # left three days ago would read as now.
+            "character": save["name"] if save is not None else "",
+            "class_id": save["class_id"] if save is not None else "",
+            "level": int(save["level"] or 1) if save is not None else 0,
+            "area": save["area"] if save is not None else "",
         })
     return out
+
+
+# THE GUILD'S OWN HISTORY. How much each guild keeps, and how much of it the
+# panel is sent. A hundred is months of an active guild; the panel shows the
+# newest dozen because it is a glance, not an archive.
+GUILD_EVENTS_KEPT = 100
+GUILD_ACTIVITY_SHOWN = 12
+
+# Every kind log_guild_event() is called with. test_guilds.py reads the calls
+# in this file and fails on one that is not listed, so the client's words for
+# them cannot silently miss a new one.
+GUILD_EVENT_KINDS = (
+    "founded", "joined", "left", "invited", "promoted", "demoted",
+    "leader", "removed", "renamed",
+)
+
+
+def log_guild_event(db, guild_id, kind, actor="", target="", detail="", now=None):
+    """One line of a guild's history, in the caller's transaction.
+
+    IN THE SAME TRANSACTION as the thing it describes, like staff_actions: a
+    promotion that happened with no line about it, or a line about one that
+    did not happen, are both worse than no history at all.
+    """
+    if now is None:
+        now = int(time.time())
+    db.execute(
+        "INSERT INTO guild_events (guild_id, at, kind, actor, target, detail)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (int(guild_id), int(now), kind, actor or "", target or "", detail or ""))
+    # PRUNED ON WRITE, per guild, so one busy guild cannot push a quiet one's
+    # history out and nothing has to run on a schedule.
+    db.execute(
+        "DELETE FROM guild_events WHERE guild_id = ? AND id NOT IN ("
+        "  SELECT id FROM guild_events WHERE guild_id = ? ORDER BY id DESC LIMIT ?)",
+        (int(guild_id), int(guild_id), GUILD_EVENTS_KEPT))
+
+
+def guild_activity(db, guild_id, limit=GUILD_ACTIVITY_SHOWN):
+    """The newest events, newest first, as the panel reads them."""
+    return [{
+        "at": int(row["at"]),
+        "kind": row["kind"],
+        "actor": row["actor"],
+        "target": row["target"],
+        "detail": row["detail"],
+    } for row in db.execute(
+        "SELECT at, kind, actor, target, detail FROM guild_events"
+        " WHERE guild_id = ? ORDER BY id DESC LIMIT ?", (int(guild_id), int(limit))
+    ).fetchall()]
 
 
 def guild_dict(db, guild_row, now=None):
@@ -3544,15 +3997,25 @@ def guild_dict(db, guild_row, now=None):
         "members": roster,
         "size": len(roster),
         "capacity": MAX_GUILD_MEMBERS,
+        # Members only: every route that returns this is one a member called.
+        "activity": guild_activity(db, int(guild_row["id"])),
     }
 
 
-# 'guild' IS DECLARED AND REFUSED. Guilds are not built yet, and leaving the
-# name out until they are would mean every client, every cursor and every tab
-# needing a change on the day they arrive. Declared now, it is one branch in
-# chat_write_check() that stops saying no.
+# 'guild' WAS DECLARED HERE BEFORE GUILDS EXISTED, so that the day they arrived
+# would be one branch in chat_write_check() rather than a change to every
+# client, cursor and tab. That day came: guild chat is live, gated only on
+# being in a guild (chat_write_check, read_chat). The client took longer - its
+# Guild tab went on saying "Guilds are not in the game yet." and never asked,
+# until a player typed "oi bruv" into it and nothing happened.
 CHAT_CHANNELS = ("world", "private", "friends", "guild")
 CHAT_DEFAULT_CHANNEL = "world"
+
+# WHAT GUILD CHAT SAYS TO SOMEBODY WITH NO GUILD - reading it, or writing to it.
+# One sentence, because the chat window shows whichever arrived last, and two
+# wordings of the same fact read as two different problems. It says where to
+# go, not only what is missing.
+GUILD_CHAT_NO_GUILD = "You are not in a guild yet. Open Guild to found one, or answer an invite."
 
 # THE TAIL KEPT PER CHANNEL, on top of the 24 hours. A world channel on a busy
 # night and a private conversation nobody has opened in a week are very
@@ -3591,7 +4054,7 @@ def chat_write_check(channel, target_row):
         if guild_membership(g.user["id"]) is None:
             return {
                 "error": "Conflict",
-                "message": "You are not in a guild.",
+                "message": GUILD_CHAT_NO_GUILD,
             }, 409
         return None
 
@@ -4164,6 +4627,7 @@ def friend_entry(row, presence, now):
     return {
         "username": row["username"],
         "role": role_for(row),
+        "name_hue": name_hue_of(row),
         "online": last_seen > 0 and now - last_seen <= ONLINE_WINDOW_SECONDS,
         "last_seen_at": last_seen,
     }
@@ -4609,6 +5073,24 @@ def register():
         }, 409
 
     user_id = cursor.lastrowid
+    # THE SIGNUP'S OWN FAILED LOGIN IS NOT EVIDENCE. The game has no separate
+    # "create account" form: it logs in first and registers only after a 401,
+    # so every new account begins with a 'no-such-user' row - which is on the
+    # spray gate's allowlist. Six people signing up behind one address inside
+    # ten minutes (a household, a school, a carrier's NAT, or EVERYONE behind a
+    # proxy with ELUSION_TRUSTED_PROXIES at 0) tripped IP_MAX_USERNAMES and
+    # locked that address out of logging in for a quarter of an hour.
+    #
+    # RELABELLED, NOT DELETED: the log keeps what happened, and only the rows
+    # for THIS name, from THIS address, inside the window stop counting. That
+    # name did not exist when it failed, so it guessed at nobody's password;
+    # a spray against real accounts leaves 'bad-password' rows, untouched here.
+    db.execute(
+        "UPDATE login_attempts SET reason = 'signup-first-login'"
+        " WHERE ip = ? AND lower(username) = lower(?) AND reason = 'no-such-user' AND at >= ?",
+        (ip, username, now - IP_WINDOW_SECONDS),
+    )
+    db.commit()
     token, expires_at = issue_token(user_id)
     # The account's first address. Recorded here as well as on login, so an
     # account that registers and is banned before it ever logs in still carries
@@ -4628,6 +5110,8 @@ def register():
         "username": username,
         "role": "owner" if is_owner(username) else DEFAULT_ROLE,
         "is_owner": is_owner(username),
+        # A new account has chosen nothing yet; the client draws its default.
+        "name_hue": None,
         "token": token,
         "expires_at": expires_at,
         # Always true here: an account one second old cannot have confirmed
@@ -4817,6 +5301,9 @@ def login():
         # be possible, so role_for() answers from ELUSION_OWNER first.
         "role": role_for(row),
         "is_owner": is_owner(row["username"]),
+        # THE COLOUR COMES WITH THE LOGIN, so a second machine draws the name
+        # the player chose on the first one.
+        "name_hue": name_hue_of(row),
         "token": token,
         "expires_at": expires_at,
         # THE PROMPT SWITCH. The client shows the "secure your account" step
@@ -4885,6 +5372,7 @@ def session_info():
         "username": g.user["username"],
         "role": role_for(g.user),
         "is_owner": is_owner(g.user["username"]),
+        "name_hue": name_hue_of(g.user),
         "expires_at": g.user["expires_at"],
         "maintenance": maintenance_public(),
         "email_verified": not needs_recovery_email(g.user),
@@ -5747,6 +6235,30 @@ def bad_request(message):
     return {"error": "Bad Request", "message": message}, 400
 
 
+def parse_cell(payload, capacity):
+    """
+    The optional `position` on a request that takes an item out of a grid:
+    which cell the player actually used. Returns (cell_or_None, error_or_None).
+
+    Absent means "no preference", and the take falls back to its usual order.
+    Present means a real cell of that grid or a 400 - a malformed position is a
+    client bug worth hearing about, not a hint worth guessing at. Same bool
+    trap as parse_slot().
+    """
+    if "position" not in payload or payload.get("position") is None:
+        return None, None
+    raw = payload.get("position")
+    if isinstance(raw, bool):
+        return None, bad_request("position must be an integer 0-%d" % (capacity - 1))
+    try:
+        cell = int(raw)
+    except (TypeError, ValueError):
+        return None, bad_request("position must be an integer 0-%d" % (capacity - 1))
+    if cell < 0 or cell >= capacity:
+        return None, bad_request("position must be an integer 0-%d" % (capacity - 1))
+    return cell, None
+
+
 def parse_pet_id(raw):
     """
     Validate an active_pet_id from a request body.
@@ -5791,10 +6303,6 @@ EQUIP_SLOTS_FALLBACK = (
 )
 EQUIP_SLOTS = (tuple(sorted(gamedata.EQUIP_SLOTS)) if gamedata.EQUIP_EXPORTED
                else EQUIP_SLOTS_FALLBACK)
-
-# A hotbar is nine keys. Fixed, because the client draws nine.
-HOTBAR_SIZE = 9
-
 
 def parse_equipment(raw, class_id="", character_level=0):
     """
@@ -5857,37 +6365,6 @@ def parse_equipment(raw, class_id="", character_level=0):
 
         out[slot_name] = text
     return out
-
-
-def parse_hotbar(raw):
-    """
-    Validate a hotbar from a request body: a list of item ids, "" for empty.
-
-    PADDED AND TRIMMED rather than refused on length. An older client that
-    sends seven entries is not lying about anything - it just predates two of
-    the keys - and 400-ing an otherwise honest save over the shape of a
-    convenience feature would stop that client saving at all.
-    """
-    if raw is None:
-        return [""] * HOTBAR_SIZE
-    if not isinstance(raw, list):
-        return None
-
-    out = []
-    for item_id in raw[:HOTBAR_SIZE]:
-        if item_id is None or item_id == "":
-            out.append("")
-            continue
-        if isinstance(item_id, bool) or not isinstance(item_id, (str, int, float)):
-            return None
-        text = str(item_id).strip()
-        if text == "":
-            out.append("")
-            continue
-        if len(text) > 64 or not gamedata.has_item(text):
-            return None
-        out.append(text)
-    return out + [""] * (HOTBAR_SIZE - len(out))
 
 
 # The ceiling on one character's explored map. Every area in the game together
@@ -5960,12 +6437,34 @@ def _stored_json(raw, fallback):
     """Read one of the JSON columns back, forgiving anything unreadable.
 
     A row written by a future version, or corrupted by hand, must not make the
-    save endpoint 500 - the character is still playable without their hotbar."""
+    save endpoint 500 - the character is still playable without its explored
+    map."""
     try:
         value = json.loads(raw) if raw else fallback
     except (TypeError, ValueError):
         return fallback
     return value if isinstance(value, type(fallback)) else fallback
+
+
+def _derived_stats(row, class_id=None, level=None):
+    """
+    gamedata.max_stats_for() for this saves row, WITH WHAT IT IS WEARING.
+
+    The one way app.py asks for a character's maxima. A Vitality amulet adds to
+    max_hp, and the status route clamps hp to whatever this returns - so a call
+    that left the equipment out would give a character a lower ceiling than
+    their own client shows and take the difference off them on the next save.
+
+    row["equipment"] IS READ, NOT .get()'d. A SELECT that forgot the column
+    raises IndexError here and fails loudly in the tests, rather than quietly
+    deriving a bare maximum. class_id and level override the row's own when the
+    caller knows better (the save route's class, the kill route's new level).
+    """
+    return gamedata.max_stats_for(
+        row["class_id"] if class_id is None else class_id,
+        int(row["level"] if level is None else level),
+        _stored_json(row["equipment"], {}),
+    )
 
 
 def save_row_to_dict(row):
@@ -5977,7 +6476,6 @@ def save_row_to_dict(row):
         "area": row["area"],
         "active_pet_id": row["active_pet_id"],
         "equipment": _stored_json(row["equipment"], {}),
-        "hotbar": _stored_json(row["hotbar"], [""] * HOTBAR_SIZE),
         "explored": _stored_json(row["explored"], {}),
         "updated_at": row["updated_at"],
     }
@@ -6113,10 +6611,12 @@ def write_save():
             "explored must be an object of {area: {w, h, ox, oy, bits}} and "
             "under %d bytes" % MAX_EXPLORED_BYTES)
 
-    hotbar_key_sent = "hotbar" in payload
-    hotbar = parse_hotbar(payload.get("hotbar")) if hotbar_key_sent else []
-    if hotbar_key_sent and hotbar is None:
-        return bad_request("hotbar must be a list of known item ids, or \"\" for empty")
+    # THE HOTBAR IS NOT A SAVE FIELD ANY MORE. It used to be a list of item ids,
+    # one per key, pointing into the backpack. Now each key holds the item
+    # itself, as a carry_items row past the bag (see CARRY_CAPACITY), and moves
+    # with PUT /api/character/inventory like any other cell. Ignored rather
+    # than refused, for the reason given for equipment below.
+    hotbar_ignored = "hotbar" in payload
 
     now = int(time.time())
 
@@ -6190,8 +6690,8 @@ def write_save():
     db.execute(
         """
         INSERT INTO saves (user_id, slot, class_id, name, level, area, active_pet_id,
-                           equipment, hotbar, explored, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           equipment, explored, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id, slot) DO UPDATE SET
             class_id      = excluded.class_id,
             name          = excluded.name,
@@ -6205,19 +6705,15 @@ def write_save():
                                  ELSE saves.active_pet_id END,
             equipment     = CASE WHEN ? THEN excluded.equipment
                                  ELSE saves.equipment END,
-            hotbar        = CASE WHEN ? THEN excluded.hotbar
-                                 ELSE saves.hotbar END,
             explored      = CASE WHEN ? THEN excluded.explored
                                  ELSE saves.explored END,
             updated_at    = excluded.updated_at
         """,
         (g.user["id"], slot, class_id, name, level, area, active_pet_id,
-         json.dumps(equipment), json.dumps(hotbar or [""] * HOTBAR_SIZE),
-         json.dumps(explored), now,
+         json.dumps(equipment), json.dumps(explored), now,
          1 if area_key_sent else 0,
          1 if pet_key_sent else 0,
          equip_key_sent,
-         1 if hotbar_key_sent else 0,
          1 if explored_key_sent else 0),
     )
     db.commit()
@@ -6231,10 +6727,14 @@ def write_save():
     # Recomputed on every save rather than only on creation: max_hp is a pure
     # function of class and level, so there is no state where storing anything
     # else is correct.
-    stored_level = db.execute(
-        "SELECT level FROM saves WHERE user_id = ? AND slot = ?", (g.user["id"], slot)
-    ).fetchone()["level"]
-    derived = gamedata.max_stats_for(class_id, stored_level)
+    #
+    # AND OF WHAT IS WORN, read back from the row rather than the request -
+    # equipment is server-owned and this route never writes it.
+    stored = db.execute(
+        "SELECT class_id, level, equipment FROM saves WHERE user_id = ? AND slot = ?",
+        (g.user["id"], slot),
+    ).fetchone()
+    derived = _derived_stats(stored, class_id=class_id)
 
     if derived is not None:
         if is_new:
@@ -6244,18 +6744,27 @@ def write_save():
                 """
                 UPDATE saves
                    SET max_hp = ?, hp = ?, max_mana = ?, mana = ?,
-                       max_stamina = ?, stamina = ?
+                       max_stamina = ?, stamina = ?, xp_to_next = ?
                  WHERE user_id = ? AND slot = ?
                 """,
                 (derived["max_hp"], derived["max_hp"],
                  derived["max_mana"], derived["max_mana"],
                  derived["max_stamina"], derived["max_stamina"],
+                 # The table's DEFAULT 100 is the old curve's first level; a
+                 # new character is told what the current curve says.
+                 gamedata.xp_needed_for_level(int(stored["level"])),
                  g.user["id"], slot),
             )
         else:
+            # THE POOLS COME DOWN WITH THE CEILING, never up. A maximum can fall
+            # now - an amulet came off - and a stored hp above it would be a
+            # character the status route then has to argue with.
             db.execute(
-                "UPDATE saves SET max_hp = ?, max_mana = ?, max_stamina = ? WHERE user_id = ? AND slot = ?",
+                "UPDATE saves SET max_hp = ?, max_mana = ?, max_stamina = ?, "
+                "hp = MIN(hp, ?), mana = MIN(mana, ?), stamina = MIN(stamina, ?) "
+                "WHERE user_id = ? AND slot = ?",
                 (derived["max_hp"], derived["max_mana"], derived["max_stamina"],
+                 derived["max_hp"], derived["max_mana"], derived["max_stamina"],
                  g.user["id"], slot),
             )
         db.commit()
@@ -6270,8 +6779,14 @@ def write_save():
     # is not doing anything wrong - it simply predates the endpoints - but a
     # field that is silently dropped is a client and a server disagreeing
     # forever with nothing to notice it by.
+    ignored = []
     if equipment_ignored:
-        result["ignored"] = ["equipment"]
+        ignored.append("equipment")
+    if hotbar_ignored:
+        ignored.append("hotbar")
+    if ignored:
+        result["ignored"] = ignored
+    if equipment_ignored:
         result["equipment"] = _stored_json(
             get_db().execute(
                 "SELECT equipment FROM saves WHERE user_id = ? AND slot = ?",
@@ -7003,7 +7518,7 @@ def write_player_status():
     # maximum the server believes in rather than the one the client sent. A
     # client declaring max_hp = 999999 alongside hp = 999999 would otherwise pass
     # the paired check below on its own say-so.
-    derived = gamedata.max_stats_for(row["class_id"], row["level"])
+    derived = _derived_stats(row)
 
     updates = {}
     ignored = []
@@ -7263,7 +7778,16 @@ def _add_to_bank(user_id, item_id, quantity):
     return [position for position, _, _ in writes]
 
 
-def _take_from_cells(rows, item_id, quantity):
+def _preferred_first(cells, prefer):
+    """cells - (position, ...) tuples already in take order - with the one at
+    `prefer` moved to the front. A stable sort, so the rest keep their order;
+    unchanged when prefer is None or names a cell not in the list."""
+    if prefer is None:
+        return list(cells)
+    return sorted(cells, key=lambda cell: int(cell[0]) != int(prefer))
+
+
+def _take_from_cells(rows, item_id, quantity, prefer=None):
     """
     Work out which cells to empty or reduce to remove quantity of item_id.
 
@@ -7276,6 +7800,14 @@ def _take_from_cells(rows, item_id, quantity):
     HIGHEST POSITION FIRST. Emptying the last cell of a split stack leaves the
     player's grid looking like they expect - things disappear from the end, not
     out of the middle.
+
+    EXCEPT THE CELL THE PLAYER USED, when the request names one. `prefer` is
+    that cell, and it is spent first when it holds the item. With the hotbar
+    in the same rows as the bag, the highest cell holding a potion is usually a
+    KEY - so without this, dragging the potions in your bag into the bank
+    emptied the ones on key 1 and left the bag stack you dragged. A `prefer`
+    that does not hold the item is ignored rather than refused: the request is
+    still "move five potions", and the client's picture may be a moment old.
     """
     held = [(int(r["position"]), int(r["quantity"]))
             for r in rows if r["item_id"] == item_id]
@@ -7285,7 +7817,7 @@ def _take_from_cells(rows, item_id, quantity):
 
     remaining = int(quantity)
     changes = []
-    for position, held_qty in sorted(held, reverse=True):
+    for position, held_qty in _preferred_first(sorted(held, reverse=True), prefer):
         if remaining <= 0:
             break
         taken = min(held_qty, remaining)
@@ -7437,6 +7969,54 @@ def account_payload(user_id):
         "bank_inventory": cells,
         "capacity": BANK_CAPACITY,
     }
+
+
+@app.put("/api/account/name-colour")
+@require_auth
+def set_name_colour():
+    """
+    Choose the colour your name is drawn in, everywhere
+    ---
+    tags:
+      - Account
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [hue]
+          properties:
+            hue: {type: integer, description: "0-359, a position on the colour wheel"}
+    responses:
+      200:
+        description: The hue as stored
+      400:
+        description: Not a whole number 0-359
+      401:
+        description: Missing, invalid or expired token
+    """
+    # EVERYBODY, STAFF INCLUDED. The rule used to be that staff names were
+    # painted in their rank colour and the Options slider did nothing for them;
+    # rank is shown by a badge now (the owner's crown, MOD and DEV), which a
+    # player cannot choose, so the colour is free for everybody to choose.
+    #
+    # A HUE, NOT A COLOUR. The client fixes saturation and brightness so every
+    # choice reads against the world; accepting a whole colour would let a
+    # patched client store black-on-black.
+    payload = request.get_json(silent=True) or {}
+    hue = parse_stat(payload.get("hue"))
+    if hue is None or hue > NAME_HUE_MAX:
+        return bad_request("hue must be a whole number 0-%d" % NAME_HUE_MAX)
+
+    db = get_db()
+    db.execute("UPDATE users SET name_hue = ? WHERE id = ?", (hue, g.user["id"]))
+    db.commit()
+    return {"name_hue": hue}, 200
 
 
 @app.get("/api/account")
@@ -7624,6 +8204,7 @@ def move_bank_items():
             op:       {type: string,  enum: [deposit, withdraw]}
             item_id:  {type: string,  example: "tinyhealthpotion"}
             quantity: {type: integer, example: 5}
+            position: {type: integer, example: 3, description: "The source cell dragged - a carried cell for a deposit, a bank cell for a withdrawal. Taken from first when it holds the item."}
     responses:
       200:
         description: Both grids afterwards, plus the account
@@ -7672,6 +8253,11 @@ def move_bank_items():
     if quantity > QUANTITY_CEILING:
         return bad_request("quantity must be at most %d" % QUANTITY_CEILING)
 
+    position, error = parse_cell(
+        payload, CARRY_CAPACITY if op == "deposit" else BANK_CAPACITY)
+    if error is not None:
+        return error
+
     db = get_db()
 
     if op == "deposit":
@@ -7685,7 +8271,7 @@ def move_bank_items():
             (user_id,),
         ).fetchall()
 
-    changes, available = _take_from_cells(source_rows, item_id, quantity)
+    changes, available = _take_from_cells(source_rows, item_id, quantity, prefer=position)
     if changes is None:
         where = "carried" if op == "deposit" else "banked"
         return bad_request(
@@ -7703,7 +8289,7 @@ def move_bank_items():
     else:
         _apply_cell_changes("bank_items", ("user_id",), (user_id,), changes)
         written = _add_to_backpack(user_id, slot, item_id, quantity)
-        full_message = "Your backpack is full (%d slots)." % CARRY_CAPACITY
+        full_message = "Your backpack is full (%d slots)." % INVENTORY_CAPACITY
 
     if written is None:
         # Nothing was committed, so the rollback puts the source rows back
@@ -7985,7 +8571,7 @@ def combat_kill():
 
     db = get_db()
     row = db.execute(
-        "SELECT class_id, level, xp, xp_to_next, last_kill_at, kill_tokens FROM saves WHERE user_id = ? AND slot = ?",
+        "SELECT class_id, level, equipment, xp, xp_to_next, last_kill_at, kill_tokens FROM saves WHERE user_id = ? AND slot = ?",
         (user_id, slot),
     ).fetchone()
     if row is None:
@@ -8065,7 +8651,7 @@ def combat_kill():
     # Found by a test asserting max_hp against the curve rather than against a
     # hardcoded 180: the moment a kill-burst test started levelling the
     # character up, the stale value stopped matching.
-    derived = gamedata.max_stats_for(row["class_id"], level) if levels_gained else None
+    derived = _derived_stats(row, level=level) if levels_gained else None
 
     if levels_gained:
         # THE REFILL THAT COMES WITH A LEVEL, recorded so the healing
@@ -8129,14 +8715,20 @@ def combat_kill():
     # the request: the response still reports a level, the database never sees
     # it. Sharing the commit also means the character's XP and the attack XP
     # from one kill can never be stored apart from each other.
+    #
+    # THE CLASS SPECIALTY APPLIES. A warrior trains attack half again as fast
+    # (SKILL_PROFICIENCY), and this is the only place attack trains.
+    attack_gained = proficient_amount(row["class_id"], "attack", rewards["attack_xp"])
     attack_level, attack_xp, attack_levels = _grant_skill_xp(
-        user_id, slot, "attack", rewards["attack_xp"]
+        user_id, slot, "attack", attack_gained
     )
 
     # Recorded in the same transaction, for the same reason the grant is: a kill
     # that paid out and left no trace, or a trace for a kill that was rolled
     # back, would both make the log a thing you cannot reason from.
-    _record_kill(db, user_id, slot, enemy_id, rewards, level, now_ms // 1000)
+    # AS PAID: the attack XP the character actually banked, specialty included.
+    _record_kill(db, user_id, slot, enemy_id, dict(rewards, attack_xp=attack_gained),
+                 level, now_ms // 1000)
 
     db.commit()
 
@@ -8156,8 +8748,13 @@ def combat_kill():
         "bag_id": bag_id,
         "enemy_id": enemy_id,
         "xp_gained": rewards["xp"],
-        "attack_xp_gained": rewards["attack_xp"],
+        # WHAT WAS BANKED, specialty included, and where it left the skill -
+        # the client sets its attack bar to these rather than adding up its
+        # own, so the screen and the record cannot drift apart.
+        "attack_xp_gained": attack_gained,
         "attack_level": attack_level,
+        "attack_xp": attack_xp,
+        "attack_xp_to_next": gamedata.xp_needed_for_skill_level("attack", attack_level),
         "attack_levelled_up": attack_levels > 0,
         "levels_gained": levels_gained,
         "level": level,
@@ -8734,7 +9331,7 @@ def staff_grant():
     if written is None:
         return {
             "error": "Conflict",
-            "message": "Your backpack is full (%d slots)." % CARRY_CAPACITY,
+            "message": "Your backpack is full (%d slots)." % INVENTORY_CAPACITY,
         }, 409
 
     # IN THE SAME TRANSACTION AS THE GRANT. An item that appears with no line in
@@ -8802,8 +9399,12 @@ def staff_teleport():
     # WHERE. Defaults to the caller's own area, because "come here" is the
     # thing a dev wants nine times out of ten and typing your own location is
     # a step with nothing to gain.
-    mine = db.execute("SELECT area FROM saves WHERE user_id = ? LIMIT 1", (g.user["id"],)).fetchone()
-    area = str(payload.get("area", "") or (mine["area"] if mine is not None else "elusion")).strip()
+    #
+    # THE AREA OF THE CHARACTER BEING PLAYED. This read `LIMIT 1` with no
+    # ORDER BY, which is whichever save SQLite happened to return first - not
+    # even the latest - so "bring everyone to me" could send them to where an
+    # alt was parked.
+    area = str(payload.get("area", "") or _playing_area(db, g.user["id"]) or "elusion").strip()
     if area == "":
         area = "elusion"
 
@@ -9020,12 +9621,184 @@ def staff_powers():
     }, 200
 
 
+# =============================================================================
+# THE STAFF LIST AND THE MODERATION RECORD, FOR A SERVER THAT IS NOT SMALL
+# =============================================================================
+#
+# The staff panel used to ask for every account on the server, every ten
+# seconds for as long as it was open, and search and sort them on the client.
+# Fine at forty accounts; at forty thousand it is the server denying service to
+# itself, and the panel is open exactly when things are busy. So the list
+# answers a PAGE - a search, a filter, a cursor and a limit - and the client
+# asks for the next page when somebody scrolls to it.
+#
+# KEYSET, NOT OFFSET. "Skip 3,000 rows" makes SQLite walk 3,000 rows to throw
+# them away, and a row added or removed between two pages shifts every later
+# one - a player registering while a mod pages through the list pushes somebody
+# else off the edge of a page, unseen. "Names after zed_7" is one index seek
+# and cannot skip anyone.
+
+STAFF_PAGE_DEFAULT = 50
+STAFF_PAGE_MAX = 200
+
+# Every filter is a WHERE clause, never a Python filter over a fetched page:
+# filtering after the LIMIT hands back a page of three when fifty matched
+# further down, and "more" would be a lie in both directions.
+STAFF_LIST_SHOWS = ("all", "online", "banned", "staff")
+
+# EVERY ACTION NAME log_staff_action() IS CALLED WITH. The log's filter checks
+# against it, so a typo answers 400 rather than an empty page that reads as
+# "nobody has ever been banned", and the route hands it to the client so the
+# panel's dropdown is not a second copy. test_moderation.py reads every
+# log_staff_action() call in this file and fails on a name missing from here.
+STAFF_ACTION_KINDS = (
+    "ban", "unban", "kick", "warn", "note", "role",
+    "grant", "teleport", "chat_delete",
+    "guild_rename", "guild_disband",
+    "maintenance", "minbuild", "pvp",
+)
+
+# WRITTEN FOR THE PEOPLE WHO CAN ACT ON THE ACCOUNT, NOT FOR THE ACCOUNT.
+#
+# A note or a warning is an opinion about a person, kept so the next member of
+# staff to meet them does not start from nothing. It is read under the rule
+# that already guards IP addresses - can_act_on(), strictly above - so a mod
+# reads the notes on players and not the notes on other mods, and nobody ever
+# reads the notes about themselves. The player never sees either: no route a
+# player can reach reads staff_actions at all.
+#
+# A ban is not private. The banned player is told why, and every mod can
+# already see ban state on the list, so the rest of the log is open to staff.
+STAFF_PRIVATE_KINDS = ("note", "warn")
+
+# The same ceiling as a ban reason, for the same reader.
+STAFF_NOTE_MAX = 500
+
+# How many are online right now, for the heading over the list. A constant so
+# test_moderation.py can ask SQLite for the plan of this exact statement.
+STAFF_ONLINE_COUNT_SQL = (
+    "SELECT COUNT(DISTINCT user_id) FROM sessions"
+    " WHERE last_seen_at >= ? AND expires_at > ?"
+)
+
+# What the account list counts against each name, so a repeat offender stands
+# out on the list before anybody opens their record.
+STAFF_RECORD_KINDS = ("ban", "kick", "warn", "note")
+
+
+def _query_int(name, default, low, high):
+    """An integer query parameter, or None when it is not one in [low, high]."""
+    raw = request.args.get(name, "").strip()
+    if raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if low <= value <= high else None
+
+
+def _like_contains(text):
+    """
+    A LIKE pattern matching `text` anywhere, with LIKE's own wildcards escaped.
+
+    `_` is a wildcard to LIKE and a legal username character, so an unescaped
+    search for "a_b" also finds "axb" - on a server where half the names have
+    an underscore in them.
+    """
+    escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return "%" + escaped + "%"
+
+
+def _rank_level_sql(alias):
+    """
+    role_for() as SQL: the ladder position of users row `alias`, as (sql, params).
+
+    Built from ROLES and OWNER_USERNAME rather than typed out, so a rank added
+    to the ladder is a rank this understands. The owner is decided by name
+    before the column, exactly like role_for(), so a column reading 'owner'
+    counts as a player here too. NULL for a row that is not there - a LEFT JOIN
+    onto an account since deleted - which callers read as a player.
+    """
+    whens = []
+    params = []
+    if OWNER_USERNAME:
+        # users.username is COLLATE NOCASE, so this is is_owner()'s
+        # case-insensitive match, not a second rule beside it.
+        whens.append("WHEN %s.username = ? THEN %d" % (alias, ROLES.index("owner")))
+        params.append(OWNER_USERNAME)
+    for name in SETTABLE_ROLES:
+        if name != DEFAULT_ROLE:
+            whens.append("WHEN %s.role = '%s' THEN %d" % (alias, name, ROLES.index(name)))
+    sql = "(CASE WHEN %s.id IS NULL THEN NULL %s ELSE %d END)" % (
+        alias, " ".join(whens), ROLES.index(DEFAULT_ROLE))
+    return sql, params
+
+
+def _staff_users_query(q, show, after, limit, now):
+    """
+    The staff list's SQL: (page_sql, page_params, count_sql, count_params).
+
+    ONE FUNCTION FOR THE ROUTE AND FOR THE TEST. test_moderation.py asks SQLite
+    for the plan of exactly this statement, because a plan checked on a copy of
+    a query proves the copy.
+    """
+    where = []
+    params = []
+
+    if q:
+        # A SUBSTRING, NOT A PREFIX. A mod has "sniper" off a chat log and the
+        # name is xXsniperXx. That makes it a scan of the name index rather than
+        # a seek - on the users table, for a staff-only route, typed rather
+        # than polled - which is the right trade.
+        where.append("u.username LIKE ? ESCAPE '\\'")
+        params.append(_like_contains(q))
+
+    if show == "online":
+        # The same test as the "online" flag on each row below, so a row the
+        # filter admits never says it is offline.
+        where.append("u.id IN (SELECT user_id FROM sessions"
+                     " WHERE last_seen_at >= ? AND expires_at > ?)")
+        params += [now - ONLINE_WINDOW_SECONDS, now]
+    elif show == "banned":
+        # ban_state()'s rule - flagged, and permanent or not yet expired - so a
+        # served sentence drops off this filter the moment it is up.
+        where.append("u.is_banned = 1 AND (u.ban_expires_at IS NULL OR u.ban_expires_at > ?)")
+        params.append(now)
+    elif show == "staff":
+        level, level_params = _rank_level_sql("u")
+        where.append("%s > %d" % (level, ROLES.index(DEFAULT_ROLE)))
+        params += level_params
+
+    # The count is the whole match, not what is left after the cursor.
+    count_sql = "SELECT COUNT(*) FROM users u"
+    if where:
+        count_sql += " WHERE " + " AND ".join(where)
+    count_params = list(params)
+
+    if after:
+        # COLLATE NOCASE from the column, which is also the order of the index
+        # the ORDER BY walks, so "after" means after in the order shown.
+        where.append("u.username > ?")
+        params.append(after)
+
+    page_sql = "SELECT * FROM users u"
+    if where:
+        page_sql += " WHERE " + " AND ".join(where)
+    # One row past the page: whether it exists is what "more" means, with no
+    # second query to ask.
+    page_sql += " ORDER BY u.username LIMIT ?"
+    params.append(limit + 1)
+
+    return page_sql, params, count_sql, count_params
+
+
 @app.get("/api/staff/users")
 @require_auth
 @require_role("mod")
 def list_accounts():
     """
-    Every account, with rank, ban state and whether they are online
+    One page of accounts, with rank, ban state, record and whether they are online
     ---
     tags:
       - Moderation
@@ -9034,33 +9807,87 @@ def list_accounts():
         name: Authorization
         type: string
         required: true
+      - in: query
+        name: q
+        type: string
+        description: "Any part of a username, any case."
+      - in: query
+        name: show
+        type: string
+        description: "all (default), online, banned or staff"
+      - in: query
+        name: after
+        type: string
+        description: "The previous page's next_after."
+      - in: query
+        name: limit
+        type: integer
+        description: "1-200, default 50"
     responses:
       200:
-        description: The account list
+        description: The page, whether there is more, and how many matched
+      400:
+        description: An unknown filter, or a limit out of range
       401:
         description: Missing, invalid or expired token
     """
-    db = get_db()
-    rows = db.execute(
-        "SELECT * FROM users ORDER BY id"
-    ).fetchall()
+    q = request.args.get("q", "").strip()
+    show = request.args.get("show", "").strip().lower() or "all"
+    after = request.args.get("after", "").strip()
+    limit = _query_int("limit", STAFF_PAGE_DEFAULT, 1, STAFF_PAGE_MAX)
 
-    # PRESENCE IN ONE QUERY, not one per account. Only unexpired sessions: an
-    # expired row is dead whatever its last heartbeat says.
+    if show not in STAFF_LIST_SHOWS:
+        return bad_request("show must be one of: %s" % ", ".join(STAFF_LIST_SHOWS))
+    if limit is None:
+        return bad_request("limit must be a whole number 1-%d" % STAFF_PAGE_MAX)
+    if len(q) > 64 or len(after) > 64:
+        return bad_request("q and after are at most 64 characters")
+
+    db = get_db()
     now = int(time.time())
-    seen = {
-        int(r["user_id"]): int(r["last_seen"] or 0)
+
+    page_sql, page_params, count_sql, count_params = _staff_users_query(
+        q, show, after, limit, now)
+    rows = db.execute(page_sql, page_params).fetchall()
+    more = len(rows) > limit
+    rows = rows[:limit]
+
+    # PRESENCE AND RECORD FOR THIS PAGE, one query each - not one per account,
+    # and not for the whole server. Only unexpired sessions: an expired row is
+    # dead whatever its last heartbeat says.
+    ids = [int(row["id"]) for row in rows]
+    seen = {}
+    record = {}
+    if ids:
+        marks = ",".join("?" * len(ids))
         for r in db.execute(
             "SELECT user_id, MAX(last_seen_at) AS last_seen FROM sessions"
-            " WHERE expires_at > ? GROUP BY user_id",
-            (now,),
-        ).fetchall()
-    }
+            " WHERE expires_at > ? AND user_id IN (%s) GROUP BY user_id" % marks,
+            [now] + ids,
+        ).fetchall():
+            seen[int(r["user_id"])] = int(r["last_seen"] or 0)
+
+        kind_marks = ",".join("?" * len(STAFF_RECORD_KINDS))
+        for r in db.execute(
+            "SELECT target_id, action, COUNT(*) AS n FROM staff_actions"
+            " WHERE target_id IN (%s) AND action IN (%s)"
+            " GROUP BY target_id, action" % (marks, kind_marks),
+            ids + list(STAFF_RECORD_KINDS),
+        ).fetchall():
+            record.setdefault(int(r["target_id"]), {})[r["action"]] = int(r["n"])
 
     accounts = []
     for row in rows:
         ban = ban_state(row)
         last_seen = seen.get(int(row["id"]), 0)
+        actionable = can_act_on(g.user, row)
+        tally = dict(record.get(int(row["id"]), {}))
+        if not actionable:
+            # The private kinds are counted under their own rule - see
+            # STAFF_PRIVATE_KINDS. A count is not the text, but "3 warnings"
+            # on another mod's row is the notes about them in summary.
+            for kind in STAFF_PRIVATE_KINDS:
+                tally.pop(kind, None)
         accounts.append({
             "id": row["id"],
             "username": row["username"],
@@ -9069,16 +9896,272 @@ def list_accounts():
             "ban": ban,
             # Whether YOU can act on this person, so a client can grey out the
             # buttons rather than offering them and being refused.
-            "actionable": can_act_on(g.user, row),
+            "actionable": actionable,
             # See ONLINE_WINDOW_SECONDS. 0 means no live session at all.
             "online": last_seen > 0 and now - last_seen <= ONLINE_WINDOW_SECONDS,
             "last_seen_at": last_seen,
+            "record": tally,
         })
 
-    # THE SERVER'S CLOCK, so "last seen 4 min ago" is worked out against the
-    # same clock that wrote last_seen_at - a client whose own clock is off by
-    # an hour would otherwise say so about everyone.
-    return {"accounts": accounts, "now": now}, 200
+    matched = int(db.execute(count_sql, count_params).fetchone()[0])
+    online = int(db.execute(
+        STAFF_ONLINE_COUNT_SQL, (now - ONLINE_WINDOW_SECONDS, now),
+    ).fetchone()[0])
+
+    return {
+        "accounts": accounts,
+        # THE SERVER'S CLOCK, so "last seen 4 min ago" is worked out against
+        # the same clock that wrote last_seen_at - a client whose own clock is
+        # off by an hour would otherwise say so about everyone.
+        "now": now,
+        "more": more,
+        "next_after": accounts[-1]["username"] if more else None,
+        "matched": matched,
+        "online": online,
+        "show": show,
+        "q": q,
+        "limit": limit,
+    }, 200
+
+
+def _log_subject_sql(name, id_column, name_column):
+    """
+    How the log finds entries about, or by, `name`: (sql, params).
+
+    BY ID WHEN THE ACCOUNT EXISTS. The id is what the entry was written
+    against, so a player cannot be confused with a guild that shares their
+    name - guild actions name the guild and carry no id.
+
+    BY NAME WHEN IT DOES NOT. Names are stored beside ids precisely so the log
+    still answers after an account is gone, and "server" and "everyone" never
+    had an account to begin with.
+    """
+    row = get_db().execute(
+        "SELECT id FROM users WHERE username = ?", (name,)
+    ).fetchone()
+    if row is not None:
+        return "sa.%s = ?" % id_column, [int(row["id"])]
+    return "sa.%s = ? COLLATE NOCASE" % name_column, [name]
+
+
+def _staff_log_query(viewer, player="", staff="", kind="", before=0, limit=STAFF_PAGE_DEFAULT):
+    """
+    The moderation log's SQL: (page_sql, page_params, summary_sql, summary_params).
+
+    The summary is the same WHERE without the kind and the cursor - how many of
+    each thing the whole record holds, not how many are on this page.
+    """
+    level_sql, level_params = _rank_level_sql("t")
+    kind_marks = ",".join("?" * len(STAFF_PRIVATE_KINDS))
+
+    # THE PRIVACY RULE, IN THE QUERY. Filtering private rows out in Python
+    # after the LIMIT would shorten pages at random and let "more" be wrong;
+    # here a page is always a full page of what this viewer may read.
+    where = ["(sa.action NOT IN (%s) OR COALESCE(%s, %d) < ?)" % (
+        kind_marks, level_sql, ROLES.index(DEFAULT_ROLE))]
+    params = list(STAFF_PRIVATE_KINDS) + level_params + [ROLES.index(role_for(viewer))]
+
+    if player:
+        clause, extra = _log_subject_sql(player, "target_id", "target_name")
+        where.append(clause)
+        params += extra
+    if staff:
+        clause, extra = _log_subject_sql(staff, "actor_id", "actor_name")
+        where.append(clause)
+        params += extra
+
+    base = "FROM staff_actions sa LEFT JOIN users t ON t.id = sa.target_id WHERE "
+    summary_sql = ("SELECT sa.action AS action, COUNT(*) AS n " + base
+                   + " AND ".join(where) + " GROUP BY sa.action")
+    summary_params = list(params)
+
+    if kind:
+        where.append("sa.action = ?")
+        params.append(kind)
+    if before:
+        where.append("sa.id < ?")
+        params.append(before)
+
+    page_sql = ("SELECT sa.id, sa.created_at, sa.actor_name, sa.action,"
+                " sa.target_name, sa.detail " + base + " AND ".join(where)
+                + " ORDER BY sa.id DESC LIMIT ?")
+    params.append(limit + 1)
+
+    return page_sql, params, summary_sql, summary_params
+
+
+@app.get("/api/staff/actions")
+@require_auth
+@require_role("mod")
+def staff_action_log():
+    """
+    The moderation log, newest first, one page at a time
+    ---
+    tags:
+      - Moderation
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: query
+        name: player
+        type: string
+        description: "Only entries about this account (any case)."
+      - in: query
+        name: staff
+        type: string
+        description: "Only entries by this member of staff (any case)."
+      - in: query
+        name: action
+        type: string
+        description: "Only this kind - one of the response's `kinds`."
+      - in: query
+        name: before
+        type: integer
+        description: "The previous page's next_before."
+      - in: query
+        name: limit
+        type: integer
+        description: "1-200, default 50"
+    responses:
+      200:
+        description: A page of entries, whether there is more, and with `player` a tally of that record
+      400:
+        description: An unknown action, or a cursor or limit out of range
+      401:
+        description: Missing, invalid or expired token
+    """
+    # THE REASON THIS EXISTS. staff_actions has recorded every moderation act
+    # since the first day, and the only way to read it was sqlite3 on the box
+    # holding elusion.db - or twenty rows at a time through one account's view.
+    # "What happened while I was away", "has anybody warned this player
+    # before", "what has the new mod been doing" were all unanswerable for
+    # anybody but the owner at a terminal. A log nobody can read is not the
+    # review that makes delegating safe; it is a promise of one.
+    player = request.args.get("player", "").strip()
+    staff = request.args.get("staff", "").strip()
+    kind = request.args.get("action", "").strip().lower()
+    before = _query_int("before", 0, 0, 2 ** 62)
+    limit = _query_int("limit", STAFF_PAGE_DEFAULT, 1, STAFF_PAGE_MAX)
+
+    if kind and kind not in STAFF_ACTION_KINDS:
+        return bad_request("action must be one of: %s" % ", ".join(STAFF_ACTION_KINDS))
+    if before is None:
+        return bad_request("before must be a whole number, 0 or more")
+    if limit is None:
+        return bad_request("limit must be a whole number 1-%d" % STAFF_PAGE_MAX)
+    if len(player) > 64 or len(staff) > 64:
+        return bad_request("player and staff are at most 64 characters")
+
+    db = get_db()
+    page_sql, page_params, summary_sql, summary_params = _staff_log_query(
+        g.user, player, staff, kind, before, limit)
+
+    rows = db.execute(page_sql, page_params).fetchall()
+    more = len(rows) > limit
+    entries = [{
+        "id": int(r["id"]),
+        "at": int(r["created_at"]),
+        "by": r["actor_name"],
+        "action": r["action"],
+        "target": r["target_name"],
+        "detail": r["detail"],
+    } for r in rows[:limit]]
+
+    body = {
+        "actions": entries,
+        "more": more,
+        "next_before": entries[-1]["id"] if more else None,
+        "kinds": list(STAFF_ACTION_KINDS),
+        "now": int(time.time()),
+    }
+
+    if player:
+        # THE RECORD AT A GLANCE: "2 bans, 1 kick, 3 warnings" answers "is this
+        # the first time" before anybody reads a line of it.
+        body["summary"] = {
+            r["action"]: int(r["n"])
+            for r in db.execute(summary_sql, summary_params).fetchall()
+        }
+
+    return body, 200
+
+
+@app.post("/api/staff/note")
+@require_auth
+@require_role("mod")
+def staff_note():
+    """
+    Write a staff-only note or warning onto an account's record
+    ---
+    tags:
+      - Moderation
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [username, text]
+          properties:
+            username: {type: string}
+            text:     {type: string, description: "1-500 characters"}
+            kind:     {type: string, description: "note (default) or warn"}
+    responses:
+      200:
+        description: The entry as recorded
+      400:
+        description: Empty or over-long text, or an unknown kind
+      404:
+        description: No such account, one you may not act on, or not staff
+      401:
+        description: Missing, invalid or expired token
+    """
+    # THE SANCTION BELOW A KICK, and the memory between shifts. A mod who told
+    # somebody to stop had nowhere to write it down, so the next mod started
+    # from nothing and a player could collect a first warning from every one
+    # of them. A warning here is a record that one was given - the player is
+    # not sent anything, because what they were told was said to them already,
+    # by a person, in the game.
+    #
+    # REACH, like every sanction: _moderation_target() is can_act_on(), so a
+    # note is only ever written by somebody who could read it back.
+    payload = request.get_json(silent=True) or {}
+
+    target, error = _moderation_target(payload)
+    if error is not None:
+        return error
+
+    kind = str(payload.get("kind", "") or "note").strip().lower()
+    if kind not in STAFF_PRIVATE_KINDS:
+        return bad_request("kind must be one of: %s" % ", ".join(STAFF_PRIVATE_KINDS))
+
+    # One line. The panel shows a note as a row in a list, and a pasted block
+    # with newlines in it would be a row that swallows the rows under it.
+    text = " ".join(str(payload.get("text", "")).split())
+    if not text or len(text) > STAFF_NOTE_MAX:
+        return bad_request("text must be 1-%d characters" % STAFF_NOTE_MAX)
+
+    db = get_db()
+    log_staff_action(g.user, kind, target["username"], target["id"], text)
+    entry_id = int(db.execute("SELECT last_insert_rowid()").fetchone()[0])
+    db.commit()
+
+    return {
+        "entry": {
+            "id": entry_id,
+            "at": int(time.time()),
+            "by": g.user["username"],
+            "action": kind,
+            "target": target["username"],
+            "detail": text,
+        },
+    }, 200
 
 
 @app.get("/api/staff/user/<username>")
@@ -9138,6 +10221,10 @@ def staff_read_user(username):
     may_see_addresses = can_act_on(g.user, row)
 
     characters = []
+    # WHICH ONE THEY ARE ON, so a moderator reading four characters knows which
+    # of them was in the fight being reported - the same rule the trade window
+    # and the lists use (_playing_slot).
+    playing_slot = _playing_slot(db, int(row["id"]))
     for save in db.execute(
         # AREA, AND NOTHING FINER, because that is all `saves` holds. An earlier
         # pass added "x, y" here for the owner panel's "go to them" and broke
@@ -9155,6 +10242,7 @@ def staff_read_user(username):
             "level": int(save["level"]),
             "area": save["area"],
             "updated_at": int(save["updated_at"] or 0),
+            "playing": int(save["slot"]) == playing_slot,
         })
 
     # LOGINS. Recent rows for the timeline, plus a summary so a long quiet
@@ -9202,10 +10290,19 @@ def staff_read_user(username):
 
     # WHAT STAFF HAVE ALREADY DONE TO THEM. A second mod arriving at the same
     # account should see the first one's decision before making their own.
+    #
+    # Notes and warnings only for somebody who could act on the account - the
+    # rule GET /api/staff/actions applies, see STAFF_PRIVATE_KINDS. Without it
+    # this route was a side door: a mod looking up another mod read what a dev
+    # had written about them. ORDER BY id, not created_at: two entries in the
+    # same second are still in the order they were written.
+    private_marks = ",".join("?" * len(STAFF_PRIVATE_KINDS))
     history = []
     for entry in db.execute(
         "SELECT action, actor_name, detail, created_at FROM staff_actions"
-        " WHERE target_id = ? ORDER BY created_at DESC LIMIT 20", (row["id"],)
+        " WHERE target_id = ? AND (? OR action NOT IN (%s))"
+        " ORDER BY id DESC LIMIT 20" % private_marks,
+        [row["id"], 1 if may_see_addresses else 0] + list(STAFF_PRIVATE_KINDS),
     ).fetchall():
         history.append({
             "action": entry["action"],
@@ -9354,6 +10451,14 @@ def server_status():
         # the world, not about an account, and the login screen is exactly where
         # somebody wants to know before they walk in.
         "pvp": pvp_enabled(),
+        # THE BUILD GATE, ON THE ONE ROUTE IT DOES NOT GATE. An outdated client
+        # is refused everywhere else, so this is where it finds out what it
+        # needs - and a client that is merely BEHIND, with the gate still
+        # disarmed, can say so without being refused at all. That is what makes
+        # shipping it at 0 useful rather than inert: the notice works from day
+        # one, the refusal waits until it is wanted.
+        "min_client_build": min_client_build(),
+        "current_client_build": CURRENT_CLIENT_BUILD,
     }, 200
 
 
@@ -9456,12 +10561,17 @@ def set_maintenance():
     # are not playing yet; this is the half that reaches the ones who are.
     # Posted before the sessions are ended so it is already in the table when
     # the last poll before disconnection asks for it.
-    if grace > 0:
-        post_broadcast(
-            "%s (closing in %ds - your progress is being saved)" % (message, grace),
-            "system", g.user["username"])
-    else:
-        post_broadcast("%s (closing now)" % message, "system", g.user["username"])
+    #
+    # THE COUNTDOWN IS NEVER THE PART CUT. post_broadcast() trims the whole line
+    # to MAX_BROADCAST_LENGTH, and the owner's message may already be 200 - so
+    # a long message used to push "(closing in 60s - ...)" off the end, and the
+    # players lost the one thing in the notice they had to act on. The message
+    # is what gives way now, with an ellipsis to say so.
+    tail = (" (closing in %ds - your progress is being saved)" % grace) if grace > 0 \
+        else " (closing now)"
+    room = MAX_BROADCAST_LENGTH - len(tail)
+    said = message if len(message) <= room else message[:room - 3].rstrip() + "..."
+    post_broadcast(said + tail, "system", g.user["username"])
 
     ended = _end_all_player_sessions(db) if grace == 0 else 0
 
@@ -9483,6 +10593,86 @@ def set_maintenance():
         "sessions_ended": ended,
     }, 200
 
+
+
+@app.post("/api/server/minbuild")
+@require_auth
+@require_owner
+def set_min_build():
+    """
+    Set the oldest client build allowed to connect (owner only)
+    ---
+    tags:
+      - Status
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [build]
+          properties:
+            build: {type: integer, description: "oldest build allowed; 0 disarms the gate"}
+    responses:
+      200:
+        description: The gate as it now stands
+      400:
+        description: Malformed body
+      404:
+        description: Not the owner (the same 404 every owner route gives)
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+    if "build" not in payload:
+        return bad_request('send {"build": 3} to require build 3 or newer, '
+                           'or {"build": 0} to let every client in')
+
+    try:
+        wanted = int(payload.get("build"))
+    except (TypeError, ValueError):
+        return bad_request("build must be a whole number")
+    if wanted < 0:
+        return bad_request("build cannot be negative")
+
+    # A MINIMUM ABOVE THE BUILD THAT EXISTS LOCKS EVERYONE OUT INCLUDING YOU,
+    # and unlike the maintenance switch there is no owner exemption to climb
+    # back in through - the gate runs before authentication, because refusing a
+    # protocol mismatch cannot depend on parsing a token that build may not
+    # know how to send. So the one typo that would need a shell on the server to
+    # undo is refused here instead.
+    if wanted > CURRENT_CLIENT_BUILD:
+        return bad_request(
+            "build %d is newer than any client that exists (current is %d). "
+            "That would refuse every player including you, and this gate runs "
+            "before authentication - there would be no way back in from the game."
+            % (wanted, CURRENT_CLIENT_BUILD))
+
+    db = get_db()
+    # Written even when unchanged, like the two switches beside it, so
+    # server_settings keeps who set it and when.
+    set_server_setting(MIN_BUILD_KEY, json.dumps({"build": wanted}),
+                       g.user["username"])
+
+    # NOT ANNOUNCED IN CHAT, and that is the difference from the PvP switch.
+    # The people this affects are the ones who cannot connect, so a broadcast
+    # reaches everybody except its audience. The client reads it off
+    # /api/status - the one route the gate never refuses - which is where a
+    # player who cannot get in is already looking.
+    log_staff_action(g.user, "minbuild", "server", None,
+                     "min client build set to %d" % wanted)
+    db.commit()
+
+    return {
+        "min_client_build": wanted,
+        "current_client_build": CURRENT_CLIENT_BUILD,
+        "armed": wanted > 0,
+    }, 200
 
 
 @app.post("/api/server/pvp")
@@ -9666,11 +10856,17 @@ def read_broadcasts():
     except (TypeError, ValueError):
         return bad_request("since must be a whole number")
 
+    # WHICH CHARACTER IS BEING PLAYED, if the client says - see stamp_presence().
+    # IGNORED WHEN MALFORMED, not refused: this request is also the heartbeat,
+    # and a 400 here reads to the client as "the server cannot be reached",
+    # which is a far worse answer to a bad slot than simply not recording it.
+    playing = parse_slot(request.args.get("slot")) if request.args.get("slot") is not None else None
+
     db = get_db()
     # AFTER THE VALIDATION, so a malformed request is answered rather than
     # recorded as a beat - and committed with the read below rather than on its
     # own, so this is one transaction, not two.
-    stamp_presence(db)
+    stamp_presence(db, playing)
     db.commit()
 
     # A FIRST POLL ASKS FOR THE TAIL, NOT THE WHOLE TABLE. since=0 means "I just
@@ -9736,6 +10932,15 @@ def read_broadcasts():
         # the whole system to answer this, which is why it is answered here
         # rather than by a second timer in the client.
         **_own_guild(db, int(g.user["id"])),
+        # THE TRADE YOU ARE IN, if any, in one line - so somebody who has not
+        # opened the trade window finds out a trade was opened WITH them. The
+        # window polls /api/trade itself, but only while it is open, and before
+        # this nothing told the other person to open it.
+        "trade": _trade_summary(db, int(g.user["id"])),
+        # AND THE RESULT OF ONE THAT FINISHED WITHOUT YOU WATCHING. See
+        # _take_resync(): whoever accepted first learns here that it went
+        # through, and gets the bag and purse it went through with.
+        "trade_resync": _take_resync(db, int(g.user["id"])),
     }, 200
 
 
@@ -9851,7 +11056,7 @@ def chat_send():
         seat = guild_membership(g.user["id"])
         if seat is None:
             return {"error": "Conflict",
-                    "message": "You are not in a guild."}, 409
+                    "message": GUILD_CHAT_NO_GUILD}, 409
         target_id = int(seat["guild_id"])
 
     new_id = post_chat(g.user, text, channel, target_id, image_id)
@@ -9871,6 +11076,7 @@ def chat_send():
         "id": int(new_id or 0),
         "by": g.user["username"],
         "role": role_for(g.user),
+        "name_hue": name_hue_of(g.user),
         "body": text[:MAX_CHAT_LENGTH],
         "channel": channel,
         "image": image_id,
@@ -9968,7 +11174,9 @@ def read_chat():
                 "now": int(time.time()),
                 "channel": channel,
                 "available": False,
-                "notice": "You are not in a guild yet.",
+                # SAYS WHERE TO GO, not only what is missing. The chat window
+                # shows this as it is; see _apply_read() in chatpanel.gd.
+                "notice": GUILD_CHAT_NO_GUILD,
                 # Present here too. A field that exists on most answers and
                 # vanishes on one is how a client ends up with a stale value
                 # it believes is current.
@@ -10428,6 +11636,27 @@ def chat_delete():
 # the database.
 INVENTORY_CAPACITY = 20
 
+# THE HOTBAR IS TEN MORE CARRIED CELLS, drawn along the bottom of the screen
+# instead of in the bag: keys 1-9 then 0 (Hotbar.SLOT_COUNT in the client's
+# src/ui/hotbar.gd). They are carry_items rows at positions INVENTORY_CAPACITY
+# to CARRY_CAPACITY - 1, so the backpack's rules are the hotbar's rules for
+# free: the ledger reconciles them, respawning deletes them, and moving a stack
+# between the bag and a key is a reorder of one array.
+#
+# It used to hold item ids pointing INTO the bag, so the same potion was drawn
+# twice - once in its bag cell, once on its key. Dragging to a key now moves the
+# item, the way equipping moves one onto the character.
+HOTBAR_SIZE = 10
+
+# Every cell a character carries: the bag, then the hotbar.
+#
+# BAG-ONLY PLACEMENT. _add_to_backpack() - loot, the shop, bank withdrawals,
+# trades, catches, cooking, a staff grant - only ever tops up or opens cells
+# below INVENTORY_CAPACITY. A key holds what the player put there and nothing
+# lands on one by itself. "Your backpack is full" is therefore about the twenty,
+# and says twenty.
+CARRY_CAPACITY = INVENTORY_CAPACITY + HOTBAR_SIZE
+
 # Skills a character can have. An unknown id is refused rather than stored,
 # because a typo'd skill name would otherwise sit in the table forever, be
 # returned on every load, and never match anything the client looks for.
@@ -10513,12 +11742,17 @@ def _parse_positional_items(cells, field):
     return parsed, None
 
 
-def _inventory_totals(user_id, slot):
-    """item_id -> total quantity the server currently records for this slot."""
+def _inventory_totals(user_id, slot, below=None):
+    """item_id -> total quantity the server currently records for this slot.
+
+    `below` counts only cells at positions under it - the cells a backpack
+    write is replacing. See write_inventory() for why that matters."""
     totals = {}
+    if below is None:
+        below = CARRY_CAPACITY
     rows = get_db().execute(
-        "SELECT item_id, quantity FROM carry_items WHERE user_id = ? AND slot = ?",
-        (user_id, slot),
+        "SELECT item_id, quantity FROM carry_items WHERE user_id = ? AND slot = ? AND position < ?",
+        (user_id, slot, int(below)),
     ).fetchall()
     for row in rows:
         totals[row["item_id"]] = totals.get(row["item_id"], 0) + int(row["quantity"])
@@ -10602,7 +11836,7 @@ def _reconcile_bank(user, claimed):
     return kept
 
 
-def _reconcile_inventory(user, slot, claimed):
+def _reconcile_inventory(user, slot, claimed, covered=None):
     """
     SERVER AUTHORITY OVER GAINS. Returns the claimed backpack with any item the
     client holds MORE of than the server recorded trimmed back down to what the
@@ -10629,7 +11863,7 @@ def _reconcile_inventory(user, slot, claimed):
     if role_at_least(user, "mod"):
         return claimed
 
-    kept, trims = _trim_to_recorded(claimed, _inventory_totals(user["id"], slot))
+    kept, trims = _trim_to_recorded(claimed, _inventory_totals(user["id"], slot, covered))
     if trims:
         detail = ", ".join("%s -%d" % (i, q) for i, q in sorted(trims.items()))
         print("[LEDGER] trimmed unearned items for %s slot %d: %s"
@@ -10646,26 +11880,33 @@ def _slot_exists(user_id, slot):
 
 def inventory_payload(user_id, slot):
     """
-    The backpack as a POSITIONAL ARRAY of length INVENTORY_CAPACITY, with null
-    in every empty cell - not as a list of the items that happen to exist.
+    Everything carried as a POSITIONAL ARRAY of length CARRY_CAPACITY, with
+    null in every empty cell - not as a list of the items that happen to exist.
+    The first INVENTORY_CAPACITY cells are the bag and the rest are the hotbar's
+    keys, in order.
 
-    The client's inventory is an array where index IS the grid cell, and
-    returning a packed list would make the client responsible for rebuilding
-    the gaps. It would get that right the first time and wrong the first time
-    someone changed the capacity.
+    The client's inventory is an array where index IS the cell, and returning a
+    packed list would make the client responsible for rebuilding the gaps. It
+    would get that right the first time and wrong the first time someone changed
+    the capacity.
+
+    THE HOTBAR RIDES IN THE SAME ARRAY on purpose. Every endpoint that changes
+    what a character carries answers with this, and the client applies it in one
+    place - so no response can update the bag and leave a key showing an item
+    the server has just taken off it.
     """
     rows = get_db().execute(
         "SELECT position, item_id, quantity FROM carry_items WHERE user_id = ? AND slot = ? ORDER BY position",
         (user_id, slot),
     ).fetchall()
 
-    cells = [None] * INVENTORY_CAPACITY
+    cells = [None] * CARRY_CAPACITY
     for row in rows:
         position = int(row["position"])
         # Defensive: a row outside the current capacity means the capacity was
         # reduced after it was written. Drop it from the view rather than
         # crashing on the index - the next write prunes it for real.
-        if 0 <= position < INVENTORY_CAPACITY:
+        if 0 <= position < CARRY_CAPACITY:
             cells[position] = {"item_id": row["item_id"], "quantity": int(row["quantity"])}
 
     return cells
@@ -10793,7 +12034,7 @@ def shop_buy():
         db.rollback()
         return {
             "error": "Conflict",
-            "message": "Your backpack is full (%d slots)." % CARRY_CAPACITY,
+            "message": "Your backpack is full (%d slots)." % INVENTORY_CAPACITY,
         }, 409
 
     # THE BURN. Negative delta, through gold_delta() so it lands in the ledger
@@ -10924,6 +12165,211 @@ TRADE_MAX_ITEM_TYPES = 8
 # which means an abandoned trade costs nothing until it is in the way.
 TRADE_EXPIRY_SECONDS = 600
 
+# How long a CANCELLED trade is kept. A finished trade is kept for good - it is
+# the record a moderator needs when somebody says they were scammed - but a
+# cancelled one is two people who talked and walked away, and nothing reads it
+# after a week. Pruned when a new trade is opened, like loot bags on a kill:
+# the thing making rows is the thing that clears them, and there is no sweeper.
+TRADE_CANCELLED_KEPT_SECONDS = 7 * 24 * 60 * 60
+
+# How many finished trades GET /api/trade/history returns. Enough to answer
+# "what did I just do" and "did that trade yesterday go through"; a full
+# ledger is a moderation question, not a panel.
+TRADE_HISTORY_SHOWN = 10
+
+
+# WHICH CHARACTER AN ACCOUNT IS PLAYING, as one SQL expression. {user} is
+# whatever names the account in the query it lands in - "?" on its own, or
+# "saves.user_id" inside a query that is already walking saves. It takes two
+# parameters, in order: the online cutoff, then now. See _playing_slot().
+PLAYING_SLOT_SQL = (
+    "COALESCE("
+    "(SELECT ps.playing_slot FROM sessions ps"
+    "   JOIN saves pv ON pv.user_id = ps.user_id AND pv.slot = ps.playing_slot"
+    "  WHERE ps.user_id = {user} AND ps.playing_slot IS NOT NULL"
+    "    AND ps.last_seen_at > ? AND ps.expires_at > ?"
+    "  ORDER BY ps.last_seen_at DESC LIMIT 1),"
+    "(SELECT pl.slot FROM saves pl WHERE pl.user_id = {user}"
+    "  ORDER BY pl.updated_at DESC, pl.slot ASC LIMIT 1))"
+)
+
+
+def _playing_slot(db, user_id):
+    """
+    The character this account is playing right now, or None if it has none.
+
+    WHAT THE CLIENT SAID, WHILE IT IS STILL SAYING IT. The broadcast poll
+    carries the slot (see stamp_presence), so a session seen inside
+    ONLINE_WINDOW_SECONDS whose playing_slot still has a save behind it is the
+    answer - freshest session first, because one account can be logged in on
+    two machines and the one that spoke last is the one at the keyboard.
+
+    OTHERWISE THE LAST SAVE, which is what every other "which character" in
+    this file asks (the online list, the guild roster). It is right most of
+    the time and wrong in exactly the moment that mattered here: the minute
+    after somebody picks a different character, before anything has changed
+    enough to be saved.
+
+    THE RULE IS PLAYING_SLOT_SQL, and this runs it. The nearby list needs the
+    same answer for twenty accounts inside one query, and a Python copy of the
+    rule beside a SQL copy is two opinions about who is playing whom.
+    """
+    now = int(time.time())
+    row = db.execute(
+        "SELECT %s AS slot" % PLAYING_SLOT_SQL.format(user="?"),
+        (user_id, now - ONLINE_WINDOW_SECONDS, now, user_id),
+    ).fetchone()
+    return None if row is None or row["slot"] is None else int(row["slot"])
+
+
+def _playing_area(db, user_id):
+    """The area of the character this account is playing, or "" with none."""
+    slot = _playing_slot(db, user_id)
+    if slot is None:
+        return ""
+    row = db.execute("SELECT area FROM saves WHERE user_id = ? AND slot = ?",
+                     (user_id, slot)).fetchone()
+    return str(row["area"] or "") if row is not None else ""
+
+
+def _trade_summary(db, user_id):
+    """
+    The caller's open trade in one line, for the broadcast poll - or None.
+
+    ENOUGH TO SAY "somebody wants to trade" AND NOTHING MORE. The items and the
+    gold are the trade window's business and it reads them itself; this is
+    what gets the window opened in the first place.
+    """
+    trade = _trade_find_open(db, user_id)
+    if trade is None or _trade_expired(trade):
+        return None
+    side = _trade_side_of(trade, user_id)
+    other = "b" if side == "a" else "a"
+    row = db.execute("SELECT username FROM users WHERE id = ?",
+                     (int(trade["%s_user" % other]),)).fetchone()
+    return {
+        "trade_id": trade["trade_id"],
+        "with": row["username"] if row is not None else "?",
+        # SIDE A IS WHOEVER OPENED IT. So b is "they asked you".
+        "from_them": side == "b",
+        "they_accepted": bool(int(trade["%s_confirmed" % other])),
+        "you_accepted": bool(int(trade["%s_confirmed" % side])),
+    }
+
+
+def _mark_resync(db, trade):
+    """
+    Flag both characters in a finished trade as holding a stale picture.
+
+    THE BUG THIS EXISTS FOR, reproduced before it was fixed: whoever accepts
+    FIRST is not the one whose request runs the trade. Their client is told
+    nothing, goes on showing the bag it had, and the next time they so much as
+    drag a potion it saves that bag with PUT /api/character/inventory - which
+    is a whole-bag replace. The item they received is not in it, so the replace
+    deletes it. The trade worked and the player lost what they traded for.
+
+    BOTH SIDES, not only the one who was not asking. The one who was asking is
+    handed the result in the confirm response - unless that response is lost
+    to a timeout, and then they are in exactly the same position. Flagging them
+    too costs, in the ordinary case, one redundant re-read of a bag that
+    already matches.
+
+    NO COMMIT. This is part of _execute_trade's transaction: a trade is never
+    finished without the flag, and the flag never outlives a rolled-back trade.
+    """
+    for prefix in ("a", "b"):
+        db.execute(
+            "UPDATE saves SET resync_trade = ? WHERE user_id = ? AND slot = ?",
+            (trade["trade_id"], int(trade["%s_user" % prefix]), int(trade["%s_slot" % prefix])),
+        )
+
+
+def _take_resync(db, user_id, slot=None):
+    """
+    What a flagged character now holds, and clear the flag. None if in step.
+
+    {"slot", "gold", "inventory", "trade"} - the server's bag and purse, and a
+    line about the trade that changed them. Delivered by whichever of three
+    routes reaches the client first: the trade window's poll, the broadcast
+    poll, or a refused bag write. See _mark_resync().
+
+    CLEARED ON DELIVERY. What is delivered is read NOW, not at the moment of the
+    trade, so it is the latest truth and applying it twice is harmless; there is
+    no older copy that could arrive late and roll anything back.
+
+    COMMITS, because every caller is a read that would otherwise throw the
+    clearing away when the request's connection closes.
+    """
+    if slot is None:
+        row = db.execute(
+            "SELECT slot, gold, resync_trade FROM saves"
+            " WHERE user_id = ? AND resync_trade IS NOT NULL"
+            " ORDER BY updated_at DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    else:
+        row = db.execute(
+            "SELECT slot, gold, resync_trade FROM saves"
+            " WHERE user_id = ? AND slot = ? AND resync_trade IS NOT NULL",
+            (user_id, int(slot)),
+        ).fetchone()
+    if row is None:
+        return None
+
+    slot = int(row["slot"])
+    db.execute("UPDATE saves SET resync_trade = NULL WHERE user_id = ? AND slot = ?",
+               (user_id, slot))
+    db.commit()
+    return {
+        "slot": slot,
+        "gold": int(row["gold"]),
+        "inventory": inventory_payload(user_id, slot),
+        "trade": _trade_record(db, row["resync_trade"], user_id),
+    }
+
+
+def _trade_record(db, trade_id, user_id):
+    """
+    One finished trade as the person in it would describe it: who with, what
+    you gave, what you got, and what the kingdom took from you.
+
+    WORDED FROM THE CALLER'S SIDE, so a panel never has to work out whether it
+    was "a" or "b". None for a trade the caller was not in - this is handed a
+    trade_id by the server, never by a request, but it still only ever answers
+    for the person asking.
+    """
+    trade = db.execute("SELECT * FROM trades WHERE trade_id = ?", (trade_id,)).fetchone()
+    if trade is None:
+        return None
+    side = _trade_side_of(trade, user_id)
+    if side is None:
+        return None
+    other = "b" if side == "a" else "a"
+    who = db.execute(
+        "SELECT u.username, s.name FROM users u"
+        " LEFT JOIN saves s ON s.user_id = u.id AND s.slot = ?"
+        " WHERE u.id = ?",
+        (int(trade["%s_slot" % other]), int(trade["%s_user" % other])),
+    ).fetchone()
+    # WHICH OF THE CALLER'S OWN CHARACTERS it was. A player with four has four
+    # bags, and "did that trade go through" is often "on which one".
+    own = db.execute("SELECT name FROM saves WHERE user_id = ? AND slot = ?",
+                     (int(user_id), int(trade["%s_slot" % side]))).fetchone()
+    return {
+        "trade_id": trade["trade_id"],
+        "state": trade["state"],
+        "at": int(trade["updated_at"]),
+        "opened_at": int(trade["created_at"]),
+        "character": (own["name"] or "") if own is not None else "",
+        "with": who["username"] if who is not None else "?",
+        "with_name": (who["name"] or "") if who is not None else "",
+        "gave": _trade_items(db, trade["trade_id"], side),
+        "got": _trade_items(db, trade["trade_id"], other),
+        "gold_gave": int(trade["%s_gold" % side]),
+        "gold_got": int(trade["%s_gold" % other]),
+        "tax": int(trade["%s_tax" % side]),
+    }
+
 
 def _trade_side_of(trade, user_id):
     """'a', 'b', or None for somebody else's trade."""
@@ -10964,6 +12410,55 @@ def _trade_find_open(db, user_id):
     ).fetchone()
 
 
+def _trade_find_recent(db, user_id, limit, states=("done",)):
+    """The caller's most recent trades in the given states, newest first.
+
+    FROM THE CALLER, like _trade_find_open - there is no route that lets a
+    client name a trade (test_ownership.py, O-2). The first page of
+    _trade_find_page(), which holds the query."""
+    return _trade_find_page(db, user_id, limit, states)
+
+
+def _trade_find_page(db, user_id, limit, states=("done",), before=None):
+    """
+    One page of an account's trades in the given states, newest first.
+
+    `before` is (updated_at, rowid) of the last row of the previous page, or
+    None for the first. KEYSET, NEVER OFFSET: an offset re-reads every row it
+    skips, so page fifty of a busy trader's history would cost fifty pages.
+
+    ONE BOUNDED READ PER (SIDE, STATE). A player is side a of some trades and
+    side b of others, and idx_trades_a_recent / idx_trades_b_recent are ordered
+    by updated_at only WITHIN one state - so each (side, state) pair is its own
+    branch that takes its newest `limit` straight off the index and stops. Only
+    those are merged. A trader with ten thousand trades costs the same as one
+    with ten; `state IN (...)` in a single branch would have sorted all of them.
+
+    ROWID BREAKS THE TIE. updated_at is in seconds, and a trade that finished
+    and the next one called off in the same second came back in either order.
+    Rows are inserted as trades open, so the later rowid is the later trade;
+    and every index carries the rowid as its last column, so this costs the
+    index nothing.
+    """
+    branches = []
+    params = []
+    for side in ("a", "b"):
+        for state in states:
+            where = "%s_user = ? AND state = ?" % side
+            branch_params = [user_id, state]
+            if before is not None:
+                where += " AND (updated_at < ? OR (updated_at = ? AND rowid < ?))"
+                branch_params += [int(before[0]), int(before[0]), int(before[1])]
+            branches.append(
+                "SELECT * FROM (SELECT trade_id, state, updated_at, rowid AS seq FROM trades"
+                " WHERE %s ORDER BY updated_at DESC, rowid DESC LIMIT ?)" % where)
+            params += branch_params + [int(limit)]
+    return db.execute(
+        " UNION ALL ".join(branches) + " ORDER BY updated_at DESC, seq DESC LIMIT ?",
+        tuple(params + [int(limit)]),
+    ).fetchall()
+
+
 def _trade_expired(trade):
     return (int(time.time()) - int(trade["updated_at"])) > TRADE_EXPIRY_SECONDS
 
@@ -10986,32 +12481,58 @@ def _trade_payload(db, trade):
     a_value = _trade_value(a_items, int(trade["a_gold"]))
     b_value = _trade_value(b_items, int(trade["b_gold"]))
 
-    def names(user_id):
-        row = db.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
-        return row["username"] if row is not None else "?"
+    a_user, b_user = int(trade["a_user"]), int(trade["b_user"])
+
+    # ONE QUERY FOR BOTH SIDES' PRESENCE, not one each - this payload is built
+    # for every poll of every open trade window.
+    now = int(time.time())
+    seen = _presence_for(db, [a_user, b_user])
+
+    def who(user_id, slot):
+        # The character as well as the account, and the name the way every
+        # other list draws it: in the colour its owner chose, with the rank
+        # as a badge. See nametag.gd.
+        row = db.execute(
+            "SELECT u.username, u.role, u.name_hue, s.name, s.level FROM users u"
+            " LEFT JOIN saves s ON s.user_id = u.id AND s.slot = ?"
+            " WHERE u.id = ?", (slot, user_id)).fetchone()
+        if row is None:
+            return {"username": "?", "role": "player", "name_hue": None, "name": "", "level": 1}
+        return {
+            "username": row["username"],
+            "role": row["role"],
+            "name_hue": name_hue_of(row),
+            "name": row["name"] or "",
+            "level": int(row["level"] or 1),
+        }
+
+    def side(prefix, items, value, receives_value):
+        user_id, slot = int(trade["%s_user" % prefix]), int(trade["%s_slot" % prefix])
+        return {
+            **who(user_id, slot),
+            "slot": slot,
+            "items": items,
+            "gold": int(trade["%s_gold" % prefix]),
+            "confirmed": bool(int(trade["%s_confirmed" % prefix])),
+            "offering_value": value,
+            # What this side will pay: tax on what it RECEIVES, which is the
+            # other side's offer.
+            "tax": gamedata.trade_tax(receives_value) if receives_value is not None else None,
+            # STILL THERE? A trade with somebody who has closed the game can
+            # only ever be cancelled, and the window should say so rather
+            # than leave you waiting for an accept that is not coming.
+            "online": int(seen.get(user_id, 0)) > now - ONLINE_WINDOW_SECONDS,
+        }
 
     return {
         "trade_id": trade["trade_id"],
         "state": trade["state"],
-        "a": {
-            "username": names(int(trade["a_user"])),
-            "slot": int(trade["a_slot"]),
-            "items": a_items,
-            "gold": int(trade["a_gold"]),
-            "confirmed": bool(int(trade["a_confirmed"])),
-            "offering_value": a_value,
-            # What A will pay: tax on what A RECEIVES, which is B's side.
-            "tax": gamedata.trade_tax(b_value) if b_value is not None else None,
-        },
-        "b": {
-            "username": names(int(trade["b_user"])),
-            "slot": int(trade["b_slot"]),
-            "items": b_items,
-            "gold": int(trade["b_gold"]),
-            "confirmed": bool(int(trade["b_confirmed"])),
-            "offering_value": b_value,
-            "tax": gamedata.trade_tax(a_value) if a_value is not None else None,
-        },
+        # WHAT A CONFIRM MUST NAME. See trade_confirm(): accepting is agreeing
+        # to THIS revision of the offer, and the server refuses an accept that
+        # names any other.
+        "revision": int(trade["revision"]),
+        "a": side("a", a_items, a_value, b_value),
+        "b": side("b", b_items, b_value, a_value),
     }
 
 
@@ -11021,9 +12542,18 @@ def _trade_touch(db, trade_id):
     You confirm what you were shown. If one side could add an item after the
     other had agreed, 'confirmed' would mean nothing - and the version of this
     bug that ships is the one where the change is a REMOVAL.
+
+    AND THE REVISION MOVES, which is the half that closes the race. Clearing
+    the confirms only protects an accept that already happened. An accept that
+    is in flight WHILE the other side swaps their sword for a stick lands after
+    the swap, on the new offer, and nothing about it says the player never saw
+    the stick - their window polls every second and a half. So every change
+    bumps the revision, and trade_confirm() refuses an accept for any revision
+    but the current one.
     """
     db.execute(
-        "UPDATE trades SET a_confirmed = 0, b_confirmed = 0, updated_at = ?"
+        "UPDATE trades SET a_confirmed = 0, b_confirmed = 0,"
+        " revision = revision + 1, updated_at = ?"
         " WHERE trade_id = ?",
         (int(time.time()), trade_id),
     )
@@ -11073,6 +12603,7 @@ def _execute_trade(db, trade):
          one-for-one swap between two full backpacks still works
       6. move the gold as a TRANSFER, writing NO ledger rows
       7. burn the two taxes through gold_delta(), which does write rows
+      8. record the taxes on the row, and flag both bags as changed
     Any refusal rolls the whole thing back; the caller does not commit on a
     non-200.
 
@@ -11138,12 +12669,21 @@ def _execute_trade(db, trade):
             "The kingdom's cut is %d and %d; one of you cannot cover it." % (a_tax, b_tax)))
 
     # 4. TAKE. Both bags emptied of what was promised before anything is added.
+    #
+    # THE BAG BEFORE THE KEYS. An offer is a quantity, not a cell, so the
+    # server chooses which cells it comes out of - and _take_from_backpack's
+    # own order, highest position first, puts the hotbar (cells 20-29) ahead of
+    # the whole bag. Trading away three of your ten potions emptied key 1 and
+    # left the seven in the bag, so the next fight started with nothing on the
+    # key you press.
     for entry in a_items:
-        if not _take_from_backpack(a_user, a_slot, entry["item_id"], entry["quantity"]):
+        if not _take_from_backpack(a_user, a_slot, entry["item_id"], entry["quantity"],
+                                   keys_last=True):
             return _trade_refuse(db, trade_id,
                                  *bad_request("Somebody no longer has the items they offered."))
     for entry in b_items:
-        if not _take_from_backpack(b_user, b_slot, entry["item_id"], entry["quantity"]):
+        if not _take_from_backpack(b_user, b_slot, entry["item_id"], entry["quantity"],
+                                   keys_last=True):
             return _trade_refuse(db, trade_id,
                                  *bad_request("Somebody no longer has the items they offered."))
 
@@ -11178,6 +12718,13 @@ def _execute_trade(db, trade):
     if b_tax > 0:
         gold_delta(db, b_user, b_slot, -b_tax, "kingdom_tax",
                    "trade %s receiving %d" % (trade_id[:8], a_value))
+
+    # 8. THE RECORD, and the flag that makes both clients re-read their bags.
+    # The taxes go on the row so the history can say what each side paid
+    # without parsing the ledger's prose; see _mark_resync() for the flag.
+    db.execute("UPDATE trades SET a_tax = ?, b_tax = ? WHERE trade_id = ?",
+               (a_tax, b_tax, trade_id))
+    _mark_resync(db, trade)
 
     db.commit()
 
@@ -11234,22 +12781,49 @@ def trade_offer():
         return bad_request("username is required")
 
     db = get_db()
-    other = db.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+    other = db.execute("SELECT id, username FROM users WHERE username = ?", (username,)).fetchone()
     if other is None:
         return bad_request("No player called '%s'." % username)
 
     other_id = int(other["id"])
+    # THEIR NAME AS STORED, not as typed. users.username is COLLATE NOCASE, so
+    # "BOBBY" finds bobby - and every message below should say bobby.
+    username = other["username"]
     # REFUSED EXPLICITLY, not left to chance. A self-trade would run every step
     # below against one backpack, and step 4 taking from the same bag step 5
     # adds to is precisely how a duplication bug is written.
     if other_id == user_id:
         return bad_request("You cannot trade with yourself.")
 
-    to_slot = parse_slot(payload.get("to_slot", 0))
+    # SOMEBODY WHO IS THERE. A trade needs two people to press accept, and one
+    # opened with a player who has closed the game can only sit there until it
+    # expires - blocking both of you from trading with anyone else for ten
+    # minutes, with nothing on screen to say why.
+    if not _presence_for(db, [other_id]).get(other_id, 0) > int(time.time()) - ONLINE_WINDOW_SECONDS:
+        return bad_request("%s is not online." % username)
+
+    # THE CHARACTER THEY ARE PLAYING, decided here and not by the caller.
+    #
+    # to_slot used to default to 0, and the trade window sent 0 whenever a name
+    # was typed rather than picked - so typing a friend's name opened a trade
+    # with their FIRST character, whoever they were actually playing. Their
+    # window then listed the bag they were carrying while the server checked a
+    # different one, and every offer they made was refused for items they could
+    # see in front of them.
+    #
+    # A to_slot that is sent is still checked, and must name that same
+    # character: an offer is to a person at the keyboard, not to a character
+    # parked on their account.
+    to_slot = _playing_slot(db, other_id)
     if to_slot is None:
-        return bad_request("to_slot must be an integer 0-%d" % MAX_SLOT)
-    if not _slot_exists(other_id, to_slot):
-        return bad_request("%s has no character in slot %d." % (username, to_slot))
+        return bad_request("%s has no character." % username)
+    if payload.get("to_slot") is not None:
+        asked = parse_slot(payload.get("to_slot"))
+        if asked is None:
+            return bad_request("to_slot must be an integer 0-%d" % MAX_SLOT)
+        if asked != to_slot:
+            return {"error": "Conflict",
+                    "message": "%s is playing a different character now." % username}, 409
 
     # ONE OPEN TRADE EACH. Two concurrent trades could each validate against the
     # same sword and both pass, because neither holds it.
@@ -11273,6 +12847,11 @@ def trade_offer():
         " VALUES (?, ?, ?, ?, ?, ?, ?)",
         (trade_id, user_id, slot, other_id, to_slot, now, now),
     )
+    # THE PRUNE, on the request that makes rows. Cancelled trades only - a
+    # finished one is the record of who gave whom what. trade_items goes with
+    # them by ON DELETE CASCADE; idx_trades_cancelled keeps this off a table scan.
+    db.execute("DELETE FROM trades WHERE state = 'cancelled' AND updated_at < ?",
+               (now - TRADE_CANCELLED_KEPT_SECONDS,))
     db.commit()
 
     return _trade_payload(db, db.execute(
@@ -11294,13 +12873,29 @@ def trade_current():
         required: true
         description: "Bearer <token>"
     responses:
-      200: {description: The open trade, or {"trade": null}}
+      200: {description: 'The open trade or null, and "resync" - a bag and purse to re-read, or null'}
     """
     db = get_db()
-    trade = _trade_find_open(db, g.user["id"])
+    user_id = g.user["id"]
+    trade = _trade_find_open(db, user_id)
+
+    # THE WINDOW IS THE FASTEST WAY THIS REACHES A CLIENT. It polls every second
+    # and a half while open, and the person who accepted first is usually still
+    # looking at it - so this is where they learn the trade went through, and
+    # get the bag it went through with. See _mark_resync().
+    resync = _take_resync(db, user_id)
+
     if trade is None or _trade_expired(trade):
-        return {"trade": None}, 200
-    return {"trade": _trade_payload(db, trade)}, 200
+        # HOW THE LAST ONE ENDED, when there is no open one - so a window that
+        # was watching a trade can say "complete" or "called off" rather than
+        # guessing. The result itself may already have been delivered by the
+        # broadcast poll; this is the fact that stays true after that.
+        recent = _trade_find_recent(db, user_id, 1, ("done", "cancelled"))
+        last = None
+        if recent:
+            last = {"trade_id": recent[0]["trade_id"], "state": recent[0]["state"]}
+        return {"trade": None, "resync": resync, "last": last}, 200
+    return {"trade": _trade_payload(db, trade), "resync": resync}, 200
 
 
 @app.post("/api/trade/update")
@@ -11391,6 +12986,17 @@ def trade_update():
         if held.get(item_id, 0) < quantity:
             return bad_request("You only have %d x %s." % (held.get(item_id, 0), item_id))
 
+    # THE SAME OFFER AGAIN IS NOT A CHANGE. Every write below withdraws both
+    # acceptances and moves the revision, which is right for a real change and
+    # wrong for a repeat: a window that re-sends what is already standing -
+    # after a reconnect, or a quantity box set to the number it already had -
+    # would silently un-accept the other player, who then has to notice and
+    # press accept again for an offer nobody altered.
+    standing = {entry["item_id"]: entry["quantity"]
+                for entry in _trade_items(db, trade["trade_id"], side)}
+    if standing == merged and int(trade["%s_gold" % side]) == raw_gold:
+        return _trade_payload(db, trade), 200
+
     db.execute("DELETE FROM trade_items WHERE trade_id = ? AND side = ?",
                (trade["trade_id"], side))
     for item_id, quantity in sorted(merged.items()):
@@ -11421,21 +13027,55 @@ def trade_confirm():
         type: string
         required: true
         description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [revision]
+          properties:
+            revision: {type: integer, example: 3, description: "The revision of the offer you were shown"}
     responses:
       200: {description: The trade, or its result if that confirm completed it}
-      400: {description: Somebody cannot cover the tax or no longer holds their offer}
+      400: {description: No revision, somebody cannot cover the tax, or no longer holds their offer}
       404: {description: You are not in a trade}
-      409: {description: The trade closed underneath you, or a backpack is full}
+      409: {description: The offer changed since you saw it, the trade closed underneath you, or a backpack is full}
     """
+    payload = request.get_json(silent=True) or {}
     user_id = g.user["id"]
     db = get_db()
     trade = _trade_find_open(db, user_id)
     if trade is None or _trade_expired(trade):
         return {"error": "Not Found", "message": "You are not in a trade."}, 404
 
+    # ACCEPTING IS AGREEING TO WHAT YOU SAW, AND ONLY THE CLIENT KNOWS WHAT THAT
+    # WAS. So it has to say: the revision on the payload it drew. REQUIRED, not
+    # optional - an accept that names nothing is an accept of whatever happens
+    # to be standing when it lands, which is the scam this closes. See
+    # _trade_touch() for the race.
+    revision = payload.get("revision")
+    if isinstance(revision, bool) or not isinstance(revision, int):
+        return bad_request("revision is required: the revision of the offer you are accepting")
+
     side = _trade_side_of(trade, user_id)
-    db.execute("UPDATE trades SET %s_confirmed = 1, updated_at = ? WHERE trade_id = ?" % side,
-               (int(time.time()), trade["trade_id"]))
+    # COMPARE-AND-SET, in the UPDATE itself. Checking the revision on the row
+    # read above and then writing would leave a gap between the two for the
+    # other side's change to land in; conditioning the write on it does not.
+    agreed = db.execute(
+        "UPDATE trades SET %s_confirmed = 1, updated_at = ?"
+        " WHERE trade_id = ? AND revision = ? AND state = 'open'" % side,
+        (int(time.time()), trade["trade_id"], revision))
+    if agreed.rowcount != 1:
+        db.rollback()
+        current = db.execute("SELECT * FROM trades WHERE trade_id = ?",
+                             (trade["trade_id"],)).fetchone()
+        if current is None or current["state"] != "open":
+            return {"error": "Conflict", "message": "That trade is no longer open."}, 409
+        # THE CURRENT OFFER COMES BACK WITH THE REFUSAL, so the window can
+        # redraw it at once rather than show a stale one for another poll.
+        return {"error": "Conflict",
+                "message": "The offer changed. Look at it again before you accept.",
+                "trade": _trade_payload(db, current)}, 409
 
     # RE-READ, don't reason about the row we started from: the other side may
     # have confirmed between our read and our write.
@@ -11477,6 +13117,134 @@ def trade_cancel():
                (int(time.time()), trade["trade_id"]))
     db.commit()
     return {"cancelled": True, "trade_id": trade["trade_id"]}, 200
+
+
+# The states a staff member may page through. Open ones too: a scam is often
+# reported while it is still being attempted.
+STAFF_TRADE_STATES = ("open", "done", "cancelled")
+
+
+@app.get("/api/staff/trades")
+@require_auth
+@require_role("mod")
+def staff_trades():
+    """
+    Every trade an account has been in, newest first, one page at a time
+    ---
+    tags:
+      - Moderation
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: query
+        name: username
+        type: string
+        required: true
+      - in: query
+        name: before_at
+        type: integer
+        description: "The previous page's next_before.at"
+      - in: query
+        name: before_seq
+        type: integer
+        description: "The previous page's next_before.seq"
+      - in: query
+        name: limit
+        type: integer
+        description: "1-200, default 50"
+    responses:
+      200:
+        description: A page of trades worded from that account's side, a tally by state, and the cursor for the next page
+      400:
+        description: No username, a half cursor, or a limit out of range
+      404:
+        description: No such account, or one outside your reach - the same answer for both
+    """
+    # "HE SCAMMED ME" IS THE REPORT THIS ANSWERS. Every finished trade is kept
+    # for good for exactly this, and until now the only way to read one was
+    # sqlite3 on the box holding the database. A moderator can page through
+    # what an account gave, got and paid, with whom and on which character.
+    #
+    # UNDER REACH, like every other staff view of a person: the account must
+    # be one you could act on, and out of reach reads exactly like "no such
+    # account" - see _moderation_target(). A trade WITH a mod still shows up
+    # in the player's own history, which is the one being investigated.
+    target, refusal = _moderation_target({"username": request.args.get("username", "")})
+    if refusal is not None:
+        return refusal
+
+    limit = _query_int("limit", STAFF_PAGE_DEFAULT, 1, STAFF_PAGE_MAX)
+    if limit is None:
+        return bad_request("limit must be a whole number 1-%d" % STAFF_PAGE_MAX)
+    before_at = _query_int("before_at", -1, 0, 2 ** 62)
+    before_seq = _query_int("before_seq", -1, 0, 2 ** 62)
+    if before_at is None or before_seq is None or (before_at == -1) != (before_seq == -1):
+        return bad_request("before_at and before_seq come together, from next_before")
+    before = (before_at, before_seq) if before_at != -1 else None
+
+    db = get_db()
+    user_id = int(target["id"])
+    rows = _trade_find_page(db, user_id, limit + 1, STAFF_TRADE_STATES, before)
+    more = len(rows) > limit
+    rows = rows[:limit]
+    trades = []
+    for row in rows:
+        record = _trade_record(db, row["trade_id"], user_id)
+        if record is not None:
+            trades.append(record)
+
+    # THE TALLY, before anybody reads a line: twelve trades, three called off.
+    # Counted off the two indexes rather than the rows - a covering read.
+    summary = {state: 0 for state in STAFF_TRADE_STATES}
+    for side in ("a", "b"):
+        for r in db.execute(
+                "SELECT state, COUNT(*) AS n FROM trades WHERE %s_user = ? GROUP BY state" % side,
+                (user_id,)).fetchall():
+            if r["state"] in summary:
+                summary[r["state"]] += int(r["n"])
+
+    return {
+        "username": target["username"],
+        "trades": trades,
+        "more": more,
+        "next_before": {"at": int(rows[-1]["updated_at"]), "seq": int(rows[-1]["seq"])}
+                       if more and rows else None,
+        "summary": summary,
+        "now": int(time.time()),
+    }, 200
+
+
+@app.get("/api/trade/history")
+@require_auth
+def trade_history():
+    """
+    Your last few finished trades
+    ---
+    tags:
+      - Trade
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+    responses:
+      200: {description: 'Newest first: who with, what you gave, what you got, and the kingdom''s cut'}
+    """
+    # "DID THAT GO THROUGH?" is the question every trade eventually gets asked,
+    # usually a day later, and until now nothing could answer it but a
+    # moderator reading the database. Finished trades only: one that was called
+    # off moved nothing, and a list of those is a list of conversations.
+    db = get_db()
+    user_id = g.user["id"]
+    rows = _trade_find_recent(db, user_id, TRADE_HISTORY_SHOWN)
+    trades = [_trade_record(db, row["trade_id"], user_id) for row in rows]
+    # THE SERVER'S CLOCK, so "2 h ago" is aged against the same clock that
+    # stamped the trade - not against a player's system time, which is wrong
+    # often enough that the guild panel already learned this.
+    return {"trades": [t for t in trades if t is not None], "now": int(time.time())}, 200
 
 
 # How many players the board returns. Two hundred, not ten.
@@ -11596,13 +13364,9 @@ def players_online():
 
     # WHERE THE CALLER IS, so the list can be grouped into "here with you" and
     # "elsewhere" without the client having to ask a second route for its own
-    # area. Read from the most recently saved slot: a player has up to four
-    # characters and only one of them is being played.
-    mine = db.execute(
-        "SELECT area FROM saves WHERE user_id = ? ORDER BY updated_at DESC LIMIT 1",
-        (user_id,),
-    ).fetchone()
-    my_area = str(mine["area"]) if mine is not None else ""
+    # area. From the character being PLAYED - see _playing_slot(); a player has
+    # up to four and "saved last" is wrong for the minute after a switch.
+    my_area = _playing_area(db, user_id)
 
     # BOTH CONDITIONS. last_seen_at says a client was there in the last 45
     # seconds; expires_at says the session is still allowed to be. Either one
@@ -11612,6 +13376,7 @@ def players_online():
         """
         SELECT users.username                AS username,
                users.role                    AS role,
+               users.name_hue                AS name_hue,
                MAX(sessions.last_seen_at)    AS seen,
                saves.name                    AS name,
                saves.level                   AS level,
@@ -11620,7 +13385,11 @@ def players_online():
                guilds.name                   AS guild
           FROM sessions
           JOIN users ON users.id = sessions.user_id
+          -- THE CHARACTER THEY ARE PLAYING, and only that one, by the rule the
+          -- trade window and the guild roster use (PLAYING_SLOT_SQL). It used
+          -- to join every save and keep whichever was saved last.
           LEFT JOIN saves ON saves.user_id = sessions.user_id
+                         AND saves.slot = %s
           -- THE GUILD RIDES THE JOIN THAT IS ALREADY HERE. Two LEFT JOINs on
           -- indexed keys, against a list already capped at ONLINE_LIST_LIMIT
           -- rows - not a second query, and not a lookup per player in Python.
@@ -11628,17 +13397,19 @@ def players_online():
           LEFT JOIN guilds ON guilds.id = guild_members.guild_id
          WHERE sessions.last_seen_at > ?
            AND sessions.expires_at > ?
-      GROUP BY users.id, saves.slot
-      ORDER BY users.username ASC, saves.updated_at DESC
+      GROUP BY users.id
+      ORDER BY users.username ASC
          LIMIT ?
-        """,
-        (now - ONLINE_WINDOW_SECONDS, now, ONLINE_LIST_LIMIT * 4),
+        """ % PLAYING_SLOT_SQL.format(user="users.id"),
+        # PLAYING_SLOT_SQL's two first - it sits in the JOIN, above the WHERE.
+        (now - ONLINE_WINDOW_SECONDS, now,
+         now - ONLINE_WINDOW_SECONDS, now, ONLINE_LIST_LIMIT),
     ).fetchall()
 
-    # ONE ENTRY PER ACCOUNT, and it is the character they most recently saved.
-    # The query cannot do it alone - a player has up to four slots and SQLite
-    # will happily hand back all of them - so the first row per username wins,
-    # which the ORDER BY has already arranged.
+    # ONE ENTRY PER ACCOUNT. The join now picks one character each and the
+    # GROUP BY folds an account's several sessions into one row, so this is a
+    # guard rather than the mechanism - kept because a list that shows somebody
+    # twice is the bug a future join would bring back.
     seen_accounts = set()
     players = []
     for row in rows:
@@ -11652,6 +13423,7 @@ def players_online():
             # head - see the nameplate colours in api.gd. A list that hid what
             # the world shows would just be a worse list.
             "role": role_for(row) if row["role"] is not None else DEFAULT_ROLE,
+            "name_hue": name_hue_of(row),
             "name": row["name"] or "",
             "level": int(row["level"] or 1),
             "area": row["area"] or "",
@@ -11734,6 +13506,8 @@ def players_nearby():
     rows = db.execute(
         """
         SELECT DISTINCT users.username AS username,
+               users.role     AS role,
+               users.name_hue AS name_hue,
                saves.slot   AS slot,
                saves.name   AS name,
                saves.level  AS level
@@ -11744,9 +13518,14 @@ def players_nearby():
            AND saves.user_id != ?
            AND sessions.last_seen_at > ?
            AND sessions.expires_at > ?
+           -- ONLY THE CHARACTER THEY ARE PLAYING. An account has up to four,
+           -- and without this every one of them parked in this area was
+           -- listed - so "Trade" beside somebody's old alt opened a trade
+           -- with a character nobody was playing.
+           AND saves.slot = %s
       ORDER BY saves.level DESC, users.username ASC
          LIMIT ?
-        """,
+        """ % PLAYING_SLOT_SQL.format(user="saves.user_id"),
         # LAST SEEN **AND** STILL VALID. Both, and the first version of this fix
         # had only one of them, which test_economy.py caught in one line.
         #
@@ -11767,8 +13546,10 @@ def players_nearby():
         # went on being listed for its last 45 seconds - which is exactly what
         # "an offline player is not listed as nearby" in test_economy.py exists
         # to catch, and did.
-        (area, user_id, int(time.time()) - ONLINE_WINDOW_SECONDS,
-         int(time.time()), NEARBY_LIMIT),
+        (area, user_id, int(time.time()) - ONLINE_WINDOW_SECONDS, int(time.time()),
+         # PLAYING_SLOT_SQL's own two, in its order: cutoff, then now.
+         int(time.time()) - ONLINE_WINDOW_SECONDS, int(time.time()),
+         NEARBY_LIMIT),
     ).fetchall()
 
     return {
@@ -11782,6 +13563,10 @@ def players_nearby():
                 "slot": int(r["slot"]),
                 "name": r["name"],
                 "level": int(r["level"]),
+                # DRAWN LIKE EVERY OTHER LIST: in the colour its owner chose,
+                # with the rank as a badge. See nametag.gd.
+                "role": r["role"],
+                "name_hue": name_hue_of(r),
             }
             for r in rows
         ],
@@ -11887,7 +13672,7 @@ def friends_list():
         # NAMED COLUMNS, NOT SELECT *. Nothing that leaves the server should be
         # able to carry a password hash out with it by accident.
         for row in db.execute(
-            "SELECT id, username, role FROM users WHERE id IN (%s)" % marks,
+            "SELECT id, username, role, name_hue FROM users WHERE id IN (%s)" % marks,
             tuple(ids),
         ).fetchall():
             people[int(row["id"])] = row
@@ -12334,6 +14119,7 @@ def guild_create():
         "INSERT INTO guild_members (user_id, guild_id, rank, joined_at)"
         " VALUES (?, ?, 'leader', ?)",
         (g.user["id"], guild_id, now))
+    log_guild_event(db, guild_id, "founded", g.user["username"], now=now)
 
     # ANY INVITATION THEY WERE HOLDING IS GONE. They are in a guild now, and a
     # pending invite to a different one is an offer that can no longer be
@@ -12416,10 +14202,15 @@ def guild_invite():
 
     # INSERT OR IGNORE: inviting somebody twice is not an error, it just does
     # not make a second invitation.
-    db.execute(
+    made = db.execute(
         "INSERT OR IGNORE INTO guild_invites"
         " (guild_id, user_id, invited_by, created_at) VALUES (?, ?, ?, ?)",
         (guild_id, int(target["id"]), g.user["username"], int(time.time())))
+    # ONE LINE PER INVITATION, not per press. Inviting somebody twice makes no
+    # second invitation, and it must not make a second line either - or the
+    # history of a guild becomes a record of somebody's impatience.
+    if made.rowcount > 0:
+        log_guild_event(db, guild_id, "invited", g.user["username"], target["username"])
     db.commit()
 
     return {"username": target["username"], "guild": guild["name"],
@@ -12496,6 +14287,7 @@ def guild_respond():
         "INSERT INTO guild_members (user_id, guild_id, rank, joined_at)"
         " VALUES (?, ?, 'member', ?)",
         (g.user["id"], int(guild["id"]), now))
+    log_guild_event(db, int(guild["id"]), "joined", g.user["username"], now=now)
     # EVERY OTHER INVITATION GOES TOO, not just this one. They are in a guild
     # now and none of the others can be accepted.
     db.execute("DELETE FROM guild_invites WHERE user_id = ?", (g.user["id"],))
@@ -12542,6 +14334,10 @@ def guild_leave():
             "make somebody else the leader first, or disband the guild")
 
     db.execute("DELETE FROM guild_members WHERE user_id = ?", (g.user["id"],))
+    # Written before the fold below. If they were the last one out the guild
+    # goes, and its history goes with it (ON DELETE CASCADE) - there is nobody
+    # left to read it.
+    log_guild_event(db, int(guild["id"]), "left", g.user["username"])
 
     # THE LAST ONE OUT TAKES THE GUILD WITH THEM. An empty guild is a name
     # nobody can use and nobody can reclaim.
@@ -12609,6 +14405,7 @@ def guild_kick():
         return {"error": "Not Found", "message": "Not found."}, 404
 
     db.execute("DELETE FROM guild_members WHERE user_id = ?", (int(target["id"]),))
+    log_guild_event(db, int(guild["id"]), "removed", g.user["username"], target["username"])
     db.commit()
     return {"username": target["username"], "state": "removed"}, 200
 
@@ -12677,6 +14474,8 @@ def guild_set_rank():
                    (int(target["id"]),))
         db.execute("UPDATE guild_members SET rank = 'officer' WHERE user_id = ?",
                    (g.user["id"],))
+        log_guild_event(db, int(guild["id"]), "leader", g.user["username"],
+                        target["username"], now=now)
         db.commit()
         return {"username": target["username"], "rank": "leader",
                 "you": "officer",
@@ -12684,6 +14483,14 @@ def guild_set_rank():
 
     db.execute("UPDATE guild_members SET rank = ? WHERE user_id = ?",
                (wanted, int(target["id"])))
+    # UP OR DOWN IS READ OFF THE LADDER, not off the word asked for, and a
+    # "change" to the rank they already hold is no line at all.
+    was = str(their_seat["rank"])
+    if was != wanted:
+        log_guild_event(
+            db, int(guild["id"]),
+            "promoted" if GUILD_RANKS.index(wanted) > GUILD_RANKS.index(was) else "demoted",
+            g.user["username"], target["username"], detail=wanted, now=now)
     db.commit()
     return {"username": target["username"], "rank": wanted,
             "guild": guild_dict(db, guild, now)}, 200
@@ -12870,6 +14677,11 @@ def staff_guild():
         # The window is minutes long and prunes itself.
         log_staff_action(g.user, "guild_rename", old_name,
                          detail="-> %s: %s" % (replacement, reason))
+        # IN THE GUILD'S OWN HISTORY TOO, and WITHOUT the name of the member of
+        # staff who did it. Members need to know their guild was renamed and
+        # what it was called; they do not need somebody to be angry at. The
+        # moderation log above keeps who, for the people who review it.
+        log_guild_event(db, guild_id, "renamed", "", replacement, detail=old_name)
         db.commit()
         return {"guild": replacement, "was": old_name, "state": "renamed"}, 200
 
@@ -13405,7 +15217,7 @@ def write_inventory():
             slot: {type: integer, example: 0}
             inventory:
               type: array
-              description: "Positional; null for an empty cell. At most 20 entries."
+              description: "Positional; null for an empty cell. Cells 0-19 are the bag, 20-29 the hotbar's keys. At most 30 entries. The bag is always replaced; a hotbar cell past the end of a shorter array is left as it is."
     responses:
       200:
         description: The backpack as stored
@@ -13426,11 +15238,47 @@ def write_inventory():
     if not _slot_exists(user_id, slot):
         return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
 
+    # A BAG BUILT BEFORE A TRADE MOVED THINGS IS NOT A BAG TO SAVE. This route
+    # replaces the whole backpack, so a client still showing what it had before
+    # a trade finished would delete what the trade just gave it - reproduced,
+    # not supposed: accept first, let the other side accept, drag a potion, and
+    # the sword you traded for was gone. See _mark_resync().
+    #
+    # REFUSED, AND THE REFUSAL CARRIES THE ANSWER. The 409 hands back the bag
+    # and purse the server holds so the client can adopt them in the same
+    # breath; the flag is cleared because the truth has now been delivered. A
+    # write that arrives after that is built on the new bag and goes through.
+    stale = _take_resync(get_db(), user_id, slot)
+    if stale is not None:
+        return {"error": "Conflict",
+                "message": "Your backpack changed on the server - a trade finished. "
+                           "It has been reloaded.",
+                "resync": stale}, 409
+
     cells = payload.get("inventory")
     if not isinstance(cells, list):
         return bad_request("inventory must be an array")
-    if len(cells) > INVENTORY_CAPACITY:
-        return bad_request("inventory has %d entries, capacity is %d" % (len(cells), INVENTORY_CAPACITY))
+    if len(cells) > CARRY_CAPACITY:
+        return bad_request("inventory has %d entries, capacity is %d" % (len(cells), CARRY_CAPACITY))
+
+    # THE HOTBAR IS REPLACED ONLY BY AN ARRAY THAT REACHES IT. The bag cells
+    # are always replaced, exactly as before the hotbar held items - a short
+    # array, [] included, still means "the bag holds this and nothing else".
+    # The hotbar's cells are replaced only as far as the array goes; past its
+    # end they are left as they are, and left out of the ledger the claim is
+    # checked against.
+    #
+    # A client that sends twenty cells - one written before the keys held
+    # items, or one whose hotbar was not attached when it saved - is not saying
+    # "empty my hotbar", it is saying nothing about it. Replacing every row
+    # would delete up to ten stacks the player can see on screen.
+    #
+    # AND THE LEDGER HAS TO SHRINK WITH IT, or the rule becomes a duplication
+    # bug: five potions on a key the write does not touch, plus a claim of five
+    # potions in the bag checked against a ledger that still counts the key's
+    # five, is ten potions. Counting only the covered cells means a write can
+    # rearrange what it covers and nothing else.
+    covered = max(len(cells), INVENTORY_CAPACITY)
 
     # THE SHARED VALIDATOR, not a second copy of it. This loop used to be
     # written out here as well as in _parse_positional_items(), twenty identical
@@ -13448,7 +15296,7 @@ def write_inventory():
     # items the server itself wrote via loot/bank/staff) pass through unchanged;
     # a modified client's fabricated excess is dropped here. See
     # _reconcile_inventory() and SECURITY_NOTES.md (E-1).
-    items = _reconcile_inventory(g.user, slot, items)
+    items = _reconcile_inventory(g.user, slot, items, covered)
 
     parsed = [(user_id, slot, index, item_id, quantity)
               for index, item_id, quantity in items]
@@ -13458,7 +15306,8 @@ def write_inventory():
     # the client cleared have to disappear, and an upsert would leave them.
     # sqlite3 opens a transaction implicitly on the first write and holds it
     # until commit, so the table is never observably empty.
-    db.execute("DELETE FROM carry_items WHERE user_id = ? AND slot = ?", (user_id, slot))
+    db.execute("DELETE FROM carry_items WHERE user_id = ? AND slot = ? AND position < ?",
+               (user_id, slot, covered))
     if parsed:
         db.executemany(
             "INSERT INTO carry_items (user_id, slot, position, item_id, quantity) VALUES (?, ?, ?, ?, ?)",
@@ -13678,8 +15527,6 @@ def train_skills():
     elapsed_s = (now_ms - int(row["last_train_at"])) / 1000.0
     elapsed_s = max(0.0, min(elapsed_s, MAX_TRAIN_ELAPSED_SECONDS))
 
-    prof = SKILL_PROFICIENCY.get(row["class_id"], {})
-
     results = {}
     for skill in TRAINABLE_SKILLS:
         reported = parse_stat(payload.get(skill, 0))
@@ -13690,7 +15537,7 @@ def train_skills():
         # ceiling; an honest one is never anywhere near it.
         allowed = MAX_TRAIN_XP_PER_SEC[skill] * elapsed_s
         raw = min(float(reported), allowed)
-        gained = int(max(0.0, raw) * prof.get(skill, 1.0))
+        gained = proficient_amount(row["class_id"], skill, raw)
         level, xp, levels_gained = _grant_skill_xp(user_id, slot, skill, gained)
         results[skill] = {"level": level, "xp": xp, "levels_gained": levels_gained}
 
@@ -13777,6 +15624,38 @@ def _equip_row(user_id, slot):
     ).fetchone()
 
 
+def _apply_worn_maxima(db, user_id, slot):
+    """
+    Re-derive the maxima from what is NOW worn, in the caller's transaction,
+    and bring hp and mana down to them if they sit above. Returns the four
+    numbers for the response.
+
+    WHY THE EQUIP ROUTES DO THIS AND NOT ONLY THE NEXT SAVE: taking off a
+    Vitality amulet lowers max_hp this instant. Left for the next status write,
+    the stored row would say 492/432 for however long that took, and anything
+    reading it meanwhile - the character sheet, the healing reconciler's
+    "before" - would be reading a character over their own ceiling.
+
+    NEVER RAISES THE POOLS. Putting one on lifts the ceiling, not the health;
+    regeneration fills the gap at the rate the new maximum allows.
+    """
+    derived = _derived_stats(_equip_row(user_id, slot))
+    if derived is None:
+        return {}
+    db.execute(
+        "UPDATE saves SET max_hp = ?, max_mana = ?, hp = MIN(hp, ?), mana = MIN(mana, ?) "
+        "WHERE user_id = ? AND slot = ?",
+        (derived["max_hp"], derived["max_mana"], derived["max_hp"], derived["max_mana"],
+         user_id, slot),
+    )
+    pools = db.execute(
+        "SELECT hp, max_hp, mana, max_mana FROM saves WHERE user_id = ? AND slot = ?",
+        (user_id, slot),
+    ).fetchone()
+    return {"hp": int(pools["hp"]), "max_hp": int(pools["max_hp"]),
+            "mana": int(pools["mana"]), "max_mana": int(pools["max_mana"])}
+
+
 @app.post("/api/character/equip")
 @require_auth
 def equip_item():
@@ -13796,10 +15675,11 @@ def equip_item():
           type: object
           required: [slot, item_id]
           properties:
-            slot:    {type: integer, example: 0}
-            item_id: {type: string,  example: cobaltrobe}
+            slot:     {type: integer, example: 0}
+            item_id:  {type: string,  example: cobaltrobe}
+            position: {type: integer, example: 4, description: "The carried cell it came from (0-19 bag, 20-29 hotbar). Taken from first when it holds the item."}
     responses:
-      200: {description: Equipped. Returns the new equipment map and bag layout}
+      200: {description: "Equipped. Returns the new equipment map, the bag layout, and stats: the hp/mana ceilings what is now worn implies"}
       400: {description: Bad slot or item_id}
       403: {description: Wrong slot for this item, wrong class, or too low a level}
       404: {description: No character in that slot, or you are not carrying that}
@@ -13815,6 +15695,10 @@ def equip_item():
     item_id = str(payload.get("item_id", "")).strip()
     if not item_id or len(item_id) > 64:
         return bad_request("item_id must be 1-64 characters")
+
+    position, error = parse_cell(payload, CARRY_CAPACITY)
+    if error is not None:
+        return error
 
     row = _equip_row(user_id, slot)
     if row is None:
@@ -13860,7 +15744,7 @@ def equip_item():
     # tidy. Taking the new item may free the cell the old one needs - swapping
     # your only chest piece for another should always work, and it only does
     # if the bag is measured after the incoming item has left it.
-    if not _take_from_backpack(user_id, slot, item_id, 1):
+    if not _take_from_backpack(user_id, slot, item_id, 1, prefer=position):
         return {"error": "Not Found", "message": "You are not carrying that."}, 404
 
     if coming_off:
@@ -13877,6 +15761,7 @@ def equip_item():
         "UPDATE saves SET equipment = ?, updated_at = ? WHERE user_id = ? AND slot = ?",
         (json.dumps(worn), int(time.time()), user_id, slot),
     )
+    pools = _apply_worn_maxima(db, user_id, slot)
     db.commit()
 
     return {
@@ -13885,6 +15770,9 @@ def equip_item():
         "equip_slot": target,
         "unequipped": coming_off,
         "equipment": worn,
+        # THE CEILINGS THE SERVER NOW HOLDS, so a client can see its own
+        # recompute agrees rather than finding out on the next save.
+        "stats": pools,
         # THE AUTHORITATIVE LAYOUT, handed back so the client renders what the
         # server did rather than guessing at it. /api/loot/take does the same.
         "inventory": inventory_payload(user_id, slot),
@@ -13913,7 +15801,7 @@ def unequip_item():
             slot:       {type: integer, example: 0}
             equip_slot: {type: string,  example: chest}
     responses:
-      200: {description: Unequipped. Returns the new equipment map and bag layout}
+      200: {description: "Unequipped. Returns the new equipment map, the bag layout, and stats: the hp/mana ceilings what is now worn implies"}
       400: {description: Bad slot or equip_slot}
       404: {description: No character in that slot, or nothing worn there}
       409: {description: The bag is full}
@@ -13953,6 +15841,7 @@ def unequip_item():
         "UPDATE saves SET equipment = ?, updated_at = ? WHERE user_id = ? AND slot = ?",
         (json.dumps(worn), int(time.time()), user_id, slot),
     )
+    pools = _apply_worn_maxima(db, user_id, slot)
     db.commit()
 
     return {
@@ -13960,6 +15849,7 @@ def unequip_item():
         "unequipped": item_id,
         "equip_slot": target,
         "equipment": worn,
+        "stats": pools,
         "inventory": inventory_payload(user_id, slot),
     }
 
@@ -13985,8 +15875,9 @@ def character_consume():
           type: object
           required: [slot, item_id]
           properties:
-            slot:    {type: integer, example: 0}
-            item_id: {type: string,  example: smallhealthpotion}
+            slot:     {type: integer, example: 0}
+            item_id:  {type: string,  example: smallhealthpotion}
+            position: {type: integer, example: 21, description: "The carried cell used (0-19 bag, 20-29 hotbar). Spent first when it holds the item."}
     responses:
       200:
         description: The item was destroyed; apply its effect
@@ -14011,6 +15902,10 @@ def character_consume():
     item_id = str(payload.get("item_id", "")).strip()
     if not item_id or len(item_id) > 64:
         return bad_request("item_id must be 1-64 characters")
+
+    position, error = parse_cell(payload, CARRY_CAPACITY)
+    if error is not None:
+        return error
 
     db = get_db()
     row = db.execute(
@@ -14075,7 +15970,7 @@ def character_consume():
 
     # ---- everything above this line is validation; everything below commits --
 
-    if not _take_from_backpack(user_id, slot, item_id, 1):
+    if not _take_from_backpack(user_id, slot, item_id, 1, prefer=position):
         # Only reachable if the stack vanished between the count above and here.
         # All-or-nothing, so nothing is written.
         return {"error": "Not Found", "message": "You are not carrying that."}, 404
@@ -14191,7 +16086,7 @@ def character_revive():
 
     db = get_db()
     row = db.execute(
-        "SELECT class_id, level, hp, gold FROM saves WHERE user_id = ? AND slot = ?",
+        "SELECT class_id, level, equipment, hp, gold FROM saves WHERE user_id = ? AND slot = ?",
         (user_id, slot),
     ).fetchone()
     if row is None:
@@ -14256,7 +16151,7 @@ def character_revive():
 
     # ---- everything above this line is validation; everything below commits --
 
-    derived = gamedata.max_stats_for(row["class_id"], int(row["level"]))
+    derived = _derived_stats(row)
     if derived is None:
         # A class the server has no curve for. Refusing is right: the
         # alternative is inventing a maximum and writing it into the save.
@@ -14418,7 +16313,7 @@ def character_respawn():
     user_id = g.user["id"]
     db = get_db()
     row = db.execute(
-        "SELECT class_id, level, hp, gold FROM saves WHERE user_id = ? AND slot = ?",
+        "SELECT class_id, level, equipment, hp, gold FROM saves WHERE user_id = ? AND slot = ?",
         (user_id, slot),
     ).fetchone()
     if row is None:
@@ -14431,7 +16326,7 @@ def character_respawn():
     if int(row["hp"] or 0) > 0:
         return {"error": "Conflict", "message": "That character is not dead."}, 409
 
-    derived = gamedata.max_stats_for(row["class_id"], int(row["level"]))
+    derived = _derived_stats(row)
     if derived is None:
         app.logger.error("respawn: no stat curve for class '%s'", row["class_id"])
         return {"error": "Conflict", "message": "That character cannot respawn."}, 409
@@ -14525,10 +16420,6 @@ def character_respawn():
 # to enforce the despawn.
 LOOT_BAG_TTL_SECONDS = 600
 
-# Matches BANK_CAPACITY's role for the backpack. The client's grid is 20 cells.
-CARRY_CAPACITY = INVENTORY_CAPACITY
-
-
 # What a fishing spot takes as bait, one per fish landed.
 #
 # NAMED HERE RATHER THAN SENT BY THE CLIENT. fishingspot.gd has its own
@@ -14554,10 +16445,16 @@ CAST_TOKENS_PER_SECOND = 0.4
 # The position IS the grid cell on both sides - that is what lets the client
 # send "take cell 2" and mean the thing the player is looking at. A bag rolled
 # with more entries than the panel can show would put loot behind a cell that
-# does not exist, and the player would never be able to ask for it. Rolls are
-# currently capped at five (one gold pile, three item slots, one pet), so this
-# is a guard against a future enemy config, not a live condition.
-LOOT_BAG_CAPACITY = 6
+# does not exist, and the player would never be able to ask for it.
+#
+# NINE, AND IT WAS SIX. The note here said rolls were capped at five - one gold
+# pile, three item slots, one pet - and that stopped being true when gold began
+# dropping as coins: one drop's gold is up to four entries on its own. Measured
+# on the old rules, 76% of boss bags ran past six and the cut fell on the pet,
+# appended last: 573 of 616 boss pet wins never reached the player. Now the
+# roll puts coins last (gamedata.rarest_first) and there are nine cells, so a
+# cut, when there is one, costs the smallest coin.
+LOOT_BAG_CAPACITY = 9
 
 # The item_id the client uses for the lusion pile - lootbaginventory.gd's
 # LUSION_ITEM_ID. There is no constant for it in gamedata.json because the game
@@ -14641,10 +16538,15 @@ def _owns_item(user_id, slot, item_id):
     ).fetchone() is not None
 
 
-def _take_from_backpack(user_id, slot, item_id, quantity):
+def _take_from_backpack(user_id, slot, item_id, quantity, prefer=None, keys_last=False):
     """
     Remove quantity of item_id from the backpack. Returns True, or False when
     the player does not hold that many - in which case NOTHING is written.
+
+    `keys_last` spends the bag (cells below INVENTORY_CAPACITY) before the
+    hotbar's keys. For a take the player did not point at - a trade takes a
+    quantity, not a cell - so the potions on key 1 are the last to go rather
+    than the first. See _execute_trade().
 
     The mirror of _add_to_backpack() below, and all-or-nothing for the same
     reason: a half-completed consume is an ingredient that left the bag without
@@ -14653,6 +16555,10 @@ def _take_from_backpack(user_id, slot, item_id, quantity):
     HIGHEST POSITION FIRST, so a partly-used stack is emptied before a full one
     is broken into. That keeps the bag tidy across a long cooking run instead of
     leaving a trail of one-item stacks.
+
+    `prefer` is the cell the player acted on - a potion drunk from key 3, a
+    sword equipped from bag cell 12 - and is spent first when it holds the item.
+    See _take_from_cells() for why, since the hotbar sits in these same rows.
     """
     quantity = int(quantity)
     if quantity <= 0:
@@ -14669,8 +16575,13 @@ def _take_from_backpack(user_id, slot, item_id, quantity):
     if held < quantity:
         return False
 
+    if keys_last:
+        # A stable sort, so within the bag and within the keys the order is
+        # still highest-first - a part-used stack still goes before a full one.
+        rows = sorted(rows, key=lambda r: int(r["position"]) >= INVENTORY_CAPACITY)
+
     remaining = quantity
-    for row in rows:
+    for row in _preferred_first(rows, prefer):
         if remaining <= 0:
             break
         position = int(row["position"])
@@ -14773,7 +16684,8 @@ def _grant_skill_xp(user_id, slot, skill_id, gained):
     xp = int(row["xp"]) if row else 0
 
     level, xp, _next, levels_gained = gamedata.apply_xp(
-        level, xp, gamedata.xp_needed_for_skill_level(skill_id, level), gained
+        level, xp, gamedata.xp_needed_for_skill_level(skill_id, level), gained,
+        need=lambda at: gamedata.xp_needed_for_skill_level(skill_id, at),
     )
 
     level = min(level, MAX_SKILL_LEVEL)
@@ -14806,6 +16718,11 @@ def _add_to_backpack(user_id, slot, item_id, quantity):
 
     Writes nothing unless the whole quantity fits. A half-completed pickup is
     the shape of bug that ends with an item in neither the bag nor the bag.
+
+    THE BAG ONLY - never a hotbar key, not even to top up a stack already on
+    one. A key holds what the player put there; loot quietly growing the potion
+    stack on key 1 would be the server rearranging the one part of the carry
+    the player arranges by hand. See CARRY_CAPACITY.
     """
     definition = gamedata.ITEMS.get(item_id, {})
     stackable = bool(definition.get("stackable", False))
@@ -14825,7 +16742,7 @@ def _add_to_backpack(user_id, slot, item_id, quantity):
 
     if stackable:
         for position in sorted(occupied):
-            if remaining <= 0:
+            if remaining <= 0 or position >= INVENTORY_CAPACITY:
                 break
             held_id, held_qty = occupied[position]
             if held_id != item_id or held_qty >= max_stack:
@@ -14835,7 +16752,7 @@ def _add_to_backpack(user_id, slot, item_id, quantity):
             writes.append((position, item_id, held_qty + moved))
             remaining -= moved
 
-    for position in range(CARRY_CAPACITY):
+    for position in range(INVENTORY_CAPACITY):
         if remaining <= 0:
             break
         if position in occupied:
@@ -15015,7 +16932,7 @@ def take_loot():
             # written - _add_to_backpack is all-or-nothing.
             return {
                 "error": "Conflict",
-                "message": "Your backpack is full (%d slots)." % CARRY_CAPACITY,
+                "message": "Your backpack is full (%d slots)." % INVENTORY_CAPACITY,
             }, 409
 
         result["credited"] = "inventory"
@@ -15176,7 +17093,7 @@ def fishing_catch():
         # nowhere to go.
         return {
             "error": "Conflict",
-            "message": "Your backpack is full (%d slots)." % CARRY_CAPACITY,
+            "message": "Your backpack is full (%d slots)." % INVENTORY_CAPACITY,
         }, 409
 
     level, xp, levels_gained = _grant_skill_xp(user_id, slot, "fishing", catch["xp"])
@@ -15289,7 +17206,7 @@ def cooking_cook():
             # The raw fish is not consumed - nothing is committed.
             return {
                 "error": "Conflict",
-                "message": "Your backpack is full (%d slots)." % CARRY_CAPACITY,
+                "message": "Your backpack is full (%d slots)." % INVENTORY_CAPACITY,
             }, 409
 
     level, xp, levels_gained = _grant_skill_xp(user_id, slot, "cooking", outcome["xp"])

@@ -375,11 +375,20 @@ for label, response in [
     ("session", client.get("/api/auth/session", headers=auth(newcomer))),
     ("own email", client.get("/api/account/email", headers=auth(newcomer))),
     ("staff view", client.get("/api/staff/user/newcomer", headers=auth(owner))),
-    ("staff list", client.get("/api/staff/users", headers=auth(owner))),
+    # Searched for, so the account is ON the page being read - the list is
+    # paged, and an account on page two leaks nothing from page one.
+    ("staff list", client.get("/api/staff/users", headers=auth(owner),
+                              query_string={"q": "newcomer"})),
 ]:
     if "newcomer@example.com" in response.get_data(as_text=True):
         leaks.append(label)
 check("the raw address appears in no response", leaks == [], "leaked in: %s" % leaks)
+# AND THE LIST ABOVE WAS ABOUT THEM. A leak check on a page that does not hold
+# the account passes whatever the route does with addresses.
+_page = client.get("/api/staff/users", headers=auth(owner),
+                   query_string={"q": "newcomer"}).get_json()
+check("the staff list checked above holds that account",
+      any(a["username"] == "newcomer" for a in _page.get("accounts", [])), str(_page))
 
 res = client.get("/api/account/email", headers=auth(newcomer))
 check("the owner of the account sees it masked",

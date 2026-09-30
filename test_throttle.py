@@ -496,6 +496,60 @@ _gd.SPAWNS_EXPORTED = _saved_flag
 _gd.ENEMIES[_target] = _saved_enemy
 
 
+# =============================================================================
+section("A SIGNUP IS NOT A SPRAY")
+# =============================================================================
+# The game has no "create account" form: it logs in, and registers only after
+# the 401. So every new account starts with a 'no-such-user' row, which is on
+# the spray gate's allowlist - and the sixth household member to sign up inside
+# ten minutes locked the whole address out. register() relabels the signup's
+# own row; a real spray (names that never become accounts, or real accounts
+# with wrong passwords) still counts.
+
+HOUSEHOLD = "192.0.2.201"
+
+
+def _signup_like_the_game(name, ip):
+    first = login(name, "hunter2hunter2", ip)
+    made = client.post("/api/auth/register",
+                       json={"username": name, "password": "hunter2hunter2"},
+                       environ_base={"REMOTE_ADDR": ip})
+    return first.status_code, made.status_code
+
+
+_family = [_signup_like_the_game("famsign%d" % i, HOUSEHOLD) for i in range(8)]
+check("eight people sign up behind one address, the game's way (401 then 201)",
+      _family == [(401, 201)] * 8, _family)
+check("and every one of them can still log in",
+      all(login("famsign%d" % i, "hunter2hunter2", HOUSEHOLD).status_code == 200 for i in range(8)))
+_rows = db().execute(
+    "SELECT reason, COUNT(*) AS n FROM login_attempts WHERE ip = ? AND ok = 0 GROUP BY reason",
+    (HOUSEHOLD,)).fetchall()
+_reasons = {r["reason"]: r["n"] for r in _rows}
+check("their first logins are still in the log, relabelled rather than deleted",
+      _reasons.get("signup-first-login") == 8 and "no-such-user" not in _reasons, _reasons)
+
+SPRAYER = "192.0.2.202"
+for i in range(app_module.IP_MAX_USERNAMES):
+    login("nobodyhere%d" % i, "hunter2hunter2", SPRAYER)
+check("six names that never became accounts still lock the address",
+      login("nobodyhere99", "hunter2hunter2", SPRAYER).status_code == 429)
+
+MIXED = "192.0.2.203"
+_signup_like_the_game("mixsign0", MIXED)
+for i in range(app_module.IP_MAX_USERNAMES):
+    login("famsign%d" % i, "wrongwrongwrong", MIXED)
+check("a signup does not launder a spray against real accounts",
+      login("famsign7", "hunter2hunter2", MIXED).status_code == 429)
+
+_other = login("nobody_else1", "hunter2hunter2", "192.0.2.204")
+client.post("/api/auth/register", json={"username": "someoneelse1", "password": "hunter2hunter2"},
+            environ_base={"REMOTE_ADDR": "192.0.2.204"})
+check("registering one name forgives only that name's row",
+      db().execute("SELECT COUNT(*) FROM login_attempts WHERE ip = '192.0.2.204'"
+                   " AND reason = 'no-such-user'").fetchone()[0] == 1)
+
+
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))
 print("=" * 60)

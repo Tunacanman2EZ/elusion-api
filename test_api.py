@@ -1022,6 +1022,34 @@ check("and they are the positions the bag actually holds",
 status("a position past the bag's own grid", client.post("/api/loot/take", headers=H4,
        json={"bag_id": body["bag_id"], "position": app_module.LOOT_BAG_CAPACITY}), 400)
 
+# A FULL BAG LOSES COPPER, NEVER THE PET. The bag used to be six cells with the
+# coins rolled first and the pet appended last, and a boss drop's gold alone is
+# up to four coin entries - so 573 of 616 simulated boss pet wins were cut
+# away. The pet now comes first, coins last, and there are nine cells.
+_gd = app_module.gamedata
+_saved_odds = {eid: e.get("pet_odds") for eid, e in _gd.ENEMIES.items()}
+_boss_ids = sorted(eid for eid, e in _gd.ENEMIES.items() if e.get("slots_are_gear"))
+_lost_items = 0
+_lost_any = 0
+_rolls = 0
+try:
+    for _eid in _boss_ids:
+        _gd.ENEMIES[_eid]["pet_odds"] = 1
+        for _ in range(2000):
+            _roll = _gd.roll_kill_rewards(_eid)["contents"]
+            _kept = _roll[:app_module.LOOT_BAG_CAPACITY]
+            _cut = _roll[app_module.LOOT_BAG_CAPACITY:]
+            _rolls += 1
+            _lost_any += 1 if _cut else 0
+            _lost_items += sum(1 for c in _cut if _gd.ITEMS[c["item_id"]]["type_name"] != "CURRENCY")
+finally:
+    for _eid, _odds in _saved_odds.items():
+        _gd.ENEMIES[_eid]["pet_odds"] = _odds
+check("a boss bag with a pet never loses the pet or its gear to the cell limit",
+      _lost_items == 0, "%d items cut from %d bags" % (_lost_items, _rolls))
+check("and almost never loses even a coin", _lost_any / max(_rolls, 1) < 0.01,
+      "%d of %d bags cut" % (_lost_any, _rolls))
+
 
 # =============================================================================
 # ACCOUNT - BANK (SHARED ACROSS CHARACTERS)
@@ -1080,15 +1108,13 @@ check("what one character banked, another can see",
 
 
 # =============================================================================
-# EQUIPMENT AND HOTBAR SURVIVE A RE-LOGIN
+# EQUIPMENT SURVIVES A RE-LOGIN, AND THE SAVE IS NOT HOW YOU CHANGE IT
 # =============================================================================
-# Both are strings the client cannot keep for itself. hotbar_assignments used
-# to live only in the local slot dictionary, so it survived a scene change and
-# not a re-login - the pet came back, because active_pet_id has a column, and
-# the hotbar did not, because it had none. Equipment would have inherited that
-# exact hole.
+# A string the client cannot keep for itself, like active_pet_id. The hotbar
+# used to sit beside it here as a list of item ids; it holds real items now,
+# as carried cells, and has its own section under CHARACTER - BACKPACK.
 
-section("SAVE - EQUIPMENT AND HOTBAR")
+section("SAVE - EQUIPMENT")
 
 def save_slot(**fields):
     body = {"slot": 0, "class_id": "warrior", "name": "checker"}
@@ -1156,21 +1182,20 @@ check("nor can gear be forced into the wrong slot",
 check("the save stored no equipment at all",
       slot_zero().get("equipment", {}) == {}, slot_zero().get("equipment"))
 
-status("a save with a hotbar", save_slot(
+# THE OLD HOTBAR FIELD IS IGNORED, NOT REFUSED - the same courtesy equipment
+# gets below, and for the same reason: a client that still sends it is out of
+# date, not lying, and a 400 would stop it saving anything else.
+body = status("a save that still sends the old hotbar list", save_slot(
     hotbar=["tinyhealthpotion", "", "embersword"]), 200)
-body = slot_zero()
-check("the hotbar came back", body.get("hotbar", [])[0] == "tinyhealthpotion",
-      body.get("hotbar"))
-check("padded to nine, so the client always draws nine",
-      len(body.get("hotbar", [])) == 9, body.get("hotbar"))
+check("is told the field was dropped",
+      "hotbar" in body.get("ignored", []), body)
+check("and no hotbar comes back on the save any more",
+      "hotbar" not in slot_zero(), slot_zero())
 
 # THE RULE THAT MATTERS MOST: a save that says nothing about gear must not
 # undress you. Several callers write this slot and not all of them know what
 # the player is wearing - the same reasoning active_pet_id carries.
 status("a save that mentions neither", save_slot(area="field"), 200)
-body = slot_zero()
-check("the hotbar is untouched by a save that does not mention it",
-      body.get("hotbar", [])[0] == "tinyhealthpotion", body.get("hotbar"))
 
 # EQUIPMENT REFUSALS MOVED WITH THE FEATURE. These used to assert that /api/save
 # 400s on a slot the catalogue does not have, an item it has never heard of, and
@@ -1191,17 +1216,9 @@ status("even when it is not a map at all",
 check("and none of it reached the column",
       slot_zero().get("equipment", {}) == {}, slot_zero().get("equipment"))
 
-status("a hotbar item that does not exist", save_slot(hotbar=["sombrero"]), 400)
-status("a hotbar sent as a string", save_slot(hotbar="potion"), 400)
-
-body = slot_zero()
-check("and not one refusal disturbed the hotbar",
-      body.get("hotbar", [])[0] == "tinyhealthpotion", body.get("hotbar"))
-
-# A short hotbar is an older client, not a liar.
-status("a hotbar shorter than nine", save_slot(hotbar=["tinyhealthpotion"]), 200)
-check("is padded rather than refused", len(slot_zero().get("hotbar", [])) == 9,
-      slot_zero().get("hotbar"))
+status("an old hotbar naming an item that does not exist is dropped too",
+       save_slot(hotbar=["sombrero"]), 200)
+status("and so is one that is not even a list", save_slot(hotbar="potion"), 200)
 
 
 # =============================================================================
@@ -1458,7 +1475,8 @@ body = status("write a positional inventory", client.put("/api/character/invento
                   {"item_id": "smallhealthpotion", "quantity": 7},
               ]}), 200)
 inv = body["inventory"]
-check("comes back as 20 positional cells", len(inv) == 20, len(inv))
+check("comes back as every carried cell - the bag, then the hotbar",
+      len(inv) == app_module.CARRY_CAPACITY, len(inv))
 check("empty cells stay empty", inv[1] is None and inv[2] is None, inv[:4])
 check("an item stays in the cell it was put in",
       inv[3] is not None and inv[3]["item_id"] == "smallhealthpotion", inv[3])
@@ -1479,7 +1497,7 @@ body = status("an empty array", client.put("/api/character/inventory", headers=H
 check("clears the bag rather than leaving it", all(c is None for c in body["inventory"]))
 
 status("more entries than capacity", client.put("/api/character/inventory", headers=H,
-       json={"slot": 0, "inventory": [None] * 21}), 400)
+       json={"slot": 0, "inventory": [None] * (app_module.CARRY_CAPACITY + 1)}), 400)
 status("quantity 0", client.put("/api/character/inventory", headers=H,
        json={"slot": 0, "inventory": [{"item_id": "ironsword", "quantity": 0}]}), 400)
 status("a cell that is not an object", client.put("/api/character/inventory", headers=H,
@@ -1498,6 +1516,229 @@ status("a write with a bad entry LATE in the array", client.put("/api/character/
 body = status("read it back", client.get("/api/character?slot=0", headers=H), 200)
 check("a rejected write changed NOTHING",
       body["inventory"][0]["item_id"] == "ironsword", body["inventory"][0])
+
+
+# =============================================================================
+# THE HOTBAR IS CARRIED
+# =============================================================================
+# The ten keys hold real items: carry_items rows at positions INVENTORY_CAPACITY
+# and up. Dragging a potion onto key 2 is a reorder of one array, so everything
+# below leans on rules the backpack already had - and the checks are about the
+# three places the hotbar could have broken them: a write that does not reach
+# the keys, placement that must never land on one, and a take that must spend
+# the cell the player actually used.
+
+section("CHARACTER - THE HOTBAR IS CARRIED")
+
+BAG = app_module.INVENTORY_CAPACITY
+CARRY = app_module.CARRY_CAPACITY
+check("the bag is twenty cells and the hotbar ten more",
+      BAG == 20 and app_module.HOTBAR_SIZE == 10 and CARRY == BAG + 10,
+      (BAG, app_module.HOTBAR_SIZE, CARRY))
+
+# A PLAYER, not the owner: the owner is exempt from the ledger, and half of
+# this section is about the ledger.
+_hb_reg = client.post("/api/auth/register",
+                      json={"username": "keyholder", "password": "password123"})
+HB = {"Authorization": "Bearer " + _hb_reg.get_json()["token"]}
+status("a character to carry things", client.put("/api/save", headers=HB,
+       json={"slot": 0, "class_id": "warrior", "name": "keyholder"}), 200)
+
+
+def seed_cells(username, cells):
+    """carry_items exactly as given, {position: (item_id, qty)} - as if the
+    server had granted them there. Everything else in slot 0 is cleared."""
+    conn = _sq.connect(DB_PATH)
+    uid = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()[0]
+    conn.execute("DELETE FROM carry_items WHERE user_id = ? AND slot = 0", (uid,))
+    conn.executemany(
+        "INSERT INTO carry_items (user_id, slot, position, item_id, quantity) VALUES (?, 0, ?, ?, ?)",
+        [(uid, pos, item, qty) for pos, (item, qty) in cells.items()])
+    conn.commit()
+    conn.close()
+
+
+def carry(headers):
+    return client.get("/api/character?slot=0", headers=headers).get_json()["inventory"]
+
+
+def cell(inv, position):
+    c = inv[position] if position < len(inv) else None
+    return (c["item_id"], c["quantity"]) if c else None
+
+
+def total(inv, item_id):
+    return sum(c["quantity"] for c in inv if c and c["item_id"] == item_id)
+
+
+def layout(cells):
+    """A full CARRY-length write with the given {position: (item, qty)}."""
+    out = [None] * CARRY
+    for pos, (item, qty) in cells.items():
+        out[pos] = {"item_id": item, "quantity": qty}
+    return out
+
+
+def put_carry(headers, cells):
+    return client.put("/api/character/inventory", headers=headers,
+                      json={"slot": 0, "inventory": cells})
+
+
+seed_cells("keyholder", {0: ("tinyhealthpotion", 5)})
+inv = carry(HB)
+check("a read hands back the bag and the keys together", len(inv) == CARRY, len(inv))
+
+# ---- moving to a key and back is a reorder, and the ledger lets it through --
+body = status("drag five potions from bag cell 0 onto key 2",
+              put_carry(HB, layout({BAG + 1: ("tinyhealthpotion", 5)})), 200)
+inv = body["inventory"]
+check("they are on the key", cell(inv, BAG + 1) == ("tinyhealthpotion", 5), inv[BAG:])
+check("and gone from the bag - one place, not two", cell(inv, 0) is None, inv[0])
+check("and there are still exactly five", total(inv, "tinyhealthpotion") == 5)
+
+inv = status("and drag them back into bag cell 3",
+             put_carry(HB, layout({3: ("tinyhealthpotion", 5)})), 200)["inventory"]
+check("back in the bag", cell(inv, 3) == ("tinyhealthpotion", 5), inv[:4])
+check("and the key is empty again", cell(inv, BAG + 1) is None, inv[BAG:])
+
+# ---- a key is not a way round the ledger ------------------------------------
+inv = status("claim a sword on key 5 that the server never granted",
+             put_carry(HB, layout({3: ("tinyhealthpotion", 5),
+                                   BAG + 4: ("embersword", 1)})), 200)["inventory"]
+check("the invented sword is trimmed off the key", cell(inv, BAG + 4) is None, inv[BAG:])
+
+# ---- a write that stops at the bag leaves the keys alone --------------------
+seed_cells("keyholder", {0: ("ironsword", 1), BAG + 1: ("tinyhealthpotion", 5)})
+inv = status("a twenty-cell write that moves the sword",
+             put_carry(HB, [None, {"item_id": "ironsword", "quantity": 1}] + [None] * (BAG - 2)),
+             200)["inventory"]
+check("moves the sword", cell(inv, 1) == ("ironsword", 1) and cell(inv, 0) is None, inv[:2])
+check("AND LEAVES THE POTIONS ON THE KEY - it never mentioned them",
+      cell(inv, BAG + 1) == ("tinyhealthpotion", 5), inv[BAG:])
+
+inv = status("a twenty-cell write claiming those same potions in the bag",
+             put_carry(HB, [{"item_id": "tinyhealthpotion", "quantity": 5}] + [None] * (BAG - 1)),
+             200)["inventory"]
+check("CANNOT DUPLICATE THEM: the key's five are not in the ledger it spends",
+      total(inv, "tinyhealthpotion") == 5, inv)
+check("the key still has them", cell(inv, BAG + 1) == ("tinyhealthpotion", 5), inv[BAG:])
+
+inv = status("an empty array", put_carry(HB, []), 200)["inventory"]
+check("still empties the bag, as it always has",
+      all(c is None for c in inv[:BAG]), inv[:BAG])
+check("and still leaves the keys", cell(inv, BAG + 1) == ("tinyhealthpotion", 5), inv[BAG:])
+
+status("a write of exactly every carried cell", put_carry(HB, [None] * CARRY), 200)
+check("which does reach the keys, and empties them",
+      all(c is None for c in carry(HB)), carry(HB))
+
+# ---- nothing is PLACED on a key ---------------------------------------------
+# A bank withdrawal runs the same _add_to_backpack() as loot, the shop, a trade,
+# a catch and a staff grant, so it stands in for all of them - and unlike a
+# grant it leaves no staff_actions row for a later section to trip over.
+def seed_bank(username, cells):
+    conn = _sq.connect(DB_PATH)
+    uid = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()[0]
+    conn.execute("DELETE FROM bank_items WHERE user_id = ?", (uid,))
+    conn.executemany(
+        "INSERT INTO bank_items (user_id, position, item_id, quantity) VALUES (?, ?, ?, ?)",
+        [(uid, pos, item, qty) for pos, (item, qty) in cells.items()])
+    conn.commit()
+    conn.close()
+
+
+def withdraw(item_id, quantity):
+    return client.post("/api/bank/items", headers=HB, json={
+        "slot": 0, "op": "withdraw", "item_id": item_id, "quantity": quantity})
+
+
+seed_cells("keyholder", {0: ("tinyhealthpotion", 3), BAG: ("tinyhealthpotion", 3)})
+seed_bank("keyholder", {0: ("tinyhealthpotion", 2)})
+inv = status("withdraw two potions with part-used stacks in the bag AND on key 1",
+             withdraw("tinyhealthpotion", 2), 200)["inventory"]
+check("they top up the bag stack", cell(inv, 0) == ("tinyhealthpotion", 5), inv[0])
+check("and never the one on the key", cell(inv, BAG) == ("tinyhealthpotion", 3), inv[BAG])
+
+seed_cells("keyholder", {BAG + 2: ("tinyhealthpotion", 3)})
+seed_bank("keyholder", {0: ("tinyhealthpotion", 1)})
+inv = status("withdraw one with potions ONLY on a key", withdraw("tinyhealthpotion", 1),
+             200)["inventory"]
+check("it opens a bag cell rather than joining the key's stack",
+      cell(inv, 0) == ("tinyhealthpotion", 1) and cell(inv, BAG + 2) == ("tinyhealthpotion", 3),
+      (inv[0], inv[BAG + 2]))
+
+seed_cells("keyholder", {p: ("ironsword", 1) for p in range(BAG)})
+seed_bank("keyholder", {0: ("embersword", 1)})
+body = status("withdraw into a full bag with every key empty", withdraw("embersword", 1), 409)
+check("is refused as a full bag - the empty keys are not room",
+      "(%d slots)" % BAG in str(body.get("message", "")), body)
+check("and nothing landed on a key", all(c is None for c in carry(HB)[BAG:]), carry(HB)[BAG:])
+seed_bank("keyholder", {})
+
+# ---- a take spends the cell the player used ---------------------------------
+seed_cells("keyholder", {2: ("tinyhealthpotion", 4), BAG + 2: ("tinyhealthpotion", 4)})
+status("drink from bag cell 2", client.post("/api/character/consume", headers=HB,
+       json={"slot": 0, "item_id": "tinyhealthpotion", "position": 2}), 200)
+inv = carry(HB)
+check("the bag's stack went down", cell(inv, 2) == ("tinyhealthpotion", 3), inv[2])
+check("and the key's did not", cell(inv, BAG + 2) == ("tinyhealthpotion", 4), inv[BAG + 2])
+status("drink from key 3", client.post("/api/character/consume", headers=HB,
+       json={"slot": 0, "item_id": "tinyhealthpotion", "position": BAG + 2}), 200)
+inv = carry(HB)
+check("now the key's went down",
+      cell(inv, BAG + 2) == ("tinyhealthpotion", 3) and cell(inv, 2) == ("tinyhealthpotion", 3),
+      (inv[2], inv[BAG + 2]))
+status("a position that holds something else is only a preference",
+       client.post("/api/character/consume", headers=HB,
+                   json={"slot": 0, "item_id": "tinyhealthpotion", "position": 7}), 200)
+check("and one potion still went", total(carry(HB), "tinyhealthpotion") == 5, carry(HB))
+for bad in (CARRY, -1, "seven", True):
+    status("consume at position %r" % (bad,), client.post("/api/character/consume", headers=HB,
+           json={"slot": 0, "item_id": "tinyhealthpotion", "position": bad}), 400)
+
+seed_cells("keyholder", {1: ("tinyhealthpotion", 3), BAG + 3: ("tinyhealthpotion", 3)})
+status("deposit the bag's three, naming bag cell 1", client.post("/api/bank/items", headers=HB,
+       json={"slot": 0, "op": "deposit", "item_id": "tinyhealthpotion", "quantity": 3,
+             "position": 1}), 200)
+inv = carry(HB)
+check("the bag cell emptied", cell(inv, 1) is None, inv[1])
+check("and the key kept its three", cell(inv, BAG + 3) == ("tinyhealthpotion", 3), inv[BAG + 3])
+status("and deposit the key's, naming key 4", client.post("/api/bank/items", headers=HB,
+       json={"slot": 0, "op": "deposit", "item_id": "tinyhealthpotion", "quantity": 3,
+             "position": BAG + 3}), 200)
+check("which empties the key", cell(carry(HB), BAG + 3) is None, carry(HB)[BAG:])
+status("a bank position past the bank", client.post("/api/bank/items", headers=HB,
+       json={"slot": 0, "op": "withdraw", "item_id": "tinyhealthpotion", "quantity": 1,
+             "position": app_module.BANK_CAPACITY}), 400)
+inv = status("withdraw them", client.post("/api/bank/items", headers=HB,
+             json={"slot": 0, "op": "withdraw", "item_id": "tinyhealthpotion",
+                   "quantity": 6}), 200)["inventory"]
+check("a withdrawal lands in the bag, never on a key",
+      total(inv[:BAG], "tinyhealthpotion") == 6 and all(c is None for c in inv[BAG:]), inv)
+
+seed_cells("keyholder", {5: ("ironsword", 1), BAG + 5: ("ironsword", 1)})
+status("equip the sword in bag cell 5", client.post("/api/character/equip", headers=HB,
+       json={"slot": 0, "item_id": "ironsword", "position": 5}), 200)
+inv = carry(HB)
+check("the bag's sword went on", cell(inv, 5) is None, inv[5])
+check("and the one on key 6 stayed", cell(inv, BAG + 5) == ("ironsword", 1), inv[BAG + 5])
+status("equip at a position past the carry", client.post("/api/character/equip", headers=HB,
+       json={"slot": 0, "item_id": "ironsword", "position": CARRY}), 400)
+
+# ---- death takes the keys with the bag --------------------------------------
+# Otherwise the hotbar is a pocket that keeps ten stacks through a death the
+# bag loses everything to.
+seed_cells("keyholder", {0: ("ironsword", 1), BAG: ("tinyhealthpotion", 5)})
+_hconn = _sq.connect(DB_PATH)
+_hconn.execute("UPDATE saves SET hp = 0 WHERE slot = 0 AND user_id ="
+               " (SELECT id FROM users WHERE username = 'keyholder')")
+_hconn.commit()
+_hconn.close()
+status("die and respawn", client.post("/api/character/respawn", headers=HB,
+       json={"slot": 0}), 200)
+check("THE KEYS ARE EMPTIED WITH THE BAG", all(c is None for c in carry(HB)), carry(HB))
+
+print("  keys hold items; writes, placement, takes and death all know where they are")
 
 
 # =============================================================================
@@ -1781,7 +2022,13 @@ status("and demotion works", client.put("/api/staff/role", headers=OWNER_H,
 # kick list has to tell apart: here now, logged in but gone quiet, logged out.
 
 def _listed(name, headers=OWNER_H):
-    for entry in client.get("/api/staff/users", headers=headers).get_json()["accounts"]:
+    # SEARCHED FOR, not read off the first page. The list is paged now (see
+    # test_moderation.py), and by this point the suite has registered more
+    # accounts than one page holds - so "is it in the default list" would
+    # quietly start answering "is it in the first fifty by name".
+    body = client.get("/api/staff/users", headers=headers,
+                      query_string={"q": name}).get_json()
+    for entry in body["accounts"]:
         if entry["username"] == name:
             return entry
     return None
@@ -1948,9 +2195,9 @@ check("a ban records who, what and why",
 check("a rank change records both sides",
       any(act == "role" and "player -> mod" in d for _, act, _, d in _log), _log)
 
-body = status("the account list shows rank and reach",
-              client.get("/api/staff/users", headers=MOD_H), 200)
-_by_name = {a["username"]: a for a in body["accounts"]}
+status("the account list shows rank and reach",
+       client.get("/api/staff/users", headers=MOD_H), 200)
+_by_name = {name: _listed(name, MOD_H) for name in ("checker", "victim")}
 check("the owner is listed as owner", _by_name["checker"]["role"] == "owner", _by_name["checker"])
 check("and is not actionable by a mod", _by_name["checker"]["actionable"] is False, _by_name["checker"])
 check("a player is actionable by a mod", _by_name["victim"]["actionable"] is True, _by_name["victim"])
@@ -2093,6 +2340,25 @@ check("and the audit row came with it, not an empty table",
 check("the stale index was dropped", "idx_admin_actions_target" not in _schema, _schema)
 check("and the renamed one exists exactly once",
       _schema.get("idx_staff_actions_target") == "index", _schema)
+
+# THE MODERATION LOG'S INDEXES, AND THE PRESENCE ONE, ON AN OLD DATABASE. The
+# presence index is on a column this legacy sessions table did not have until
+# a migration added it, so creating it in the schema block would not merely
+# fail to appear here - it would stop the boot. See idx_sessions_seen.
+_indexes = {row[0] for row in _db.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+check("an old database gets the log's indexes",
+      {"idx_staff_actions_target_id", "idx_staff_actions_actor_nc"} <= _indexes, sorted(_indexes))
+check("and the presence index, after the column it indexes",
+      "idx_sessions_seen" in _indexes, sorted(_indexes))
+# THE NAME COLOUR, on an account and on a chat line, arrives on an old
+# database as a column holding nothing - "never chose", which the client draws
+# as its default - rather than as a missing column and a 500 on login.
+check("an old database gets the name colour column, empty",
+      "name_hue" in _user_cols_after(_db)
+      and all(r[0] is None for r in _db.execute("SELECT name_hue FROM users")),
+      _user_cols_after(_db))
+check("and so does its chat",
+      "name_hue" in [r[1] for r in _db.execute("PRAGMA table_info(chat_messages)")])
 _db.close()
 
 # Booting twice must not double the gold or duplicate the rows - every server

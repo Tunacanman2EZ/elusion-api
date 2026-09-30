@@ -115,7 +115,7 @@ MIN_SPAN_SECONDS_FOR_RATE = 300       # ...measured over at least this long a sp
 # instances on a 30s+ respawner, each taking 30-40s to actually kill, so an
 # honest player clears well under two a minute. A per-boss rate this far above
 # that is worth a look on its own, separate from the overall rate.
-BOSS_HP_THRESHOLD = 1000              # max_hp at or above this counts as a boss
+BOSS_HP_THRESHOLD = 1000              # only for a catalogue with no slots_are_gear
 BOSS_SUSPICIOUS_PER_HOUR = 90         # boss-family kills/hr above this -> review
 MIN_BOSS_KILLS_FOR_RATE = 20
 
@@ -131,6 +131,21 @@ MIN_KILLS_FOR_DOMINANCE = 100
 # level of everyone who has killed that boss, so the bar is set by the players
 # themselves and not by a number picked here. Flag a claim below half the median
 # and below an absolute floor, so a low-but-plausible level never trips it.
+# WHAT A BOSS IS: the enemy whose bag is one guaranteed piece of gear
+# (EnemyData.slots_are_gear), which is how the loot roll already tells the seven
+# bosses apart. It used to be "max_hp of 1,000 or more", and the element bands
+# made that wrong the day they landed: a normal dark bush mage has 1,555 health,
+# so an honest player farming the dark field at five kills a minute would have
+# been flagged for 300 "boss" kills an hour. Health says how long a fight is,
+# not what kind of fight it is.
+def is_boss(enemy):
+    if enemy is None:
+        return False
+    if "slots_are_gear" in enemy:
+        return bool(enemy.get("slots_are_gear"))
+    return int(enemy.get("max_hp", 0)) >= BOSS_HP_THRESHOLD
+
+
 LOWLEVEL_BOSS_MEDIAN_FRACTION = 0.5
 LOWLEVEL_BOSS_ABSOLUTE_FLOOR = 10
 MIN_BOSS_KILLERS_FOR_MEDIAN = 5
@@ -250,12 +265,12 @@ def analyze(con, window=KILL_WINDOW_SECONDS, respawn=KILL_RESPAWN_FLOOR_SECONDS)
     if _GAMEDATA_OK:
         for user_id, enemy_id, _slot, level_at, at in rows:
             enemy = gamedata.ENEMIES.get(enemy_id)
-            if enemy is not None and int(enemy.get("max_hp", 0)) >= BOSS_HP_THRESHOLD:
+            if is_boss(enemy):
                 boss_levels.setdefault(enemy_id, []).append((user_id, level_at))
 
         for (user_id, enemy_id), times in by_user_enemy.items():
             enemy = gamedata.ENEMIES.get(enemy_id)
-            if enemy is None or int(enemy.get("max_hp", 0)) < BOSS_HP_THRESHOLD:
+            if not is_boss(enemy):
                 continue
             if len(times) < MIN_BOSS_KILLS_FOR_RATE:
                 continue

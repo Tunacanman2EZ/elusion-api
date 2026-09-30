@@ -32,7 +32,7 @@ Role definitions, the ladder and how the owner is named: [`CLAUDE.md` → Ranks]
 |---|---|---|
 | **Anonymous** | `GET /api/status`, register, log in | Any state at all. Three routes, and `/api/status` exists because a login screen has to ask "are you there?" before anyone has logged in |
 | **Logged-in player** | Move, chat, save, and *request* loot, trades, purchases, revives, cooking, fishing — each as a claim the server re-derives | Their own level, XP, stat maxima, loot rolls, gold totals, lusion totals, any of the six skills, or any row that is not theirs |
-| **Mod** | Kick, ban up to 30 days, take a chat line down, read the staff user list and linked accounts | Banning at or above their own rank, banning permanently, granting a rank at or above their own, touching the economy |
+| **Mod** | Kick, ban up to 30 days, take a chat line down, read the staff user list, the moderation log and linked accounts, write staff-only notes and warnings | Banning at or above their own rank, banning permanently, granting a rank at or above their own, touching the economy |
 | **Dev** | Everything a mod can, plus permanent bans, teleporting a player, reading economy supply | Granting dev or owner, moving the whole server, minting gold, the metrics endpoint |
 | **Owner** | Everything, incl. broadcast, maintenance, metrics, moving everyone | Being stored anywhere. `ELUSION_OWNER` is an environment variable, so no request writes it and no database backup carries it |
 | **The server** | Owns level, XP, derived maxima, loot rolls and loot bag contents; sole author of the gold and lusion ledgers | Knowing whether the client is honest, or whether the IP it sees is the player's. Both are assumed false |
@@ -45,7 +45,7 @@ the backpack ledger is still whatever the client pushes.
 
 ## Invariants
 
-Sixteen promises, each anchored. The first three are structural — they cannot
+Twenty promises, each anchored. The first three are structural — they cannot
 rot because there is nothing to change.
 
 (It said "Ten" for a while after it had thirteen, which is the small version of
@@ -129,6 +129,39 @@ that it was wrong, in bold, on the security page, is the point.)
     → Held by: `test_security.py` — "1 hp to full with no potion is logged"
     → and: `test_economy.py` — "the respawn explains the rise instead of it being clamped", "the loss is in the ledger under its own reason"
     → and in the game: `src/tools/testrunner.gd` — `_test_death_reaches_the_server()`
+17. **A staff note is read only by staff who could act on its subject.** Notes
+    and warnings are opinions about a person, kept for the next member of staff,
+    and they are read under the rule that guards IP addresses — `can_act_on()`,
+    strictly above. A mod never reads what was written about another mod, nobody
+    reads what was written about themselves, and no route a player can reach
+    reads the table at all. The rule is in the query, not applied after it, so a
+    page of the log is always a full page.
+    The same reach guards an account's trade history on the staff desk: out
+    of reach reads exactly like an account that does not exist.
+    → Held by: `test_moderation.py` — "a note about a mod is not read by another mod", "the account view does not carry notes to a mod who cannot act", "no route the player can reach carries a note about them"
+    → and: `test_trades.py` — "so is one above the mod's reach, indistinguishably"
+18. **A name's colour proves nothing; rank is a badge.** Every player, staff
+    included, chooses the hue their name is drawn in, so a player can pick the
+    owner's gold. What marks staff is the crown and the MOD / DEV badge, drawn
+    from the `role` the server sends - never from anything a player sets.
+    → Held by: `test_namecolour.py` — "the owner is still the owner - rank did not ride on the colour"
+    → and in the game: `src/tools/testrunner.gd` — `_test_staff_panel()`
+19. **Accept agrees to the offer that was on the screen, and nothing else.**
+    Every change to either side of a trade moves its revision, and
+    `POST /api/trade/confirm` must name the revision the client drew. The write
+    is conditioned on it, so an offer swapped a moment before the click refuses
+    the accept rather than executing it - the other side cannot turn "accept
+    the sword" into "accept the stick" by being faster than a poll.
+    → Held by: `test_trades.py` — "an accept for an offer that has since changed is refused", "an accept that names no revision is refused"
+    → and in the game: `src/tools/testrunner.gd` — `_test_trades_reach_the_right_people()`
+20. **A bag the server changed is never overwritten by a copy from before.**
+    A trade changes the bags of two players and only one of them asked. Both
+    characters are flagged in the trade's own transaction; until the new bag
+    has been delivered, a whole-bag save from that client is refused with the
+    bag the server holds, so what a trade gave cannot be deleted by the
+    receiver's next ordinary save.
+    → Held by: `test_trades.py` — "a whole-bag save built before the trade is refused", "the sword he received survives it"
+    → and in the game: `src/tools/testrunner.gd` — `_test_trades_reach_the_right_people()`
 
 ---
 

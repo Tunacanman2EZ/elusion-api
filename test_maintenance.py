@@ -322,6 +322,34 @@ open_server(owner_token)
 
 
 # =============================================================================
+# A LONG MESSAGE DOES NOT CUT THE COUNTDOWN
+# =============================================================================
+# post_broadcast() trims the whole notice to MAX_BROADCAST_LENGTH, and the
+# owner's message may be 200 already - the countdown the players act on was
+# the part that fell off. The message gives way now.
+
+print("\n--- a long message keeps its countdown ---")
+
+long_message = "The realm is being rebuilt tonight. " * 10
+res = close_server(owner_token, message=long_message, grace_seconds=60)
+check("a 360-character message is accepted", res.status_code == 200, str(res.status_code))
+notices = client.get("/api/server/broadcasts?since=0", headers=auth(owner_token)).get_json()
+bodies = [m.get("body", "") for m in (notices.get("messages", []) if isinstance(notices, dict) else [])]
+last = bodies[-1] if bodies else ""
+check("the notice still ends with the countdown",
+      last.endswith("(closing in 60s - your progress is being saved)"), repr(last[-60:]))
+check("and fits the broadcast limit, the message shortened with an ellipsis",
+      len(last) <= app_module.MAX_BROADCAST_LENGTH and "..." in last, "%d chars" % len(last))
+open_server(owner_token)
+res = close_server(owner_token, message="Back soon.", grace_seconds=0)
+notices = client.get("/api/server/broadcasts?since=0", headers=auth(owner_token)).get_json()
+bodies = [m.get("body", "") for m in (notices.get("messages", []) if isinstance(notices, dict) else [])]
+check("a short one is left whole", bodies and bodies[-1] == "Back soon. (closing now)",
+      bodies[-1] if bodies else "none")
+open_server(owner_token)
+
+
+# =============================================================================
 print("\n=================================")
 print("passed: %d   failed: %d" % (passed, failed))
 if failures:

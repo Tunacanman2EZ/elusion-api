@@ -609,6 +609,33 @@ def holding(username, item_id):
     return int(row["n"])
 
 
+def confirm(headers):
+    """
+    Accept the trade AS IT STANDS: the revision read the way the window reads
+    it, off GET /api/trade. POST /api/trade/confirm requires the revision you
+    were shown - see trade_confirm() in app.py - so an accept without one is an
+    accept the server no longer takes, and a test sending it would be testing
+    nothing the game does.
+    """
+    body = client.get("/api/trade", headers=headers).get_json() or {}
+    trade = body.get("trade") or {}
+    return client.post("/api/trade/confirm", headers=headers,
+                       json={"revision": trade.get("revision", 0)})
+
+
+def present(*headers):
+    """
+    One heartbeat each, so the offer's "is that player online" check sees them.
+
+    Login stamps presence too, so a fast run never needed this - but a slow run
+    (a loaded machine, a sabotage pass) can take longer than
+    ONLINE_WINDOW_SECONDS between a login and the offer, and then this suite
+    would fail for a reason that has nothing to do with trade.
+    """
+    for h in headers:
+        client.get("/api/server/broadcasts", headers=h)
+
+
 def ledger_rows(reason=None):
     conn = db_conn()
     if reason:
@@ -633,8 +660,7 @@ status("trading with a stranger", client.post(
     "/api/trade/offer", headers=P1, json={"slot": 0, "username": "nobodyatall"}), 400)
 status("updating with no trade open", client.post(
     "/api/trade/update", headers=P1, json={"gold": 10}), 404)
-status("confirming with no trade open", client.post(
-    "/api/trade/confirm", headers=P1, json={}), 404)
+status("confirming with no trade open", confirm(P1), 404)
 
 body = status("no token", client.get("/api/trade"), 401)
 
@@ -644,6 +670,7 @@ print("\ntrade: gold for goods")
 
 give("tradealice", "ironsword", 1)
 check("alice holds the sword", holding("tradealice", "ironsword") == 1)
+present(P1, P2)
 
 body = status("alice opens a trade with bob", client.post(
     "/api/trade/offer", headers=P1, json={"slot": 0, "username": "tradebob"}), 200)
@@ -684,25 +711,29 @@ check("alice is quoted tax on the gold she receives",
 check("bob is quoted tax on the sword he receives",
       body and body["b"]["tax"] == want_b_tax, "got %r want %d" % (body["b"]["tax"], want_b_tax))
 
-body = status("alice confirms", client.post("/api/trade/confirm", headers=P1, json={}), 200)
+body = status("alice confirms", confirm(P1), 200)
 check("alice is confirmed and bob is not",
       body and body["a"]["confirmed"] and not body["b"]["confirmed"], body)
 check("nothing has moved yet", holding("tradealice", "ironsword") == 1)
 
 # CHANGING AN OFFER MUST UN-CONFIRM BOTH SIDES. The version of this bug that
 # actually costs somebody an item is a REMOVAL after the other side agreed.
+#
+# A REAL EDIT, not the same offer sent again - an identical update is no longer
+# a change and deliberately does not withdraw anything (see trade_update).
 body = status("bob edits his offer", client.post(
-    "/api/trade/update", headers=P2, json={"gold": 1000}), 200)
+    "/api/trade/update", headers=P2, json={"gold": 999}), 200)
 check("alice's confirmation was withdrawn by bob's edit",
       body and not body["a"]["confirmed"] and not body["b"]["confirmed"], body)
+status("and bob puts it back", client.post(
+    "/api/trade/update", headers=P2, json={"gold": 1000}), 200)
 
 alice_before, bob_before = purse("tradealice"), purse("tradebob")
 supply_before = supply()
 tax_rows_before = ledger_rows("kingdom_tax")
 
-status("alice re-confirms", client.post("/api/trade/confirm", headers=P1, json={}), 200)
-body = status("bob confirms and it executes", client.post(
-    "/api/trade/confirm", headers=P2, json={}), 200)
+status("alice re-confirms", confirm(P1), 200)
+body = status("bob confirms and it executes", confirm(P2), 200)
 
 check("the trade reports done", body and body.get("state") == "done", body)
 check("the kingdom took both cuts",
@@ -727,7 +758,7 @@ check("exactly two burn rows were written",
       "wrote %d" % (ledger_rows("kingdom_tax") - tax_rows_before))
 balanced("a gold-for-goods trade")
 
-status("the trade is over", client.post("/api/trade/confirm", headers=P1, json={}), 404)
+status("the trade is over", confirm(P1), 404)
 
 
 # -----------------------------------------------------------------------------
@@ -737,6 +768,7 @@ print("\ntrade: the gold leg writes no ledger rows")
 # write a -N and a +N claiming two supply events that never happened.
 
 give("tradealice", "tinyhealthpotion", 1)
+present(P1, P2)
 status("open", client.post("/api/trade/offer", headers=P1,
                            json={"slot": 0, "username": "tradebob"}), 200)
 status("alice puts up a potion", client.post("/api/trade/update", headers=P1,
@@ -744,8 +776,8 @@ status("alice puts up a potion", client.post("/api/trade/update", headers=P1,
 status("bob puts up 40 gold", client.post("/api/trade/update", headers=P2, json={"gold": 40}), 200)
 
 rows_before = ledger_rows()
-status("alice confirms", client.post("/api/trade/confirm", headers=P1, json={}), 200)
-status("bob confirms", client.post("/api/trade/confirm", headers=P2, json={}), 200)
+status("alice confirms", confirm(P1), 200)
+status("bob confirms", confirm(P2), 200)
 
 # Two taxes, and nothing else. Forty gold moved between two purses and the
 # ledger is silent about it, which is correct: both purses are supply.
@@ -761,6 +793,7 @@ print("\ntrade: barter is taxed too")
 
 give("tradealice", "ironsword", 1)
 give("tradebob", "ironhelm", 1)
+present(P1, P2)
 status("open", client.post("/api/trade/offer", headers=P1,
                            json={"slot": 0, "username": "tradebob"}), 200)
 status("sword up", client.post("/api/trade/update", headers=P1,
@@ -769,8 +802,8 @@ status("helm up", client.post("/api/trade/update", headers=P2,
        json={"items": [{"item_id": "ironhelm", "quantity": 1}]}), 200)
 
 before = supply()
-status("alice confirms", client.post("/api/trade/confirm", headers=P1, json={}), 200)
-body = status("bob confirms", client.post("/api/trade/confirm", headers=P2, json={}), 200)
+status("alice confirms", confirm(P1), 200)
+body = status("bob confirms", confirm(P2), 200)
 
 check("no gold changed hands at all", body and body["kingdom_take"] > 0, body)
 check("but supply still fell", supply()["held"] < before["held"],
@@ -799,6 +832,7 @@ check("a trade worth nothing pays nothing", gamedata.trade_tax(0) == 0)
 # -----------------------------------------------------------------------------
 print("\ntrade: cancelling, and the tax you cannot afford")
 
+present(P1, P2)
 status("open", client.post("/api/trade/offer", headers=P1,
                            json={"slot": 0, "username": "tradebob"}), 200)
 body = status("alice cancels", client.post("/api/trade/cancel", headers=P1, json={}), 200)
@@ -814,6 +848,7 @@ status("pauper character", client.put("/api/save", headers=POOR,
 check("the pauper is broke", purse("tradepauper") == 0, purse("tradepauper"))
 
 give("tradealice", "amethystsword", 1)
+present(P1, POOR)
 status("open with the pauper", client.post("/api/trade/offer", headers=P1,
        json={"slot": 0, "username": "tradepauper"}), 200)
 status("alice offers something expensive", client.post("/api/trade/update", headers=P1,
@@ -821,9 +856,8 @@ status("alice offers something expensive", client.post("/api/trade/update", head
 
 before = supply()
 alice_had = purse("tradealice")
-status("alice confirms", client.post("/api/trade/confirm", headers=P1, json={}), 200)
-status("the pauper confirms and cannot cover the cut", client.post(
-    "/api/trade/confirm", headers=POOR, json={}), 400)
+status("alice confirms", confirm(P1), 200)
+status("the pauper confirms and cannot cover the cut", confirm(POOR), 400)
 
 check("the sword did not move", holding("tradealice", "amethystsword") == 1)
 check("the pauper got nothing", holding("tradepauper", "amethystsword") == 0)
@@ -925,13 +959,14 @@ check("and they still see the realm's total", body and body["total"] == burned_t
 # THE BOARD MOVES WHEN A TRADE IS TAXED, which is the whole point of it.
 give("tradealice", "ironsword", 1)
 before = status("read before", kingdom(P1), 200)
+present(P1, P2)
 status("open", client.post("/api/trade/offer", headers=P1,
                            json={"slot": 0, "username": "tradebob"}), 200)
 status("sword up", client.post("/api/trade/update", headers=P1,
        json={"items": [{"item_id": "ironsword", "quantity": 1}]}), 200)
 status("gold up", client.post("/api/trade/update", headers=P2, json={"gold": 200}), 200)
-status("alice confirms", client.post("/api/trade/confirm", headers=P1, json={}), 200)
-result = status("bob confirms", client.post("/api/trade/confirm", headers=P2, json={}), 200)
+status("alice confirms", confirm(P1), 200)
+result = status("bob confirms", confirm(P2), 200)
 after = status("read after", kingdom(P1), 200)
 
 check("the realm's total rose by exactly this trade's take",
@@ -1341,6 +1376,7 @@ check("and that key is null when there is none", body and body["trade"] is None,
 give("tradealice", "ironsword", 1)
 give("tradebob", "ironhelm", 1)
 
+present(P1, P2)
 # OPEN. The panel renders straight from this response rather than re-polling,
 # so it has to be the same shape as the poll's trade object.
 opened = status("POST /api/trade/offer", client.post(
@@ -1388,8 +1424,7 @@ check("both sides are quoted a tax the panel can print",
       (trade["a"].get("tax"), trade["b"].get("tax")))
 
 # CONFIRM, ONE SIDE. The panel checks state != "done" and re-renders.
-half = status("POST /api/trade/confirm (first side)", client.post(
-    "/api/trade/confirm", headers=P1, json={}), 200)
+half = status("POST /api/trade/confirm (first side)", confirm(P1), 200)
 check("a single confirm does not execute", half and half.get("state") != "done", half)
 check("and it comes back as a trade the panel can render",
       half is not None and "a" in half and "b" in half, half)
@@ -1397,8 +1432,7 @@ check("our side reads as accepted", half["a"]["confirmed"] is True, half["a"])
 check("theirs does not", half["b"]["confirmed"] is False, half["b"])
 
 # CONFIRM, SECOND SIDE - the execution response, which is a DIFFERENT shape.
-done = status("POST /api/trade/confirm (second side)", client.post(
-    "/api/trade/confirm", headers=P2, json={}), 200)
+done = status("POST /api/trade/confirm (second side)", confirm(P2), 200)
 check("it reports done", done and done.get("state") == "done", done)
 for key in ("tax_paid", "kingdom_take", "a", "b"):
     check("the result carries %s" % key, key in done, sorted(done.keys()))
@@ -1412,7 +1446,7 @@ for side in ("a", "b"):
     check("result.%s carries inventory" % side, "inventory" in done[side], done[side].keys())
     check("result.%s inventory is a positional array" % side,
           isinstance(done[side]["inventory"], list)
-          and len(done[side]["inventory"]) == app_module.INVENTORY_CAPACITY,
+          and len(done[side]["inventory"]) == app_module.CARRY_CAPACITY,
           len(done[side]["inventory"]) if isinstance(done[side]["inventory"], list) else None)
 
 check("the sword reached bob", holding("tradebob", "ironsword") >= 1)
@@ -1420,6 +1454,7 @@ check("the helm reached alice", holding("tradealice", "ironhelm") >= 1)
 balanced("a trade driven the way the panel drives it")
 
 # CANCEL, which the panel reads a single boolean out of.
+present(P1, P2)
 status("open another", client.post("/api/trade/offer", headers=P1,
                                    json={"slot": 0, "username": "tradebob"}), 200)
 cancelled = status("POST /api/trade/cancel", client.post(

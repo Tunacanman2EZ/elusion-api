@@ -39,10 +39,15 @@ ever touches `elusion.db`.
 
 **THERE IS NO CHECK COUNT WRITTEN DOWN HERE, AND THAT IS DELIBERATE.** This
 line used to say "262 checks" and the Layout below used to give a figure for
-each of five suites. There are twenty-six now, and every one of those numbers
-was wrong - `test_api.py` alone had gone from 262 to 454. A number in a comment
-cannot fail, so it stays wrong until somebody trusts it. `run_tests.ps1` counts;
-this file does not.
+each of five suites. Every one of those numbers was wrong - `test_api.py` alone
+had gone from 262 to 454. A number in a comment cannot fail, so it stays wrong
+until somebody trusts it. `run_tests.ps1` counts; this file does not.
+
+**AND THIS PARAGRAPH BROKE ITS OWN RULE.** It went on to say "there are
+twenty-six now" - a count, in the passage explaining why counts do not belong
+here - and by the time anybody read this sentence there were twenty-seven. The
+suite number is as perishable as the check number and for the same reason, so
+it is gone too. `run_tests.ps1` prints `Suites: N` at the top of every run.
 
 **`elusion.db` holds real accounts and password hashes.** It is gitignored and
 must stay that way. Do not paste rows from it anywhere.
@@ -507,6 +512,222 @@ is looking.
 it describes, with names stored alongside ids so the log still makes sense after
 an account is gone.
 
+**And the log can be read now, which is what makes it a review rather than a
+promise of one.** `GET /api/staff/actions` pages it newest-first, filtered by
+player, by member of staff or by kind; `POST /api/staff/note` writes a note or a
+warning onto an account's record. `test_moderation.py` is the suite. Four things
+in it are decisions, not details:
+
+- **Both lists are pages, with a keyset cursor.** The staff panel used to fetch
+  every account every ten seconds. `after=<last name>` and `before=<last id>` are
+  one index seek each and cannot skip or repeat anybody when an account
+  registers mid-walk, which `OFFSET` can. Every filter is a `WHERE` clause, never
+  a Python filter over a fetched page, or a page comes back short and `more` lies.
+- **Notes and warnings are read under reach** - `STAFF_PRIVATE_KINDS`, the same
+  `can_act_on()` rule as IP addresses. A mod never reads what a dev wrote about
+  another mod, nobody reads the notes about themselves, and the player sees
+  none of it. `/api/staff/user/<name>`'s history obeys it too; it was the side
+  door.
+- **"About this player" means the account id when the account exists**, and the
+  stored name only when it does not. A guild can share a player's name, and
+  guild actions carry no id.
+- **`STAFF_ACTION_KINDS` is checked against the source** with `ast`, so a new
+  `log_staff_action()` call with a new kind fails the suite until the log's
+  filter knows it. The index checks read SQLite's own `EXPLAIN QUERY PLAN` for
+  the statement the route builds - a plan, not a stopwatch, because a stopwatch
+  is green on a fast machine.
+
+`idx_sessions_seen` is created **after** the migration that adds `last_seen_at`,
+not in the schema block: on a database from before presence existed, the schema
+block would fail on "no such column" and take the boot with it. The MIGRATION
+section in `test_api.py` boots exactly that shape, and fails if the index moves back.
+
+## Name colours, and a guild's history
+
+**A name's colour is the player's; rank is a badge.** `users.name_hue` holds the
+hue each player chose (0-359, `PUT /api/account/name-colour`, NULL for "never
+chose" so the default lives only in the client). It rides on login, the session
+heartbeat, every chat line (a snapshot, like `guild`), the friends list, the
+players menu and the guild roster. Staff choose too: rank is shown by the
+owner's crown and a MOD / DEV badge the client draws from `role`, which nobody
+can choose - so a player who picks the owner's gold is still visibly a player.
+`test_namecolour.py`.
+
+**Guilds keep their own history** in `guild_events`: founded, invited, joined,
+promoted, demoted, handed on, removed, left, renamed - one line per real change,
+in the same transaction, bounded per guild (`GUILD_EVENTS_KEPT`), gone with the
+guild, and sent to members only (the newest `GUILD_ACTIVITY_SHOWN` ride on
+`guild_dict`). A staff rename is recorded **without the staff member's name**:
+members need to know it happened, not whom to be angry at; `staff_actions` keeps
+who. The roster also carries each member's latest character, class, level and
+area. `test_guildlife.py`.
+
+## Trades
+
+The money of a trade - tax, burn, the supply invariant - is `test_economy.py`.
+Everything around it is `test_trades.py`, and each rule below was a defect
+found by driving a trade between two real accounts:
+
+- **An offer goes to the character the other player is PLAYING.** The client
+  names its slot on the broadcast poll (`stamp_presence(db, slot)` fills
+  `sessions.playing_slot`); `PLAYING_SLOT_SQL` is the rule - a fresh session's
+  said slot with a save behind it, else the most recent save - and
+  `_playing_slot()` runs it. One SQL expression because `/api/players/nearby`
+  needs the same answer for twenty accounts inside one query. `to_slot` used to
+  default to 0, so a typed name reached the other player's first character.
+- **Only to somebody online.** An unanswerable trade blocks both players for
+  `TRADE_EXPIRY_SECONDS`.
+- **Accept names the revision it saw.** `trades.revision` moves on every real
+  change (`_trade_touch`); `trade_confirm` requires it and conditions the UPDATE
+  on it - a compare-and-set, not a read-then-write. An identical update is not
+  a change and un-accepts nobody.
+- **Both bags are flagged when a trade runs** (`saves.resync_trade`, in the
+  trade's transaction). Whoever accepted FIRST is not the one whose request ran
+  it; their client was told nothing and its next whole-bag
+  `PUT /api/character/inventory` deleted what they received. While a flag is up
+  that PUT is refused with 409 and the bag the server holds; the trade poll and
+  the broadcast poll deliver the same thing (`_take_resync`, cleared on
+  delivery). The requester is flagged too, in case their response was lost.
+- **Items leave the bag before the hotbar keys** (`keys_last=True`).
+- **History** is `GET /api/trade/history`, worded from the caller's side
+  (`_trade_record`). Finished trades are kept for good - they are what a
+  moderator reads when somebody says they were scammed; cancelled ones are
+  pruned after `TRADE_CANCELLED_KEPT_SECONDS`, on the offer route, through the
+  partial index `idx_trades_cancelled`. **Partial on purpose:** a plain
+  `(state, updated_at)` index was picked by the planner for "find my open
+  trade" and turned the most-polled read into a scan of every open trade.
+- **Same-second ties break on rowid** in `_trade_find_recent`.
+
+- **Staff read an account's trades** at `GET /api/staff/trades` - every state,
+  worded from that account's side, a tally by state, under reach
+  (`_moderation_target`: out of reach is the same 404 as no such account).
+  Paged by the pair `(updated_at, rowid)` through `_trade_find_page`, one
+  bounded index read per (side, state); `_trade_find_recent` is its first page.
+
+**Which character an account is playing** is one rule, `PLAYING_SLOT_SQL`,
+and every surface asks it: the trade offer, `/api/players/nearby`, the online
+list (and the caller's own "here"), the guild roster, the staff account view's
+`playing` flag and a staff teleport's default area. `test_playing.py` holds
+the surfaces and scans app.py for any new "saved last" pick.
+
+**Guild chat** has been live since guilds: `chat_write_check` and `read_chat`
+gate it on membership, and a line carries its guild in `target_id`. The one
+sentence for "no guild", reading or writing, is `GUILD_CHAT_NO_GUILD`. The
+client refused the tab locally until it was reported; see the game's CLAUDE.md.
+
+## Loot: the tier first, then the item
+
+`gamedata.roll_loot_tier()` picks which tier a filled bag slot lands on from
+the enemy's `tier_odds` (top first: the enemy's own tier, one below, two
+below), and `pick_loot_item()` then picks evenly inside that tier, stepping
+DOWN to the nearest tier that has something. It used to be one weight per
+item, `2^(max_tier - tier)`, which let the catalogue set the odds: eleven iron
+pieces outvoted everything and 58% of a boss bag was iron.
+
+- **Every gear piece can drop.** The amethyst and ember weapons and armour
+  were finished items marked not droppable and not sold, so the best reachable
+  gear was cobalt. `max_loot_tier` is what keeps them rare: nothing drops above
+  it. Fishing rods, cooked fish and pets keep their own `droppable = false`.
+- **A boss bag is one piece of gear and sometimes a potion**
+  (`slots_are_gear`, `bonus_potion_chance`), at its tier or one below.
+  `tier_up_chance` rolls one ABOVE the enemy's tier, for elites.
+- **Rarest first.** `rarest_first()` orders a bag pet, items, coins, and
+  `LOOT_BAG_CAPACITY` is nine. It was six with the coins first and the pet
+  appended last, and a drop's gold is up to four coin entries - so on the old
+  rules 76% of boss bags ran past six and 573 of 616 boss pet wins were cut by
+  `_create_loot_bag()` without a word. A cut now costs the smallest coin.
+
+**Legendary is rare, and `tier_odds` may hold zeros for it.** Dark normals put
+ember on 3% of slots (about one an hour); the fire boss and the Crowned roll
+`[0, 0.25, 0.75]` from tier 6 (legendary 1 in 4); the other bosses have a zero
+on every ember share. A zero keeps `max_loot_tier` - which also sets gold and
+pet odds - unchanged. `test_rewards.py` measures the rates with the real roll.
+
+`test_loot.py` holds the odds, the unlock, the boss bag and the order;
+`test_api.py` holds that a boss bag with a pet never loses the pet or its gear
+to the cell limit.
+
+## Gear bonuses: a character's maximum includes what it wears
+
+Amulets add max health (`bonus_max_hp`), max mana (`bonus_max_mana`) or a
+damage percent (`bonus_damage_percent`, applied by the client). The first two
+are the server's business because `max_hp` and `max_mana` are server-derived
+and the status route clamps hp to them.
+
+- `gamedata.gear_bonuses(equipment)` sums the three fields over what is worn,
+  counting a piece **only in the slot it is worn in** and flooring negatives.
+  `max_stats_for(class_id, level, equipment)` adds hp and mana to the curve.
+- **app.py derives maxima only through `_derived_stats(row)`**, which reads the
+  row's own `equipment` with `row["equipment"]` - a SELECT that forgot the
+  column fails loudly rather than deriving a bare maximum. Save, status, kill,
+  revive, respawn and both equip routes use it; `test_gearbonus.py` fails if
+  `gamedata.max_stats_for(` is called anywhere else.
+- **The equip routes move the maxima in the same transaction**
+  (`_apply_worn_maxima`) and bring hp/mana DOWN to them, never up. Taking off a
+  Vitality amulet at full health leaves you at the lower full. The response
+  carries `stats` so the client can see it agrees. The save route clamps the
+  same way when it rewrites the maxima.
+- The healing reconciler still applies: raising the ceiling does not grant the
+  health in it, regeneration does, at the rate the new maximum allows.
+- **It is not only amulets.** Every gear piece from jade up carries a bonus now
+  (plate health, cloth mana, weapons damage, plain rings and amulets all
+  three), so a full ember warrior is +150 max health on the server too.
+  `test_rewards.py` holds the sums.
+
+## Levels: the curve is derived, never read back
+
+The curve is 1,250 x 1.27 (eight hours to level 22) and comes from
+gamedata.json's `xp_base` / `xp_growth`.
+
+- **`apply_xp()` derives the requirement from the level** (`need(level)`) and
+  ignores the stored `xp_to_next`. A row still holding the table's DEFAULT 100
+  would otherwise give a new character a first level twelve times too cheap.
+  Skills pass their own curve with `need=`; before that argument existed, a
+  skill grant crossing two levels priced the second on the character curve.
+- A new character is written `xp_to_next = xp_needed_for_level(1)`, and
+  `_migrate_xp_to_next_from_curve()` rewrites every row's display copy on boot
+  (idempotent, skipped if gamedata.json did not load, never touches xp).
+- **A boss is `slots_are_gear`, not "1,000+ health".** killwatch used health,
+  and a normal dark bush mage now has 1,555; `killwatch.is_boss()` falls back
+  to health only for a catalogue without the field.
+- **A small slime's kill ceiling is eight per placed large** (the exporter's
+  `placed_count`). The large grants nothing and a kill claim for it is 400.
+
+`test_pacing.py` holds all of it, including the eight hours.
+
+## Attack XP: banked at the kill, with the class specialty
+
+Attack trains only at `/api/combat/kill`. `proficient_amount(class_id, skill,
+raw)` is the one rule for `SKILL_PROFICIENCY` - the kill and `/api/skill/train`
+both call it - so a warrior banks 1.5x the enemy's `attack_xp_reward`. It used to
+be applied only by the train route, which never handles attack, and the client
+showed the 1.5 (plus per-hit attack XP of its own) that the server never banked.
+
+The kill answer carries `attack_xp_gained` (what was banked), `attack_level`,
+`attack_xp` and `attack_xp_to_next`; the client copies those onto its bar rather
+than adding up its own. `kill_reports.attack_xp` records what was paid.
+`test_attackxp.py`.
+
+## A signup is not a spray
+
+The client has no "create account" form - it logs in and registers only after
+the 401 - so every new account starts with a `no-such-user` row, which is
+throttle evidence. Six signups behind one address inside `IP_WINDOW_SECONDS`
+tripped `IP_MAX_USERNAMES` and locked that address out of logging in for
+`IP_LOCKOUT_SECONDS`: a household, a school, a carrier's NAT - or everyone, if
+this runs behind a proxy with `ELUSION_TRUSTED_PROXIES` at 0.
+
+`register()` relabels **that name's** `no-such-user` rows from **that address**
+inside the window to `signup-first-login`, which is not on
+`THROTTLE_EVIDENCE_REASONS`. Relabelled, not deleted: the log keeps them. A
+spray of names that never become accounts, or of wrong passwords against real
+ones, still counts - `test_throttle.py`, "A SIGNUP IS NOT A SPRAY".
+
+**The maintenance notice keeps its countdown.** `post_broadcast()` trims to
+`MAX_BROADCAST_LENGTH`, so a long owner message used to push "(closing in 60s
+- ...)" off the end; the message gives way now, with an ellipsis.
+`test_maintenance.py`.
+
 ## Decided, not built: staff commands
 
 **Put the required rank on the command definition, not in the handler.** A
@@ -543,8 +764,8 @@ summon - stepping through is the consent, and it sorts the audience for free.
 app.py          every route, the schema, the migrations
 gamedata.py     loot rolls, XP curve, stat curves - the game's rules
 gamedata.json   exported from the Godot project, NOT hand-edited
-test_*.py       twenty-six suites, discovered and run by run_tests.ps1. No
-                counts here on purpose - see above. What each one is FOR:
+test_*.py       discovered and run by run_tests.ps1, which prints how many.
+                No counts here on purpose - see above. What each one is FOR:
   api           the broad one; read its header before adding to it
   economy       the gold ledger and the supply invariant
   security      server authority - inventory, skills, gold, lusions, item
@@ -552,13 +773,20 @@ test_*.py       twenty-six suites, discovered and run by run_tests.ps1. No
   ownership     no route lets you name somebody else's row
   refusals      which code a refusal answers with, and why 404 not 403
   revocation    bans, demotions and what a token stops buying
-  throttle      login defences, rate limits, credential rotation
+  moderation    the paged staff list, the moderation log, staff-only notes
+  namecolour    the colour each player chose, carried with every name
+  guildlife     who guild members are playing, and the guild's own history
+  throttle      login defences, rate limits, credential rotation, and
+                that a signup is not a spray
+  attackxp      attack XP banked at the kill, with the class specialty
   gathering     fishing and cooking - the item-minting endpoints
   loot          bags, rolls, and taking things out of them
   equipment     what a worn item is worth, and what the tooltip says
   chat/chatrooms  the feed, the channels, moderation and picture revocation
   broadcast     the server's voice, and the poll that doubles as a heartbeat
   maintenance   the kill switch and its countdown
+  security_doc  the docs against the code: SECURITY.md's claims, and that
+                DEPLOY.md names the runner rather than a list of suites
   guilds / friends / mail / map / teleport / recovery / settings /
   healing / equipmove / skill_train / catalogue / killwatch
 set_role.py     sets an account's rank; --list shows every account

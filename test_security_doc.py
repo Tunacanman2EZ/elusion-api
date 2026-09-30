@@ -195,6 +195,84 @@ check("the page does not claim the server owns kill events",
       not re.search(r"server\b[^.]{0,80}\bowns\b[^.]{0,40}\bkills?\b", doc, re.IGNORECASE),
       "E-3 is open; an actors table saying the server owns kills contradicts it")
 
+# =============================================================================
+# DEPLOY.md NAMES THE RUNNER, NOT A LIST OF SUITES
+# =============================================================================
+# THE SAME FAILURE AS EVERY OTHER ENTRY IN THIS SUITE, in the one document that
+# gates going public. The go-live checklist used to read:
+#
+#     - [ ] All four suites green against the deployed code, not against a
+#           working copy: test_api.py, test_security.py, test_throttle.py,
+#           test_gathering.py.
+#
+# True when it was written. By the time anybody followed it there were
+# twenty-seven suites, so following it meant going public having run four of
+# them - and not the four that matter most at that moment, because
+# test_revocation.py, test_refusals.py, test_ownership.py and
+# test_maintenance.py all cover behaviour that only HAS consequences once
+# somebody else can connect, and none of them was on the list.
+#
+# run_tests.ps1 discovers suites with Get-ChildItem test_*.py, so it has been
+# correct the whole time. The checklist was the only thing that went stale, and
+# it is the thing a person reads before opening the firewall.
+#
+# CLAUDE.md already carries a section explaining that a written-down COUNT
+# cannot fail and therefore stays wrong - and that section had itself gone stale
+# by one, saying "twenty-six". A written-down LIST is the same defect with more
+# words. So this checks the instruction rather than the number: name the runner,
+# and let it count.
+
+print("\n=== DEPLOY.md  -  the go-live checklist names the runner ===\n")
+
+DEPLOY = os.path.join(HERE, "DEPLOY.md")
+check("DEPLOY.md exists", os.path.exists(DEPLOY),
+      "the checklist somebody follows before the first stranger connects")
+
+if os.path.exists(DEPLOY):
+    dep = open(DEPLOY, "r", encoding="utf-8").read()
+
+    GATE = "## Before the first stranger connects"
+    check("it still has %s" % GATE, GATE in dep,
+          "the section this whole file exists to produce")
+
+    section = ""
+    if GATE in dep:
+        after = dep.split(GATE, 1)[1]
+        # BOUNDED TO THE SECTION, because "run_tests.ps1" appears elsewhere in
+        # the file and an unscoped search would pass on a checklist that never
+        # mentions it. Same rule the Godot suite needed five times over.
+        section = after.split("\n---", 1)[0]
+
+    check("the checklist points at run_tests.ps1",
+          "run_tests.ps1" in section,
+          "a checklist that names suites instead of the runner goes stale the "
+          "next time one is added, and nobody re-reads a checklist")
+
+    # A COUNT BOUND TO THE WORD "suites" ANYWHERE IN THE FILE. This is the exact
+    # shape that rotted - "All four suites" - and it rots silently because the
+    # sentence stays grammatical forever.
+    COUNTED = re.compile(
+        r"\b(?:all|the|these|those)\s+"
+        r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+        r"twenty[- ]?\w*|thirty[- ]?\w*)\s+suites\b",
+        re.IGNORECASE)
+    hit = COUNTED.search(dep)
+    check("no line binds a number to the word 'suites'",
+          hit is None,
+          ("'%s' - run_tests.ps1 prints the count; this file must not"
+           % hit.group(0)) if hit else "")
+
+    # EVERY SUITE IT DOES NAME HAS TO RESOLVE, the same discipline SECURITY.md
+    # is held to above. Naming one is fine - as an example, as a pointer - but a
+    # name that no longer exists is a reader sent to a file that is not there.
+    named = sorted(set(re.findall(r"\btest_[a-z_]+\.py\b", dep)))
+    check("DEPLOY.md names at least one suite to point at", len(named) >= 1,
+          named)
+    for name in named:
+        check("%s named in DEPLOY.md exists" % name,
+              os.path.exists(os.path.join(HERE, name)),
+              "renamed or deleted, and the checklist still sends you to it")
+
 print("\n" + "=" * 70)
 print("  %d passed, %d failed, %d skipped" % (passed, failed, skipped))
 if failures:

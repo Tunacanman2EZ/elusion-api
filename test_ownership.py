@@ -289,16 +289,40 @@ for body in trade_bodies:
 check("no trade route accepts a trade_id from the client", named == [],
       "%s - an id the client can name is an id the client can change" % named)
 
+# THE RESOLVERS THAT START FROM THE CALLER. _trade_find_open for the open trade,
+# _trade_find_recent for the history - both take the caller's own id and nothing
+# a request supplies. A route that finds its trade any other way is the one to
+# look at.
+CALLER_RESOLVERS = ("_trade_find_open(db, ", "_trade_find_open(db,",
+                    "_trade_find_recent(db, user_id", "_trade_find_recent(db, g.user")
 for body in trade_bodies:
     path = body.split('"', 1)[0]
     if "db.execute" not in body and "_trade_" not in body:
         continue
     check("%s resolves the trade from the caller" % path,
-          "_trade_find_open(db, " in body or "_trade_find_open(db," in body
-          or "trade_current" in body,
+          any(r in body for r in CALLER_RESOLVERS) or "trade_current" in body,
           "every trade route must start from g.user, not from a field")
 
-# Behaviourally: alice and bob open a trade, carol has no way in.
+# AND THE HISTORY'S RESOLVER REALLY IS SCOPED TO ITS FIRST ARGUMENT. The check
+# above trusts the name; this reads the function that holds the query and
+# holds it to the name - every branch, for both sides, filtered on the user it
+# was given, and nothing else. _trade_find_recent is the first page of it.
+_recent = re.search(r"\ndef _trade_find_recent\(.*?(?=\ndef )", trade_src, re.S)
+_page = re.search(r"\ndef _trade_find_page\(.*?(?=\ndef )", trade_src, re.S)
+_recent_src = _recent.group(0) if _recent else ""
+_page_src = _page.group(0) if _page else ""
+check("_trade_find_recent is a page of _trade_find_page",
+      "return _trade_find_page(db, user_id," in _recent_src, _recent_src[:200])
+check("_trade_find_page filters every branch, both sides, on the caller",
+      'for side in ("a", "b"):' in _page_src
+      and 'where = "%s_user = ? AND state = ?" % side' in _page_src
+      and "branch_params = [user_id, state]" in _page_src,
+      "both sides of a trade must be scoped to the id passed in")
+
+# Behaviourally: alice and bob open a trade, carol has no way in. A beat from
+# bob first, because an offer needs him online and a slow run can outlast the
+# presence his login stamped.
+client.get("/api/server/broadcasts", headers=bob)
 res = client.post("/api/trade/offer", headers=alice,
                   json={"slot": 0, "username": "bob", "to_slot": 0})
 check("alice opens a trade with bob", res.status_code in (200, 201), res.get_json())
@@ -513,6 +537,10 @@ SWEEPS_ALLOWED = [
     ("chat_deletions", "deleted_at <", "retention: past CHAT_DELETION_WINDOW_SECONDS"),
     ("chat_messages", "id NOT IN", "the per-channel ring buffer trim"),
     ("sessions", "expires_at <", "expired sessions"),
+    # a boot-time migration: every save's display copy of xp_to_next re-derived
+    # from the curve after 100 x 1.15 became 1,250 x 1.27. It sets a pure
+    # function of each row's own level, so it cannot move a value between users.
+    ("saves", "level = ? AND xp_to_next !=", "migration: xp_to_next from the curve"),
     # your own row, addressed by a credential only you hold
     ("sessions", "token =", "your own session, by the bearer token"),
     # staff acting on somebody else's row ON PURPOSE. The rank decorator is the

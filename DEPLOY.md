@@ -122,9 +122,45 @@ address that changes every request, means it is not.
       account. Run `backup_db.py` on a schedule (see **Backups** below); it takes
       a consistent snapshot while the server is live and verifies it before
       trusting it.
-- [ ] **All four suites green against the deployed code**, not against a working
-      copy: `test_api.py`, `test_security.py`, `test_throttle.py`,
-      `test_gathering.py`.
+- [ ] **Every suite green against the deployed code**, not against a working
+      copy. Run `run_tests.ps1`, which DISCOVERS them — `Get-ChildItem test_*.py`
+      — so a suite added after this line was written is still run.
+
+      This checkbox used to name four: `test_api.py`, `test_security.py`,
+      `test_throttle.py`, `test_gathering.py`. That was true when it was written
+      and there are twenty-seven now, so following it would have meant going
+      public having run four of them — and not the four that matter most here.
+      `test_revocation.py`, `test_refusals.py`, `test_ownership.py` and
+      `test_maintenance.py` all cover behaviour that only has consequences once
+      somebody else can connect, and none of them was on the list.
+
+      A written-down list of suites is the same failure as a written-down count,
+      which CLAUDE.md already has a section about. Name the runner, not its
+      contents.
+- [ ] **Nothing to do about the client build gate, and that is the point.**
+      Every request now carries `X-Elusion-Build`, and the server can refuse a
+      build older than a minimum it holds in `server_settings`. **It ships
+      disarmed** — `min_client_build` is 0, so nothing is refused — because the
+      mechanism is what could not be added later and the enforcement can be
+      switched on at any moment:
+
+      ```
+      POST /api/server/minbuild  {"build": 3}     # refuse builds below 3
+      POST /api/server/minbuild  {"build": 0}     # let everybody in again
+      ```
+
+      Owner only, 404 to anyone else. The current minimum and the newest known
+      build are on `/api/status`, which is the one route the gate never
+      refuses — so a client turned away can still find out why.
+
+      **It stops an honest old build and nothing else.** The build is a header
+      and headers are client-controlled, so anyone who can type a curl command
+      can claim any build. It is protocol hygiene, not a security control, and
+      that limitation is also the way back in if you ever lock yourself out:
+      send the header by hand and set the minimum to 0. `set_min_build()`
+      refuses a minimum above the newest build that exists, so getting into
+      that state takes deliberate effort rather than a typo.
+
 - [ ] **The Godot client points at the deployed URL.** `Api.BASE_URL` now
       resolves at startup from, in order: `--server=https://host` on the command
       line, `ELUSION_SERVER` in the environment, a one-line `user://server.cfg`,
@@ -132,6 +168,144 @@ address that changes every request, means it is not.
       shipped build — it repoints an already-installed client without a rebuild.
       The boot log prints the address whenever it is not the default, because a
       client aimed at the wrong server looks exactly like a server that is down.
+      The browser build needs none of this: it always uses the address it was
+      loaded from (see **The browser build** below).
+
+---
+
+## The browser build
+
+The game can also be played in a browser. The export (Godot, Project > Export >
+Web, preset in the game repo) is a folder of static files: `index.html` beside
+`index.js`, `index.wasm` and `index.pck`. It needs two things from the site, and
+both fit on the same box as the API, behind the same proxy.
+
+**One address.** A browser build sends its API calls to the address the page
+came from. This API sends no cross-site headers, so the browser refuses any other
+address. This was measured, not assumed: a page on one port calling the API on
+another had every request blocked. So the site that serves the game also passes
+`/api/` to the API.
+
+**Refresh means update.** Nothing in the export is versioned by name, so
+nothing may be cached blind. `Cache-Control: no-cache` makes the browser ask
+about every file on every visit. Unchanged files get a 304, and a new upload is
+picked up on the next visit or refresh. A raised `min_client_build` then tells an
+open tab to refresh, in the game's own words.
+
+A DNS record `A play -> YOUR_SERVER_IP`, then one site block. Both of these
+were tested unchanged against a real export (apart from the port and the name).
+
+**Caddy**, beside the API's own site in `/etc/caddy/Caddyfile`. It fetches the
+certificate itself:
+
+```caddy
+play.elusionrpg.com {
+	encode zstd gzip
+
+	# THE API ON THE PAGE'S OWN ADDRESS. The browser refuses the game's calls
+	# to any other one - the API sends no cross-site headers.
+	handle /api/* {
+		reverse_proxy 127.0.0.1:5000
+	}
+
+	# The export: index.html and the files beside it, nowhere near elusion.db.
+	# Compressed as it goes by encode, above. Not "precompressed": Caddy 2.10.2
+	# answered a plain request for a precompressed file with 206 Partial Content.
+	# REFRESH MEANS UPDATE: the browser asks about every file on every visit
+	# and gets a 304 when nothing changed, so an upload is picked up on the
+	# next one. Nothing here is versioned by name, so nothing may be cached blind.
+	handle {
+		root * /srv/elusion-web
+		header Cache-Control "no-cache"
+		file_server
+	}
+}
+```
+
+**nginx**, if the box runs that instead. Put this in
+`/etc/nginx/sites-available/elusion-play`:
+
+```nginx
+server {
+    listen 80;
+    server_name play.elusionrpg.com;
+
+    # The export: index.html and the files beside it. Outside the API's folder,
+    # and nowhere near elusion.db.
+    root /srv/elusion-web;
+    index index.html;
+
+    # REFRESH MEANS UPDATE. The browser asks about every file on every load and
+    # gets a 304 when nothing changed, so a new upload is picked up by a
+    # refresh. Nothing here is versioned by name, so nothing may be cached blind.
+    location / {
+        add_header Cache-Control "no-cache" always;
+        try_files $uri $uri/ =404;
+    }
+
+    # THE API ON THE PAGE'S OWN ADDRESS. The browser refuses the game's calls
+    # to any other one - the API sends no cross-site headers.
+    location /api/ {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 30s;
+        client_max_body_size 12M;
+    }
+
+    # 51 MB as exported, 21 MB compressed. gzip_static sends the .gz beside a
+    # file when there is one (gzip -k9 index.wasm index.pck index.js after an
+    # upload); anything else is compressed as it goes.
+    gzip on;
+    gzip_static on;
+    gzip_types application/wasm application/octet-stream text/javascript application/javascript;
+    gzip_min_length 1024;
+}
+```
+
+```
+sudo ln -s /etc/nginx/sites-available/elusion-play /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+sudo certbot --nginx -d play.elusionrpg.com --redirect
+```
+
+**Uploading a build**, from the game folder, to a folder the service user owns
+(`sudo mkdir -p /srv/elusion-web && sudo chown elusion:elusion /srv/elusion-web`
+once):
+
+```
+rsync -rv --checksum --delete builds/web/ elusion@YOUR_SERVER_IP:/srv/elusion-web/
+```
+
+- **`--checksum`** leaves a file alone when its bytes did not change, so its
+  date and ETag stay the same. A returning player then downloads only what is
+  new, usually the 14 MB `.pck` and not the 38 MB `.wasm`.
+- **Behind nginx,** run `gzip -k9 builds/web/index.wasm builds/web/index.pck
+  builds/web/index.js` first. `gzip_static` then sends the `.gz` files and does
+  no work per player.
+- **Caddy** compresses the `.wasm` and `.js` as it sends them. It leaves the
+  `.pck` alone (octet-stream is not on its list), which costs about 2 MB a
+  first visit.
+
+**What this changes elsewhere: nothing.**
+
+- It is the same proxy, one hop, so `ELUSION_TRUSTED_PROXIES` stays `1`.
+- The `/api/` block is the same proxy as the API's own site. The browser build
+  has no `server.cfg` and needs none.
+- The desktop client keeps `https://api.elusionrpg.com`.
+
+Tested in the sandbox against a real export:
+
+- The setup was Caddy 2.10.2, nginx 1.24 (the version Ubuntu 24.04 ships) and
+  headless Chromium.
+- Both blocks above were used unchanged, apart from the port and the name.
+- Compression took the export from 51.8 MB to about 21 MB, and the loader showed
+  progress the whole way.
+- A login, the character list, the town and a save all went through `/api/`.
+- A second visit transferred nothing but 304s, and an upload was running on the
+  next visit.
 
 ---
 
@@ -237,10 +411,12 @@ matters most with strangers connected. Not closed, but now **watched**:
 `killwatch.py` (above) turns an invisible claim into a flagged, bannable account,
 and alarms outright if the rate limit or spawn ceiling ever stops running.
 
-**E-2 — three skills are still client-claimed.** `defense`, `agility` and
-`magic` have no server-observed event to grant against, so a client can claim
-any level up to `MAX_SKILL_LEVEL`. `attack`, `fishing` and `cooking` are
-server-owned.
+**E-2 — closed: all six skills are server-owned.** Fishing, cooking and attack
+ride their own server events; defense, agility and magic report activity to
+`/api/skill/train`, which clamps each to a per-second ceiling times the time
+elapsed and applies class proficiency itself. A client's claimed level earns
+nothing. (This paragraph used to say three skills were still client-claimed;
+`SECURITY_NOTES.md` has the full record.)
 
 None of these let someone take another player's account, which is the line that
 matters most for going public. They let a determined player cheat their own

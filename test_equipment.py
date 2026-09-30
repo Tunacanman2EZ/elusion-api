@@ -449,7 +449,9 @@ check("and stacked with the best defense tier it still is not immunity",
 # alone would have cut that to 9-13. Boss health is x4 so the fight lands back
 # where it was FOR A PLAYER WHO BROUGHT THE GEAR - and is genuinely out of
 # reach for one who did not, which is the point of a boss.
-BOSS_FIGHT = [("lightboss", "cobalt"), ("boss", "cobalt"),
+# The Crowned is measured in EMBER now: it is the finale, reached through the
+# arena's door after the fire boss, not a cobalt-tier fight off the field.
+BOSS_FIGHT = [("lightboss", "cobalt"), ("boss", "ember"),
               ("iceboss", "amethyst"), ("earthboss", "amethyst"),
               ("fireboss", "ember")]
 LEVEL = {"iron": 1, "jade": 5, "cobalt": 10, "amethyst": 16, "ember": 22}
@@ -732,8 +734,7 @@ section("THE SAVE BODY")
 
 slot = {"character": "warrior", "level": 1}
 check("a slot that has never had gear says nothing about it",
-      "equipment" not in C.save_body(0, slot)
-      and "hotbar" not in C.save_body(0, slot), C.save_body(0, slot))
+      "equipment" not in C.save_body(0, slot), C.save_body(0, slot))
 
 # The distinction that matters: `{}` is "take everything off", an absent key is
 # "leave it alone". A save file written before equipment existed has no key,
@@ -743,8 +744,10 @@ slot["hotbar_assignments"] = ["tinyhealthpotion"]
 body = C.save_body(0, slot)
 check("once it does, it is sent", body["equipment"] == {"weapon": "ironsword"},
       body)
-check("a short hotbar is padded to nine on the way out",
-      body["hotbar"] == ["tinyhealthpotion"] + [""] * 8, body["hotbar"])
+# THE HOTBAR IS NOT ON THE SAVE ANY MORE - its keys hold items, which travel in
+# the inventory array. A slot dictionary left over from before still has
+# hotbar_assignments, and the save must not resurrect them.
+check("an old slot's hotbar list is not sent", "hotbar" not in body, body)
 
 slot["equipment"] = {}
 check("and taking everything off is sent explicitly",
@@ -753,16 +756,12 @@ check("and taking everything off is sent explicitly",
 back = C.slot_from_server({
     "class_id": "warrior",
     "equipment": {"weapon": "ironsword"},
-    "hotbar": ["tinyhealthpotion", "", "ironsword"],
     "status": {"level": 4},
 })
 check("what comes back lands under the client's own key names",
-      back["equipment"] == {"weapon": "ironsword"}
-      and back["hotbar_assignments"][2] == "ironsword", back)
-check("a hotbar of the wrong length is still nine on the way in",
-      len(C.slot_from_server({"hotbar": ["a"] * 40})["hotbar_assignments"]) == 9)
-check("and a missing one is nine empty keys",
-      C.slot_from_server({})["hotbar_assignments"] == [""] * 9)
+      back["equipment"] == {"weapon": "ironsword"}, back)
+check("and makes no hotbar list of its own",
+      "hotbar_assignments" not in back, back)
 
 
 # =============================================================================
@@ -799,8 +798,7 @@ def server_slot(index=0):
 player = C.Player("warrior", 1)
 for item_id in PLATE:
     player.equip(item_id)
-local = {"character": "warrior", "level": 1, "equipment": dict(player.equipped),
-         "hotbar_assignments": ["tinyhealthpotion", "", "ironsword"]}
+local = {"character": "warrior", "level": 1, "equipment": dict(player.equipped)}
 
 res = client.put("/api/save", headers=H, json=C.save_body(0, local))
 check("the body ServerStorage builds is one the server accepts",
@@ -828,24 +826,18 @@ check("every piece equips through the endpoint", _worn_ok)
 row = server_slot()
 check("all eight pieces came back", len(row.get("equipment", {})) == 8,
       row.get("equipment"))
-check("and the hotbar with them",
-      row.get("hotbar", [])[2] == "ironsword", row.get("hotbar"))
 
 # The full circle: server -> _slot_from_server() -> CharacterData ->
-# load_character_state() -> the player. This is the path a re-login takes, and
-# the one the hotbar never used to survive.
+# load_character_state() -> the player. This is the path a re-login takes.
 restored = C.slot_from_server({
     "class_id": row.get("class_id", ""),
     "equipment": row.get("equipment", {}),
-    "hotbar": row.get("hotbar", []),
     "status": {"level": row.get("level", 1)},
 })
 reloaded = C.Player("warrior", 1)
 reloaded.equipped = C.prune_equipment(restored["equipment"], C.bag(*PLATE))
 check("a re-login puts the same eight pieces back on",
       reloaded.equipped == player.equipped, reloaded.equipped)
-check("and the hotbar survives it too",
-      restored["hotbar_assignments"][2] == "ironsword")
 
 # A save that says nothing about gear must not undress anyone - and the body
 # the client builds for a gear-less slot is exactly that save.

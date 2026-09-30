@@ -233,16 +233,59 @@ def revive_gold_cost(total_gold):
     return max(floor, int(math.ceil(total * rate)))
 
 
-def max_stats_for(class_id, level):
+# WHAT WEARING SOMETHING ADDS, beyond armour and a weapon's hit. Same three
+# names as ItemData's exports; an item that does not carry one has 0.
+GEAR_BONUS_FIELDS = ("bonus_max_hp", "bonus_max_mana", "bonus_damage_percent")
+
+
+def gear_bonuses(equipment):
     """
-    What a character of this class SHOULD have at this level.
+    Every bonus field summed over what is worn: {"bonus_max_hp": 60, ...}.
+
+    COUNTED ONLY WHERE IT BELONGS. A piece in a slot it is not worn in adds
+    nothing - an amulet stored under "weapon" is not being worn as an amulet.
+    The equip endpoint already refuses that, so this only matters for a row
+    written some other way, and there the safe answer is no bonus, not a free
+    one. Unknown ids, non-string ids and a non-dict map all add nothing.
+
+    Negatives are floored at 0 for the same reason the exporter refuses them:
+    a bad number in the catalogue must never take a character's maximum below
+    its class curve.
+    """
+    totals = {field: 0 for field in GEAR_BONUS_FIELDS}
+    if not isinstance(equipment, dict):
+        return totals
+    for slot_name, item_id in equipment.items():
+        if not isinstance(item_id, str) or not item_id:
+            continue
+        item = ITEMS.get(item_id)
+        if item is None or equip_slot_for(item_id) != str(slot_name).strip().lower():
+            continue
+        for field in GEAR_BONUS_FIELDS:
+            try:
+                totals[field] += max(0, int(item.get(field, 0) or 0))
+            except (TypeError, ValueError):
+                continue
+    return totals
+
+
+def max_stats_for(class_id, level, equipment=None):
+    """
+    What a character of this class SHOULD have at this level, wearing this.
 
     Port of Player._recompute_max_stats():
 
-        max_hp = hp_base + (level - 1) * hp_per_lvl
+        max_hp = hp_base + (level - 1) * hp_per_lvl + worn bonus_max_hp
 
     Level 1 gets exactly the base, which is what the -1 is for. Both
     implementations must agree on that or every character is one level out.
+
+    THE GEAR HALF IS NOT OPTIONAL IN PRACTICE, even though the argument is.
+    The status route clamps hp to this maximum, so a caller that forgets the
+    equipment hands a character in a Vitality amulet a lower ceiling than their
+    client shows, and the next save quietly takes the difference away. app.py
+    reaches this only through _derived_stats(row), which reads the row's own
+    equipment; test_gearbonus.py scans for any other call.
 
     Returns None for an unknown class, meaning "no opinion" - the caller then
     leaves the client's values alone rather than zeroing a character it cannot
@@ -252,10 +295,11 @@ def max_stats_for(class_id, level):
     if curve is None:
         return None
 
+    worn = gear_bonuses(equipment)
     steps = max(int(level) - 1, 0)
     return {
-        "max_hp": int(curve["hp_base"]) + steps * int(curve["hp_per_lvl"]),
-        "max_mana": int(curve["mana_base"]) + steps * int(curve["mana_per_lvl"]),
+        "max_hp": int(curve["hp_base"]) + steps * int(curve["hp_per_lvl"]) + worn["bonus_max_hp"],
+        "max_mana": int(curve["mana_base"]) + steps * int(curve["mana_per_lvl"]) + worn["bonus_max_mana"],
         "max_stamina": int(curve["stam_base"]) + steps * int(curve["stam_per_lvl"]),
     }
 
@@ -780,7 +824,7 @@ def xp_needed_for_level(level):
     return int(base * (growth ** max(level - 1, 0)))
 
 
-def apply_xp(level, xp, xp_to_next, gained):
+def apply_xp(level, xp, xp_to_next, gained, need=None):
     """
     Port of Player.gain_xp()'s level-up loop. Pure - it computes, it does not
     write. Returns (level, xp, xp_to_next, levels_gained).
@@ -792,11 +836,29 @@ def apply_xp(level, xp, xp_to_next, gained):
     levels_gained = 0
     xp += gained
 
+    # WHICH CURVE. `need(level)` is the requirement for one level; the character
+    # curve unless a caller passes its own. Skills pass theirs - and before this
+    # argument existed, a skill grant that crossed two levels priced the second
+    # one on the CHARACTER curve, because the loop below hardcoded it. Harmless
+    # while the two curves were 100 x 1.15 and 100 x 1.18; not once the
+    # character curve became 1,250 x 1.27.
+    if need is None:
+        need = xp_needed_for_level
+
+    # THE REQUIREMENT IS DERIVED FROM THE LEVEL, NOT READ FROM THE ROW. It is a
+    # pure function of level (the client's sanitizer already recomputes its own
+    # copy on every load), and the stored figure goes stale the moment the curve
+    # is retuned - which it was, for the eight hours to level 22. A row still
+    # holding the old 100 would otherwise hand every new character a first level
+    # twelve times cheaper than the curve. The argument stays in the signature
+    # so callers do not change.
+    xp_to_next = need(level)
+
     while xp >= xp_to_next:
         xp -= xp_to_next
         level += 1
         levels_gained += 1
-        xp_to_next = xp_needed_for_level(level)
+        xp_to_next = need(level)
 
         # A guard the client does not need and the server does. The client's
         # loop is bounded by the XP a real kill can award; this one is bounded
@@ -812,53 +874,87 @@ def apply_xp(level, xp, xp_to_next, gained):
 # LOOT
 # =============================================================================
 
-def pick_weighted_item_id(max_tier):
-    """
-    Port of BaseEnemy._pick_weighted_item_id().
+# The item types a boss's guaranteed slot may hold (EnemyData.slots_are_gear).
+LOOT_GEAR_TYPES = {"WEAPON", "ARMOR"}
 
-    Weight is 2^(max_tier - item.tier), so an item exactly at the enemy's tier
-    is the rarest thing it can drop and each tier below it is twice as likely.
-    Returns "" when nothing qualifies, same as the GDScript.
-    """
-    candidates = []
-    weights = []
-    total_weight = 0
+# EnemyData.tier_odds's default, for a catalogue exported before the field
+# existed. Top tier first: 15% the enemy's own tier, 45% one below, 40% two.
+DEFAULT_TIER_ODDS = (0.15, 0.45, 0.40)
 
+
+def _droppable(item):
+    """Can this item come out of a bag at all? Tier aside."""
+    if item["type_name"] in EXCLUDED_FROM_LOOT:
+        return False
+    # PER-ITEM OPT-OUT, independent of tier. A cooked fish is a
+    # Type.CONSUMABLE exactly like a potion, so the type exclusion above
+    # cannot reach it - and a slime dropping cooked mudfish takes the point
+    # out of the fishing skill. See ItemData.droppable in the Godot project
+    # for the full reasoning. .get() with a default because a gamedata.json
+    # exported before the field existed simply will not have it, and the
+    # server refusing to boot over an additive field would be worse than
+    # treating an old catalogue as all-droppable.
+    return bool(item.get("droppable", True))
+
+
+def loot_pool(tier, kind="any"):
+    """
+    Every item one bag slot could hold at exactly this tier, in id order so a
+    seeded roll is repeatable. kind: "any", "gear" (weapons and armour) or
+    "potion" (consumables).
+    """
+    out = []
     for item in ITEMS.values():
-        if item["tier"] > max_tier:
+        if int(item["tier"]) != int(tier) or not _droppable(item):
             continue
-        if item["type_name"] in EXCLUDED_FROM_LOOT:
+        if kind == "gear" and item["type_name"] not in LOOT_GEAR_TYPES:
             continue
-
-        # PER-ITEM OPT-OUT, independent of tier. A cooked fish is a
-        # Type.CONSUMABLE exactly like a potion, so the type exclusion above
-        # cannot reach it - and a slime dropping cooked mudfish takes the point
-        # out of the fishing skill. See ItemData.droppable in the Godot project
-        # for the full reasoning. .get() with a default because a gamedata.json
-        # exported before the field existed simply will not have it, and the
-        # server refusing to boot over an additive field would be worse than
-        # treating an old catalogue as all-droppable.
-        if not item.get("droppable", True):
+        if kind == "potion" and item["type_name"] not in CONSUMABLE_TYPES:
             continue
+        out.append(item["item_id"])
+    out.sort()
+    return out
 
-        weight = 2 ** max(max_tier - item["tier"], 0)
-        if weight < 1:
-            weight = 1
 
-        candidates.append(item["item_id"])
-        weights.append(weight)
-        total_weight += weight
+def roll_loot_tier(enemy):
+    """
+    Which tier one filled slot rolls. TIER FIRST, then the item.
 
-    if not candidates or total_weight <= 0:
-        return ""
+    IT USED TO BE ONE WEIGHT PER ITEM, 2^(max_tier - item.tier), and that let
+    the catalogue decide the odds: eleven iron pieces outvoted everything, so
+    58% of what a boss dropped was iron and the amethyst and ember gear came
+    out at 1%. Now EnemyData.tier_odds says what share of slots land on each
+    tier, top first, however many items each tier holds.
 
-    roll = _rng.randrange(total_weight)          # Godot: randi() % total_weight
-    cumulative = 0
-    for index, candidate in enumerate(candidates):
-        cumulative += weights[index]
-        if roll < cumulative:
-            return candidate
+    Never below 1. A tier_up_chance hit rolls one above the enemy's tier.
+    """
+    top = max(1, int(enemy.get("max_loot_tier", 1)))
+    up = float(enemy.get("tier_up_chance", 0.0) or 0.0)
+    if up > 0.0 and _rng.random() < up:
+        return top + 1
+    odds = enemy.get("tier_odds") or DEFAULT_TIER_ODDS
+    roll = _rng.random()
+    running = 0.0
+    for step, share in enumerate(odds):
+        running += float(share)
+        if roll < running:
+            return max(1, top - step)
+    return max(1, top - (len(odds) - 1))
 
+
+def pick_loot_item(tier, kind="any"):
+    """
+    An item at this tier, evenly - or, when the tier holds nothing droppable of
+    this kind, at the nearest tier BELOW that does. Returns "" only when
+    nothing at or below the tier qualifies.
+
+    Stepping down, never up: a tier-6 boss has no tier-6 gear, and the honest
+    answer is its best tier-5 piece, not nothing and not something above it.
+    """
+    for t in range(int(tier), 0, -1):
+        pool = loot_pool(t, kind)
+        if pool:
+            return pool[_rng.randrange(len(pool))]
     return ""
 
 
@@ -950,11 +1046,20 @@ def build_bag_contents(enemy):
             contents.append({"item_id": gold_id, "quantity": gold_amount})
 
     slot_fill_chance = float(enemy.get("slot_fill_chance", 0.0))
+    slot_kind = "gear" if enemy.get("slots_are_gear", False) else "any"
     for _ in range(int(enemy.get("max_item_slots", 0))):
         if _rng.random() <= slot_fill_chance:
-            picked = pick_weighted_item_id(max_tier)
+            picked = pick_loot_item(roll_loot_tier(enemy), slot_kind)
             if picked:
                 contents.append({"item_id": picked, "quantity": 1})
+
+    # A boss's potion rides beside its gear piece rather than competing with it
+    # for the one slot.
+    potion_chance = float(enemy.get("bonus_potion_chance", 0.0) or 0.0)
+    if potion_chance > 0.0 and _rng.random() < potion_chance:
+        picked = pick_loot_item(roll_loot_tier(enemy), "potion")
+        if picked:
+            contents.append({"item_id": picked, "quantity": 1})
 
     return contents
 
@@ -1001,7 +1106,7 @@ def roll_fishing_catch(rod_tier, fishing_level):
     whatever it likes." Everything this needs - the rod, the level - is read by
     the caller from rows the server owns.
 
-    Weighted exactly like pick_weighted_item_id(): 2^(ceiling - tier), so the
+    Weighted like the old item roll, 2^(ceiling - tier) per fish, so the
     best fish a player can currently reach is also the rarest, and each tier
     below it is twice as likely.
     """
@@ -1100,6 +1205,29 @@ def roll_cook(item_id, cooking_level):
     }
 
 
+def rarest_first(contents):
+    """
+    The bag's entries with the pet first, then the other items, then the coins.
+
+    THE ORDER IS WHAT A FULL BAG LOSES. The panel has a fixed number of cells
+    and app._create_loot_bag() cuts anything past them. Coins used to come
+    first, because gold is rolled first - and once a drop's gold was split
+    into denominations it took up to four cells on its own, so the cut fell on
+    the items and on the pet, which is appended last. Measured on the old
+    rules, 76% of boss bags ran past six cells and 573 of 616 boss pet wins
+    were cut away without a word. Coins last means a cut costs copper.
+    """
+    def rank(entry):
+        item = ITEMS.get(entry.get("item_id", ""), {})
+        kind = item.get("type_name", "")
+        if kind == "PET":
+            return 0
+        if kind == "CURRENCY":
+            return 2
+        return 1
+    return sorted(contents, key=rank)
+
+
 def roll_kill_rewards(enemy_id):
     """
     The whole reward for one kill. Port of BaseEnemy._die() plus
@@ -1129,6 +1257,7 @@ def roll_kill_rewards(enemy_id):
         contents = build_bag_contents(enemy)
         if pet_won:
             contents.append({"item_id": pick_pet_id(enemy), "quantity": 1})
+        contents = rarest_first(contents)
 
     return {
         "enemy_id": enemy_id,

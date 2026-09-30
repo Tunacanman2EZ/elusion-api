@@ -30,8 +30,11 @@ import gamedata
 #   bushmage          placed=1,  175 hp  -> ordinary; ceiling 11 / 300s
 #   poisonslimesmall  placed=0           -> ceiling-EXEMPT (runtime-spawned)
 #   poisonslimelarge  placed=0, rewards=false -> the reward-less enemy
+# PLACED AND PAYING. A large slime is placed and grants nothing - it bursts
+# into smalls - so a kill claim for one is the reward-less IMPOSSIBLE below, not
+# an honest farm.
 PLACED = [eid for eid, e in gamedata.ENEMIES.items()
-          if int(e.get("placed_count", 0)) > 0]
+          if int(e.get("placed_count", 0)) > 0 and e.get("grants_rewards", True)]
 
 _passed = 0
 _failed = 0
