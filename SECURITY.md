@@ -178,6 +178,15 @@ that it was wrong, in bold, on the security page, is the point.)
     a ban or a staff code still owed ends nothing.
     → Held by: `test_accounts.py` — "the earlier session is refused", "game A's bag, from before all that, is refused", "and the remembered one - which another copy of the game would also be holding - is refused, saying why", "the login still ends when it would have: resuming does not renew it", "and that half-login signs nobody out"
     → and in the game: `src/tools/testrunner.gd` — `_test_one_game_per_account()`
+23. **A report is only for a line you were shown.** Reporting takes a message
+    id, and ids are sequential, so a report route that accepted any id would
+    tell you which ones are other people's whispers. The line is checked
+    against the same rules the chat read uses - a whisper only for the two in
+    it, a friends line only for the author's friends, a guild line only for
+    that guild - and anything else is the same 404 as a line that does not
+    exist.
+    → Held by: `test_chatsafety.py` — "a whisper between two other people is a 404 - you were never shown it", "a friends-channel line is a 404 to somebody who is not the author's friend", "  but the one it was said to can report it"
+    → and in the game: `src/tools/testrunner.gd` — `_test_chat_safety_menu()`
 
 ---
 

@@ -1703,6 +1703,46 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_chat_deletions_age
             ON chat_deletions(deleted_at);
 
+        -- WHO A PLAYER HAS CHOSEN NOT TO HEAR. See IGNORE, REPORT, MUTE. One row
+        -- per pair, directional: user_id is the one who ignores. Their lines
+        -- are left out of every read of mine; their whispers, friend requests
+        -- and trades to me are refused.
+        CREATE TABLE IF NOT EXISTS ignores (
+            user_id    INTEGER NOT NULL,
+            ignored_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (user_id, ignored_id)
+        );
+
+        -- A LINE A PLAYER TOLD STAFF ABOUT. The line is COPIED - who said it,
+        -- where, what it said - because the report has to outlive the line: a
+        -- mod deletes it, the ring buffer trims it, and the evidence would go
+        -- with it. One per reporter per line; a second press is not a second
+        -- report. Resolving closes every report on the same line together.
+        CREATE TABLE IF NOT EXISTS chat_reports (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id    INTEGER NOT NULL,
+            reporter_id   INTEGER NOT NULL,
+            reporter_name TEXT    NOT NULL,
+            reported_id   INTEGER NOT NULL,
+            reported_name TEXT    NOT NULL,
+            channel       TEXT    NOT NULL,
+            body          TEXT    NOT NULL DEFAULT '',
+            image_id      TEXT    NOT NULL DEFAULT '',
+            said_at       INTEGER NOT NULL DEFAULT 0,
+            reason        TEXT    NOT NULL,
+            created_at    INTEGER NOT NULL,
+            resolved_at   INTEGER NOT NULL DEFAULT 0,
+            resolved_by   TEXT    NOT NULL DEFAULT '',
+            outcome       TEXT    NOT NULL DEFAULT '',
+            UNIQUE (message_id, reporter_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_chat_reports_open
+            ON chat_reports(resolved_at, created_at);
+        CREATE INDEX IF NOT EXISTS idx_chat_reports_by
+            ON chat_reports(reporter_id, created_at);
+
         -- WHO KNOWS WHO.
         --
         -- ONE ROW PER PAIR, and the key is directional on purpose: which way
@@ -2099,6 +2139,13 @@ def init_db():
     # existing account starts clean. See login() and SECURITY_NOTES.md (E-5).
     _migrate_add_column(db, "users", "failed_logins", "INTEGER NOT NULL DEFAULT 0")
     _migrate_add_column(db, "users", "lockout_until", "INTEGER NOT NULL DEFAULT 0")
+
+    # A CHAT MUTE: a unix time before which this account may not speak, and
+    # who said so and why. 0 is "not muted", so every existing account starts
+    # able to talk. See IGNORE, REPORT, MUTE.
+    _migrate_add_column(db, "users", "chat_muted_until", "INTEGER NOT NULL DEFAULT 0")
+    _migrate_add_column(db, "users", "chat_mute_reason", "TEXT NOT NULL DEFAULT ''")
+    _migrate_add_column(db, "users", "chat_muted_by", "TEXT NOT NULL DEFAULT ''")
 
     _migrate_seed_gold_ledger(db)
     _migrate_seed_lusion_ledger(db)
@@ -2612,6 +2659,7 @@ def user_for_token(token):
         SELECT u.id, u.username, u.role,
                u.is_banned, u.ban_expires_at, u.ban_reason, u.banned_by, u.banned_at,
                u.email_verified, u.name_hue,
+               u.chat_muted_until, u.chat_mute_reason,
                s.expires_at
         FROM sessions s
         JOIN users u ON u.id = s.user_id
@@ -4201,6 +4249,9 @@ def chat_write_check(channel, target_row):
             return bad_request("private messages need a 'to' account")
         if int(target_row["id"]) == int(g.user["id"]):
             return bad_request("you cannot message yourself")
+        if ignores(get_db(), int(target_row["id"]), int(g.user["id"])):
+            return {"error": "Forbidden",
+                    "message": "%s is not taking whispers from you." % target_row["username"]}, 403
         return None
 
     if channel == "guild":
@@ -4216,6 +4267,94 @@ def chat_write_check(channel, target_row):
         return None
 
     return bad_request("unknown channel")
+
+
+# =============================================================================
+# IGNORE, REPORT, MUTE
+# =============================================================================
+# Three tools for a busy world chat, one for each of the people in it.
+#
+#   IGNORE is the player's own: somebody's lines stop reaching you, in every
+#   channel, and their whispers, friend requests and trades to you are refused.
+#   Filtered in the read's own WHERE clause, like everything else in chat, so
+#   there is no second pass to forget.
+#
+#   REPORT is how a player hands a line to staff. The line is copied into the
+#   report, so it survives being deleted - which is usually what a report leads
+#   to. Staff see open reports in their panel and a count on the poll.
+#
+#   MUTE is staff's, and smaller than a ban: the account keeps playing and
+#   cannot speak until the time runs out. Every channel, pictures included.
+#
+# STAFF CANNOT BE IGNORED. A mod telling you to stop, and the owner announcing
+# a restart in chat, have to arrive. A member of staff who is the problem is a
+# report, like anybody else.
+
+IGNORE_LIMIT = 200
+REPORT_REASONS = ("spam", "harassment", "hate", "cheating", "other")
+# Per reporter. Far above anybody reporting what they see; below somebody
+# using the button to flood the staff panel.
+REPORTS_PER_HOUR = 20
+# A mod's mute is at most a day - longer is a ban's job, and a ban has a rank
+# ladder of its own. Dev and the owner can go to thirty days.
+MUTE_MAX_MINUTES_MOD = 24 * 60
+MUTE_MAX_MINUTES = 30 * 24 * 60
+
+# APPENDED TO A CHAT READ'S WHERE, with the reader's id as its one parameter.
+IGNORED_AUTHORS_CLAUSE = " AND user_id NOT IN (SELECT ignored_id FROM ignores WHERE user_id = ?)"
+
+
+def ignores(db, user_id, other_id):
+    """Does `user_id` ignore `other_id`?"""
+    return db.execute("SELECT 1 FROM ignores WHERE user_id = ? AND ignored_id = ?",
+                      (int(user_id), int(other_id))).fetchone() is not None
+
+
+def chat_mute_state(row, now=None):
+    """None, or {"until", "seconds_left", "reason"} while `row` is muted."""
+    if row is None:
+        return None
+    now = int(time.time()) if now is None else now
+    try:
+        until = _row_int(row, "chat_muted_until")
+        reason = str(row["chat_mute_reason"] or "")
+    except (KeyError, IndexError):
+        return None
+    if until <= now:
+        return None
+    return {"until": until, "seconds_left": until - now, "reason": reason}
+
+
+def describe_mute(state):
+    """The sentence a muted player reads."""
+    line = "You are muted in chat for another %s." % _wait_words(state["seconds_left"])
+    if state.get("reason"):
+        line += " Reason: %s" % state["reason"]
+    return line
+
+
+def _can_read_chat_row(db, user_id, row):
+    """Could `user_id` have read this line? The read's own rules, one line at a
+    time - a report is only for a line you were shown."""
+    channel = str(row["channel"] or CHAT_DEFAULT_CHANNEL)
+    author = int(row["user_id"] or 0)
+    if channel == "world":
+        return True
+    if channel == "private":
+        return user_id in (author, int(row["target_id"] or 0))
+    if channel == "friends":
+        return author == user_id or author in _friend_ids(db, user_id)
+    if channel == "guild":
+        seat = guild_membership(user_id)
+        return seat is not None and int(seat["guild_id"]) == int(row["target_id"] or 0)
+    return False
+
+
+def _open_report_count(db):
+    """Lines with an open report, which is what a member of staff has to look
+    at - three reports of one line are one thing to do."""
+    return int(db.execute("SELECT COUNT(DISTINCT message_id) FROM chat_reports"
+                          " WHERE resolved_at = 0").fetchone()[0] or 0)
 
 
 def _friend_ids(db, user_id):
@@ -10027,7 +10166,7 @@ STAFF_LIST_SHOWS = ("all", "online", "banned", "staff")
 # log_staff_action() call in this file and fails on a name missing from here.
 STAFF_ACTION_KINDS = (
     "ban", "unban", "kick", "warn", "note", "role",
-    "grant", "teleport", "chat_delete",
+    "grant", "teleport", "chat_delete", "mute", "unmute", "report",
     "guild_rename", "guild_disband",
     "maintenance", "minbuild", "pvp",
 )
@@ -10057,7 +10196,7 @@ STAFF_ONLINE_COUNT_SQL = (
 
 # What the account list counts against each name, so a repeat offender stands
 # out on the list before anybody opens their record.
-STAFF_RECORD_KINDS = ("ban", "kick", "warn", "note")
+STAFF_RECORD_KINDS = ("ban", "kick", "mute", "warn", "note")
 
 
 def _query_int(name, default, low, high):
@@ -10268,6 +10407,7 @@ def list_accounts():
             "role": role_for(row),
             "banned": ban is not None,
             "ban": ban,
+            "mute": chat_mute_state(row, now),
             # Whether YOU can act on this person, so a client can grey out the
             # buttons rather than offering them and being refused.
             "actionable": actionable,
@@ -10747,6 +10887,7 @@ def staff_read_user(username):
         "role": role_for(row),
         "created_at": int(row["created_at"] or 0),
         "ban": ban_state(row),
+        "mute": chat_mute_state(row),
         "actionable": may_see_addresses,
         # ALWAYS SHOWN, unlike the addresses and the linked accounts.
         #
@@ -11317,6 +11458,9 @@ def read_broadcasts():
         "trade_resync": _take_resync(db, int(g.user["id"])),
         # WHAT WAS SAID TO YOU WHILE YOU WERE NOT LOOKING. See _chat_news().
         "chat_news": _chat_news(db, int(g.user["id"])),
+        # LINES WAITING FOR STAFF, for staff only - a report nobody sees is a
+        # report nobody reads. 0 for everyone else, not absent.
+        "open_reports": _open_report_count(db) if role_at_least(g.user, "mod") else 0,
     }, 200
 
 
@@ -11333,24 +11477,28 @@ def _chat_news(db, user_id):
 
     Three index reads (idx_chat_to, idx_chat_private), on chat that is pruned
     after a day."""
+    # NOBODY YOU IGNORE, in all three - the same clause the read uses.
     whisper = db.execute(
         "SELECT id, username, body, image_id, created_at FROM chat_messages"
         " WHERE channel = 'private' AND target_id = ? AND user_id != ?"
-        " ORDER BY id DESC LIMIT 1", (user_id, user_id)).fetchone()
+        + IGNORED_AUTHORS_CLAUSE +
+        " ORDER BY id DESC LIMIT 1", (user_id, user_id, user_id)).fetchone()
     seat = guild_membership(user_id)
     guild_line = 0
     if seat is not None:
         guild_line = db.execute(
             "SELECT MAX(id) AS n FROM chat_messages"
-            " WHERE channel = 'guild' AND target_id = ? AND user_id != ?",
-            (int(seat["guild_id"]), user_id)).fetchone()["n"] or 0
+            " WHERE channel = 'guild' AND target_id = ? AND user_id != ?"
+            + IGNORED_AUTHORS_CLAUSE,
+            (int(seat["guild_id"]), user_id, user_id)).fetchone()["n"] or 0
     friend_line = 0
     friends = sorted(_friend_ids(db, user_id))
     if friends:
         friend_line = db.execute(
             "SELECT MAX(id) AS n FROM chat_messages WHERE channel = 'friends'"
-            " AND user_id IN (%s)" % ",".join("?" for _ in friends),
-            tuple(friends)).fetchone()["n"] or 0
+            " AND user_id IN (%s)" % ",".join("?" for _ in friends)
+            + IGNORED_AUTHORS_CLAUSE,
+            tuple(friends) + (user_id,)).fetchone()["n"] or 0
     return {
         "whisper": None if whisper is None else {
             "id": int(whisper["id"]),
@@ -11419,6 +11567,13 @@ def chat_send():
     channel = str(payload.get("channel", CHAT_DEFAULT_CHANNEL)).strip().lower()
     if channel not in CHAT_CHANNELS:
         return bad_request("channel must be one of: %s" % ", ".join(CHAT_CHANNELS))
+
+    # MUTED IS MUTED, in every channel and for pictures too. Before the
+    # throttle, so a muted player's attempts cost them nothing they would
+    # want back when it lifts.
+    muted = chat_mute_state(g.user)
+    if muted is not None:
+        return {"error": "Forbidden", "message": describe_mute(muted), "muted": muted}, 403
 
     # A PICTURE ON ITS OWN IS A MESSAGE. Demanding words alongside it would be
     # demanding a caption nobody writes.
@@ -11602,6 +11757,7 @@ def read_chat():
                 # vanishes on one is how a client ends up with a stale value
                 # it believes is current.
                 "world_image_wait": world_image_wait(g.user),
+                "muted": chat_mute_state(g.user),
             }, 200
 
         # BY THE GUILD THE LINE WAS SENT TO, not by who is in the guild now.
@@ -11615,6 +11771,11 @@ def read_chat():
         # good, whoever moves afterwards.
         where += " AND target_id = ?"
         params += [int(seat["guild_id"])]
+
+    # NOBODY YOU IGNORE, in any channel. In the WHERE with everything else, so
+    # the cursor, the tail and the removed list all agree about it.
+    where += IGNORED_AUTHORS_CLAUSE
+    params += [me]
 
     # Same two-shaped read as broadcasts: a first poll wants the tail of the
     # conversation, a returning poll wants only what it has not seen.
@@ -11685,6 +11846,9 @@ def read_chat():
         # not depend on which channel is being read and a client that has just
         # switched tabs should not have a stale one.
         "world_image_wait": world_image_wait(g.user),
+        # WHETHER YOU MAY SPEAK, so the box can say so before you type rather
+        # than after. null, or {until, seconds_left, reason}.
+        "muted": chat_mute_state(g.user),
     }, 200
 
 
@@ -12014,9 +12178,450 @@ def chat_delete():
 
     log_staff_action(g.user, "chat_delete", row["username"], row["user_id"],
                      row["body"][:120])
+    # A DELETED LINE'S REPORTS ARE ANSWERED. Deleting it is what they asked for,
+    # and leaving them open would have the next mod look at a line that is gone.
+    db.execute("UPDATE chat_reports SET resolved_at = ?, resolved_by = ?, outcome = 'deleted'"
+               " WHERE message_id = ? AND resolved_at = 0",
+               (now, g.user["username"], message_id))
     db.commit()
 
     return {"id": message_id, "deleted": True, "image_dropped": image_dropped}, 200
+
+
+# =============================================================================
+# IGNORE, REPORT, MUTE - the routes (the rules are above chat_write_check)
+# =============================================================================
+
+@app.get("/api/ignores")
+@require_auth
+def list_ignores():
+    """
+    The players you have chosen not to hear
+    ---
+    tags:
+      - Chat
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+    responses:
+      200:
+        description: '{"ignored": [{"username", "since"}], "limit": 200}'
+    """
+    rows = get_db().execute(
+        "SELECT u.username, i.created_at FROM ignores i JOIN users u ON u.id = i.ignored_id"
+        " WHERE i.user_id = ? ORDER BY u.username COLLATE NOCASE", (g.user["id"],)).fetchall()
+    return {"ignored": [{"username": r["username"], "since": int(r["created_at"])} for r in rows],
+            "limit": IGNORE_LIMIT}, 200
+
+
+@app.post("/api/ignores")
+@require_auth
+def add_ignore():
+    """
+    Stop hearing a player
+    ---
+    tags:
+      - Chat
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [username]
+          properties:
+            username: {type: string}
+    responses:
+      200:
+        description: Ignored - their lines are gone from every chat read of yours
+      400:
+        description: No name, or your own
+      403:
+        description: Staff cannot be ignored
+      404:
+        description: No such account
+      409:
+        description: The ignore list is full
+    """
+    payload = request.get_json(silent=True) or {}
+    name = str(payload.get("username", "")).strip()
+    if not name:
+        return bad_request("username is required")
+    target = _user_by_name(name)
+    if target is None:
+        return {"error": "Not Found", "message": "No such account."}, 404
+    me = int(g.user["id"])
+    if int(target["id"]) == me:
+        return bad_request("You cannot ignore yourself.")
+    if role_at_least(target, "mod"):
+        return {"error": "Forbidden",
+                "message": "Staff cannot be ignored. If one of them is the problem, "
+                           "report the message."}, 403
+    db = get_db()
+    if ignores(db, me, target["id"]):
+        return {"username": target["username"], "ignored": True, "already": True}, 200
+    held = int(db.execute("SELECT COUNT(*) FROM ignores WHERE user_id = ?", (me,)).fetchone()[0])
+    if held >= IGNORE_LIMIT:
+        return {"error": "Conflict",
+                "message": "You are ignoring %d players, which is the most. "
+                           "Stop ignoring somebody first." % IGNORE_LIMIT}, 409
+    db.execute("INSERT INTO ignores (user_id, ignored_id, created_at) VALUES (?, ?, ?)",
+               (me, int(target["id"]), int(time.time())))
+    db.commit()
+    return {"username": target["username"], "ignored": True}, 200
+
+
+@app.post("/api/ignores/remove")
+@require_auth
+def remove_ignore():
+    """
+    Hear a player again
+    ---
+    tags:
+      - Chat
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [username]
+          properties:
+            username: {type: string}
+    responses:
+      200:
+        description: Not ignored any more (or never was - was_ignored says which)
+      404:
+        description: No such account
+    """
+    payload = request.get_json(silent=True) or {}
+    name = str(payload.get("username", "")).strip()
+    if not name:
+        return bad_request("username is required")
+    target = _user_by_name(name)
+    if target is None:
+        return {"error": "Not Found", "message": "No such account."}, 404
+    db = get_db()
+    gone = db.execute("DELETE FROM ignores WHERE user_id = ? AND ignored_id = ?",
+                      (int(g.user["id"]), int(target["id"]))).rowcount
+    db.commit()
+    return {"username": target["username"], "ignored": False, "was_ignored": gone > 0}, 200
+
+
+@app.post("/api/chat/report")
+@require_auth
+def report_chat_line():
+    """
+    Tell staff about a chat line
+    ---
+    tags:
+      - Chat
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [id, reason]
+          properties:
+            id:     {type: integer}
+            reason: {type: string, enum: [spam, harassment, hate, cheating, other]}
+    responses:
+      200:
+        description: Reported (or already reported by you - "already" says so)
+      400:
+        description: A bad id or reason, or your own line
+      404:
+        description: No such line, or one you could not have read
+      429:
+        description: Too many reports this hour
+    """
+    payload = request.get_json(silent=True) or {}
+    try:
+        message_id = int(payload.get("id", 0))
+    except (TypeError, ValueError):
+        message_id = 0
+    if message_id <= 0:
+        return bad_request("id must be a whole number")
+    reason = str(payload.get("reason", "")).strip().lower()
+    if reason not in REPORT_REASONS:
+        return bad_request("reason must be one of: %s" % ", ".join(REPORT_REASONS))
+    db = get_db()
+    me = int(g.user["id"])
+    row = db.execute("SELECT * FROM chat_messages WHERE id = ?", (message_id,)).fetchone()
+    # A LINE YOU WERE NEVER SHOWN IS NOT THERE. The same 404 for both, so the
+    # route cannot be used to find out which ids are somebody's whispers.
+    if row is None or not _can_read_chat_row(db, me, row):
+        return {"error": "Not Found", "message": "No such message."}, 404
+    if int(row["user_id"] or 0) == me:
+        return bad_request("That is your own message.")
+    if db.execute("SELECT 1 FROM chat_reports WHERE message_id = ? AND reporter_id = ?",
+                  (message_id, me)).fetchone() is not None:
+        return {"id": message_id, "reported": True, "already": True}, 200
+    now = int(time.time())
+    recent = int(db.execute("SELECT COUNT(*) FROM chat_reports WHERE reporter_id = ? AND created_at > ?",
+                            (me, now - 3600)).fetchone()[0])
+    if recent >= REPORTS_PER_HOUR:
+        return {"error": "Too Many Requests",
+                "message": "You have sent a lot of reports this hour. Staff have them - "
+                           "try again later."}, 429
+    db.execute(
+        "INSERT INTO chat_reports (message_id, reporter_id, reporter_name, reported_id,"
+        " reported_name, channel, body, image_id, said_at, reason, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (message_id, me, g.user["username"], int(row["user_id"] or 0), row["username"],
+         str(row["channel"] or CHAT_DEFAULT_CHANNEL), str(row["body"] or ""),
+         str(row["image_id"] or ""), int(row["created_at"] or 0), reason, now))
+    db.commit()
+    return {"id": message_id, "reported": True}, 200
+
+
+@app.get("/api/staff/reports")
+@require_auth
+@require_role("mod")
+def staff_reports():
+    """
+    Reported chat lines, one entry per line
+    ---
+    tags:
+      - Moderation
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: query
+        name: state
+        type: string
+        description: "open (the default) or all"
+    responses:
+      200:
+        description: '{"reports": [...], "open": n, "now": t}'
+      400:
+        description: A state that is neither open nor all
+    """
+    state = str(request.args.get("state", "open")).strip().lower()
+    if state not in ("open", "all"):
+        return bad_request("state must be open or all")
+    db = get_db()
+    where = "WHERE resolved_at = 0" if state == "open" else ""
+    rows = db.execute("SELECT * FROM chat_reports %s ORDER BY created_at DESC, id DESC LIMIT 500"
+                      % where).fetchall()
+    grouped = {}
+    order = []
+    for row in rows:
+        key = int(row["message_id"])
+        if key not in grouped:
+            if len(order) >= 100:
+                continue
+            order.append(key)
+            grouped[key] = {"rows": []}
+        grouped[key]["rows"].append(row)
+    out = []
+    for key in order:
+        group = grouped[key]["rows"]
+        first = group[-1]
+        reported = _user_by_name(first["reported_name"])
+        reasons = {}
+        for row in group:
+            reasons[row["reason"]] = reasons.get(row["reason"], 0) + 1
+        out.append({
+            "message_id": key,
+            "reported": first["reported_name"],
+            "reported_role": role_for(reported) if reported is not None else "player",
+            "channel": first["channel"],
+            "body": first["body"],
+            "image_id": first["image_id"],
+            "said_at": int(first["said_at"]),
+            "reports": len(group),
+            "reporters": sorted({row["reporter_name"] for row in group}),
+            "reasons": reasons,
+            "first_at": int(first["created_at"]),
+            "resolved_at": int(group[0]["resolved_at"]),
+            "resolved_by": group[0]["resolved_by"],
+            "outcome": group[0]["outcome"],
+            # Whether YOU may close it or act on who said it. A mod does not
+            # judge reports about another mod - or about themselves.
+            "actionable": reported is not None and can_act_on(g.user, reported),
+            # Still in chat, or already gone - deleted, or trimmed by age.
+            "line_exists": db.execute("SELECT 1 FROM chat_messages WHERE id = ?",
+                                      (key,)).fetchone() is not None,
+        })
+    return {"reports": out, "open": _open_report_count(db), "now": int(time.time())}, 200
+
+
+@app.post("/api/staff/reports/resolve")
+@require_auth
+@require_role("mod")
+def resolve_reports():
+    """
+    Close every open report on one line
+    ---
+    tags:
+      - Moderation
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [message_id, outcome]
+          properties:
+            message_id: {type: integer}
+            outcome:    {type: string, enum: [dismissed, actioned]}
+    responses:
+      200:
+        description: Closed
+      400:
+        description: A bad id or outcome
+      404:
+        description: No open report on that line, or one about somebody you cannot act on
+    """
+    payload = request.get_json(silent=True) or {}
+    try:
+        message_id = int(payload.get("message_id", 0))
+    except (TypeError, ValueError):
+        message_id = 0
+    if message_id <= 0:
+        return bad_request("message_id must be a whole number")
+    outcome = str(payload.get("outcome", "")).strip().lower()
+    if outcome not in ("dismissed", "actioned"):
+        return bad_request("outcome must be dismissed or actioned")
+    db = get_db()
+    first = db.execute("SELECT * FROM chat_reports WHERE message_id = ? AND resolved_at = 0"
+                       " ORDER BY id LIMIT 1", (message_id,)).fetchone()
+    not_found = ({"error": "Not Found", "message": "No open report on that line."}, 404)
+    if first is None:
+        return not_found
+    reported = _user_by_name(first["reported_name"])
+    if reported is None or not can_act_on(g.user, reported):
+        return not_found
+    now = int(time.time())
+    closed = db.execute("UPDATE chat_reports SET resolved_at = ?, resolved_by = ?, outcome = ?"
+                        " WHERE message_id = ? AND resolved_at = 0",
+                        (now, g.user["username"], outcome, message_id)).rowcount
+    log_staff_action(g.user, "report", first["reported_name"], first["reported_id"],
+                     "%s: %s" % (outcome, str(first["body"] or "(a picture)")[:100]))
+    db.commit()
+    return {"message_id": message_id, "outcome": outcome, "closed": closed}, 200
+
+
+@app.post("/api/staff/mute")
+@require_auth
+@require_role("mod")
+def mute_account():
+    """
+    Stop an account talking in chat for a while
+    ---
+    tags:
+      - Moderation
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [username, minutes, reason]
+          properties:
+            username: {type: string}
+            minutes:  {type: integer, description: "1 to 1440 for a mod; up to 30 days for dev and the owner"}
+            reason:   {type: string}
+    responses:
+      200:
+        description: The mute as stored
+      400:
+        description: Missing reason, or minutes out of range
+      403:
+        description: A mod muting for longer than a day
+      404:
+        description: No such account, or one you may not act on
+    """
+    payload = request.get_json(silent=True) or {}
+    target, error = _moderation_target(payload)
+    if error is not None:
+        return error
+    reason = str(payload.get("reason", "")).strip()
+    if not reason or len(reason) > 500:
+        # Required, like a ban's: a mute nobody can explain later is one
+        # nobody can review.
+        return bad_request("reason must be 1-500 characters")
+    minutes = parse_stat(payload.get("minutes"))
+    if minutes is None or minutes < 1 or minutes > MUTE_MAX_MINUTES:
+        return bad_request("minutes must be a whole number 1-%d" % MUTE_MAX_MINUTES)
+    if minutes > MUTE_MAX_MINUTES_MOD and not role_at_least(g.user, "dev"):
+        return {"error": "Forbidden",
+                "message": "A mod may mute for at most %s." % _wait_words(MUTE_MAX_MINUTES_MOD * 60)}, 403
+    db = get_db()
+    until = int(time.time()) + minutes * 60
+    db.execute("UPDATE users SET chat_muted_until = ?, chat_mute_reason = ?, chat_muted_by = ?"
+               " WHERE id = ?", (until, reason, g.user["username"], target["id"]))
+    log_staff_action(g.user, "mute", target["username"], target["id"],
+                     "%s: %s" % (_wait_words(minutes * 60), reason))
+    db.commit()
+    return {"username": target["username"], "muted": True, "until": until,
+            "reason": reason, "muted_by": g.user["username"]}, 200
+
+
+@app.post("/api/staff/unmute")
+@require_auth
+@require_role("mod")
+def unmute_account():
+    """
+    Let an account talk again
+    ---
+    tags:
+      - Moderation
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [username]
+          properties:
+            username: {type: string}
+    responses:
+      200:
+        description: Not muted
+      404:
+        description: No such account, or one you may not act on
+    """
+    payload = request.get_json(silent=True) or {}
+    target, error = _moderation_target(payload)
+    if error is not None:
+        return error
+    db = get_db()
+    db.execute("UPDATE users SET chat_muted_until = 0, chat_mute_reason = '', chat_muted_by = ''"
+               " WHERE id = ?", (target["id"],))
+    log_staff_action(g.user, "unmute", target["username"], target["id"])
+    db.commit()
+    return {"username": target["username"], "muted": False}, 200
 
 
 # =============================================================================
@@ -13215,6 +13820,9 @@ def trade_offer():
     # adds to is precisely how a duplication bug is written.
     if other_id == user_id:
         return bad_request("You cannot trade with yourself.")
+    if ignores(db, other_id, user_id):
+        return {"error": "Forbidden",
+                "message": "%s is not taking trades from you." % username}, 403
 
     # SOMEBODY WHO IS THERE. A trade needs two people to press accept, and one
     # opened with a player who has closed the game can only sit there until it
@@ -14171,6 +14779,10 @@ def friends_request():
     me = int(g.user["id"])
     them = int(target["id"])
     now = int(time.time())
+
+    if ignores(db, them, me):
+        return {"error": "Forbidden",
+                "message": "%s is not taking friend requests from you." % target["username"]}, 403
 
     link = _friend_link(db, me, them)
     if link is not None:

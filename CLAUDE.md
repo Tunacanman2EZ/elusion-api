@@ -573,6 +573,34 @@ HUD runs anyway, like `trade`. `idx_chat_to (channel, target_id, id)` is the
 index it reads; the test checks the query plan uses it. `test_chatrooms.py`,
 "what was said to you".
 
+## Chat: ignore, report, mute
+
+IGNORE, REPORT, MUTE in app.py (the rules sit above `chat_write_check`, the
+routes after `chat_delete`); `test_chatsafety.py` holds all three.
+
+- **Ignore is a WHERE clause.** `IGNORED_AUTHORS_CLAUSE` goes on the end of
+  every chat read's `where` (with the reader's id), so the tail, the cursor and
+  the `removed` list agree about it, and on `_chat_news()`'s three queries. It
+  also refuses whispers, friend requests and trades TO the person who ignores
+  (`ignores(db, them, me)`). **Staff cannot be ignored**: a mod telling you to
+  stop has to arrive. `IGNORE_LIMIT` rows per player.
+- **A report copies the line** into `chat_reports` - body, author, channel,
+  when - because what a report usually leads to is the line being deleted.
+  `_can_read_chat_row()` is the read's own rules, one line at a time: you can
+  only report a line you were shown, so the route is not a way to find out
+  which ids are other people's whispers. One report per reporter per line,
+  `REPORTS_PER_HOUR` per reporter. Staff get one entry per LINE with a count;
+  resolving closes every report on the line; `chat_delete` closes them as
+  `deleted`. `open_reports` rides the broadcast poll for mod and up (0 for
+  everyone else). A mod cannot close a report about another mod - the same
+  `can_act_on()` as every sanction.
+- **A mute is three columns on users** (`chat_muted_until`, reason, by), read
+  by `chat_mute_state()`, refused in `chat_send` before the flood bucket so a
+  muted player's attempts cost nothing. A mod's longest is a day
+  (`MUTE_MAX_MINUTES_MOD`), dev and owner thirty days; a reason is required,
+  like a ban's. Reads carry `muted` so the box can say so before anyone types.
+  Mutes count on the record (`STAFF_RECORD_KINDS`).
+
 ## Signing in: one game per account, and what the login screen is told
 
 A sweep of the login screen against the real game found four things; each is
@@ -875,6 +903,7 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
   staffcode     staff logins need the code from their email
   accounts      signing in: one game per account, the miss that locks,
                 no recovery-email demand with no mail
+  chatsafety    ignore, report and mute
   attackxp      attack XP banked at the kill, with the class specialty
   gathering     fishing and cooking - the item-minting endpoints
   loot          bags, rolls, and taking things out of them
