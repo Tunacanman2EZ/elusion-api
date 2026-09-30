@@ -155,7 +155,7 @@ status, body = login("CHECKER")
 check("asking again within a minute sends no second email", status == 202 and len(SENT) == 1, (status, len(SENT)))
 
 status, body = login("CHECKER", code="000000" if first_code != "000000" else "111111")
-check("a wrong code is 400 - never 401, which the client would take as 'try to register'",
+check("a wrong code is 400 - never 401, which the game would read as a wrong password",
       status == 400 and body.get("code_required") is True and "token" not in body, (status, body))
 row = read_sql("SELECT failed_logins FROM users WHERE username = 'CHECKER'")
 check("  and counts as a failed login", row is not None and row[0] == 1, row)

@@ -71,6 +71,11 @@ app_module.send_mail = fake_send_mail
 # to the same synchronous recorder so the assertions below stay deterministic -
 # a test that raced a thread would pass or fail by timing.
 app_module.send_mail_async = fake_send_mail
+# AND THE SERVER HAS SOMEWHERE TO SEND IT. With no mail set up the server asks
+# nobody for an address and refuses to take one (needs_recovery_email(), and the
+# 503 in set_account_email() - test_accounts.py holds both). This suite is about
+# a server whose mail works, which is what the recorder above stands in for.
+app_module.mail_can_send = lambda: True
 
 
 def last_code():
@@ -83,6 +88,11 @@ def last_code():
 
 def auth(token):
     return {"Authorization": "Bearer %s" % token}
+
+
+def _time_now():
+    import time as _t
+    return _t.time()
 
 
 def raw_sql(statement, args=()):
@@ -218,11 +228,17 @@ check("a wrong code is refused", res.status_code == 400, str(res.status_code))
 check("and says nothing useful about why",
       "wrong or has expired" in str(res.get_json().get("message", "")), str(res.get_json()))
 
-# A second session, so we can prove the reset throws it out.
-intruder = client.post("/api/auth/login",
-                       json={"username": "victim", "password": "password123"}).get_json()["token"]
+# A second session, so we can prove the reset throws it out. PUT IN BY HAND: a
+# second LOGIN would end the player's own session (one login at a time), and
+# "and so is the player's own" below would then pass before the reset ran.
+intruder = "stray-intruder-session"
+raw_sql("INSERT INTO sessions (token, user_id, expires_at, last_seen_at)"
+        " VALUES (?, (SELECT id FROM users WHERE username = 'victim'), ?, ?)",
+        (intruder, int(_time_now()) + 3600, int(_time_now())))
 check("intruder holds a live session",
       client.get("/api/auth/session", headers=auth(intruder)).status_code == 200)
+check("and so does the player, until the reset",
+      client.get("/api/auth/session", headers=auth(victim)).status_code == 200)
 
 res = client.post("/api/auth/reset",
                   json={"email": "victim@example.com", "code": reset_code,
@@ -369,9 +385,13 @@ print("\n--- the address stays private ---")
 owner = client.post("/api/auth/register",
                     json={"username": "checker", "password": "password123"}).get_json()["token"]
 leaks = []
+# THE LOGIN FIRST, AND ITS TOKEN FROM THEN ON. One login at a time: signing in
+# ends newcomer's earlier session, and a leak check read off a 401 would pass
+# whatever the route does with addresses.
+_login = client.post("/api/auth/login", json={"username": "newcomer", "password": "password123"})
+newcomer = _login.get_json()["token"]
 for label, response in [
-    ("login", client.post("/api/auth/login",
-                          json={"username": "newcomer", "password": "password123"})),
+    ("login", _login),
     ("session", client.get("/api/auth/session", headers=auth(newcomer))),
     ("own email", client.get("/api/account/email", headers=auth(newcomer))),
     ("staff view", client.get("/api/staff/user/newcomer", headers=auth(owner))),

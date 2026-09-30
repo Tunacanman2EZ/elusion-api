@@ -2074,10 +2074,16 @@ check("and does NOT extend the login",
                (_present["token"],))[0] == _expiry_before,
       "a heartbeat proves the game is running, not that the login is fresh")
 
-# ONLY THE SESSION THAT BEAT. A second device left open elsewhere must not be
-# vouched for by this one - the stamp is keyed by token, not by account.
-_second = client.post("/api/auth/login",
-                      json={"username": "present", "password": "password123"}).get_json()
+# ONLY THE SESSION THAT BEAT. A second session on the account must not be
+# vouched for by this one - the stamp is keyed by token, not by account. A
+# second LOGIN would end the first (ONE LOGIN AT A TIME, test_accounts.py), so
+# the second row is put in the table by hand.
+_second = {"token": "stray-present-device"}
+_conn = _owner_sq.connect(DB_PATH)
+_conn.execute("INSERT INTO sessions (token, user_id, expires_at, last_seen_at)"
+              " VALUES (?, (SELECT id FROM users WHERE username = 'present'), ?, ?)",
+              (_second["token"], int(time.time()) + 3600, int(time.time())))
+_conn.commit(); _conn.close()
 _age_heartbeats("present", 10_000)
 client.get("/api/auth/session", headers=_PRESENT_H)
 _rows = {

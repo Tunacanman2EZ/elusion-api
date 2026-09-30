@@ -91,6 +91,27 @@ def auth(username, password="password123"):
     return {"Authorization": "Bearer " + token} if token else {}
 
 
+def stray_session(username):
+    """A second live session on one account, put in the table by hand.
+
+    A second LOGIN can no longer make one: ONE LOGIN AT A TIME in app.py ends
+    the account's other sessions whenever it signs in (test_accounts.py holds
+    that). But "a ban ends every session" is a promise about the TABLE, not
+    about how rows got there - a session from before that rule, a race, or a
+    restored backup - so the rows are made directly and the sanctions still
+    have to clear them all."""
+    db = sqlite3.connect(DB_PATH)
+    try:
+        uid = db.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()[0]
+        token = "stray-%s-%d" % (username, db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0])
+        db.execute("INSERT INTO sessions (token, user_id, expires_at, last_seen_at)"
+                   " VALUES (?, ?, ?, ?)", (token, uid, int(time.time()) + 3600, int(time.time())))
+        db.commit()
+    finally:
+        db.close()
+    return {"Authorization": "Bearer " + token}
+
+
 def live(headers):
     """Does this token still get served? /api/account is the cheapest authed route."""
     return client.get("/api/account", headers=headers).status_code
@@ -123,16 +144,13 @@ print("\n=== R-1  A BAN ENDS EVERY SESSION AT ONCE ===\n")
 # having to know they existed.
 
 dev_a = auth("griefer")
-dev_b = auth("griefer")
-dev_c = auth("griefer")
+dev_b = stray_session("griefer")
+dev_c = stray_session("griefer")
 
-# FOUR, not three: /api/auth/register hands back a token of its own, so the
-# account has a session before it ever calls /api/auth/login. That is a
-# deliberate convenience - register then play, without a second round trip - and
-# it means "how many sessions does this account have" is one more than the number
-# of logins.
-check("register plus three logins is four live sessions",
-      sessions_for("griefer") == 4, sessions_for("griefer"))
+# THREE: the login ended the session register handed back (one login at a
+# time), and the other two are rows no login made - see stray_session().
+check("a login plus two stray sessions is three live sessions",
+      sessions_for("griefer") == 3, sessions_for("griefer"))
 check("and all three are served", all(live(h) == 200 for h in (dev_a, dev_b, dev_c)))
 
 res = client.post("/api/staff/ban", headers=owner,
@@ -251,13 +269,13 @@ print("\n=== R-5  A KICK IS THE SANCTION BAN MADE NECESSARY ===\n")
 # game - which makes the smallest response to "this account is behaving oddly"
 # the largest one. Asserted mostly on what it does NOT do.
 
-n_a, n_b = auth("noisy"), auth("noisy")
-check("register plus two logins is three live sessions",
-      sessions_for("noisy") == 3, sessions_for("noisy"))
+n_a, n_b = auth("noisy"), stray_session("noisy")
+check("a login plus a stray session is two live sessions",
+      sessions_for("noisy") == 2, sessions_for("noisy"))
 
 res = client.post("/api/staff/kick", headers=owner, json={"username": "noisy", "reason": "quiet"})
 check("the kick reports how many it ended",
-      res.status_code == 200 and res.get_json().get("sessions_ended") == 3, res.get_json())
+      res.status_code == 200 and res.get_json().get("sessions_ended") == 2, res.get_json())
 check("both devices are signed out", all(live(h) == 401 for h in (n_a, n_b)))
 check("the account is NOT banned", sessions_for("noisy") == 0 and
       client.post("/api/auth/login",

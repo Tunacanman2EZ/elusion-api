@@ -168,8 +168,16 @@ that it was wrong, in bold, on the security page, is the point.)
     answers 202 and emails a six-digit code, and only the code gets a token. A
     wrong code counts toward the account lockout like a wrong password, and the
     streak clears only on a login that gets its token.
-    → Held by: `test_staffcode.py` — "a correct owner password answers 202, not 200", "a wrong code is 400 - never 401, which the client would take as 'try to register'", "a lockout's worth of wrong codes freezes the account, even for the right code"
+    → Held by: `test_staffcode.py` — "a correct owner password answers 202, not 200", "a wrong code is 400 - never 401, which the game would read as a wrong password", "a lockout's worth of wrong codes freezes the account, even for the right code"
     → and in the game: `src/tools/testrunner.gd` — `_test_staff_logins_take_a_code()`
+22. **One login at a time.** A login that gets its token - or a game reopening
+    a remembered one, which swaps its token - ends every other session the
+    account holds, so two games can never write the same bag, and a stolen
+    token dies the next time the owner signs in. Resuming keeps the login's end
+    date, so a remembered login cannot renew itself forever. A wrong password,
+    a ban or a staff code still owed ends nothing.
+    → Held by: `test_accounts.py` — "the earlier session is refused", "game A's bag, from before all that, is refused", "and the remembered one - which another copy of the game would also be holding - is refused, saying why", "the login still ends when it would have: resuming does not renew it", "and that half-login signs nobody out"
+    → and in the game: `src/tools/testrunner.gd` — `_test_one_game_per_account()`
 
 ---
 

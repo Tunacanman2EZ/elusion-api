@@ -462,12 +462,19 @@ print("\n=== MODERATION  SESSIONS, AND THE SANCTION THAT IS NOT A BAN ===\n")
 # stop them logging back in, and it does not reach further than a ban would.
 
 kicked = register("kickme")
-_dev2 = {"Authorization": "Bearer " + client.post(
-    "/api/auth/login", json={"username": "kickme", "password": "password123"}
-).get_json()["token"]}
-_dev3 = {"Authorization": "Bearer " + client.post(
-    "/api/auth/login", json={"username": "kickme", "password": "password123"}
-).get_json()["token"]}
+# TWO MORE SESSIONS, PUT IN THE TABLE BY HAND. A second login can no longer
+# make one - ONE LOGIN AT A TIME in app.py ends the others, and test_accounts.py
+# holds that - but a kick is a promise about every row the account has, however
+# it got there.
+def _stray_session(name, tag):
+    _c = sqlite3.connect(DB_PATH)
+    _uid = _c.execute("SELECT id FROM users WHERE username = ?", (name,)).fetchone()[0]
+    _c.execute("INSERT INTO sessions (token, user_id, expires_at, last_seen_at) VALUES (?, ?, ?, ?)",
+               ("stray-" + tag, _uid, int(time.time()) + 3600, int(time.time())))
+    _c.commit(); _c.close()
+    return {"Authorization": "Bearer stray-" + tag}
+_dev2 = _stray_session("kickme", "kick2")
+_dev3 = _stray_session("kickme", "kick3")
 
 _before = staff_view(owner, "kickme").get_json()
 check("the staff view reports live sessions",
@@ -646,9 +653,15 @@ check("no password hash or token rides along in the staff view",
 print("\n=== E-5  LOGIN LOCKS OUT AFTER REPEATED FAILURES ===\n")
 
 register("lockme", "correct-horse")
-for i in range(app_module.LOGIN_MAX_ATTEMPTS):
+for i in range(app_module.LOGIN_MAX_ATTEMPTS - 1):
     r = client.post("/api/auth/login", json={"username": "lockme", "password": "wrongpass123"})
     check("failed attempt %d returns 401" % (i + 1), r.status_code == 401, r.status_code)
+# THE MISS THAT LOCKS IT SAYS SO, rather than one more 401 and then a surprise
+# on the right password.
+r = client.post("/api/auth/login", json={"username": "lockme", "password": "wrongpass123"})
+check("failed attempt %d is the one that locks, and says so (429)" % app_module.LOGIN_MAX_ATTEMPTS,
+      r.status_code == 429 and "15 minutes" in (r.get_json() or {}).get("message", ""),
+      (r.status_code, r.get_json()))
 
 # Now locked: even the CORRECT password is refused with 429 until the cooldown.
 r = client.post("/api/auth/login", json={"username": "lockme", "password": "correct-horse"})

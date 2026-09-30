@@ -147,6 +147,9 @@ print("\n--- N-3 it comes back with the login ---")
 # =============================================================================
 login = client.post("/api/auth/login", json={"username": "ann", "password": "password123"}).get_json() or {}
 check("a login hands the colour back, for a second machine", login.get("name_hue") == 10, login.get("name_hue"))
+# ONE LOGIN AT A TIME (app.py): that login ended the first machine's session,
+# so ann carries on from the second one.
+ANN = {"Authorization": "Bearer " + login.get("token", "")}
 session = client.get("/api/auth/session", headers=ANN).get_json() or {}
 check("and so does the heartbeat", session.get("name_hue") == 10, session.get("name_hue"))
 

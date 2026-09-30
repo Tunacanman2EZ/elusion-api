@@ -573,6 +573,37 @@ HUD runs anyway, like `trade`. `idx_chat_to (channel, target_id, id)` is the
 index it reads; the test checks the query plan uses it. `test_chatrooms.py`,
 "what was said to you".
 
+## Signing in: one game per account, and what the login screen is told
+
+A sweep of the login screen against the real game found four things; each is
+held by `test_accounts.py`.
+
+- **One login at a time** (ONE LOGIN AT A TIME in app.py). A login that gets
+  its token ends every other session on the account (`_end_other_sessions()`),
+  and so does `POST /api/auth/resume`, which is what the game calls on boot
+  with a remembered token - it gets a new token that ends when the old one
+  would have. Two games on one account lost items: each held its own copy of
+  the bag, and the bag write replaces the whole bag. The ended token's hash
+  goes in `ended_sessions` for a day so `require_auth`'s 401 can carry
+  `signed_in_elsewhere` - looked up only on a refusal, never on a request that
+  works. **A test that needs two live sessions on one account inserts the
+  second row by hand** (see `stray_session()` in `test_revocation.py`); a
+  second login ends the first, and a check that keeps using the first token is
+  reading 401s. That happened in three suites when this landed, and two of the
+  checks were passing on the 401.
+- **The miss that locks says so.** `_register_failed_login()` returns True on
+  the miss that locks, and the login answers 429 at once instead of one more
+  401. `_wait_words()` puts every wait in minutes.
+- **No mail, no demand.** `needs_recovery_email()` is False when
+  `mail_can_send()` is, and `POST /api/account/email` answers 503 instead of a
+  200 "check that inbox" for a code that went nowhere. The 503 comes after the
+  request's own checks (a malformed address is still 400, a wrong password
+  still 401) and before anything is stored.
+- **The game never registers from the sign-in button.** It used to on a 401,
+  so a typo in your own name made a new account. `/api/auth/register` is
+  called only by the "Create an account" form now, so its 409 means what it
+  says.
+
 ## Staff logins take a code from their email
 
 A staff name is public: the owner's crown, the MOD and DEV badges, the players
@@ -585,9 +616,9 @@ CODES in app.py, `test_staffcode.py`.
 - **The code is the reset machinery**: `_store_code()` / `_consume_code()`
   under purpose `staff-login` - hashed, 15 minutes, five misses burn it. A
   reset or verify code does not open a login.
-- **A wrong code is 400, never 401.** The client answers a 401 by trying to
-  register the name; that is how it tells "no such account" from "wrong
-  password". A 401 here would turn a mistyped code into "Incorrect password."
+- **A wrong code is 400, never 401.** The game reads a 401 as "Wrong name or
+  password", and the password was right - a 401 here would send a staff member
+  off to retype it over a mistyped code.
 - **A wrong code counts toward the account lockout**, and the streak clears
   only on a login that gets its token. It used to clear on a correct password,
   which is the first half of every code attempt, so guessing codes would never
@@ -842,6 +873,8 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
   throttle      login defences, rate limits, credential rotation, and
                 that a signup is not a spray
   staffcode     staff logins need the code from their email
+  accounts      signing in: one game per account, the miss that locks,
+                no recovery-email demand with no mail
   attackxp      attack XP banked at the kill, with the class specialty
   gathering     fishing and cooking - the item-minting endpoints
   loot          bags, rolls, and taking things out of them

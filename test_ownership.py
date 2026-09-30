@@ -537,6 +537,7 @@ SWEEPS_ALLOWED = [
     ("chat_deletions", "deleted_at <", "retention: past CHAT_DELETION_WINDOW_SECONDS"),
     ("chat_messages", "id NOT IN", "the per-channel ring buffer trim"),
     ("sessions", "expires_at <", "expired sessions"),
+    ("ended_sessions", "ended_at <", "retention: why a session ended, kept a day"),
     # a boot-time migration: every save's display copy of xp_to_next re-derived
     # from the curve after 100 x 1.15 became 1,250 x 1.27. It sets a pure
     # function of each row's own level, so it cannot move a value between users.
@@ -676,8 +677,13 @@ check("both people in the conversation hear about it",
       "the deletion has to reach the two screens holding it")
 check("WORLD CHAT DOES NOT", w_id not in read(bob, since=cursor).get("removed", []),
       "an id is not content, but it still says a whisper existed and was removed")
+# `mod` IS carol, on the login that made her a mod - which ended the session
+# `carol` was holding (one login at a time). Read with the old one, this check
+# got a 401 with no "removed" in it and passed on nothing, so it now also says
+# the read was answered.
+_carol_view = read(mod, channel="private", with_name="alice")
 check("and neither does an unrelated conversation",
-      w_id not in read(carol, channel="private", with_name="alice").get("removed", []),
+      "removed" in _carol_view and w_id not in _carol_view.get("removed", []),
       "carol was never in it - this falls out of reusing the read's own WHERE")
 
 # The guild channel answers early when you have no guild, and a field that exists

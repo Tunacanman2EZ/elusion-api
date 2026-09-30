@@ -86,12 +86,16 @@ section("PER-ACCOUNT LOCKOUT - vertical brute force")
 # Many passwords against ONE account. LOGIN_MAX_ATTEMPTS consecutive misses
 # freeze it, and the freeze is checked BEFORE the password, so guessing right
 # on the next attempt does not get you in.
-for i in range(app_module.LOGIN_MAX_ATTEMPTS):
+for i in range(app_module.LOGIN_MAX_ATTEMPTS - 1):
     r = login("realuser", "wrongpass%d" % i, ip="198.51.100.1")
 check("misses below the ceiling stay 401", r.status_code == 401, r.status_code)
 
+r = login("realuser", "wrongpass-last", ip="198.51.100.1")
+check("the miss that reaches LOGIN_MAX_ATTEMPTS locks it, and says so -> 429",
+      r.status_code == 429, r.get_json())
+
 r = login("realuser", "wrongagain1", ip="198.51.100.1")
-check("crossing LOGIN_MAX_ATTEMPTS -> 429", r.status_code == 429, r.get_json())
+check("and the next one is refused too -> 429", r.status_code == 429, r.get_json())
 
 r = login("realuser", REAL_PASSWORD, ip="198.51.100.1")
 check("the CORRECT password is refused while locked", r.status_code == 429,
@@ -284,7 +288,16 @@ check("'one account, many failures' is one query",
 
 
 section("REVOCATION - what makes a 30-day token defensible")
-second = login("bystander", REAL_PASSWORD, ip="192.0.2.78").get_json()["token"]
+# THE SECOND DEVICE IS A ROW PUT IN BY HAND. Logging in again would END the
+# first device's session (ONE LOGIN AT A TIME in app.py, held by
+# test_accounts.py), so it cannot make two. "Everywhere" is a promise about
+# every row the account holds, however it got there.
+second = "stray-bystander-device"
+_c = db()
+_c.execute("INSERT INTO sessions (token, user_id, expires_at, last_seen_at)"
+           " VALUES (?, (SELECT id FROM users WHERE username = 'bystander'), ?, ?)",
+           (second, int(_time.time()) + 3600, int(_time.time())))
+_c.commit(); _c.close()
 
 # SCOPED TO THIS USER. Counting every row in sessions also counts realuser's,
 # which logout-all must NOT touch - so a total here would either fail wrongly
@@ -334,7 +347,14 @@ r = client.post(
 )
 check("an account to rotate", r.status_code == 201, r.get_json())
 first = r.get_json()["token"]
-elsewhere = login("rotator", OLD_PW, ip=ROTATOR_IP).get_json()["token"]
+# The other device, by hand - see the note in REVOCATION above. A login would
+# end `first`, which is ONE LOGIN AT A TIME working, not a device to revoke.
+elsewhere = "stray-rotator-device"
+_c = db()
+_c.execute("INSERT INTO sessions (token, user_id, expires_at, last_seen_at)"
+           " VALUES (?, (SELECT id FROM users WHERE username = 'rotator'), ?, ?)",
+           (elsewhere, int(_time.time()) + 3600, int(_time.time())))
+_c.commit(); _c.close()
 
 
 def change(current, new, tok, ip=ROTATOR_IP):

@@ -1040,6 +1040,18 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 
+        -- SESSIONS ENDED BY THE SAME ACCOUNT SIGNING IN SOMEWHERE ELSE. See
+        -- ONE LOGIN AT A TIME. The session row is deleted, as a kick deletes
+        -- it; this keeps only enough to tell the game it left behind WHY, so
+        -- the player reads "signed in somewhere else" and not "signed out by
+        -- the server". A hash, not the token: a dead token is still nobody's
+        -- business. Pruned after a day with the sessions.
+        CREATE TABLE IF NOT EXISTS ended_sessions (
+            token_hash TEXT    PRIMARY KEY,
+            user_id    INTEGER NOT NULL,
+            ended_at   INTEGER NOT NULL
+        );
+
         -- WHICH ADDRESSES AN ACCOUNT HAS ACTUALLY LOGGED IN FROM.
         --
         -- ONE ROW PER (account, address) PAIR, not per request, so this stays
@@ -2522,11 +2534,14 @@ def validate_credentials(payload):
 # AUTH HELPERS
 # =============================================================================
 
-def issue_token(user_id):
-    """Mint a session token and store it. Returns (token, expires_at)."""
+def issue_token(user_id, expires_at=None):
+    """Mint a session token and store it. Returns (token, expires_at).
+
+    `expires_at` keeps an existing login's end date - see resume_session()."""
     token = secrets.token_urlsafe(32)
     now = int(time.time())
-    expires_at = now + TOKEN_TTL
+    if expires_at is None:
+        expires_at = now + TOKEN_TTL
 
     db = get_db()
     # Seen NOW: whoever just logged in is, by definition, at the keyboard.
@@ -2538,6 +2553,52 @@ def issue_token(user_id):
     db.commit()
 
     return token, expires_at
+
+
+# =============================================================================
+# ONE LOGIN AT A TIME
+# =============================================================================
+# A new login - or a game reopening a remembered one - ends every other session
+# the account holds. The game it left behind is refused on its next request and
+# goes back to the login screen saying why.
+#
+# WHY. Two games on one account was lost items, reproduced: both games hold a
+# picture of the same backpack, and the bag write replaces the whole bag. One
+# game unequips a sword into the bag; the other, still showing the bag from
+# before, saves its own bag a moment later - and the sword is gone from both
+# the bag and the gear. The trade version of this was fixed with a resync; this
+# is the same bug with nothing to resync against, because the other writer is
+# the same player. Every online game answers it the same way, and so do we.
+#
+# THE OLD SESSION IS DELETED, like a kick deletes it, so the other game cannot
+# write anything from that moment on - not after its next heartbeat, now.
+# ended_sessions keeps a hash of it for a day so the 401 can say "somewhere
+# else" instead of "signed out by the server".
+
+def _token_hash(token):
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+
+def _end_other_sessions(db, user_id, keep_token):
+    """Ends every session `user_id` holds except `keep_token`. Caller commits."""
+    now = int(time.time())
+    for row in db.execute("SELECT token FROM sessions WHERE user_id = ? AND token != ?",
+                          (user_id, keep_token)).fetchall():
+        db.execute("INSERT OR REPLACE INTO ended_sessions (token_hash, user_id, ended_at)"
+                   " VALUES (?, ?, ?)", (_token_hash(row["token"]), user_id, now))
+    db.execute("DELETE FROM sessions WHERE user_id = ? AND token != ?", (user_id, keep_token))
+
+
+def _ended_elsewhere(token):
+    """True when `token` was ended because its account signed in again."""
+    if not token:
+        return False
+    return get_db().execute("SELECT 1 FROM ended_sessions WHERE token_hash = ?",
+                            (_token_hash(token),)).fetchone() is not None
+
+
+SIGNED_IN_ELSEWHERE_MESSAGE = ("This account signed in somewhere else, so this game "
+                               "was signed out.")
 
 
 def user_for_token(token):
@@ -2927,6 +2988,9 @@ def _prune_sessions(db, now):
     grow without something also tidying it.
     """
     db.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+    # A day is long past any game still running on an ended session: it is
+    # refused on its next request, within a heartbeat.
+    db.execute("DELETE FROM ended_sessions WHERE ended_at < ?", (now - 86400,))
     db.commit()
 
 
@@ -3027,9 +3091,12 @@ def _register_throttle_state(db, ip, now):
 def _register_failed_login(db, row, now):
     """One more consecutive miss for this account; lock it if that crosses the
     threshold. Called only for a real row with a wrong password - a login for a
-    username that does not exist has nothing to count against."""
+    username that does not exist has nothing to count against.
+
+    Returns True when this miss is the one that locked it."""
     count = _row_int(row, "failed_logins") + 1
-    if count >= LOGIN_MAX_ATTEMPTS:
+    locked = count >= LOGIN_MAX_ATTEMPTS
+    if locked:
         db.execute(
             "UPDATE users SET failed_logins = 0, lockout_until = ? WHERE id = ?",
             (now + LOGIN_LOCKOUT_SECONDS, row["id"]),
@@ -3040,6 +3107,18 @@ def _register_failed_login(db, row, now):
             (count, row["id"]),
         )
     db.commit()
+    return locked
+
+
+def _wait_words(seconds):
+    """"15 minutes", "1 minute", "40 seconds" - for a person, not a stopwatch.
+    Rounded UP: telling somebody "14 minutes" when there are 14 and a half is
+    sending them back to a door that is still shut."""
+    seconds = max(1, int(seconds))
+    if seconds < 60:
+        return "%d second%s" % (seconds, "" if seconds == 1 else "s")
+    minutes = (seconds + 59) // 60
+    return "%d minute%s" % (minutes, "" if minutes == 1 else "s")
 
 
 def is_owner(username):
@@ -4931,6 +5010,13 @@ def require_auth(view):
     def wrapped(*args, **kwargs):
         user = user_for_token(bearer_token())
         if user is None:
+            # Only a refusal pays for this lookup, never a request that works.
+            if _ended_elsewhere(bearer_token()):
+                return {
+                    "error": "Unauthorized",
+                    "message": SIGNED_IN_ELSEWHERE_MESSAGE,
+                    "signed_in_elsewhere": True,
+                }, 401
             return {
                 "error": "Unauthorized",
                 "message": "Missing, invalid or expired token.",
@@ -5090,7 +5176,7 @@ def register():
         _record_login_attempt(db, username, ip, False, reason)
         return {
             "error": "Too Many Requests",
-            "message": "Too many failed attempts from this address. Try again in %d seconds." % retry,
+            "message": "Too many failed attempts from this address. Try again in %s." % _wait_words(retry),
         }, 429
 
     probe_state = _register_throttle_state(db, ip, now)
@@ -5099,7 +5185,7 @@ def register():
         _record_login_attempt(db, username, ip, False, reason)
         return {
             "error": "Too Many Requests",
-            "message": "Too many registration attempts from this address. Try again in %d seconds." % retry,
+            "message": "Too many registration attempts from this address. Try again in %s." % _wait_words(retry),
         }, 429
 
     # BAN EVASION. The pattern this catches is the ordinary one: banned, makes
@@ -5192,11 +5278,13 @@ def register():
         "name_hue": None,
         "token": token,
         "expires_at": expires_at,
-        # Always true here: an account one second old cannot have confirmed
-        # an address yet. Sent anyway rather than left out, so the client
-        # reads the same key on register as it does on login.
+        # An account one second old cannot have confirmed an address yet, so
+        # this is true - unless the server cannot send mail at all, in which
+        # case there is nothing to ask for (see needs_recovery_email()).
+        # Sent rather than left out, so the client reads the same key on
+        # register as it does on login.
         "email_verified": False,
-        "needs_email": True,
+        "needs_email": needs_recovery_email(None),
     }, 201
 
 
@@ -5260,8 +5348,8 @@ def _staff_login_step(db, row, data, ip, now):
             return None
         _register_failed_login(db, row, now)
         _record_login_attempt(db, row["username"], ip, False, "bad-code")
-        # 400, NOT 401. The client answers a 401 by trying to register the
-        # name, which is how it tells "no such account" from "wrong password".
+        # 400, NOT 401. The game reads a 401 as "wrong name or password", and
+        # the password here was right.
         return {
             "error": "Bad Code",
             "code_required": True,
@@ -5377,7 +5465,7 @@ def login():
         _record_login_attempt(db, (data or {}).get("username", ""), ip, False, reason)
         return {
             "error": "Too Many Requests",
-            "message": "Too many failed attempts from this address. Try again in %d seconds." % retry,
+            "message": "Too many failed attempts from this address. Try again in %s." % _wait_words(retry),
         }, 429
 
     row = db.execute(
@@ -5398,7 +5486,7 @@ def login():
         _record_login_attempt(db, data["username"], ip, False, "account-locked")
         return {
             "error": "Too Many Requests",
-            "message": "Too many failed attempts. Try again in %d seconds." % retry,
+            "message": "Too many failed attempts. Try again in %s." % _wait_words(retry),
         }, 429
 
     # same response whether the user is missing or the password is wrong -
@@ -5417,8 +5505,7 @@ def login():
     password_ok = check_password_hash(stored_hash, data["password"])
 
     if row is None or not password_ok:
-        if row is not None:
-            _register_failed_login(db, row, now)
+        locked = row is not None and _register_failed_login(db, row, now)
         # The REASON is recorded even though the RESPONSE cannot distinguish
         # them. The 401 has to stay identical or it enumerates usernames; the
         # log is on our side of that line, and "no-such-user" against forty
@@ -5427,6 +5514,17 @@ def login():
             db, data["username"], ip, False,
             "no-such-user" if row is None else "bad-password",
         )
+        # THE MISS THAT LOCKS IT SAYS SO. It used to answer the same 401 as the
+        # seven before it, so the player learned about the lock only by typing
+        # the RIGHT password next and being told to wait fifteen minutes. The
+        # next attempt would have said "locked" anyway - this is the same
+        # sentence one try sooner, not anything a stranger could not learn.
+        if locked:
+            return {
+                "error": "Too Many Requests",
+                "message": "Too many failed attempts. Try again in %s."
+                           % _wait_words(LOGIN_LOCKOUT_SECONDS),
+            }, 429
         return {
             "error": "Unauthorized",
             "message": "Incorrect username or password.",
@@ -5467,6 +5565,10 @@ def login():
         db.commit()
 
     token, expires_at = issue_token(row["id"])
+    # ONE LOGIN AT A TIME: only a login that got its token. A wrong password,
+    # a ban or a staff code still to come ends nothing.
+    _end_other_sessions(db, row["id"], token)
+    db.commit()
     _record_login_attempt(db, row["username"], ip, True, "")
     # ON SUCCESS ONLY, and after the ban check above - a banned account never
     # reaches here, so a ban cannot keep refreshing its own address history and
@@ -5558,6 +5660,54 @@ def session_info():
         "is_owner": is_owner(g.user["username"]),
         "name_hue": name_hue_of(g.user),
         "expires_at": g.user["expires_at"],
+        "maintenance": maintenance_public(),
+        "email_verified": not needs_recovery_email(g.user),
+        "needs_email": needs_recovery_email(g.user),
+    }, 200
+
+
+@app.post("/api/auth/resume")
+@require_auth
+def resume_session():
+    """
+    Carry a remembered login into this game, on a new token
+    ---
+    tags:
+      - Auth
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+    responses:
+      200:
+        description: What /api/auth/session answers, plus the token to use from now on
+      401:
+        description: Missing, invalid or expired token
+    """
+    # ONE LOGIN AT A TIME, for the game that never typed a password. A second
+    # copy of the game opened on the same computer finds the same remembered
+    # token, and GET /api/auth/session would let both run on one session - the
+    # two-writer bug with nothing to end. So opening the game swaps the token:
+    # this one gets a fresh session, and every other session on the account,
+    # the one it came in on included, ends as if it had been signed in over.
+    #
+    # THE NEW TOKEN ENDS WHEN THE OLD ONE WOULD HAVE. A fresh thirty days
+    # here would let a remembered login - or a stolen token - renew itself
+    # forever without anybody typing a password. It is the same login, moved.
+    db = get_db()
+    token, expires_at = issue_token(g.user["id"], int(g.user["expires_at"]))
+    _end_other_sessions(db, g.user["id"], token)
+    db.commit()
+    return {
+        "user_id": g.user["id"],
+        "username": g.user["username"],
+        "role": role_for(g.user),
+        "is_owner": is_owner(g.user["username"]),
+        "name_hue": name_hue_of(g.user),
+        "token": token,
+        "expires_at": expires_at,
         "maintenance": maintenance_public(),
         "email_verified": not needs_recovery_email(g.user),
         "needs_email": needs_recovery_email(g.user),
@@ -5733,7 +5883,7 @@ def change_password():
         _record_login_attempt(db, row["username"], ip, False, reason)
         return {
             "error": "Too Many Requests",
-            "message": "Too many failed attempts from this address. Try again in %d seconds." % retry,
+            "message": "Too many failed attempts from this address. Try again in %s." % _wait_words(retry),
         }, 429
 
     if _row_int(row, "lockout_until") > now:
@@ -5741,7 +5891,7 @@ def change_password():
         _record_login_attempt(db, row["username"], ip, False, "account-locked")
         return {
             "error": "Too Many Requests",
-            "message": "Too many failed attempts. Try again in %d seconds." % retry,
+            "message": "Too many failed attempts. Try again in %s." % _wait_words(retry),
         }, 429
 
     if not check_password_hash(row["password_hash"], current):
@@ -5845,6 +5995,14 @@ def needs_recovery_email(row):
     typo would quietly leave the account unrecoverable, which is the exact
     situation the prompt exists to prevent.
     """
+    # NOTHING TO ASK FOR WHEN NOTHING CAN BE SENT. The login screen will not
+    # let a player past the prompt until a code arrives, so a server with no
+    # mail set up - or one whose mail was never configured on the day - turned
+    # every new player away at the door with "check that inbox". The same rule
+    # the staff login code follows: it stands aside when there is nowhere to
+    # send one, and the boot log says so.
+    if not mail_can_send():
+        return False
     if row is None:
         return True
     try:
@@ -6161,6 +6319,15 @@ def set_account_email():
         db.commit()
         return {"error": "Unauthorized", "message": "That password is not correct."}, 401
 
+    # SAID, NOT SWALLOWED. With no mail set up the code went nowhere and this
+    # answered 200 "Check that inbox" all the same - a player waited for an
+    # email that could never come. After every check a request can fail on its
+    # own, and before anything is stored.
+    if not mail_can_send():
+        return {"error": "Service Unavailable",
+                "message": "The server cannot send email right now, so an address "
+                           "cannot be confirmed yet. Please try again later."}, 503
+
     # UNVERIFIED UNTIL A CODE COMES BACK FROM IT. Until then this address
     # cannot receive a reset, so a typo here costs a re-entry, not an account.
     db.execute("UPDATE users SET email = ?, email_verified = 0 WHERE id = ?",
@@ -6358,7 +6525,7 @@ def complete_recovery():
         db.commit()
         return {
             "error": "Too Many Requests",
-            "message": "Too many failed attempts from this address. Try again in %d seconds." % retry,
+            "message": "Too many failed attempts from this address. Try again in %s." % _wait_words(retry),
         }, 429
 
     row = None
