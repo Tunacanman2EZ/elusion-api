@@ -1,4 +1,5 @@
 from flask import Flask, request, g
+from flask.json.provider import DefaultJSONProvider
 from flasgger import Swagger
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -15,6 +16,7 @@ import os
 import re
 import sys
 import threading
+import unicodedata
 import math
 import smtplib
 import hashlib
@@ -40,6 +42,37 @@ except ImportError:
     PILLOW_AVAILABLE = False
 
 app = Flask(__name__)
+
+
+# A LONE SURROGATE IS REFUSED AT THE DOOR. "\ud800" with no partner is legal
+# JSON, and json.loads turns it into a Python str that cannot be encoded as
+# UTF-8 - so the first database write that touched it raised, and a chat
+# message, a character save or an email address came back as a 500. No
+# keyboard types one; a script does. Refused here, once, for every route:
+# get_json(silent=True) sees None, exactly like any other body that is not
+# JSON, and the route answers 400 in its own words.
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _holds_lone_surrogate(value):
+    if isinstance(value, str):
+        return _LONE_SURROGATE.search(value) is not None
+    if isinstance(value, dict):
+        return any(_holds_lone_surrogate(k) or _holds_lone_surrogate(v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_holds_lone_surrogate(v) for v in value)
+    return False
+
+
+class _StrictJSONProvider(DefaultJSONProvider):
+    def loads(self, s, **kwargs):
+        parsed = super().loads(s, **kwargs)
+        if _holds_lone_surrogate(parsed):
+            raise ValueError("a lone UTF-16 surrogate in the JSON body")
+        return parsed
+
+
+app.json = _StrictJSONProvider(app)
 
 # HARD BODY-SIZE CAP. A save can carry ~64 KB per explored area (see
 # MAX_EXPLORED_BYTES), so this sits far above any legitimate request while
@@ -1569,6 +1602,10 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_chat_channel ON chat_messages(channel, id);
         CREATE INDEX IF NOT EXISTS idx_chat_private
             ON chat_messages(channel, user_id, target_id, id);
+        -- "What was said TO me": the newest whisper to an account, and the
+        -- newest line in a guild, both asked on every broadcast poll.
+        CREATE INDEX IF NOT EXISTS idx_chat_to
+            ON chat_messages(channel, target_id, id);
 
         -- PICTURES, FETCHED BY THE SERVER AND RE-SERVED BY IT.
         --
@@ -3687,6 +3724,47 @@ def _spend_chat_token(user_id):
     return None
 
 
+# ONE LINE, AS TYPED. Everything a player types that other players will read
+# goes through clean_player_text() before it is stored. Each rule below was a
+# message that did real damage on a real screen:
+#
+#   - a newline, tab or other control character is a space. One message of
+#     150 newlines was 150 blank lines: the whole chat window, wiped, by one
+#     line the flood limit counted as one. A newline also let a player write
+#     "12:00 [SERVER] Server restarting - log out now" on a line of its own.
+#   - an invisible format character is dropped: bidi overrides printed a
+#     message backwards, and a message of nothing but zero-width spaces was
+#     an empty line under somebody's name. ZWJ (U+200D) stays - emoji like the
+#     family are built with it.
+#   - at most MAX_MARKS_PER_LETTER accents stack on one letter, so a pile of
+#     combining marks cannot draw over the lines above and below it.
+#   - runs of spaces become one.
+MAX_MARKS_PER_LETTER = 3
+
+
+def clean_player_text(raw, limit):
+    out = []
+    marks = 0
+    for ch in str(raw or ""):
+        kind = unicodedata.category(ch)
+        if kind in ("Cc", "Zl", "Zp") or ch.isspace():
+            ch = " "
+        elif kind == "Cf" and ch != "\u200d":
+            continue
+        elif kind == "Cs":
+            continue
+        if kind in ("Mn", "Me"):
+            marks += 1
+            if marks > MAX_MARKS_PER_LETTER:
+                continue
+        else:
+            marks = 0
+        if ch == " " and (not out or out[-1] == " "):
+            continue
+        out.append(ch)
+    return "".join(out).strip()[:limit].strip()
+
+
 def post_chat(user_row, body, channel="world", target_id=0, image_id=""):
     """
     Record one player message. Caller commits, like post_broadcast().
@@ -3695,7 +3773,7 @@ def post_chat(user_row, body, channel="world", target_id=0, image_id=""):
     means neither words NOR a picture, because a picture on its own is a
     perfectly good message.
     """
-    text = str(body or "").strip()[:MAX_CHAT_LENGTH]
+    text = clean_player_text(body, MAX_CHAT_LENGTH)
     if text == "" and not image_id:
         return None
 
@@ -6687,8 +6765,12 @@ def write_save():
     if class_id not in VALID_CLASSES:
         return bad_request("class_id must be one of: %s" % ", ".join(sorted(VALID_CLASSES)))
 
-    name = str(payload.get("name", "")).strip()
-    if not name or len(name) > 20:
+    # Shown to other players - the online list, a guild's roster, a trade - so
+    # held to the same one-line rule as chat. The client names characters
+    # after their class; only a modified one could send anything else.
+    raw_name = str(payload.get("name", "")).strip()
+    name = clean_player_text(raw_name, 20)
+    if not name or len(raw_name) > 20:
         return bad_request("name must be 1-20 characters")
 
     # NOT from the payload. level is server-owned (see SERVER_OWNED_STATS): a
@@ -11066,7 +11148,52 @@ def read_broadcasts():
         # _take_resync(): whoever accepted first learns here that it went
         # through, and gets the bag and purse it went through with.
         "trade_resync": _take_resync(db, int(g.user["id"])),
+        # WHAT WAS SAID TO YOU WHILE YOU WERE NOT LOOKING. See _chat_news().
+        "chat_news": _chat_news(db, int(g.user["id"])),
     }, 200
+
+
+def _chat_news(db, user_id):
+    """The newest whisper TO this player, and the newest line in their guild
+    and among their friends - each said by somebody else.
+
+    THE CHAT WINDOW ONLY READS THE TAB THAT IS OPEN, AND ONLY WHILE IT IS
+    OPEN. So a whisper reached nobody: with chat closed, or open on World, it
+    sat on the server, and the Whisper tab only shows a conversation with a
+    name you already typed. A player could be whispered all day and never
+    know. This rides the poll that runs anyway, like "trade" above, and the
+    HUD says who whispered and lights the tabs.
+
+    Three index reads (idx_chat_to, idx_chat_private), on chat that is pruned
+    after a day."""
+    whisper = db.execute(
+        "SELECT id, username, body, image_id, created_at FROM chat_messages"
+        " WHERE channel = 'private' AND target_id = ? AND user_id != ?"
+        " ORDER BY id DESC LIMIT 1", (user_id, user_id)).fetchone()
+    seat = guild_membership(user_id)
+    guild_line = 0
+    if seat is not None:
+        guild_line = db.execute(
+            "SELECT MAX(id) AS n FROM chat_messages"
+            " WHERE channel = 'guild' AND target_id = ? AND user_id != ?",
+            (int(seat["guild_id"]), user_id)).fetchone()["n"] or 0
+    friend_line = 0
+    friends = sorted(_friend_ids(db, user_id))
+    if friends:
+        friend_line = db.execute(
+            "SELECT MAX(id) AS n FROM chat_messages WHERE channel = 'friends'"
+            " AND user_id IN (%s)" % ",".join("?" for _ in friends),
+            tuple(friends)).fetchone()["n"] or 0
+    return {
+        "whisper": None if whisper is None else {
+            "id": int(whisper["id"]),
+            "from": whisper["username"],
+            "body": whisper["body"] or ("(a picture)" if whisper["image_id"] else ""),
+            "at": int(whisper["created_at"]),
+        },
+        "guild": int(guild_line),
+        "friends": int(friend_line),
+    }
 
 
 def _own_guild(db, user_id):
@@ -11117,7 +11244,9 @@ def chat_send():
         description: Sending faster than the flood bucket allows
     """
     payload = request.get_json(silent=True) or {}
-    text = str(payload.get("body", "")).strip()
+    # CLEANED BEFORE IT IS JUDGED EMPTY, so a message of nothing but invisible
+    # characters is refused rather than posted as a blank line.
+    text = clean_player_text(payload.get("body", ""), MAX_CHAT_LENGTH)
     image_id = str(payload.get("image", "")).strip()
 
     channel = str(payload.get("channel", CHAT_DEFAULT_CHANNEL)).strip().lower()

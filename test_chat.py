@@ -286,6 +286,56 @@ with app_module.app.app_context():
 check("and writing prunes it away", left == 0, left)
 
 
+print("\n--- one line, as typed: what one message could do to everyone's screen ---")
+refill("alice")
+res = say(alice_token, "top" + "\n" * 150 + "bottom")
+check("150 newlines are one line: a single message cannot wipe the window",
+      res.status_code == 200 and res.get_json()["body"] == "top bottom", res.get_json())
+res = say(alice_token, "hi\n12:00 [SERVER] Server restarting - log out now")
+check("so nobody can put a fake server line on a line of its own",
+      "\n" not in res.get_json()["body"], res.get_json())
+res = say(alice_token, "\u202eevil text reversed")
+check("a bidi override is dropped, so a message cannot print backwards",
+      res.get_json()["body"] == "evil text reversed", res.get_json())
+res = say(alice_token, "\u200b\u200b\u2060\ufeff")
+check("a message of nothing but invisible characters is refused, not posted blank",
+      res.status_code == 400, res.status_code)
+res = say(alice_token, "Z" + "\u0336\u0337\u0338\u0301" * 30)
+check("accents stack at most three deep on one letter",
+      res.get_json()["body"] == "Z\u0336\u0337\u0338", res.get_json())
+res = say(alice_token, "a\t\t\tb   c")
+check("tabs and runs of spaces are one space", res.get_json()["body"] == "a b c", res.get_json())
+refill("alice")
+res = say(alice_token, "\U0001F468\u200D\U0001F469\u200D\U0001F467 Vi\u1ec7t #\ufe0f\u20e3")
+check("emoji joined with ZWJ, accented words and keycaps come through untouched",
+      res.get_json()["body"] == "\U0001F468\u200D\U0001F469\u200D\U0001F467 Vi\u1ec7t #\ufe0f\u20e3",
+      res.get_json())
+feed = read(bob_token).get_json()["messages"]
+check("and what is stored is what everyone reads",
+      not any("\n" in m["body"] or "\u202e" in m["body"] for m in feed), [m["body"] for m in feed[-8:]])
+res = client.post("/api/chat/send", data=b'{"body": "hi \\ud800 there"}',
+                  headers={**auth(alice_token), "Content-Type": "application/json"})
+check("a lone surrogate is a 400, not a 500 (it cannot be written as UTF-8)",
+      res.status_code == 400, res.status_code)
+res = client.post("/api/account/email",
+                  data=b'{"email": "a\\udc00@example.com", "password": "password123"}',
+                  headers={**auth(alice_token), "Content-Type": "application/json"})
+check("  on every route, since it is refused where JSON is read - here, an email address",
+      res.status_code == 400, res.status_code)
+with app_module.app.app_context():
+    db = app_module.get_db()
+    alice_row = db.execute("SELECT * FROM users WHERE username = 'alice'").fetchone()
+    new_id = app_module.post_chat(alice_row, "from\n\n\nsomewhere \u202eelse")
+    stored = db.execute("SELECT body FROM chat_messages WHERE id = ?", (new_id,)).fetchone()["body"]
+    db.rollback()
+check("post_chat() cleans too, for any caller besides the send route", stored == "from somewhere else", stored)
+res = client.put("/api/save", json={"slot": 3, "class_id": "warrior", "name": "line1\n\n\u202eline2"},
+                 headers=auth(alice_token))
+saved = client.get("/api/save", headers=auth(alice_token)).get_json()
+names = [s.get("name") for s in saved.get("slots", [])]
+check("a character's name is held to the same one-line rule", "line1 line2" in names, names)
+
+
 print("\n--- nothing without a token ---")
 check("sending needs one", client.post("/api/chat/send",
                                        json={"body": "hi"}).status_code == 401)

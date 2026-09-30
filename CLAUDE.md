@@ -165,6 +165,16 @@ and `88.0` comes back. Anything the client sends is coerced on arrival —
 int, because Godot's comparisons are type-strict and a float that should be an
 int has cost this project a full day already.
 
+### A lone surrogate is legal JSON and cannot be stored
+
+`"\ud800"` with no partner parses into a Python `str` that cannot be encoded as
+UTF-8, so the first database write that touched it raised - a chat message, a
+character save or an email address came back as a 500. `_StrictJSONProvider`
+(top of app.py, `app.json = ...`) refuses it while parsing, so
+`get_json(silent=True)` sees `None` and every route gives its ordinary "not
+JSON" 400. A route that parses a body some other way does not get this for
+free.
+
 ### Use SystemRandom for anything a player benefits from predicting
 
 Python's default RNG is a Mersenne Twister and its state is reconstructible from
@@ -541,6 +551,27 @@ in it are decisions, not details:
 not in the schema block: on a database from before presence existed, the schema
 block would fail on "no such column" and take the boot with it. The MIGRATION
 section in `test_api.py` boots exactly that shape, and fails if the index moves back.
+
+## Chat is one line, as typed, and a whisper finds you
+
+**`clean_player_text(raw, limit)`** is the one rule for text other players
+read: chat (`post_chat()`, and `chat_send()` before its emptiness check) and a
+character's name (`write_save()`). Control characters, tabs and line breaks
+become a space; format characters are dropped (bidi overrides printed a line
+backwards, a line of zero-width spaces was an empty line under a name) except
+U+200D, which emoji are built from; three accents at most on one letter; runs
+of spaces collapse. What is stored is what everybody reads - the test compares
+the two. Clean BEFORE checking for empty, or a message of invisibles gets
+through as a blank line. `test_chat.py`, "one line, as typed".
+
+**`chat_news` on `/api/server/broadcasts`** (`_chat_news()`): the newest
+whisper TO the caller, and the newest line ids in their guild and among their
+friends, each said by somebody else. The chat window only reads the tab that
+is open, so before this a whisper sat on the server until the player happened
+to open the Whisper tab with the sender's name typed in. It rides the poll the
+HUD runs anyway, like `trade`. `idx_chat_to (channel, target_id, id)` is the
+index it reads; the test checks the query plan uses it. `test_chatrooms.py`,
+"what was said to you".
 
 ## Staff logins take a code from their email
 

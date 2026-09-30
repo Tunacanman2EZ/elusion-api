@@ -822,6 +822,67 @@ else:
           int(read(owner_token).get_json().get("world_image_wait", -1)) == 0)
 
 
+print("\n--- what was said to you, on the poll that runs anyway ---")
+# The chat window reads only its open tab; this is how a whisper to a player
+# with chat shut, or open on World, reaches them at all. See _chat_news().
+def news(token):
+    return client.get("/api/server/broadcasts?since=0", headers=auth(token)).get_json()["chat_news"]
+
+refill("amy", "bob", "cal")
+say(amy_token, "psst, bob", channel="private", to="bob")
+got = news(bob_token)
+whisper = got.get("whisper") or {}
+check("the newest whisper TO you rides the broadcast poll, with who and what",
+      whisper.get("from") == "amy" and whisper.get("body") == "psst, bob"
+      and int(whisper.get("id", 0)) > 0 and int(whisper.get("at", 0)) > 0, got)
+check("your own whisper is not news to you", (news(amy_token).get("whisper") or {}).get("from") != "amy",
+      news(amy_token))
+check("and nobody hears about a whisper between two other people",
+      (news(cal_token).get("whisper") or {}).get("body") != "psst, bob", news(cal_token))
+# Friends again: the section above ended it to test that removal stops the lines.
+client.post("/api/friends/request", json={"username": "bob"}, headers=auth(amy_token))
+client.post("/api/friends/respond", json={"username": "amy", "accept": True}, headers=auth(bob_token))
+refill("bob")
+bob_line = int(say(bob_token, "hi friends", channel="friends").get_json().get("id", 0))
+check("a friends line by somebody else is reported by its id",
+      bob_line > 0 and int(news(amy_token).get("friends", 0)) == bob_line, (bob_line, news(amy_token)))
+check("  but not to somebody who is nobody's friend", int(news(cal_token).get("friends", 0)) == 0,
+      news(cal_token))
+check("  and not your own", int(news(bob_token).get("friends", 0)) < bob_line, (bob_line, news(bob_token)))
+
+# A guild, written straight into the tables: founding one costs gold, and the
+# founding rules are test_guilds.py's.
+with app_module.app.app_context():
+    db = app_module.get_db()
+    now = int(time.time())
+    db.execute("INSERT INTO guilds (name, folded, founded_by, created_at)"
+               " VALUES ('Newsroom', 'newsroom', 'amy', ?)", (now,))
+    gid = db.execute("SELECT id FROM guilds WHERE folded = 'newsroom'").fetchone()["id"]
+    for name, rank in (("amy", "leader"), ("cal", "member")):
+        uid = db.execute("SELECT id FROM users WHERE username = ?", (name,)).fetchone()["id"]
+        db.execute("INSERT INTO guild_members (user_id, guild_id, rank, joined_at) VALUES (?, ?, ?, ?)",
+                   (uid, gid, rank, now))
+    db.commit()
+refill("amy")
+say(amy_token, "guild meeting at the bridge", channel="guild")
+check("a guild line by somebody else is reported to a member",
+      int(news(cal_token).get("guild", 0)) > 0, news(cal_token))
+check("  not to the one who said it", int(news(amy_token).get("guild", 0)) == 0, news(amy_token))
+check("  and not to somebody outside the guild", int(news(bob_token).get("guild", 0)) == 0, news(bob_token))
+
+with app_module.app.app_context():
+    db = app_module.get_db()
+    plans = []
+    for sql, args in (
+            ("SELECT id FROM chat_messages WHERE channel = 'private' AND target_id = ?"
+             " AND user_id != ? ORDER BY id DESC LIMIT 1", (1, 1)),
+            ("SELECT MAX(id) FROM chat_messages WHERE channel = 'guild' AND target_id = ?"
+             " AND user_id != ?", (1, 1))):
+        plans.append(" ".join(str(r[-1]) for r in db.execute("EXPLAIN QUERY PLAN " + sql, args)))
+check("both are one index read (idx_chat_to), asked every ten seconds by every player",
+      all("idx_chat_to" in plan for plan in plans), plans)
+
+
 print("\n--- nothing without a token ---")
 check("relaying needs one",
       client.post("/api/chat/image", json={"url": "http://x/y.png"}).status_code == 401)
