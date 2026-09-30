@@ -31,6 +31,8 @@ waitress-serve --listen=127.0.0.1:5000 wsgi:application
 | `ELUSION_DB` | a path outside any web root | It holds real password hashes |
 | `ELUSION_DEBUG` | **unset** | `wsgi.py` refuses to start if it is set |
 | `ELUSION_RATE_LIMIT` | e.g. `"600 per minute"` (optional) | Per-IP request ceiling; **unset = off** |
+| `ELUSION_SMTP_HOST`, `ELUSION_SMTP_PORT`, `ELUSION_SMTP_USER`, `ELUSION_SMTP_PASSWORD`, `ELUSION_MAIL_FROM` | your mail provider's | Recovery codes **and staff login codes**. Without them a staff login has no second step |
+| `ELUSION_STAFF_LOGIN_CODES` | **unset** (on) | `off` only to get back in when mail has broken - see below |
 
 `wsgi.py` checks all of these at boot and says which one is wrong.
 
@@ -160,6 +162,20 @@ address that changes every request, means it is not.
       send the header by hand and set the minimum to 0. `set_min_build()`
       refuses a minimum above the newest build that exists, so getting into
       that state takes deliberate effort rather than a typo.
+
+- [ ] **Staff logins take a code, and you have seen one arrive.** A mod, dev
+      or the owner with a confirmed recovery address gets a six-digit code by
+      email after the password, and only the code gets a token (STAFF LOGIN
+      CODES in app.py). The boot log says `staff login codes: on` when the
+      server can send mail. Log in as the owner once on the new server before
+      anyone else connects: the code arriving is the test that mail works from
+      that box.
+
+      **If mail breaks after launch, you are still the owner of the machine.**
+      Put `ELUSION_STAFF_LOGIN_CODES=off` in `.env`, restart, log in on the
+      password, fix the mail settings, take the line out and restart again.
+      Staff sessions that are already open keep working the whole time; the
+      step only gates new logins.
 
 - [ ] **The Godot client points at the deployed URL.** `Api.BASE_URL` now
       resolves at startup from, in order: `--server=https://host` on the command

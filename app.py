@@ -5122,6 +5122,102 @@ def register():
     }, 201
 
 
+# =============================================================================
+# STAFF LOGIN CODES
+# =============================================================================
+# A staff name is public: the owner's crown, the MOD and DEV badges, the
+# players list. So anyone knows which account to aim a password guess at, and
+# the lockout (LOGIN_MAX_ATTEMPTS) only slows that down.
+#
+# For a staff account with a confirmed recovery address, a correct password is
+# not enough. The login answers 202 and emails a six-digit code; only the same
+# login sent again WITH that code gets a token. A stolen or guessed password
+# alone opens nothing.
+#
+# - Staff means mod and up: the ranks whose actions reach other players.
+# - Only with a CONFIRMED address, and only while this server can send mail.
+#   Without either there is nowhere to send a code, and refusing would lock the
+#   owner out of their own server. Such a login goes through as before, and
+#   says so: "staff_unprotected" in the answer, which the HUD says once, and
+#   the boot log.
+# - The code is the password-reset machinery: hashed, fifteen minutes, five
+#   wrong tries burns it (_store_code and _consume_code, purpose "staff-login").
+# - A wrong code is a failed login for the account lockout, so guessing codes
+#   costs what guessing passwords costs. The streak only clears on a login
+#   that gets its token - a correct password followed by a wrong code is still
+#   a miss.
+# - At most one new code a minute, so a leaked password cannot flood the inbox.
+# - ELUSION_STAFF_LOGIN_CODES=off turns the step off. It is the way back in if
+#   mail breaks after launch; see DEPLOY.md.
+STAFF_LOGIN_CODE_PURPOSE = "staff-login"
+STAFF_LOGIN_CODE_RESEND_SECONDS = 60
+STAFF_LOGIN_CODES = os.environ.get("ELUSION_STAFF_LOGIN_CODES", "on").strip().lower() \
+    not in ("off", "0", "false", "no")
+
+
+def staff_login_protected(row):
+    """True when this account's logins take a code: staff, with a confirmed
+    address, on a server that has the step on and can send mail."""
+    return (STAFF_LOGIN_CODES and role_at_least(row, "mod")
+            and not needs_recovery_email(row) and mail_can_send())
+
+
+def _staff_login_step(db, row, data, ip, now):
+    """
+    None when this login may have its token now; otherwise the answer to send
+    instead. Called after the password and the ban check have both passed.
+    """
+    if not staff_login_protected(row):
+        return None
+    address = row["email"]
+    sent_to = _mask_email(address)
+    # Spaces are how people copy "183 774" out of a mail; anything longer than
+    # a code is refused before it reaches the hash.
+    code = re.sub(r"\s", "", str(data.get("code") or ""))[:16]
+
+    if code:
+        ok, _reason = _consume_code(db, row["id"], STAFF_LOGIN_CODE_PURPOSE, code, now)
+        if ok:
+            db.commit()
+            return None
+        _register_failed_login(db, row, now)
+        _record_login_attempt(db, row["username"], ip, False, "bad-code")
+        # 400, NOT 401. The client answers a 401 by trying to register the
+        # name, which is how it tells "no such account" from "wrong password".
+        return {
+            "error": "Bad Code",
+            "code_required": True,
+            "sent_to": sent_to,
+            "message": "That code is not right, or it has run out. Use the newest "
+                       "email, or clear the box and log in again for a new code.",
+        }, 400
+
+    pending = db.execute(
+        "SELECT created_at, expires_at FROM auth_codes WHERE user_id = ? AND purpose = ?",
+        (row["id"], STAFF_LOGIN_CODE_PURPOSE),
+    ).fetchone()
+    recent = (pending is not None and _row_int(pending, "expires_at") > now
+              and now - _row_int(pending, "created_at") < STAFF_LOGIN_CODE_RESEND_SECONDS)
+    if not recent:
+        new_code = _new_code()
+        _store_code(db, row["id"], STAFF_LOGIN_CODE_PURPOSE, new_code, address, now)
+        db.commit()
+        send_mail_async(
+            address, "Elusion RPG - your staff login code",
+            "Your staff login code is %s\n\n"
+            "It expires in %d minutes. Somebody - hopefully you - just typed the "
+            "correct password for %s. If that was not you, change your password "
+            "now: it is known, and this code is the only thing that stopped them."
+            % (new_code, RESET_CODE_TTL_SECONDS // 60, row["username"]))
+    _record_login_attempt(db, row["username"], ip, False, "code-sent")
+    return {
+        "code_required": True,
+        "sent_to": sent_to,
+        "expires_in": RESET_CODE_TTL_SECONDS,
+        "message": "Staff login: we emailed a code to %s." % sent_to,
+    }, 202
+
+
 @app.post("/api/auth/login")
 def login():
     """
@@ -5258,16 +5354,6 @@ def login():
             "message": "Incorrect username or password.",
         }, 401
 
-    # A correct password clears the streak - the throttle is about CONSECUTIVE
-    # misses, so one success resets it. Skip the write when there is nothing to
-    # clear, which is the common case.
-    if _row_int(row, "failed_logins") or _row_int(row, "lockout_until"):
-        db.execute(
-            "UPDATE users SET failed_logins = 0, lockout_until = 0 WHERE id = ?",
-            (row["id"],),
-        )
-        db.commit()
-
     # AFTER the password check, deliberately. Telling someone their account is
     # banned before they have proved it is theirs would make this endpoint a
     # way to find out who is banned.
@@ -5284,6 +5370,23 @@ def login():
                        else "This account is banned until further notice.",
             "ban": ban,
         }, 403
+
+    # STAFF: the password is right, and it is still not enough. See STAFF
+    # LOGIN CODES above.
+    step = _staff_login_step(db, row, data, ip, now)
+    if step is not None:
+        return step
+
+    # A login that gets its token clears the streak - the throttle is about
+    # CONSECUTIVE misses, so one success resets it. Only here, after the staff
+    # step: a correct password followed by a wrong code is still a miss. Skip
+    # the write when there is nothing to clear, which is the common case.
+    if _row_int(row, "failed_logins") or _row_int(row, "lockout_until"):
+        db.execute(
+            "UPDATE users SET failed_logins = 0, lockout_until = 0 WHERE id = ?",
+            (row["id"],),
+        )
+        db.commit()
 
     token, expires_at = issue_token(row["id"])
     _record_login_attempt(db, row["username"], ip, True, "")
@@ -5311,6 +5414,9 @@ def login():
         # recovery address without anybody having to go and ask them.
         "email_verified": not needs_recovery_email(row),
         "needs_email": needs_recovery_email(row),
+        # A staff account that logged in on the password alone, because there
+        # was nowhere to send a code. The HUD says so. See STAFF LOGIN CODES.
+        "staff_unprotected": role_at_least(row, "mod") and not staff_login_protected(row),
     }, 200
 
 
@@ -5704,6 +5810,25 @@ SMTP_USER = os.environ.get("ELUSION_SMTP_USER", "").strip()
 SMTP_PASSWORD = os.environ.get("ELUSION_SMTP_PASSWORD", "")
 MAIL_FROM = os.environ.get("ELUSION_MAIL_FROM", "").strip()
 MAIL_CONSOLE = os.environ.get("ELUSION_MAIL_CONSOLE", "").strip() == "1"
+
+
+def mail_can_send():
+    """True when send_mail() has somewhere to send: a provider, or the console
+    fallback. Read at call time, so a test can set the values it needs."""
+    return MAIL_CONSOLE or bool(SMTP_HOST and MAIL_FROM)
+
+
+# SAY SO AT BOOT, like the owner line. A staff login with no second step looks
+# exactly like one with it, until somebody else has the password.
+if not STAFF_LOGIN_CODES:
+    print("[BOOT] staff login codes: OFF (ELUSION_STAFF_LOGIN_CODES). "
+          "A staff password alone logs in.")
+elif not mail_can_send():
+    print("[BOOT] staff login codes: no mail set up, so there is nowhere to send "
+          "one. A staff password alone logs in until ELUSION_SMTP_HOST and "
+          "ELUSION_MAIL_FROM are set.")
+else:
+    print("[BOOT] staff login codes: on")
 
 
 def send_mail(to_address, subject, body):

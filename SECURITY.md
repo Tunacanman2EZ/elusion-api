@@ -45,7 +45,7 @@ the backpack ledger is still whatever the client pushes.
 
 ## Invariants
 
-Twenty promises, each anchored. The first three are structural — they cannot
+Twenty-one promises, each anchored. The first three are structural — they cannot
 rot because there is nothing to change.
 
 (It said "Ten" for a while after it had thirteen, which is the small version of
@@ -162,6 +162,14 @@ that it was wrong, in bold, on the security page, is the point.)
     receiver's next ordinary save.
     → Held by: `test_trades.py` — "a whole-bag save built before the trade is refused", "the sword he received survives it"
     → and in the game: `src/tools/testrunner.gd` — `_test_trades_reach_the_right_people()`
+21. **A staff password alone opens nothing.** Staff names are public - the crown,
+    the MOD and DEV badges - so theirs are the passwords worth guessing. For a
+    mod, dev or the owner with a confirmed recovery address, a correct password
+    answers 202 and emails a six-digit code, and only the code gets a token. A
+    wrong code counts toward the account lockout like a wrong password, and the
+    streak clears only on a login that gets its token.
+    → Held by: `test_staffcode.py` — "a correct owner password answers 202, not 200", "a wrong code is 400 - never 401, which the client would take as 'try to register'", "a lockout's worth of wrong codes freezes the account, even for the right code"
+    → and in the game: `src/tools/testrunner.gd` — `_test_staff_logins_take_a_code()`
 
 ---
 
@@ -187,6 +195,12 @@ No comforting lies. These are known, named and open.
   cannot do is **save, trade, loot, or report a kill the server will accept** —
   all four are authenticated server-side. The heartbeat fixes the honest client
   that simply never found out it had been kicked.
+- **A staff account with no confirmed recovery address logs in on its password
+  alone**, and so does every staff account while the server cannot send mail or
+  `ELUSION_STAFF_LOGIN_CODES` is off. There is nowhere to send a code, and
+  refusing would lock the owner out of their own server. The login answer says
+  so (`staff_unprotected`), the game tells that player once, and the boot log
+  says it for the server.
 - **Per-account lockout reveals that a locked username exists** (E-5). Only a
   real row can be locked. That is the standard, accepted trade for per-account
   lockout and it is written down rather than pretended away.

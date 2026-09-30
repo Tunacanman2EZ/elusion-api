@@ -542,6 +542,38 @@ not in the schema block: on a database from before presence existed, the schema
 block would fail on "no such column" and take the boot with it. The MIGRATION
 section in `test_api.py` boots exactly that shape, and fails if the index moves back.
 
+## Staff logins take a code from their email
+
+A staff name is public: the owner's crown, the MOD and DEV badges, the players
+list. So everyone knows whose password is worth guessing, and the lockout only
+slows guessing down. For a mod, dev or the owner **with a confirmed recovery
+address**, a correct password answers **202** with no token and emails a
+six-digit code; the same login sent with `"code"` gets the token. STAFF LOGIN
+CODES in app.py, `test_staffcode.py`.
+
+- **The code is the reset machinery**: `_store_code()` / `_consume_code()`
+  under purpose `staff-login` - hashed, 15 minutes, five misses burn it. A
+  reset or verify code does not open a login.
+- **A wrong code is 400, never 401.** The client answers a 401 by trying to
+  register the name; that is how it tells "no such account" from "wrong
+  password". A 401 here would turn a mistyped code into "Incorrect password."
+- **A wrong code counts toward the account lockout**, and the streak clears
+  only on a login that gets its token. It used to clear on a correct password,
+  which is the first half of every code attempt, so guessing codes would never
+  have locked anything.
+- **Nothing is sent before the password and the ban check pass.** A wrong
+  password is the same 401 as a player's; a banned mod gets the ban.
+- **At most one new code a minute**, so a leaked password cannot flood the inbox.
+  Sending no code asks for a new one.
+- **The step stands aside, and says so, when there is nowhere to send a code**:
+  no confirmed address, no mail on the server (`mail_can_send()`), or
+  `ELUSION_STAFF_LOGIN_CODES=off`. Refusing would lock the owner out of their
+  own server. The answer carries `staff_unprotected`, the game tells the player
+  once, and the boot log says which. DEPLOY.md has the way back in.
+- `code-sent` and `bad-code` are logged to `login_attempts` but are not on
+  `THROTTLE_EVIDENCE_REASONS`: the account lockout already bounds code guessing,
+  and the per-address rule is for sprays.
+
 ## Name colours, and a guild's history
 
 **A name's colour is the player's; rank is a badge.** `users.name_hue` holds the
@@ -778,6 +810,7 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
   guildlife     who guild members are playing, and the guild's own history
   throttle      login defences, rate limits, credential rotation, and
                 that a signup is not a spray
+  staffcode     staff logins need the code from their email
   attackxp      attack XP banked at the kill, with the class specialty
   gathering     fishing and cooking - the item-minting endpoints
   loot          bags, rolls, and taking things out of them
