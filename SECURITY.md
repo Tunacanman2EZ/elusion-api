@@ -167,8 +167,13 @@ that it was wrong, in bold, on the security page, is the point.)
     mod, dev or the owner with a confirmed recovery address, a correct password
     answers 202 and emails a six-digit code, and only the code gets a token. A
     wrong code counts toward the account lockout like a wrong password, and the
-    streak clears only on a login that gets its token.
-    → Held by: `test_staffcode.py` — "a correct owner password answers 202, not 200", "a wrong code is 400 - never 401, which the game would read as a wrong password", "a lockout's worth of wrong codes freezes the account, even for the right code"
+    streak clears only on a login that gets its token. **Once per computer,
+    not once per login:** a login that got in with a code is given a device
+    token, kept as a hash, and the same computer sending it back needs no code
+    for 30 days - until the account's rank changes, or a password change, a
+    recovery reset or "log out everywhere". It is checked only after the
+    password and the ban.
+    → Held by: `test_staffcode.py` — "a correct owner password answers 202, not 200", "a wrong code is 400 - never 401, which the game would read as a wrong password", "a lockout's worth of wrong codes freezes the account, even for the right code", "the same computer logs in again with no code", "a promotion asks for a code again, on the same computer", "one account's device token opens nothing for another account"
     → and in the game: `src/tools/testrunner.gd` — `_test_staff_logins_take_a_code()`
 22. **One login at a time.** A login that gets its token - or a game reopening
     a remembered one, which swaps its token - ends every other session the
@@ -218,6 +223,11 @@ No comforting lies. These are known, named and open.
   refusing would lock the owner out of their own server. The login answer says
   so (`staff_unprotected`), the game tells that player once, and the boot log
   says it for the server.
+- **A staff member's own computer is trusted for 30 days once it has proved
+  itself.** Somebody holding both the password and that computer (or the
+  game's device file from it) logs in with no code. That is the trade for not
+  asking on every login; a password change, a reset or "log out everywhere"
+  withdraws the trust from every computer at once.
 - **Per-account lockout reveals that a locked username exists** (E-5). Only a
   real row can be locked. That is the standard, accepted trade for per-account
   lockout and it is written down rather than pretended away.

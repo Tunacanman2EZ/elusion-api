@@ -302,6 +302,138 @@ check("  and neither counts toward the per-address throttle (the account lockout
 
 
 # =============================================================================
+print("\n--- one code per computer ---")
+# The owner's own complaint, the first day he had codes: every sign-in was a
+# trip to the inbox. A login that proves itself with a code is answered with a
+# device token; the same computer sending it back needs no code. See TRUSTED
+# DEVICES in app.py.
+register("keeper", "keeper@example.test", "mod")
+
+
+def device_login(username, device=None, code=None, password="password123"):
+    body = {"username": username, "password": password}
+    if device is not None:
+        body["device"] = device
+    if code is not None:
+        body["code"] = code
+    res = client.post("/api/auth/login", json=body)
+    return res.status_code, (res.get_json() or {})
+
+
+def prove(username, password="password123"):
+    """Log in with a fresh code; the answer carries the device token."""
+    clear_throttle()
+    age_code(username, 120)
+    SENT.clear()
+    device_login(username, password=password)
+    code = code_in(SENT[-1]) if SENT else None
+    return device_login(username, code=code, password=password)
+
+
+status, body = prove("keeper")
+device = body.get("device_token", "")
+check("a login that got in with a code is given a device token", status == 200 and len(device) >= 32, body)
+check("  and only its hash is stored",
+      read_sql("SELECT COUNT(*) FROM trusted_devices WHERE token_hash = ?", (device,))[0] == 0
+      and read_sql("SELECT COUNT(*) FROM trusted_devices WHERE token_hash = ?",
+                   (app_module._token_hash(device),))[0] == 1)
+
+SENT.clear()
+clear_throttle()
+status, body = device_login("keeper", device=device)
+check("the same computer logs in again with no code", status == 200 and body.get("token"), (status, body))
+check("  and no mail is sent", SENT == [], SENT)
+check("  and it is not handed a second device token", "device_token" not in body, body)
+
+status, body = device_login("keeper", device=device, password="wrong-password")
+check("the device token is no password: a wrong one is still refused", status == 401, (status, body))
+
+clear_throttle()
+age_code("keeper", 120)
+status, body = device_login("keeper", device="x" * 43)
+check("a device token nobody was given asks for a code", status == 202 and body.get("code_required"), (status, body))
+clear_throttle()
+age_code("keeper", 120)
+status, body = device_login("keeper")
+check("so does no device token", status == 202, (status, body))
+
+register("other_mod", "other@example.test", "mod")
+clear_throttle()
+age_code("other_mod", 120)
+status, body = device_login("other_mod", device=device)
+check("one account's device token opens nothing for another account", status == 202, (status, body))
+
+status, body = device_login("player1", device=device)
+check("a player is never asked, and is never given a device token",
+      status == 200 and "device_token" not in body, body)
+
+# A PROMOTION IS A NEW CODE. Rank changed by hand, as set_role.py does it.
+raw_sql("UPDATE users SET role = 'dev' WHERE username = 'keeper'")
+clear_throttle()
+age_code("keeper", 120)
+status, body = device_login("keeper", device=device)
+check("a promotion asks for a code again, on the same computer", status == 202, (status, body))
+status, body = prove("keeper")
+promoted = body.get("device_token", "")
+clear_throttle()
+status, body = device_login("keeper", device=promoted)
+check("  and the new code trusts the computer at the new rank", status == 200, (status, body))
+raw_sql("UPDATE users SET role = 'mod' WHERE username = 'keeper'")
+clear_throttle()
+age_code("keeper", 120)
+status, body = device_login("keeper", device=promoted)
+check("so does a demotion", status == 202, (status, body))
+
+# OUT OF DATE.
+status, body = prove("keeper")
+dated = body.get("device_token", "")
+raw_sql("UPDATE trusted_devices SET expires_at = ? WHERE token_hash = ?",
+        (int(time.time()) - 1, app_module._token_hash(dated)))
+clear_throttle()
+age_code("keeper", 120)
+status, body = device_login("keeper", device=dated)
+check("a computer trusted %d days ago asks again" % app_module.TRUSTED_DEVICE_DAYS, status == 202, (status, body))
+
+# WHAT SOMEBODY DOES WHEN THEY THINK THE ACCOUNT IS NOT ONLY THEIRS.
+status, body = prove("keeper")
+trusted, session = body.get("device_token", ""), body.get("token", "")
+res = client.post("/api/auth/password", headers={"Authorization": "Bearer " + session},
+                  json={"current_password": "password123", "new_password": "password456"})
+check("a password change goes through", res.status_code == 200, (res.status_code, res.get_json()))
+clear_throttle()
+age_code("keeper", 120)
+status, body = device_login("keeper", device=trusted, password="password456")
+check("  and every computer has to prove itself again", status == 202, (status, body))
+status, body = prove("keeper", "password456")
+session = body.get("token", "")
+res = client.post("/api/auth/logout-all", headers={"Authorization": "Bearer " + session})
+check("so does logging out everywhere", res.status_code == 200 and
+      read_sql("SELECT COUNT(*) FROM trusted_devices WHERE user_id = (SELECT id FROM users WHERE username = 'keeper')")[0] == 0,
+      res.status_code)
+
+status, body = prove("keeper", "password456")
+SENT.clear()
+res = client.post("/api/auth/recover", json={"email": "keeper@example.test"})
+code = code_in(SENT[-1]) if SENT else None
+res = client.post("/api/auth/reset", json={"email": "keeper@example.test", "code": code,
+                                           "new_password": "password789"})
+check("and so does a password reset by email", res.status_code == 200 and
+      read_sql("SELECT COUNT(*) FROM trusted_devices WHERE user_id = (SELECT id FROM users WHERE username = 'keeper')")[0] == 0,
+      (res.status_code, res.get_json()))
+raw_sql("UPDATE users SET password_hash = ? WHERE username = 'keeper'",
+        (app_module.generate_password_hash("password456"),))
+
+# AT MOST A FEW PER ACCOUNT.
+for _ in range(app_module.TRUSTED_DEVICES_KEPT + 3):
+    prove("keeper", "password456")
+kept = read_sql("SELECT COUNT(*) FROM trusted_devices WHERE user_id = (SELECT id FROM users WHERE username = 'keeper')")[0]
+check("an account keeps only its newest %d computers" % app_module.TRUSTED_DEVICES_KEPT,
+      kept == app_module.TRUSTED_DEVICES_KEPT, kept)
+check("  and never another account's",
+      read_sql("SELECT COUNT(*) FROM trusted_devices WHERE user_id = (SELECT id FROM users WHERE username = 'other_mod')")[0] == 0)
+
+
+# =============================================================================
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))
 if failures:

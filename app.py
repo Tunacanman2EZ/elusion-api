@@ -1381,6 +1381,49 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
 
+        -- A COMPUTER A MEMBER OF STAFF HAS ALREADY PROVED, so their logins from
+        -- it need no emailed code. See TRUSTED DEVICES by STAFF LOGIN CODES.
+        -- token_hash, NOT the token: the game keeps the token, and a database
+        -- that leaks must not hand over working trust along with it. `role` is
+        -- the rank it was trusted at - a promotion or demotion needs a new code.
+        CREATE TABLE IF NOT EXISTS trusted_devices (
+            token_hash   TEXT    PRIMARY KEY,
+            user_id      INTEGER NOT NULL,
+            role         TEXT    NOT NULL,
+            created_at   INTEGER NOT NULL,
+            last_used_at INTEGER NOT NULL,
+            expires_at   INTEGER NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_trusted_devices_user
+            ON trusted_devices(user_id, created_at);
+
+        -- A DELETED CHARACTER, KEPT FOR A WHILE. POST /api/character/delete
+        -- removes the character's rows; this keeps a copy of what it was - the
+        -- save row, its bag and its skills, as JSON - so "I did not delete
+        -- that" or "I clicked the wrong one" can be answered, and the character
+        -- put back by hand if it should be. Nothing reads it back
+        -- automatically: a restore is a decision, not a route.
+        --
+        -- The newest CHARACTER_DELETIONS_KEPT per account, pruned on write, so
+        -- creating and deleting in a loop cannot grow it without bound.
+        CREATE TABLE IF NOT EXISTS character_deletions (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER NOT NULL,
+            slot       INTEGER NOT NULL,
+            class_id   TEXT    NOT NULL,
+            name       TEXT    NOT NULL,
+            level      INTEGER NOT NULL,
+            gold       INTEGER NOT NULL DEFAULT 0,
+            deleted_at INTEGER NOT NULL,
+            snapshot   TEXT    NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_character_deletions_user
+            ON character_deletions(user_id, deleted_at);
+
         -- EVERY GOLD THAT ENTERS OR LEAVES THE ECONOMY, one row each.
         --
         -- WHAT THIS BUYS. Two numbers that must agree:
@@ -5460,6 +5503,72 @@ STAFF_LOGIN_CODES = os.environ.get("ELUSION_STAFF_LOGIN_CODES", "on").strip().lo
     not in ("off", "0", "false", "no")
 
 
+# TRUSTED DEVICES: THE CODE ONCE PER COMPUTER, NOT ONCE PER LOGIN.
+#
+# A code on every login was the owner's own complaint on the first day he had
+# it: every sign-in meant a trip to the inbox. What the code is FOR is a
+# password used from somewhere that is not the staff member's own computer, and
+# that question only needs asking once per computer. So a login that got in
+# with a code is answered with a `device_token`, the game keeps it, and a later
+# login from the same computer that sends it back needs no code.
+#
+# - Only the hash is stored, like a session token.
+# - TRUSTED_DEVICE_DAYS from the code, then a new code. Not sliding: a computer
+#   stays trusted for a month from when it proved itself, not for ever by use.
+# - At the rank it was trusted at. A promotion (or a demotion) is a new code,
+#   so somebody made a mod proves their computer as a mod. Compared against
+#   role_for(), which is also what set_role.py and ELUSION_OWNER feed, so no
+#   route that changes a rank has to remember to revoke anything.
+# - Gone on a password change, a recovery reset or "log out everywhere" - the
+#   three things somebody does when they think the account is not only theirs.
+# - The newest TRUSTED_DEVICES_KEPT per account.
+# - A device token is never enough on its own: it is checked only after the
+#   password and the ban check have passed.
+TRUSTED_DEVICE_DAYS = 30
+TRUSTED_DEVICES_KEPT = 5
+
+
+def _trusted_device(db, row, raw, now):
+    """True when `raw` is a device token this account proved, still in date,
+    at the rank the account holds now. Marks it used."""
+    raw = str(raw or "")
+    if raw == "" or len(raw) > 128:
+        return False
+    found = db.execute(
+        "SELECT role, expires_at FROM trusted_devices WHERE token_hash = ? AND user_id = ?",
+        (_token_hash(raw), row["id"]),
+    ).fetchone()
+    if found is None or _row_int(found, "expires_at") <= now or found["role"] != role_for(row):
+        return False
+    db.execute("UPDATE trusted_devices SET last_used_at = ? WHERE token_hash = ? AND user_id = ?",
+               (now, _token_hash(raw), row["id"]))
+    return True
+
+
+def _trust_device(db, row, now):
+    """A new device token for a login that just proved itself with a code.
+    Returns the token; only its hash is kept. Caller commits."""
+    raw = secrets.token_urlsafe(32)
+    db.execute(
+        "INSERT INTO trusted_devices (token_hash, user_id, role, created_at, last_used_at, expires_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (_token_hash(raw), row["id"], role_for(row), now, now,
+         now + TRUSTED_DEVICE_DAYS * 86400),
+    )
+    db.execute(
+        "DELETE FROM trusted_devices WHERE user_id = ? AND token_hash NOT IN ("
+        " SELECT token_hash FROM trusted_devices WHERE user_id = ?"
+        " ORDER BY created_at DESC, rowid DESC LIMIT ?)",
+        (row["id"], row["id"], TRUSTED_DEVICES_KEPT),
+    )
+    return raw
+
+
+def _forget_devices(db, user_id):
+    """Every computer this account proved has to prove itself again. Caller commits."""
+    db.execute("DELETE FROM trusted_devices WHERE user_id = ?", (user_id,))
+
+
 def staff_login_protected(row):
     """True when this account's logins take a code: staff, with a confirmed
     address, on a server that has the step on and can send mail."""
@@ -5480,10 +5589,19 @@ def _staff_login_step(db, row, data, ip, now):
     # a code is refused before it reaches the hash.
     code = re.sub(r"\s", "", str(data.get("code") or ""))[:16]
 
+    # A COMPUTER THAT HAS ALREADY PROVED ITSELF needs no code. See TRUSTED
+    # DEVICES. Only when no code was sent: a code is always checked as a code.
+    if not code and _trusted_device(db, row, data.get("device"), now):
+        db.commit()
+        return None
+
     if code:
         ok, _reason = _consume_code(db, row["id"], STAFF_LOGIN_CODE_PURPOSE, code, now)
         if ok:
             db.commit()
+            # The login answers with a device token, so this computer is not
+            # asked again. Only here: a code that was right, just now.
+            g.staff_code_proved = True
             return None
         _register_failed_login(db, row, now)
         _record_login_attempt(db, row["username"], ip, False, "bad-code")
@@ -5707,6 +5825,7 @@ def login():
     # ONE LOGIN AT A TIME: only a login that got its token. A wrong password,
     # a ban or a staff code still to come ends nothing.
     _end_other_sessions(db, row["id"], token)
+    device_token = _trust_device(db, row, now) if g.get("staff_code_proved") else ""
     db.commit()
     _record_login_attempt(db, row["username"], ip, True, "")
     # ON SUCCESS ONLY, and after the ban check above - a banned account never
@@ -5736,6 +5855,9 @@ def login():
         # A staff account that logged in on the password alone, because there
         # was nowhere to send a code. The HUD says so. See STAFF LOGIN CODES.
         "staff_unprotected": role_at_least(row, "mod") and not staff_login_protected(row),
+        # Only after a staff code: this computer's proof, for the next login.
+        # See TRUSTED DEVICES.
+        **({"device_token": device_token} if device_token else {}),
     }, 200
 
 
@@ -5923,6 +6045,8 @@ def logout_all():
     # the ambiguity is the last thing you need.
     db = get_db()
     cursor = db.execute("DELETE FROM sessions WHERE user_id = ?", (g.user["id"],))
+    # And every computer's trust: see TRUSTED DEVICES.
+    _forget_devices(db, g.user["id"])
     db.commit()
 
     app.logger.warning(
@@ -6054,6 +6178,7 @@ def change_password():
         (new_hash, row["id"]),
     )
     cursor = db.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+    _forget_devices(db, row["id"])
     db.commit()
 
     revoked = cursor.rowcount
@@ -6697,6 +6822,7 @@ def complete_recovery():
         (generate_password_hash(new), row["id"]),
     )
     cursor = db.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+    _forget_devices(db, row["id"])
     revoked = cursor.rowcount
     _record_login_attempt(db, row["username"], ip, True, "password-reset")
     db.commit()
@@ -6728,8 +6854,15 @@ def parse_slot(raw):
 
     Note the bool check: in Python `True == 1` and `isinstance(True, int)` is
     True, so without it `{"slot": true}` would quietly be accepted as slot 1.
+
+    A WHOLE NUMBER, FLOAT OR NOT. Godot sends every number as a float, so 1.0
+    is slot 1 - but int() truncates, and 1.5 used to be slot 1 as well. Found
+    by the character delete route's tests, where "delete slot 1.5" deleted
+    slot 1.
     """
     if isinstance(raw, bool):
+        return None
+    if isinstance(raw, float) and not raw.is_integer():
         return None
     try:
         slot = int(raw)
@@ -17341,7 +17474,7 @@ def character_respawn():
     payload = request.get_json(silent=True) or {}
     slot = parse_slot(payload.get("slot"))
     if slot is None:
-        return bad_request("slot must be an integer between 0 and %d" % (MAX_SLOTS - 1))
+        return bad_request("slot must be an integer between 0 and %d" % MAX_SLOT)
 
     user_id = g.user["id"]
     db = get_db()
@@ -17412,6 +17545,128 @@ def character_respawn():
         "gold_lost": burned,
         "status": status_payload(user_id, slot),
     }, 200
+
+
+# =============================================================================
+# DELETING A CHARACTER
+# =============================================================================
+# Asked for on day 1: four fixed slots, one per class, and no way to start a
+# class again. Deleting is the character's own rows - its save, its bag, its
+# skills, its loot bags and heal grants - and nothing of the account's: the
+# bank, the lusions, friends and guild all belong to the account and stay.
+
+CHARACTER_DELETIONS_KEPT = 10
+CHARACTER_DELETE_REASON = "character-deleted"
+
+
+@app.post("/api/character/delete")
+@require_auth
+def character_delete():
+    """
+    Delete one of your characters, for good
+    ---
+    tags:
+      - Character
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [slot, confirm]
+          properties:
+            slot:    {type: integer, example: 0}
+            confirm: {type: string, example: warrior, description: "The character's name, typed by the player. Any case."}
+    responses:
+      200:
+        description: The character, its bag, its gold and its skills are gone; the account's bank is not
+      400:
+        description: Bad slot, or confirm is not the character's name
+      404:
+        description: No character in that slot
+      409:
+        description: An open trade names this character
+    """
+    payload = request.get_json(silent=True) or {}
+    slot = parse_slot(payload.get("slot"))
+    if slot is None:
+        return bad_request("slot must be an integer between 0 and %d" % MAX_SLOT)
+
+    user_id = g.user["id"]
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot),
+    ).fetchone()
+    if row is None:
+        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
+
+    # THE NAME, TYPED. The game asks for it before it sends this, and the
+    # server asks again, so a stray call - a stale button, a script, a replayed
+    # request - cannot take a character. A character's name is its class, so
+    # this is "type WARRIOR", which is exactly the deliberate act it should be.
+    typed = str(payload.get("confirm", "")).strip().lower()
+    if typed == "" or typed != str(row["name"]).strip().lower():
+        return bad_request("Type the character's name to delete it.")
+
+    # NOT IN THE MIDDLE OF A TRADE. An open trade holds items offered FROM this
+    # character's bag and names it as the one receiving; running it after the
+    # rows are gone would move things to and from a character that no longer
+    # exists. Finishing or cancelling it is one click; this is the one place it
+    # has to come first.
+    trade = _trade_find_open(db, user_id)
+    if trade is not None and (
+            (trade["a_user"] == user_id and trade["a_slot"] == slot)
+            or (trade["b_user"] == user_id and trade["b_slot"] == slot)):
+        return {"error": "Conflict",
+                "message": "This character is in a trade. Finish or cancel it first."}, 409
+
+    # ---- everything above this line is validation; everything below commits --
+
+    carry = [dict(r) for r in db.execute(
+        "SELECT position, item_id, quantity FROM carry_items"
+        " WHERE user_id = ? AND slot = ? ORDER BY position", (user_id, slot))]
+    skills = [dict(r) for r in db.execute(
+        "SELECT skill_id, level, xp FROM skills WHERE user_id = ? AND slot = ?"
+        " ORDER BY skill_id", (user_id, slot))]
+    now = int(time.time())
+    gold = int(row["gold"] or 0)
+    db.execute(
+        "INSERT INTO character_deletions"
+        " (user_id, slot, class_id, name, level, gold, deleted_at, snapshot)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (user_id, slot, row["class_id"], row["name"], int(row["level"] or 1), gold, now,
+         json.dumps({"save": dict(row), "carry_items": carry, "skills": skills})),
+    )
+    db.execute(
+        "DELETE FROM character_deletions WHERE user_id = ? AND id NOT IN ("
+        " SELECT id FROM character_deletions WHERE user_id = ?"
+        " ORDER BY deleted_at DESC, id DESC LIMIT ?)",
+        (user_id, user_id, CHARACTER_DELETIONS_KEPT),
+    )
+
+    # THROUGH THE LEDGER, before the row goes: the purse is in saves, and a
+    # bare DELETE would take the gold out of SUM(saves.gold) with no burn row,
+    # and the supply invariant would be off by it for ever. The note on
+    # gold_ledger in the schema says the same about deleting a user.
+    if gold > 0:
+        gold_delta(db, user_id, slot, -gold, CHARACTER_DELETE_REASON,
+                   "carried gold of a deleted %s in slot %d" % (row["class_id"], slot))
+
+    for table in ("carry_items", "skills", "consume_grants"):
+        db.execute("DELETE FROM %s WHERE user_id = ? AND slot = ?" % table, (user_id, slot))
+    # The items in its loot bags go with the bags: loot_bag_items cascades.
+    db.execute("DELETE FROM loot_bags WHERE user_id = ? AND slot = ?", (user_id, slot))
+    db.execute("DELETE FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot))
+    db.commit()
+
+    app.logger.info("character deleted: %s slot %d (%s, level %s, %d gold, %d cells)",
+                    g.user["username"], slot, row["class_id"], row["level"], gold, len(carry))
+    return {"slot": slot, "deleted": True, "gold_lost": gold, "items_lost": len(carry)}, 200
 
 
 # =============================================================================

@@ -632,6 +632,39 @@ held by `test_accounts.py`.
   called only by the "Create an account" form now, so its 409 means what it
   says.
 
+## Deleting a character
+
+`POST /api/character/delete` (DELETING A CHARACTER in app.py,
+`test_chardelete.py`). Four fixed slots, one per class, and on day 1 no way to
+start a class again.
+
+- **The character's rows, not the account's.** Its save, `carry_items`,
+  `skills`, `consume_grants` and `loot_bags` (their items cascade). The bank,
+  lusions, friends and guild belong to the account and stay.
+- **The purse goes through `gold_delta()`** under `character-deleted`, before
+  the save row goes. The gold lives in `saves`, so a bare DELETE would take it
+  out of the supply with no burn row - the note on `gold_ledger` in the schema
+  says the same about deleting a user.
+- **`confirm` must be the character's name**, any case. The game asks for it
+  typed; the server checks it again, so a stale button or a replayed request
+  cannot take a character.
+- **Not while an open trade names it**, from either side (409). Running that
+  trade afterwards would move items to and from rows that are gone.
+- **A copy is kept** in `character_deletions` - the save row, bag and skills as
+  JSON - the newest `CHARACTER_DELETIONS_KEPT` (10) per account, pruned on
+  write. A restore is a decision made by hand, not a route.
+- **A stale save cannot bring it back.** `PUT /api/character/inventory` answers
+  404 for a slot with no save, and a character made again is a new row at
+  level 1 with full pools; a bag saved over it is trimmed like any other
+  unexplained gain.
+- **`parse_slot()` refuses a fractional slot now.** `int(1.5)` is 1, so
+  "delete slot 1.5" deleted slot 1. 1.0 is still slot 1, because Godot sends
+  every number as a float.
+- **Fixed while here:** `/api/character/respawn` named `MAX_SLOTS`, which does
+  not exist, so a bad slot there was a 500. pyflakes finds that class of bug in
+  one command; it found only this one. CD-7 now sends a bad slot to every
+  character route.
+
 ## Staff logins take a code from their email
 
 A staff name is public: the owner's crown, the MOD and DEV badges, the players
@@ -663,6 +696,17 @@ CODES in app.py, `test_staffcode.py`.
 - `code-sent` and `bad-code` are logged to `login_attempts` but are not on
   `THROTTLE_EVIDENCE_REASONS`: the account lockout already bounds code guessing,
   and the per-address rule is for sprays.
+- **Once per computer, not once per login** (TRUSTED DEVICES). The owner's
+  own complaint the first day he had codes: every sign-in was a trip to the
+  inbox. A login that got in with a code answers with a `device_token`; the
+  game keeps it (`user://devices.cfg`, apart from the session) and sends it as
+  `device`, and a staff login carrying a live one needs no code. Stored as a
+  hash, 30 days (`TRUSTED_DEVICE_DAYS`, not sliding), the newest
+  `TRUSTED_DEVICES_KEPT` per account, and only at the rank it was trusted at:
+  compared with `role_for()`, so a promotion or demotion by any route - the
+  staff desk, `set_role.py`, `ELUSION_OWNER` - asks again without any of them
+  having to revoke anything. A password change, a recovery reset and
+  `/api/auth/logout-all` forget every computer (`_forget_devices()`).
 
 ## Name colours, and a guild's history
 
@@ -904,6 +948,7 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
   accounts      signing in: one game per account, the miss that locks,
                 no recovery-email demand with no mail
   chatsafety    ignore, report and mute
+  chardelete    deleting a character, and only the character
   attackxp      attack XP banked at the kill, with the class specialty
   gathering     fishing and cooking - the item-minting endpoints
   loot          bags, rolls, and taking things out of them
