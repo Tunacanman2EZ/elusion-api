@@ -225,6 +225,18 @@ check("so every piece costs exactly its value",
       all(gamedata.shop_price("generalstore", iid) == int(gear[iid]["value"]) for iid in stock if iid in gear))
 check("an ember piece has no price at all", gamedata.shop_price("generalstore", "embersword") is None)
 
+# FISHING. Only the iron rod could be had (a drop) and worms dropped one at a
+# time, so the deeper fish were out of reach. The owner chose the store: the
+# worm and every rod but ember, at value.
+RODS = ["iron", "jade", "cobalt", "amethyst"]
+check("the worm and the iron to amethyst rods are on the shelf",
+      all(iid in stock for iid in ["fishingworm"] + [r + "fishingrod" for r in RODS]),
+      [iid for iid in ["fishingworm"] + [r + "fishingrod" for r in RODS] if iid not in stock])
+check("  at their value",
+      all(gamedata.shop_price("generalstore", iid) == int(gamedata.ITEMS[iid]["value"])
+          for iid in ["fishingworm"] + [r + "fishingrod" for r in RODS]))
+check("  and the ember rod is still found, never bought", "emberfishingrod" not in stock)
+
 # ONE BAND, ONE LEVEL. The shop draws a shelf per band titled with the level its
 # pieces need, so a band that mixed two levels would have no honest title.
 level_of = {}
@@ -297,6 +309,18 @@ r = client.post("/api/character/equip", headers=H, json={"slot": 0, "item_id": "
 check("at level 5 the same sword goes on", r.status_code == 200, (r.status_code, r.get_json()))
 r = client.post("/api/shop/buy", headers=H, json={"slot": 0, "shop_id": "generalstore", "item_id": "embersword"})
 check("and no amount of gold buys an ember sword", r.status_code == 400, r.status_code)
+conn = sqlite3.connect(DB_PATH)
+conn.execute("UPDATE saves SET gold = 2160 WHERE user_id = ? AND slot = 0", (uid,))
+conn.commit(); conn.close()
+r = client.post("/api/shop/buy", headers=H,
+                json={"slot": 0, "shop_id": "generalstore", "item_id": "fishingworm", "quantity": 20})
+check("twenty worms cost 480", r.status_code == 200 and (r.get_json() or {}).get("total_paid") == 480,
+      (r.status_code, r.get_json()))
+r = client.post("/api/shop/buy", headers=H, json={"slot": 0, "shop_id": "generalstore", "item_id": "jadefishingrod"})
+check("a jade rod costs 1,680", r.status_code == 200 and (r.get_json() or {}).get("total_paid") == 1680,
+      (r.status_code, r.get_json()))
+r = client.post("/api/fishing/catch", headers=H, json={"slot": 0})
+check("and with them a fresh character can fish", r.status_code == 200, (r.status_code, r.get_json()))
 
 
 print("\n%d passed, %d failed" % (passed, failed))

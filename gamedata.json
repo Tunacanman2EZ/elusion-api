@@ -1530,7 +1530,7 @@
 			"xp_reward": 84
 		}
 	],
-	"generated_at": 1790821290,
+	"generated_at": 1790832399,
 	"items": [
 		{
 			"armor_value": 6,
@@ -6251,6 +6251,11 @@
 				"mediumhealthpotion",
 				"mediummanapotion",
 				"mediumstaminapotion",
+				"fishingworm",
+				"ironfishingrod",
+				"jadefishingrod",
+				"cobaltfishingrod",
+				"amethystfishingrod",
 				"ironsword",
 				"ironmaul",
 				"ironstaff",
