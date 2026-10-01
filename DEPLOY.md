@@ -281,7 +281,7 @@ server {
         client_max_body_size 12M;
     }
 
-    # 51 MB as exported, 21 MB compressed. gzip_static sends the .gz beside a
+    # 46 MB as exported, 16 MB compressed. gzip_static sends the .gz beside a
     # file when there is one (gzip -k9 index.wasm index.pck index.js after an
     # upload); anything else is compressed as it goes.
     gzip on;
@@ -307,7 +307,7 @@ rsync -rv --checksum --delete builds/web/ elusion@YOUR_SERVER_IP:/srv/elusion-we
 
 - **`--checksum`** leaves a file alone when its bytes did not change, so its
   date and ETag stay the same. A returning player then downloads only what is
-  new, usually the 14 MB `.pck` and not the 38 MB `.wasm`.
+  new, usually the 8 MB `.pck` and not the 38 MB `.wasm`.
 - **Behind nginx,** run `gzip -k9 builds/web/index.wasm builds/web/index.pck
   builds/web/index.js` first. `gzip_static` then sends the `.gz` files and does
   no work per player.
@@ -328,7 +328,8 @@ Tested in the sandbox against a real export:
   headless Chromium.
 - Both blocks above were used unchanged, apart from the port and the name.
 - Compression took the export from 51.8 MB to about 21 MB, and the loader showed
-  progress the whole way.
+  progress the whole way. (It is 46.2 MB and 15.7 MB now: the game's emoji font
+  ships at chat size since 1 October. See the game's CLAUDE.md, "Speed on day 1".)
 - A login, the character list, the town and a save all went through `/api/`.
 - A second visit transferred nothing but 304s, and an upload was running on the
   next visit.
