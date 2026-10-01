@@ -157,6 +157,35 @@ Helpers defined further down the file do not exist yet when it runs. Table
 creation belongs in the schema block, not in a function called from it. This
 produced a `NameError` on startup once.
 
+### A whole-bag save built before another change undoes it
+
+`PUT /api/character/inventory` replaces the whole carry. Every other route that
+changes the carry - a loot take, a cook, a catch, a purchase, an equip, a
+consume - writes it too, and the game saves on a two-second debounce. So a save
+built after one of those and landing after the next one undid the next one: on
+day 1, cooking a stack of twelve, a save built after cook five and sent during
+cook six deleted the fish cook six had made. A loss, so it went through; the
+following save's copy of the fish was then trimmed as a gain. One cooked fish
+in every few was gone, measured in the game.
+
+**The fix is `based_on`.** The save names the bag it was built on:
+`bag_fingerprint()` of the last bag the server gave the client, which it works
+out from the array every one of those routes already answers with, so no
+answer gained a field. The server compares it with what it holds and refuses
+with 409 and the bag it does hold (`resync`, `reason: "stale_save"`), the shape
+the trade rule already sent, which the game already adopted. A body with no
+`based_on` is taken as before, so an older client still saves.
+`test_gathering.py`, "A SAVE BUILT BEFORE A COOK CANNOT UNDO IT", reproduces
+the loss and pins the fingerprint to the same string the game's suite does.
+
+**The same trap waits for any whole-row replace.** `PUT /api/account/bank` is
+the other one, and `POST /api/bank/items` changes the bank on the server, so in
+principle a stale bank save can undo a deposit. It has no `based_on` yet: four
+deposits in a row, half a second and two seconds apart, all reached the server
+on day 1, because the bank panel copies every server array into the save at
+once (`_on_bank_changed()`). If a bank item ever goes missing, this is the first
+place to look, and the fix is the same field.
+
 ### A read before the first write is outside the transaction
 
 sqlite3 opens a transaction at the first INSERT, UPDATE or DELETE, not at the
@@ -876,7 +905,9 @@ to the cell limit.
 
 Decided by the owner on day 1: the general store stocks every weapon and armour
 piece from iron to amethyst (tiers 1-4) at its value, so a player farming one
-band saves for the next band's set. Ember is still found, never bought. The
+band saves for the next band's set, and the fishing worm and the iron to
+amethyst rods, without which only the iron rod could be had and worms came one
+at a time from loot. Ember, armour or rod, is still found, never bought. The
 stock list is the game's `generalstore.tres`, read here through gamedata.json,
 so a stock change is a re-export, a copy and a restart, with no code change.
 

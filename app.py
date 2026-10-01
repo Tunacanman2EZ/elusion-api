@@ -13179,6 +13179,24 @@ def _slot_exists(user_id, slot):
     return row is not None
 
 
+def bag_fingerprint(cells):
+    """
+    Which bag this is, as a short string: sha1 of "position:item_id:quantity"
+    for every filled cell, joined with "|", in position order.
+
+    `cells` is inventory_payload()'s positional array - the exact thing every
+    route that changes the carry answers with - so the client can work out the
+    same fingerprint from what it was handed, with no extra field on any answer.
+    CharacterData.bag_fingerprint() in the game is the other half, and both
+    test suites pin the same bag to the same string.
+    """
+    parts = []
+    for position, cell in enumerate(cells or []):
+        if isinstance(cell, dict) and cell.get("item_id"):
+            parts.append("%d:%s:%d" % (position, cell["item_id"], int(cell.get("quantity", 1))))
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
+
+
 def inventory_payload(user_id, slot):
     """
     Everything carried as a POSITIONAL ARRAY of length CARRY_CAPACITY, with
@@ -16535,9 +16553,14 @@ def write_inventory():
             inventory:
               type: array
               description: "Positional; null for an empty cell. Cells 0-19 are the bag, 20-29 the hotbar's keys. At most 30 entries. The bag is always replaced; a hotbar cell past the end of a shorter array is left as it is."
+            based_on:
+              type: string
+              description: "bag_fingerprint() of the bag the client last had from the server when it built this one. Optional; when it no longer matches, the write is refused with 409."
     responses:
       200:
         description: The backpack as stored
+      409:
+        description: "The bag changed on the server since this was built (a trade, or any route that changes the carry). Carries resync: the bag and purse the server holds."
       400:
         description: Bad slot, oversized array, or a malformed entry
       404:
@@ -16571,6 +16594,32 @@ def write_inventory():
                 "message": "Your backpack changed on the server - a trade finished. "
                            "It has been reloaded.",
                 "resync": stale}, 409
+    # A BAG BUILT BEFORE ANY OTHER CHANGE IS NOT A BAG TO SAVE EITHER. The same
+    # rule as the trade above, for every route that changes the carry: a loot
+    # take, a cook, a catch, a purchase, an equip. Day 1: cooking a stack of
+    # twelve, a save built after cook five and sent during cook six landed
+    # after it, deleted the fish cook six had made (a loss, so it went
+    # through), and the next save's copy of that fish was then trimmed as a
+    # gain. One cooked fish in every few was gone.
+    #
+    # `based_on` is the fingerprint of the bag the client last had from the
+    # server when it built this one (bag_fingerprint()). Anything else on the
+    # server since means this write would undo it, so it is refused with the
+    # bag the server holds, the same 409 the trade rule sends. A client from
+    # before the field sends none and is let through as before.
+    based_on = payload.get("based_on")
+    if based_on is not None:
+        if not isinstance(based_on, str) or len(based_on) > 64:
+            return bad_request("based_on must be a bag fingerprint")
+        held = inventory_payload(user_id, slot)
+        if based_on != bag_fingerprint(held):
+            purse = get_db().execute("SELECT gold FROM saves WHERE user_id = ? AND slot = ?",
+                                     (user_id, slot)).fetchone()
+            return {"error": "Conflict",
+                    "message": "Your backpack changed on the server since this was saved. "
+                               "It has been reloaded.",
+                    "resync": {"slot": slot, "gold": int(purse["gold"] or 0) if purse else 0,
+                               "inventory": held, "trade": None, "reason": "stale_save"}}, 409
 
     cells = payload.get("inventory")
     if not isinstance(cells, list):

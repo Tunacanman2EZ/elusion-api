@@ -346,6 +346,54 @@ check("a client claiming cooking 99 is ignored",
       skill(chef, "cooking")["level"] == level_now, skill(chef, "cooking"))
 
 
+section("COOKING  -  A SAVE BUILT BEFORE A COOK CANNOT UNDO IT")
+# Day 1, cooking a stack of twelve in the game: a whole-bag save built after
+# one cook and landing after the next deleted the fish the next cook made, and
+# the save after that had its copy trimmed as a gain. A save now names the bag
+# it was built on (based_on), and the server refuses one built on a bag it no
+# longer holds, handing back the bag it does.
+fp = app_module.bag_fingerprint
+check("the fingerprint is pinned: the game works out the same string",
+      fp([{"item_id": "rawmudfish", "quantity": 2}, None, {"item_id": "cookedmudfish", "quantity": 1}])
+      == "805ee8515ba7334b57fc01675e92d96b98ae28f3"
+      and fp([None] * 30) == "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+check("  a quantity sent as 2.0, as Godot sends it, is the same bag",
+      fp([{"item_id": "rawmudfish", "quantity": 2.0}]) == fp([{"item_id": "rawmudfish", "quantity": 2}]))
+
+set_skill("chef", "cooking", mud["cook_mastery_level"])
+grant("chef", [("rawmudfish", 3)])
+def bag_of(headers, slot=0):
+    return client.get("/api/character?slot=%d" % slot, headers=headers).get_json()["inventory"]
+def save_bag(headers, cells, based_on=None, slot=0):
+    body = {"slot": slot, "inventory": cells}
+    if based_on is not None:
+        body["based_on"] = based_on
+    return client.put("/api/character/inventory", headers=headers, json=body)
+before = bag_of(chef)
+r = cook(chef, "rawmudfish")
+check("a cook in between", r.status_code == 200 and carried(chef).get(mud["cooks_into"]) == 1, carried(chef))
+r = save_bag(chef, before, fp(before))
+body = r.get_json() or {}
+check("a save built on the bag from before the cook is refused, 409", r.status_code == 409, (r.status_code, body))
+check("  and carries the bag the server holds, cooked fish and all",
+      body.get("resync", {}).get("inventory") == bag_of(chef) and body.get("resync", {}).get("reason") == "stale_save",
+      body.get("resync"))
+check("  and the cooked fish is still there", carried(chef).get(mud["cooks_into"]) == 1, carried(chef))
+
+now = bag_of(chef)
+moved = list(now)
+moved[5], moved[0] = moved[0], None
+r = save_bag(chef, moved, fp(now))
+check("a save built on the bag the server holds goes through, rearranged",
+      r.status_code == 200 and bag_of(chef)[5] == now[0] and bag_of(chef)[0] is None, (r.status_code, r.get_json()))
+check("  and its answer is the new bag, to build the next save on",
+      fp(r.get_json()["inventory"]) == fp(bag_of(chef)))
+check("a based_on that is not a string is a 400",
+      save_bag(chef, bag_of(chef), 12345).status_code == 400)
+check("a save with no based_on, from an older game, is let through as before",
+      save_bag(chef, bag_of(chef)).status_code == 200)
+
+
 section("BOTH  -  AUTH AND SLOT")
 
 check("fishing without a token -> 401",
