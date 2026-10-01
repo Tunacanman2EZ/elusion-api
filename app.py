@@ -1327,6 +1327,8 @@ def init_db():
             -- server has no item registry and inventing one here would mean
             -- every new pet the game adds needs a matching server deploy
             -- before it could be equipped. Same reasoning as bank item_ids.
+            -- It IS checked against what the player holds: /api/save stores
+            -- a pet only when the carry or the bank has it (_owns_item).
             active_pet_id TEXT NOT NULL DEFAULT '',
             -- WHAT THIS CHARACTER IS WEARING, as a JSON object of item ids.
             -- Here for the same reason active_pet_id is: a string the client
@@ -7337,6 +7339,19 @@ def write_save():
     if pet_key_sent and active_pet_id is None:
         return bad_request("active_pet_id must be a string of at most 64 characters")
 
+    # ONLY A PET YOU HOLD CAN BE OUT. This took any string, so a modified
+    # client could walk out a pet it had never won; decided on day 1 to close
+    # it. HELD means in this character's carry or the account's bank - the
+    # same _owns_item() the drop roll asks - and not "named in the catalogue":
+    # the server still keeps no list of pets, so a pet added to the game needs
+    # no server deploy before it can be summoned. A pet the player does not
+    # hold is not stored; the save clears it instead, and says so in `ignored`,
+    # the way gold and equipment are said.
+    pet_ignored = False
+    if pet_key_sent and active_pet_id and not _owns_item(g.user["id"], slot, active_pet_id):
+        active_pet_id = ""
+        pet_ignored = True
+
     explored_key_sent = "explored" in payload
     explored = parse_explored(payload.get("explored")) if explored_key_sent else {}
     if explored_key_sent and explored is None:
@@ -7513,6 +7528,8 @@ def write_save():
     # field that is silently dropped is a client and a server disagreeing
     # forever with nothing to notice it by.
     ignored = []
+    if pet_ignored:
+        ignored.append("active_pet_id")
     if equipment_ignored:
         ignored.append("equipment")
     if hotbar_ignored:

@@ -380,6 +380,23 @@ status("write with no token", client.put("/api/save",
 check("a fresh slot has no pet", body["slots"][0]["active_pet_id"] == "",
       body["slots"][0])
 
+# ONLY A PET THE PLAYER HOLDS CAN BE OUT (decided day 1). The pets below are
+# put in the carry first, as a drop would; the checks at the end of this
+# section are about the ones that are not held.
+import sqlite3 as _petsql
+def hold(item_id, position, where="carry"):
+    conn = _petsql.connect(DB_PATH)
+    uid = conn.execute("SELECT id FROM users WHERE username = 'checker'").fetchone()[0]
+    if where == "carry":
+        conn.execute("INSERT OR REPLACE INTO carry_items (user_id, slot, position, item_id, quantity)"
+                     " VALUES (?, 0, ?, ?, 1)", (uid, position, item_id))
+    else:
+        conn.execute("INSERT OR REPLACE INTO bank_items (user_id, position, item_id, quantity)"
+                     " VALUES (?, ?, ?, 1)", (uid, position, item_id))
+    conn.commit(); conn.close()
+hold("petpoisonslimesmall", 15)
+hold("petpoisonslimelarge", 16)
+
 status("equip a pet", client.put("/api/save", headers=H,
        json={"slot": 0, "class_id": "warrior", "name": "Checker", "level": 13,
              "active_pet_id": "petpoisonslimesmall"}), 200)
@@ -416,12 +433,36 @@ status("pet id that isn't a string", client.put("/api/save", headers=H,
        json={"slot": 0, "class_id": "warrior", "name": "Checker",
              "active_pet_id": {"nope": 1}}), 400)
 
-# The server has no item registry, so an unknown pet id is accepted on purpose
-# - see the schema comment. This check pins that decision down rather than
-# leaving it to be "fixed" later by someone who assumes it was an oversight.
-status("unknown pet id is accepted by design", client.put("/api/save", headers=H,
+# THE SERVER KEEPS NO LIST OF PETS, so an id it has never heard of is still
+# fine - see the schema comment - as long as the player HOLDS it. This used to
+# say "unknown pet id is accepted by design" and stored any string at all, so
+# a modified client could walk out a pet it never won. Holding is the rule
+# now; knowing the name is still not.
+hold("petfromafutureupdate", 17)
+status("an unknown pet id the player holds is accepted", client.put("/api/save", headers=H,
        json={"slot": 0, "class_id": "warrior", "name": "Checker",
              "active_pet_id": "petfromafutureupdate"}), 200)
+check("  and stored", client.get("/api/save", headers=H).get_json()["slots"][0]["active_pet_id"]
+      == "petfromafutureupdate")
+res = client.put("/api/save", headers=H, json={"slot": 0, "class_id": "warrior", "name": "Checker",
+                                               "active_pet_id": "petboss"})
+check("a pet the player does not hold is not stored: the save clears it and says so",
+      res.status_code == 200 and "active_pet_id" in (res.get_json() or {}).get("ignored", [])
+      and client.get("/api/save", headers=H).get_json()["slots"][0]["active_pet_id"] == "",
+      res.get_json())
+hold("petsniper", 3, where="bank")
+res = client.put("/api/save", headers=H, json={"slot": 0, "class_id": "warrior", "name": "Checker",
+                                               "active_pet_id": "petsniper"})
+check("a pet in the account's bank counts as held",
+      res.status_code == 200 and client.get("/api/save", headers=H).get_json()["slots"][0]["active_pet_id"]
+      == "petsniper", res.get_json())
+# Put back as found: the bank checks further down start from an empty bank,
+# and the pet checks after them from an empty carry.
+_conn = _petsql.connect(DB_PATH)
+_conn.execute("DELETE FROM bank_items WHERE item_id = 'petsniper'")
+_conn.execute("DELETE FROM carry_items WHERE item_id IN ('petpoisonslimesmall', 'petpoisonslimelarge', 'petfromafutureupdate')")
+_conn.execute("UPDATE saves SET active_pet_id = '' WHERE slot = 0")
+_conn.commit(); _conn.close()
 
 
 # =============================================================================

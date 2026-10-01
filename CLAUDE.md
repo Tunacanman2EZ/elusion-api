@@ -355,6 +355,11 @@ updating the maxima it implies.
   them in an `ignored` array. A 400 would break every honest client, because the
   client sends its whole status block and has no way to know which fields the
   server has taken ownership of since it was written.
+- **A pet is stored only when held.** `/api/save` keeps an `active_pet_id`
+  only when the character's carry or the account's bank has it
+  (`_owns_item()`); otherwise it clears the field and names it in `ignored`.
+  Still no list of pets, for the reason below. Decided on day 1; it used to
+  store any string, so a modified client could walk out a pet it never won.
 - **Item ids are not whitelisted.** Validating them against a list would mean
   every new item in the game needs a matching server deploy. Unknown ids are
   bounded by `QUANTITY_CEILING` instead; known ones by their own `max_stack`.
