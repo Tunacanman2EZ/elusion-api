@@ -157,6 +157,52 @@ Helpers defined further down the file do not exist yet when it runs. Table
 creation belongs in the schema block, not in a function called from it. This
 produced a `NameError` on startup once.
 
+### A read before the first write is outside the transaction
+
+sqlite3 opens a transaction at the first INSERT, UPDATE or DELETE, not at the
+first SELECT. So a route that read a balance, worked out the new one in Python
+and wrote it back could be run twice at once, with both reading the old figure.
+On day 1 this lost XP from every pair of kills one swing produced (six kills
+sent together banked 99 of 676), and the same shape let one loot cell pay five
+times, one potion explain five heals and one purse be deposited twice.
+
+**THE WRITE LOCK** (top of the DATABASE section) is the fix, and it is one rule:
+`get_db()` runs `BEGIN IMMEDIATE` for every POST, PUT, PATCH and DELETE, before
+the route reads anything, and `_WriteLockedConnection` takes the lock again after
+each `commit()`, so a route that commits part-way is still covered. A new write
+route gets it without anyone remembering.
+
+- **`@no_write_lock` is for slow work only**: a password hash or a picture
+  fetch, which must not make every other player's write wait. There are nine;
+  `test_concurrency.py` names them, so adding a tenth fails the suite until
+  somebody writes down why. A route that opts out must not add up a balance from
+  what it read before its first write.
+- **A GET that writes is not covered.** The broadcast poll stamps presence and
+  hands over a resync flag; neither adds to anything it read. Do not give a GET
+  a read-then-write.
+- **It costs nothing measurable.** SQLite already has one writer at a time;
+  `loadtest.py` on the kill route was ~550 writes/s before and after.
+- **`test_concurrency.py`** sends real requests together on real threads and
+  holds each route's read-to-write window open for 50 ms, so the old race fails
+  every run rather than now and then.
+
+### The heal check's clock is pools_at, not updated_at
+
+`_reconcile_heals()` allows the regeneration that fits between the stored
+pools and the new ones, so it has to know when the stored pools were written.
+It read `updated_at`, which a kill, a loot take, a skill tick, a gold move and
+an equip all bump without touching hp or mana. A player who stood still for
+twenty seconds, killed something and saved a moment later was allowed two
+seconds of regeneration; seen live on day 1 as `mana +19 vs regen 8` while
+picking up coins, and clamped once the gap was wide enough.
+
+`saves.pools_at` is written by every write that sets hp, mana or stamina - the
+status write, revive, respawn, a new character - and by nothing else. A row
+from before the column reads 0 and falls back to `updated_at`. The status
+write moving it matters as much as the others not moving it: if it stood
+still, an hour-old clock would pay for any heal. `test_healing.py`, "Something
+else wrote the row in between", holds both directions.
+
 ### JSON has no integer type
 
 The client is Godot, which parses every JSON number as a float. `88` goes out
@@ -813,6 +859,23 @@ pet odds - unchanged. `test_rewards.py` measures the rates with the real roll.
 `test_api.py` holds that a boss bag with a pet never loses the pet or its gear
 to the cell limit.
 
+## The store sells iron to amethyst
+
+Decided by the owner on day 1: the general store stocks every weapon and armour
+piece from iron to amethyst (tiers 1-4) at its value, so a player farming one
+band saves for the next band's set. Ember is still found, never bought. The
+stock list is the game's `generalstore.tres`, read here through gamedata.json,
+so a stock change is a re-export, a copy and a restart, with no code change.
+
+- **Anyone may buy any piece.** `/api/shop/buy` has no level gate on purpose;
+  the equip routes refuse a piece until the character reaches its
+  `required_level`.
+- **The pace is measured, not assumed.** `test_pacing.py`, "THE STORE SELLS
+  IRON TO AMETHYST", rolls kills through the real `roll_kill_rewards()` with a
+  seeded generator swapped in for `_rng`, and holds each next set at 2 to 6
+  hours of the previous band's gold (about 3 to 4 today). It also holds the
+  shelf against the catalogue: every tier 1-4 piece on it, nothing of tier 5.
+
 ## Gear bonuses: a character's maximum includes what it wears
 
 Amulets add max health (`bonus_max_hp`), max mana (`bonus_max_mana`) or a
@@ -949,7 +1012,9 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
                 no recovery-email demand with no mail
   chatsafety    ignore, report and mute
   chardelete    deleting a character, and only the character
+  concurrency   requests that arrive together: the write lock
   attackxp      attack XP banked at the kill, with the class specialty
+  pacing        the level curve, the element bands, and the store's saving pace
   gathering     fishing and cooking - the item-minting endpoints
   loot          bags, rolls, and taking things out of them
   equipment     what a worn item is worth, and what the tooltip says

@@ -16,6 +16,10 @@ wrong here that the game never sees:
   releases, or honest slime fights are refused;
 - killwatch called anything with 1,000+ health a boss, and a normal dark bush
   mage now has 1,555.
+
+The general store now sells every piece from iron to amethyst, so the last
+section checks the shelf against the catalogue and the saving pace: the next
+band's set should cost a few hours of the gold the current band pays.
 """
 import importlib.util, os, sqlite3, sys, tempfile
 
@@ -190,6 +194,109 @@ check("the Crowned is the biggest fight and drops the best tier",
       and int(E["boss"]["max_loot_tier"]) == 6, (E["boss"]["max_hp"], E["boss"]["max_loot_tier"]))
 check("and one Crowned kill still levels a fresh character",
       int(E["boss"]["xp_reward"]) >= gamedata.xp_needed_for_level(1), E["boss"]["xp_reward"])
+
+
+# =============================================================================
+section("THE STORE SELLS IRON TO AMETHYST, AND THE NEXT SET IS HOURS AWAY")
+# =============================================================================
+# THE DESIGN. The general store stocks every weapon and armour piece from iron
+# (tier 1) to amethyst (tier 4) at its catalogue value, so a player farming one
+# band saves up for the next band's set. Ember (tier 5) and the bosses' gear
+# stay drop-only. Anyone may buy any piece. The level gate is on wearing it,
+# not on buying it.
+#
+# WHY THE SERVER CHECKS IT. The stock list lives in a .tres the server reads
+# second-hand through gamedata.json. A re-export that drops a tier, or an
+# ember piece that slips onto the shelf, changes the economy without a single
+# line of server code changing.
+store = gamedata.SHOPS.get("generalstore") or {}
+stock = list(store.get("stock", []))
+gear = {iid: it for iid, it in gamedata.ITEMS.items() if it["type_name"] in ("WEAPON", "ARMOR")}
+missing = sorted(iid for iid, it in gear.items() if 1 <= int(it["tier"]) <= 4 and iid not in stock)
+check("every weapon and armour piece of iron to amethyst is on the shelf", stock and not missing, missing)
+over = sorted(iid for iid in stock if iid in gear and int(gear[iid]["tier"]) >= 5)
+check("and nothing of ember or above is", not over, over)
+check("every stocked id is a real item", all(iid in gamedata.ITEMS for iid in stock),
+      [iid for iid in stock if iid not in gamedata.ITEMS])
+check("nothing is stocked twice", len(stock) == len(set(stock)))
+check("the store sells at catalogue value", float(store.get("price_multiplier", 0)) == 1.0,
+      store.get("price_multiplier"))
+check("so every piece costs exactly its value",
+      all(gamedata.shop_price("generalstore", iid) == int(gear[iid]["value"]) for iid in stock if iid in gear))
+check("an ember piece has no price at all", gamedata.shop_price("generalstore", "embersword") is None)
+
+# ONE BAND, ONE LEVEL. The shop draws a shelf per band titled with the level its
+# pieces need, so a band that mixed two levels would have no honest title.
+level_of = {}
+for iid in stock:
+    if iid in gear:
+        level_of.setdefault(int(gear[iid]["tier"]), set()).add(int(gear[iid]["required_level"]))
+check("each band's pieces all need one level", all(len(v) == 1 for v in level_of.values()), level_of)
+levels = [min(level_of.get(t, {0})) for t in (1, 2, 3, 4)]
+check("and it climbs iron 1, jade 5, cobalt 10, amethyst 16", levels == [1, 5, 10, 16], levels)
+
+# SAVING PACE. Gold a band pays an hour, at the five kills a minute the level
+# curve above is priced on, sampled through the real roll_kill_rewards() with a
+# seeded generator so the numbers are the same on every run.
+import random
+coin_ids = {iid for iid, _ in gamedata.gold_denominations()}
+gold_an_hour = {}
+_real_rng = gamedata._rng
+try:
+    gamedata._rng = random.Random(2026)
+    for el, fam in FAMILY.items():
+        for eid in fam:
+            for _ in range(3000):
+                bag = gamedata.roll_kill_rewards(eid)["contents"]
+                gold_an_hour.setdefault(BAND_OF[el], []).append(
+                    sum(int(gamedata.ITEMS[c["item_id"]]["value"]) * int(c["quantity"])
+                        for c in bag if c["item_id"] in coin_ids))
+finally:
+    gamedata._rng = _real_rng
+gold_an_hour = {b: 300.0 * sum(v) / len(v) for b, v in gold_an_hour.items()}
+
+MATERIAL = {1: "iron", 2: "jade", 3: "cobalt", 4: "amethyst"}
+PLATE_SET = ["sword", "helm", "chest", "legs", "boots", "shield", "amulet", "ring"]
+CLOTH_SET = ["staff", "hood", "robe", "trousers", "slippers", "amulet", "ring"]
+def set_cost(tier, pieces):
+    """What the store asks for the whole set, or None when a piece is not on sale."""
+    prices = [gamedata.shop_price("generalstore", MATERIAL[tier] + p) for p in pieces]
+    return None if None in prices else sum(prices)
+for tier in (2, 3, 4):
+    for name, pieces in (("plate", PLATE_SET), ("cloth", CLOTH_SET)):
+        cost = set_cost(tier, pieces)
+        if cost is None:
+            check("the %s %s set is all on sale" % (MATERIAL[tier], name), False,
+                  [MATERIAL[tier] + p for p in pieces if gamedata.shop_price("generalstore", MATERIAL[tier] + p) is None])
+            continue
+        hours = cost / gold_an_hour[tier - 1]
+        check("the %s %s set (%s gold) is %.1f hours of %s-band gold: between 2 and 6"
+              % (MATERIAL[tier], name, "{:,}".format(cost), hours, MATERIAL[tier - 1]),
+              2.0 <= hours <= 6.0, (cost, round(gold_an_hour[tier - 1])))
+plate_costs = [set_cost(t, PLATE_SET) for t in (1, 2, 3, 4)]
+check("each set costs more than the one before it",
+      None not in plate_costs and all(plate_costs[i] > plate_costs[i - 1] for i in (1, 2, 3)), plate_costs)
+
+# BUY IT AT ANY LEVEL, WEAR IT AT ITS OWN. Through the real routes: the
+# purchase goes into the backpack, and the equip route refuses it until the
+# character reaches the level.
+conn = sqlite3.connect(DB_PATH)
+conn.execute("UPDATE saves SET level = 1, gold = 600 WHERE user_id = ? AND slot = 0", (uid,))
+conn.commit(); conn.close()
+r = client.post("/api/shop/buy", headers=H, json={"slot": 0, "shop_id": "generalstore", "item_id": "jadesword"})
+body = r.get_json() or {}
+check("a level 1 character may buy a jade sword, at 520", r.status_code == 200 and body.get("total_paid") == 520,
+      (r.status_code, body))
+r = client.post("/api/character/equip", headers=H, json={"slot": 0, "item_id": "jadesword"})
+check("but may not wear it yet", r.status_code in (400, 403) and "level" in str(r.get_json()).lower(),
+      (r.status_code, r.get_json()))
+conn = sqlite3.connect(DB_PATH)
+conn.execute("UPDATE saves SET level = 5 WHERE user_id = ? AND slot = 0", (uid,))
+conn.commit(); conn.close()
+r = client.post("/api/character/equip", headers=H, json={"slot": 0, "item_id": "jadesword"})
+check("at level 5 the same sword goes on", r.status_code == 200, (r.status_code, r.get_json()))
+r = client.post("/api/shop/buy", headers=H, json={"slot": 0, "shop_id": "generalstore", "item_id": "embersword"})
+check("and no amount of gold buys an ember sword", r.status_code == 400, r.status_code)
 
 
 print("\n%d passed, %d failed" % (passed, failed))
