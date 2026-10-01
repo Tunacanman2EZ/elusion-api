@@ -9,7 +9,7 @@
 # block in app.py is guarded, importing it starts nothing - the routes register
 # and the process hands control to the server instead.
 #
-#   Linux    gunicorn -w 4 -b 127.0.0.1:5000 wsgi:application
+#   Linux    gunicorn --preload -w 4 -b 127.0.0.1:5000 wsgi:application
 #   Windows  waitress-serve --listen=127.0.0.1:5000 --threads=32 --connection-limit=2000 wsgi:application
 #
 # THE WINDOWS LINE IS ONE LINE ON PURPOSE. It was briefly written wrapped with
@@ -17,6 +17,10 @@
 # PowerShell or cmd - there the backslash is passed through as an argument and
 # waitress tries to import a module called "\". A command in a comment gets
 # copied and pasted, so it has to be pasteable on the shell it is labelled for.
+#
+# --preload ON THE LINUX LINE IS NOT DECORATION. Without it every worker runs the
+# migrations at once and the first boot after an update can die on "duplicate
+# column name" - see DEPLOY.md.
 #
 # THOSE TWO WAITRESS FLAGS ARE NOT TUNING, THEY ARE THE DIFFERENCE BETWEEN
 # SERVING AND NOT SERVING, and the bare command above them was measured

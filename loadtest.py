@@ -208,7 +208,9 @@ def launch_server(workers, db_path, port):
                  "yourself (waitress-serve --listen=127.0.0.1:PORT wsgi:application) "
                  "and run with --url http://127.0.0.1:PORT instead.")
     proc = subprocess.Popen(
-        ["gunicorn", "-w", str(workers), "-b", "127.0.0.1:%d" % port,
+        # --preload: the migrations run once, in the parent. Without it the
+        # workers race each other through init_db() - see DEPLOY.md.
+        ["gunicorn", "--preload", "-w", str(workers), "-b", "127.0.0.1:%d" % port,
          "wsgi:application", "--log-level", "error", "--timeout", "60"],
         cwd=HERE, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     return proc
@@ -239,7 +241,7 @@ def main():
             base = "http://127.0.0.1:%d" % port
             tmpdir = tempfile.mkdtemp(prefix="elusion_loadtest_")
             db_path = os.path.join(tmpdir, "loadtest.db")
-            print("launching gunicorn -w %d on a scratch DB ..." % args.workers)
+            print("launching gunicorn --preload -w %d on a scratch DB ..." % args.workers)
             proc = launch_server(args.workers, db_path, port)
         else:
             base = args.url

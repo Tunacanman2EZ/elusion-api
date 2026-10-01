@@ -45,12 +45,13 @@ the backpack ledger is still whatever the client pushes.
 
 ## Invariants
 
-Twenty-one promises, each anchored. The first three are structural — they cannot
+Every promise here is anchored. The first three are structural — they cannot
 rot because there is nothing to change.
 
-(It said "Ten" for a while after it had thirteen, which is the small version of
-exactly the failure this page exists to avoid. The count is not load-bearing;
-that it was wrong, in bold, on the security page, is the point.)
+(This line used to give a count, and the count was wrong twice: "Ten" after
+there were thirteen, then "Twenty-one" after there were twenty-three. That is
+the small version of exactly the failure this page exists to avoid, so the
+number is gone, by the same rule CLAUDE.md gives for check counts.)
 
 **Structural**
 
@@ -192,6 +193,16 @@ that it was wrong, in bold, on the security page, is the point.)
     exist.
     → Held by: `test_chatsafety.py` — "a whisper between two other people is a 404 - you were never shown it", "a friends-channel line is a 404 to somebody who is not the author's friend", "  but the one it was said to can report it"
     → and in the game: `src/tools/testrunner.gd` — `_test_chat_safety_menu()`
+24. **Two requests sent together cannot both spend the same thing.** Every
+    POST, PUT, PATCH and DELETE takes the database's write lock before its
+    first read and keeps it until the request ends (THE WRITE LOCK in app.py).
+    Before this, a route read a balance, worked out the new one and wrote it
+    back, and two requests arriving together both read the old one. So a loot
+    cell taken twice at once paid twice, one potion drunk five times explained
+    five heals, one purse deposited twice put the gold in the bank twice, and
+    kills sent together lost each other's XP. The only write routes left out are
+    nine that hash a password or fetch a picture, and the suite names them.
+    → Held by: `test_concurrency.py` — "one take paid and the rest found nothing", "one drink went through", "one deposit was paid and the other refused", "every XP point the answers promised is stored", "the only ones left out are the slow ones named here"
 
 ---
 

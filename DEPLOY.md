@@ -15,8 +15,8 @@ Nothing in this file is done yet. It is the checklist, not a record.
 pip install waitress            # Windows
 pip install gunicorn            # Linux
 
-# Linux
-gunicorn -w 4 -b 127.0.0.1:5000 wsgi:application
+# Linux - --preload is not optional, see below
+gunicorn --preload -w 4 -b 127.0.0.1:5000 wsgi:application
 
 # Windows
 waitress-serve --listen=127.0.0.1:5000 wsgi:application
@@ -35,6 +35,16 @@ waitress-serve --listen=127.0.0.1:5000 wsgi:application
 | `ELUSION_STAFF_LOGIN_CODES` | **unset** (on) | `off` only to get back in when mail has broken - see below |
 
 `wsgi.py` checks all of these at boot and says which one is wrong.
+
+**`--preload`, or the first boot after an update can take the server down.**
+Without it every gunicorn worker imports app.py at the same moment, and each one
+runs the migrations in `init_db()` against the same database file. Two workers
+both see a column missing, both add it, and the second fails with `duplicate
+column name` - its worker dies, and gunicorn shuts the whole server down with
+"Worker failed to boot". It happened on day 1 against a fresh database, the
+very situation a first deploy is in. `--preload` imports the app once, in the
+parent, before the workers start, so the migrations run once. waitress is one
+process and never had this.
 
 ### Rate limiting (`ELUSION_RATE_LIMIT`)
 

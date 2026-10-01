@@ -1219,6 +1219,10 @@ MAX_HP = int(status["max_hp"])
 
 
 def set_stored(**fields):
+    # Staging "the pools were written this long ago": the heal check reads
+    # pools_at, so it moves with updated_at unless a test says otherwise.
+    if "updated_at" in fields and "pools_at" not in fields:
+        fields["pools_at"] = fields["updated_at"]
     conn = sqlite3.connect(DB_PATH)
     uid = conn.execute("SELECT id FROM users WHERE username = 'patient'").fetchone()[0]
     conn.execute("UPDATE saves SET %s WHERE user_id = ? AND slot = 0"

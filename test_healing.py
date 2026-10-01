@@ -145,11 +145,15 @@ def attempt(before, after, elapsed, grants=()):
     Returns the lines the check produced - empty means it said nothing.
     """
     conn = db_conn()
+    # pools_at is the clock the check reads - when hp, mana and stamina were
+    # last written. updated_at moves with it here because nothing else
+    # happened in between; "Something else wrote the row" is the case where it
+    # did.
     conn.execute(
-        "UPDATE saves SET hp = ?, mana = ?, stamina = ?, updated_at = ?"
+        "UPDATE saves SET hp = ?, mana = ?, stamina = ?, updated_at = ?, pools_at = ?"
         " WHERE user_id = ? AND slot = 0",
         (before["hp"], before.get("mana", 50), before.get("stamina", 50),
-         int(time.time()) - int(elapsed), USER_ID),
+         int(time.time()) - int(elapsed), int(time.time()) - int(elapsed), USER_ID),
     )
     conn.execute("DELETE FROM consume_grants WHERE user_id = ?", (USER_ID,))
     for item_id, target, amount in grants:
@@ -265,6 +269,83 @@ silent("a level-up refills all three pools",
 silent("a revive is a jump from zero to full",
        {"hp": 0}, {"hp": MAX_HP}, 2,
        [(app_module.REVIVE_GRANT_ID, "", 0)])
+
+section("Something else wrote the row in between")
+
+# DAY 1. A kill, a loot take, a skill tick and an equip all move updated_at
+# without touching a pool, and the check measured regeneration from
+# updated_at. So a player who stood still for twenty seconds, killed something
+# and saved a moment later was allowed two seconds of regeneration - seen live
+# as "mana +19 vs regen 8" while picking up coins, and clamped once the gap
+# was wide enough. It measures from pools_at now.
+MAX_MANA = int(MAXES["max_mana"])
+MANA_RATE = gamedata.regen_rate_for(MAX_MANA)
+conn = db_conn()
+twenty_ago = int(time.time()) - 20
+conn.execute("UPDATE saves SET hp = ?, mana = 0, updated_at = ?, pools_at = ?"
+             " WHERE user_id = ? AND slot = 0", (MAX_HP, twenty_ago, twenty_ago, USER_ID))
+conn.execute("DELETE FROM consume_grants WHERE user_id = ?", (USER_ID,))
+conn.commit()
+conn.close()
+quiet_enemy = next(e for e in sorted(gamedata.ENEMIES)
+                   if gamedata.ENEMIES[e].get("grants_rewards", True)
+                   and not gamedata.ENEMIES[e].get("slots_are_gear"))
+killed = client.post("/api/combat/kill", headers=H, json={"slot": 0, "enemy_id": quiet_enemy})
+row = db_conn().execute("SELECT level, updated_at, pools_at FROM saves WHERE user_id = ? AND slot = 0",
+                        (USER_ID,)).fetchone()
+check("a kill moves updated_at and leaves the pools' clock alone",
+      killed.status_code == 200 and int(row["updated_at"]) >= int(time.time()) - 1
+      and int(row["pools_at"]) == twenty_ago and int(row["level"]) == 1,
+      (killed.status_code, dict(row)))
+ear.lines.clear()
+earned = int(20 * MANA_RATE)
+client.put("/api/player/status", headers=H, json={"slot": 0, "mana": earned})
+check("twenty seconds of mana regen saved just after a kill is not flagged",
+      not [l for l in ear.lines if "unexplained heal" in l],
+      [l for l in ear.lines if "unexplained heal" in l][:1])
+check("  and none of it is clamped away",
+      int(db_conn().execute("SELECT mana FROM saves WHERE user_id = ? AND slot = 0",
+                            (USER_ID,)).fetchone()["mana"]) == earned)
+
+# THE OTHER DIRECTION, and the one that matters for cheating: a status write
+# must restart the clock, or a character whose pools were last written an hour
+# ago would have an hour of regeneration to spend on every save after.
+conn = db_conn()
+hour_ago = int(time.time()) - 3600
+conn.execute("UPDATE saves SET hp = 1, updated_at = ?, pools_at = ? WHERE user_id = ? AND slot = 0",
+             (hour_ago, hour_ago, USER_ID))
+conn.execute("DELETE FROM consume_grants WHERE user_id = ?", (USER_ID,))
+conn.commit()
+conn.close()
+client.put("/api/player/status", headers=H, json={"slot": 0, "hp": 1})
+check("a status write restarts the pools' clock",
+      int(db_conn().execute("SELECT pools_at FROM saves WHERE user_id = ? AND slot = 0",
+                            (USER_ID,)).fetchone()["pools_at"]) >= int(time.time()) - 1)
+ear.lines.clear()
+client.put("/api/player/status", headers=H, json={"slot": 0, "hp": MAX_HP})
+check("  so full health a moment later is flagged, not paid for by the hour before",
+      bool([l for l in ear.lines if "unexplained heal" in l]))
+
+# A ROW FROM BEFORE pools_at EXISTED reads 0 there, and is measured from
+# updated_at as every row was before - not from 1970, which would explain any
+# rise at all.
+conn = db_conn()
+conn.execute("UPDATE saves SET hp = 100, updated_at = ?, pools_at = 0 WHERE user_id = ? AND slot = 0",
+             (int(time.time()) - 30, USER_ID))
+conn.commit()
+conn.close()
+ear.lines.clear()
+client.put("/api/player/status", headers=H, json={"slot": 0, "hp": 100 + int(30 * RATE)})
+quiet = not [l for l in ear.lines if "unexplained heal" in l]
+conn = db_conn()
+conn.execute("UPDATE saves SET hp = 1, updated_at = ?, pools_at = 0 WHERE user_id = ? AND slot = 0",
+             (int(time.time()), USER_ID))
+conn.commit()
+conn.close()
+ear.lines.clear()
+client.put("/api/player/status", headers=H, json={"slot": 0, "hp": MAX_HP})
+check("a row from before the pools' clock is measured from updated_at, both ways",
+      quiet and bool([l for l in ear.lines if "unexplained heal" in l]))
 
 section("Small pools")
 
