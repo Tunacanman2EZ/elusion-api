@@ -297,6 +297,46 @@ app_module.MAX_FRIENDS = real_friends
 wipe()
 
 
+print("\n--- a request waiting on you rides the poll ---")
+# Day 1: a request to somebody standing next to you sat unseen until they
+# happened to open the Friends panel. The broadcast poll carries what is
+# waiting on the player's answer now, so the game can light the button.
+wipe()
+def asks(token):
+    body = client.get("/api/server/broadcasts?since=0", headers=auth(token)).get_json() or {}
+    return body.get("asks", {}).get("friends", {})
+nothing = asks(ben_token)
+check("nothing waiting is a zero, not a missing key",
+      nothing.get("count") == 0 and nothing.get("newest") == "" and nothing.get("at") == 0, nothing)
+ask(ann_token, "ben")
+ask(cal_token, "ben")   # the same second, most likely: the tie goes to the later row
+waiting = asks(ben_token)
+check("two requests waiting: the count, and the newest asker",
+      waiting.get("count") == 2 and waiting.get("newest") == "cal" and waiting.get("at", 0) > 0, waiting)
+check("the asker is not told about their own request", asks(ann_token).get("count") == 0, asks(ann_token))
+answer(ben_token, "cal", True)
+check("an accepted request stops counting",
+      asks(ben_token).get("count") == 1 and asks(ben_token).get("newest") == "ann", asks(ben_token))
+answer(ben_token, "ann", False)
+check("and so does a declined one", asks(ben_token).get("count") == 0, asks(ben_token))
+
+# EVERY PLAYER ASKS THIS EVERY TEN SECONDS, so every statement must be an index
+# read, never a walk of the table. The statements are the real ones, caught as
+# _waiting_asks() runs them, so the check cannot drift from the code.
+with app_module.app.app_context():
+    db = app_module.get_db()
+    ran = []
+    db.set_trace_callback(ran.append)
+    app_module._waiting_asks(db, 1)
+    db.set_trace_callback(None)
+    plans = [" | ".join(str(r[-1]) for r in db.execute("EXPLAIN QUERY PLAN " + sql))
+             for sql in ran if sql.lstrip().upper().startswith("SELECT")]
+check("every read behind it is an index search, not a scan",
+      len(plans) == 4 and not any(step.startswith("SCAN ") for plan in plans for step in plan.split(" | ")),
+      plans)
+wipe()
+
+
 print("\n--- nothing without a token ---")
 check("listing needs one", client.get("/api/friends").status_code == 401)
 check("asking needs one",

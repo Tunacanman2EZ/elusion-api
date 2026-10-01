@@ -248,6 +248,8 @@ check("and its only member", body.get("guild", {}).get("size") == 1, body)
 check("the cost was taken", gold_of("amy") == before - COST,
       "%d -> %d" % (before, gold_of("amy")))
 check("and the answer says what it cost", body.get("paid") == COST, body)
+check("  and what is left carried, and in the bank",
+      body.get("carried_gold") == gold_of("amy") and body.get("bank_gold") == bank_of("amy"), body)
 
 # DESTROYED, NOT MOVED. If the founding cost had been transferred anywhere,
 # or written with a bare UPDATE, this is the check that would fail.
@@ -325,6 +327,13 @@ check("and the bank covered the rest",
 check("leaving the pocket empty", gold_of("dan") == 0, gold_of("dan"))
 check("and the bank short by the remainder",
       bank_of("dan") == COST * 2 - (COST - 40), bank_of("dan"))
+# THE ANSWER CARRIES BOTH BALANCES AFTER THE PAYMENT. Gold is the server's, so
+# the game copies these rather than working them out. On day 1 it had nothing
+# to copy: a founder who paid 1,000 carried and 4,000 banked went on seeing
+# the old purse and bank until a relog.
+check("the answer says what is left carried, and in the bank",
+      paid.get("carried_gold") == gold_of("dan") == 0
+      and paid.get("bank_gold") == bank_of("dan"), paid)
 
 state = supply()
 check("and the supply STILL balances with a bank burn in it",
@@ -366,6 +375,19 @@ check("but he can see the invitation", len(seen) == 1 and
       seen[0]["guild"] == "The Crowned", seen)
 check("and who sent it", seen and seen[0]["by"] == "amy", seen)
 
+# THE POLL CARRIES IT. Day 1: an invitation sat unseen until the player
+# happened to open the Guild panel; the broadcast poll says what is waiting on
+# them now, so the game can light the button.
+def guild_asks(token):
+    body = client.get("/api/server/broadcasts?since=0", headers=auth(token)).get_json() or {}
+    return body.get("asks", {}).get("guild", {})
+waiting = guild_asks(bob_token)
+check("and so does the poll: one invitation, from The Crowned",
+      waiting.get("count") == 1 and waiting.get("newest") == "The Crowned" and waiting.get("at", 0) > 0,
+      waiting)
+check("  the guild's own leader is not told about it", guild_asks(amy_token).get("count") == 0,
+      guild_asks(amy_token))
+
 check("inviting twice is not an error", invite(amy_token, "bob").status_code == 200)
 check("and does not make a second invitation",
       len(mine(bob_token).get_json()["invites"]) == 1)
@@ -380,6 +402,7 @@ check("as a member", mine(bob_token).get_json()["rank"] == "member")
 check("and the roster shows both",
       mine(amy_token).get_json()["guild"]["size"] == 2)
 check("the invitation is gone", mine(bob_token).get_json()["invites"] == [])
+check("  and the poll stops counting it", guild_asks(bob_token).get("count") == 0, guild_asks(bob_token))
 
 check("somebody already in a guild cannot be invited",
       invite(amy_token, "bob").status_code == 400)
@@ -391,6 +414,7 @@ check("and declining leaves you out",
       mine(cass_token).get_json()["in_guild"] is False)
 check("with no invitation left either",
       mine(cass_token).get_json()["invites"] == [])
+check("  on the poll too", guild_asks(cass_token).get("count") == 0, guild_asks(cass_token))
 
 
 # ---------------------------------------------------------------------------

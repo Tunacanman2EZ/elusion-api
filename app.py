@@ -1,4 +1,4 @@
-from flask import Flask, request, g
+from flask import Flask, request, g, has_request_context
 from flask.json.provider import DefaultJSONProvider
 from flasgger import Swagger
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -886,10 +886,75 @@ def _refuse_outdated_client():
 # DATABASE
 # =============================================================================
 
+# THE WRITE LOCK: A REQUEST THAT CHANGES SOMETHING HOLDS IT FROM ITS FIRST READ.
+#
+# Most routes here read a row, work out the new numbers in Python, and write
+# them back - `xp = row["xp"] + gained`. sqlite3 only opens the transaction at
+# the first WRITE, so the read is outside it, and two requests for the same
+# character could both read the old figure; the second write then replaced the
+# first. Found by playing: a warrior's slash wave killed two enemies at once,
+# the game sent both kill reports together, and one kill's XP was gone. Six
+# kills sent together banked 99 XP of the 676 their answers had promised. The
+# client added up all 676, levelled up before the server did, refilled its
+# mana, and the healing check clamped that as a cheat.
+#
+# BEGIN IMMEDIATE takes SQLite's one write lock before the first read, so a
+# second write request waits for the first to commit (busy_timeout) and then
+# reads what it wrote. Readers are not affected - WAL lets them carry on.
+#
+# EVERY POST/PUT/PATCH/DELETE, NOT A LIST OF THE RISKY ONES. There are some
+# seventy write routes and most of them read before they write. A list would be
+# right today and wrong for the next route anyone adds; this is right for it
+# without anyone remembering. The exceptions are named instead
+# (@no_write_lock), and each one is there because it does SLOW work that must
+# not hold up every other player's writes - a password hash (about 100 ms of
+# scrypt) or fetching a picture from another server (up to six seconds).
+#
+# A COMMIT DOES NOT LET GO OF IT. Some routes commit part-way and go on reading
+# and writing (write_save, the guild and friends routes). _WriteLockedConnection
+# takes the lock again straight after each commit, so the rest of the request is
+# still covered. Teardown closes the connection, which rolls back that last,
+# empty transaction and releases the lock.
+#
+# test_concurrency.py fires real requests at once from threads against a real
+# server and checks nothing was lost: XP, gold between the bank and two
+# characters, a potion drunk five times, one loot cell taken twice.
+WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def no_write_lock(view):
+    """Mark a write route that must NOT hold the write lock from its first read.
+
+    Only for routes that do slow work before they write - hashing a password,
+    fetching a picture. They keep sqlite3's ordinary behaviour (the lock is taken
+    at their first write), so whatever they read before that can be stale; none
+    of them adds up a balance from what it read."""
+    view._elusion_no_write_lock = True
+    return view
+
+
+def _request_takes_write_lock():
+    if not has_request_context() or request.method not in WRITE_METHODS:
+        return False
+    view = app.view_functions.get(request.endpoint)
+    return view is not None and not getattr(view, "_elusion_no_write_lock", False)
+
+
+class _WriteLockedConnection(sqlite3.Connection):
+    """A connection that keeps the write lock for the rest of the request after
+    a commit. See THE WRITE LOCK above."""
+    keep_write_lock = False
+
+    def commit(self):
+        super().commit()
+        if self.keep_write_lock:
+            self.execute("BEGIN IMMEDIATE")
+
+
 def get_db():
     """One connection per request, closed automatically in teardown."""
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
+        g.db = sqlite3.connect(DB_PATH, factory=_WriteLockedConnection)
         g.db.row_factory = sqlite3.Row
         # enforce foreign keys - off by default in sqlite
         g.db.execute("PRAGMA foreign_keys = ON")
@@ -931,6 +996,12 @@ def get_db():
         # makes the contender WAIT for the lock (up to 5s) and then proceed, so
         # overlap becomes a brief queue instead of an error. Per-connection.
         g.db.execute("PRAGMA busy_timeout = 5000")
+
+        # Last, after the PRAGMAs: journal_mode cannot change inside a
+        # transaction. See THE WRITE LOCK above.
+        if _request_takes_write_lock():
+            g.db.keep_write_lock = True
+            g.db.execute("BEGIN IMMEDIATE")
     return g.db
 
 
@@ -1999,6 +2070,15 @@ def init_db():
     # /api/skill/train. 0 means never, which the endpoint reads as "clamp the
     # first report to the elapsed budget" rather than handing it the whole 1970.
     _migrate_add_column(db, "saves", "last_train_at", "INTEGER NOT NULL DEFAULT 0")
+
+    # WHEN HP, MANA AND STAMINA WERE LAST WRITTEN - the clock the healing
+    # reconciler measures regeneration against. It used updated_at, and every
+    # kill, loot take, skill tick and equip moves updated_at, so a status write
+    # two seconds after a kill was allowed two seconds of regeneration for
+    # fifteen seconds of standing still, and honest regen was clamped. 0 on an
+    # existing row means "not recorded yet", and the reconciler falls back to
+    # updated_at for it. See _reconcile_heals().
+    _migrate_add_column(db, "saves", "pools_at", "INTEGER NOT NULL DEFAULT 0")
 
     # THE RECOVERY ADDRESS. Added by migration, not only in CREATE TABLE,
     # because elusion.db already holds real accounts - a column that appears
@@ -5254,6 +5334,7 @@ def metrics():
 # =============================================================================
 
 @app.post("/api/auth/register")
+@no_write_lock
 def register():
     """
     Create a new account
@@ -5642,6 +5723,7 @@ def _staff_login_step(db, row, data, ip, now):
 
 
 @app.post("/api/auth/login")
+@no_write_lock
 def login():
     """
     Log in and receive a session token
@@ -6058,6 +6140,7 @@ def logout_all():
 
 
 @app.post("/api/auth/password")
+@no_write_lock
 @require_auth
 def change_password():
     """
@@ -6526,6 +6609,7 @@ def get_account_email():
 
 
 @app.post("/api/account/email")
+@no_write_lock
 @require_auth
 def set_account_email():
     """
@@ -6612,6 +6696,7 @@ def set_account_email():
 
 
 @app.post("/api/account/email/verify")
+@no_write_lock
 @require_auth
 def verify_account_email():
     """
@@ -6657,6 +6742,7 @@ def verify_account_email():
 
 
 @app.post("/api/auth/recover")
+@no_write_lock
 def request_recovery():
     """
     Ask for a reset code by email
@@ -6742,6 +6828,7 @@ def request_recovery():
 
 
 @app.post("/api/auth/reset")
+@no_write_lock
 def complete_recovery():
     """
     Set a new password using the emailed code
@@ -7390,7 +7477,7 @@ def write_save():
                 """
                 UPDATE saves
                    SET max_hp = ?, hp = ?, max_mana = ?, mana = ?,
-                       max_stamina = ?, stamina = ?, xp_to_next = ?
+                       max_stamina = ?, stamina = ?, xp_to_next = ?, pools_at = ?
                  WHERE user_id = ? AND slot = ?
                 """,
                 (derived["max_hp"], derived["max_hp"],
@@ -7399,7 +7486,7 @@ def write_save():
                  # The table's DEFAULT 100 is the old curve's first level; a
                  # new character is told what the current curve says.
                  gamedata.xp_needed_for_level(int(stored["level"])),
-                 g.user["id"], slot),
+                 int(time.time()), g.user["id"], slot),
             )
         else:
             # THE POOLS COME DOWN WITH THE CEILING, never up. A maximum can fall
@@ -7973,8 +8060,15 @@ def _reconcile_heals(db, user_id, slot, before, after):
     Anything that survives all of that is a client claiming health it did not
     earn.
     """
+    # MEASURED FROM WHEN THE POOLS WERE LAST WRITTEN, not from updated_at. A
+    # kill, a loot take, a skill tick or an equip all move updated_at without
+    # touching hp or mana, and measuring from them gave a player who stood still
+    # for fifteen seconds and then killed something two seconds' worth of
+    # regeneration - found on day 1 as "mana +19 vs regen 8" while looting coins.
+    # A row written before pools_at existed reads 0 there and falls back.
+    since = int(before["pools_at"] or 0) if "pools_at" in before.keys() else 0
     elapsed = max(
-        float(int(time.time()) - int(before["updated_at"] or 0)),
+        float(int(time.time()) - (since or int(before["updated_at"] or 0))),
         HEAL_MINIMUM_ELAPSED_SECONDS,
     )
 
@@ -8263,6 +8357,9 @@ def write_player_status():
         if "hp" in updates and int(row["hp"]) > 0 and int(updates["hp"]) <= 0:
             db.execute("UPDATE users SET deaths = deaths + 1 WHERE id = ?", (user_id,))
 
+        # pools_at moves only when a pool is written - see the migration.
+        if any(f in updates for f in ("hp", "mana", "stamina")):
+            updates["pools_at"] = int(time.time())
         assignments = ", ".join("%s = ?" % f for f in updates)
         values = list(updates.values()) + [int(time.time()), user_id, slot]
         db.execute(
@@ -11591,6 +11688,8 @@ def read_broadcasts():
         "trade_resync": _take_resync(db, int(g.user["id"])),
         # WHAT WAS SAID TO YOU WHILE YOU WERE NOT LOOKING. See _chat_news().
         "chat_news": _chat_news(db, int(g.user["id"])),
+        # WHAT IS WAITING ON YOUR ANSWER. See _waiting_asks().
+        "asks": _waiting_asks(db, int(g.user["id"])),
         # LINES WAITING FOR STAFF, for staff only - a report nobody sees is a
         # report nobody reads. 0 for everyone else, not absent.
         "open_reports": _open_report_count(db) if role_at_least(g.user, "mod") else 0,
@@ -11641,6 +11740,47 @@ def _chat_news(db, user_id):
         },
         "guild": int(guild_line),
         "friends": int(friend_line),
+    }
+
+
+def _waiting_asks(db, user_id):
+    """Friend requests to this player and guild invitations waiting on their
+    answer: how many of each, and the newest one's name and time.
+
+        {"friends": {"count": 1, "newest": "caster", "at": 1790800000},
+         "guild":   {"count": 0, "newest": "", "at": 0}}
+
+    WHY IT RIDES THE POLL. Both are answered from a panel, and on day 1 nothing
+    told the player to open it: a request to somebody standing next to you sat
+    there until they happened to look. The same gap trades had (see "trade"
+    above), closed the same way, on a request that already runs every ten
+    seconds. The client lights the button while the count is above zero and
+    says the newest once.
+
+    Two indexed reads each (idx_friends_addressee, idx_guild_invites_user). An
+    invitation to a guild the player is already in cannot exist: joining or
+    founding deletes every invitation they hold.
+    """
+    friends = db.execute(
+        "SELECT COUNT(*) AS n FROM friends WHERE addressee_id = ? AND state = 'pending'",
+        (user_id,)).fetchone()
+    newest_friend = db.execute(
+        "SELECT u.username, f.created_at FROM friends f JOIN users u ON u.id = f.requester_id"
+        " WHERE f.addressee_id = ? AND f.state = 'pending'"
+        " ORDER BY f.created_at DESC, f.rowid DESC LIMIT 1", (user_id,)).fetchone()
+    invites = db.execute(
+        "SELECT COUNT(*) AS n FROM guild_invites WHERE user_id = ?", (user_id,)).fetchone()
+    newest_invite = db.execute(
+        "SELECT gl.name, i.created_at FROM guild_invites i JOIN guilds gl ON gl.id = i.guild_id"
+        " WHERE i.user_id = ? ORDER BY i.created_at DESC, i.rowid DESC LIMIT 1",
+        (user_id,)).fetchone()
+    return {
+        "friends": {"count": int(friends["n"] or 0),
+                    "newest": newest_friend["username"] if newest_friend else "",
+                    "at": int(newest_friend["created_at"] or 0) if newest_friend else 0},
+        "guild": {"count": int(invites["n"] or 0),
+                  "newest": newest_invite["name"] if newest_invite else "",
+                  "at": int(newest_invite["created_at"] or 0) if newest_invite else 0},
     }
 
 
@@ -11986,6 +12126,7 @@ def read_chat():
 
 
 @app.post("/api/chat/image")
+@no_write_lock
 @require_auth
 def chat_relay_image():
     """
@@ -12068,6 +12209,7 @@ def chat_relay_image():
 # halves have to be updated together.
 @app.post("/api/chat/upload")
 @app.post("/api/chat/image/upload")
+@no_write_lock
 @require_auth
 def chat_upload_image():
     """
@@ -15260,12 +15402,13 @@ def guild_create():
     detail = "founded %s" % name[:60]
 
     left = carry_gold
+    bank_left = bank_gold
     try:
         if from_carry:
             left = gold_delta(db, g.user["id"], slot, -from_carry,
                               "guild_found", detail)
         if from_bank:
-            bank_gold_delta(db, g.user["id"], -from_bank, "guild_found", detail)
+            bank_left = bank_gold_delta(db, g.user["id"], -from_bank, "guild_found", detail)
     except InsufficientGold:
         # The balance moved between the read above and the write - somebody
         # spending in two windows at once. Nothing has been committed, so
@@ -15293,10 +15436,18 @@ def guild_create():
     db.execute("DELETE FROM guild_invites WHERE user_id = ?", (g.user["id"],))
     db.commit()
 
+    # BOTH BALANCES AFTER THE PAYMENT, so the client can show them. Gold is
+    # the server's, so the game cannot work these out and must not try; on
+    # day 1 it did not copy them either, and a founder who paid 1,000 carried
+    # and 4,000 banked went on seeing the old purse and bank until a relog.
+    # carried_gold and bank_gold are the names /api/bank/gold answers with;
+    # "gold" stays for anything that read it before.
     return {
         "guild": guild_dict(db, guild_by_id(guild_id), now),
         "rank": "leader",
         "gold": left,
+        "carried_gold": left,
+        "bank_gold": int(bank_left if bank_left is not None else bank_gold),
         "paid": GUILD_FOUND_COST,
         "from_carried": from_carry,
         "from_bank": from_bank,
@@ -17383,11 +17534,11 @@ def character_revive():
 
     db.execute(
         "UPDATE saves SET hp = ?, mana = ?, stamina = ?, "
-        "max_hp = ?, max_mana = ?, max_stamina = ?, updated_at = ? "
+        "max_hp = ?, max_mana = ?, max_stamina = ?, updated_at = ?, pools_at = ? "
         "WHERE user_id = ? AND slot = ?",
         (derived["max_hp"], derived["max_mana"], derived["max_stamina"],
          derived["max_hp"], derived["max_mana"], derived["max_stamina"],
-         int(time.time()), user_id, slot),
+         int(time.time()), int(time.time()), user_id, slot),
     )
 
     # The marker the healing reconciler reads. Same table as a potion, because
@@ -17523,11 +17674,11 @@ def character_respawn():
 
     db.execute(
         "UPDATE saves SET hp = ?, mana = ?, stamina = ?, "
-        "max_hp = ?, max_mana = ?, max_stamina = ?, updated_at = ? "
+        "max_hp = ?, max_mana = ?, max_stamina = ?, updated_at = ?, pools_at = ? "
         "WHERE user_id = ? AND slot = ?",
         (derived["max_hp"], derived["max_mana"], derived["max_stamina"],
          derived["max_hp"], derived["max_mana"], derived["max_stamina"],
-         int(time.time()), user_id, slot),
+         int(time.time()), int(time.time()), user_id, slot),
     )
 
     # The marker _reconcile_heals() reads, exactly as the revive writes one. Its

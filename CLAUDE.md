@@ -619,6 +619,19 @@ HUD runs anyway, like `trade`. `idx_chat_to (channel, target_id, id)` is the
 index it reads; the test checks the query plan uses it. `test_chatrooms.py`,
 "what was said to you".
 
+**`asks` on the same poll** (`_waiting_asks()`): the friend requests and guild
+invitations waiting on the caller's answer, a count and the newest of each.
+Found on day 1 with two accounts: a request to somebody standing next to you
+sat unseen until they happened to open the panel. Four indexed reads
+(`idx_friends_addressee`, `idx_guild_invites_user`); `test_friends.py` checks
+the plans by catching the real statements with `set_trace_callback`, so the
+check cannot drift from the code. `test_guilds.py` holds the invitation half.
+
+**`/api/guild/create` answers with both balances after paying**
+(`carried_gold`, `bank_gold`). The game used to read only the sentence out of
+the answer, so a founder paid from the bank went on seeing the old purse and
+bank until a relog.
+
 ## Chat: ignore, report, mute
 
 IGNORE, REPORT, MUTE in app.py (the rules sit above `chat_write_check`, the
