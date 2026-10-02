@@ -332,5 +332,118 @@ check("  under names the log's filter knows",
       all(k in app_module.STAFF_ACTION_KINDS for k in ("mute", "unmute", "report")))
 
 
+# =============================================================================
+section("S-4  a card per player, closed by acting, kept 90 days")
+# =============================================================================
+DAN = account("dorian")
+EVE = account("evelyn")
+refill(*names, "dorian", "evelyn")
+for n in range(6):
+    say(BOB, "spam line %d" % n)
+say(DAN, "dan says one rude thing")
+# DAN'S REPORTS GO IN FIRST, so newest-first would put bob on top - only
+# "the most people" puts dan there.
+dan_line = line_id(ANN, "dan says one rude thing")
+for who in (ANN, CAT, EVE):
+    client.post("/api/chat/report", headers=who, json={"id": dan_line, "reason": "harassment"})
+raw("UPDATE chat_reports SET created_at = created_at - 60 WHERE reported_name = 'dorian'")
+for n in range(6):
+    client.post("/api/chat/report", headers=ANN, json={"id": line_id(ANN, "spam line %d" % n), "reason": "spam"})
+client.post("/api/chat/report", headers=CAT, json={"id": line_id(CAT, "spam line 5"), "reason": "spam"})
+
+rep = client.get("/api/staff/reports", headers=MOD).get_json()
+cards = {c["reported"]: c for c in rep.get("players", [])}
+bob_card = cards.get("bob", {})
+check("one card per reported player, not per line",
+      bob_card.get("line_count") == 6 and len(bob_card.get("lines", [])) == 6, bob_card.get("line_count"))
+check("  with how many people, which reasons, and who",
+      bob_card.get("people") == 2 and bob_card.get("reasons") == {"spam": 7}
+      and bob_card.get("reporters") == ["ann", "cat"], bob_card)
+check("  the newest of their lines first, each with its own count",
+      [l["body"] for l in bob_card.get("lines", [])][0] == "spam line 5"
+      and bob_card["lines"][0]["reports"] == 2, [l.get("body") for l in bob_card.get("lines", [])])
+check("worst first: three people about one line outrank one person about six",
+      [c["reported"] for c in rep["players"]][:2] == ["dorian", "bob"], [c["reported"] for c in rep["players"]])
+check("  the poll's number is players, and the lines are still counted",
+      rep.get("open_players") == 2 and rep.get("open") == 7
+      and client.get("/api/server/broadcasts", headers=MOD).get_json().get("open_report_players") == 2,
+      (rep.get("open_players"), rep.get("open")))
+check("  and a player is told nothing",
+      client.get("/api/server/broadcasts", headers=ANN).get_json().get("open_report_players") == 0)
+check("  the per-line list is still there for older builds",
+      len(rep.get("reports", [])) == 7, len(rep.get("reports", [])))
+app_module.REPORT_LINES_PER_PLAYER = 4
+small = next((c for c in client.get("/api/staff/reports", headers=MOD).get_json()["players"]
+              if c["reported"] == "bob"), {})
+check("a card shows only the newest few lines, and says how many there are",
+      len(small.get("lines", [])) == 4 and small.get("line_count") == 6, small.get("line_count"))
+app_module.REPORT_LINES_PER_PLAYER = 10
+
+before_log = raw("SELECT COUNT(*) FROM staff_actions WHERE action = 'report'")[0][0]
+r = client.post("/api/staff/reports/resolve", headers=MOD, json={"username": "BOB", "outcome": "dismissed"})
+check("dismissing a card closes every line on it", r.status_code == 200 and r.get_json().get("lines") == 6, r.get_json())
+after_log = raw("SELECT COUNT(*) FROM staff_actions WHERE action = 'report'")[0][0]
+check("  with one line in the log, not six", after_log - before_log == 1, after_log - before_log)
+check("  and bob's card is gone",
+      "bob" not in [c["reported"] for c in client.get("/api/staff/reports", headers=MOD).get_json()["players"]])
+check("  a second press is a 404",
+      client.post("/api/staff/reports/resolve", headers=MOD, json={"username": "bob", "outcome": "dismissed"}).status_code == 404)
+refill(*names, "dorian", "evelyn")
+say(MOD2, "a mod being rude again")
+client.post("/api/chat/report", headers=ANN, json={"id": line_id(ANN, "a mod being rude again"), "reason": "harassment"})
+check("  and so is a card about somebody a mod cannot act on",
+      client.post("/api/staff/reports/resolve", headers=MOD, json={"username": "othermod", "outcome": "dismissed"}).status_code == 404)
+check("  which a dev can close",
+      client.post("/api/staff/reports/resolve", headers=DEV, json={"username": "othermod", "outcome": "dismissed"}).status_code == 200)
+check("  or nobody", client.post("/api/staff/reports/resolve", headers=MOD,
+                                 json={"username": "nobody_here", "outcome": "dismissed"}).status_code == 404)
+
+r = client.post("/api/staff/mute", headers=MOD, json={"username": "dorian", "minutes": 60, "reason": "rude"})
+check("muting dan closes the reports about him", r.status_code == 200 and r.get_json().get("reports_closed") == 1,
+      r.get_json())
+check("  as actioned, by who muted him",
+      raw("SELECT DISTINCT outcome, resolved_by FROM chat_reports WHERE reported_name = 'dorian'") == [("actioned", "safemod")],
+      raw("SELECT DISTINCT outcome, resolved_by FROM chat_reports WHERE reported_name = 'dorian'"))
+check("  and the mute's log line says so",
+      raw("SELECT detail FROM staff_actions WHERE action = 'mute' AND target_name = 'dorian'")[0][0].endswith(
+          "closed 1 reported line"), raw("SELECT detail FROM staff_actions WHERE action = 'mute' AND target_name = 'dorian'"))
+check("  the Reports tab is empty", client.get("/api/staff/reports", headers=MOD).get_json().get("players") == [])
+
+client.post("/api/staff/unmute", headers=MOD, json={"username": "dorian"})
+refill(*names, "dorian", "evelyn")
+say(DAN, "dan again")
+client.post("/api/chat/report", headers=EVE, json={"id": line_id(EVE, "dan again"), "reason": "spam"})
+r = client.post("/api/staff/kick", headers=MOD, json={"username": "dorian"})
+check("a kick closes them too", r.status_code == 200 and r.get_json().get("reports_closed") == 1, r.get_json())
+refill(*names, "dorian", "evelyn")
+say(EVE, "eve is next")
+client.post("/api/chat/report", headers=ANN, json={"id": line_id(ANN, "eve is next"), "reason": "hate"})
+r = client.post("/api/staff/ban", headers=MOD, json={"username": "evelyn", "days": 1, "reason": "hate"})
+check("  and so does a ban", r.status_code == 200 and r.get_json().get("reports_closed") == 1, r.get_json())
+check("a sanction with nothing reported closes nothing, and says nothing about it",
+      client.post("/api/staff/kick", headers=MOD, json={"username": "cat"}).get_json().get("reports_closed") == 0
+      and not raw("SELECT detail FROM staff_actions WHERE action = 'kick' AND target_name = 'cat'")[0][0].endswith("line"))
+
+refill(*names, "dorian", "evelyn")
+say(BOB, "an old open one")
+client.post("/api/chat/report", headers=ANN, json={"id": line_id(ANN, "an old open one"), "reason": "other"})
+old_close = int(time.time()) - app_module.REPORT_KEEP_SECONDS - 60
+raw("UPDATE chat_reports SET resolved_at = ? WHERE reported_name = 'bob' AND resolved_at > 0", (old_close,))
+raw("UPDATE chat_reports SET created_at = ? WHERE resolved_at = 0", (old_close,))
+kept_open = raw("SELECT COUNT(*) FROM chat_reports WHERE resolved_at = 0")[0][0]
+check("(there is an old open report to keep)", kept_open >= 1, kept_open)
+refill(*names, "dorian", "evelyn")
+say(BOB, "a fresh line to report")
+client.post("/api/chat/report", headers=ANN, json={"id": line_id(ANN, "a fresh line to report"), "reason": "spam"})
+check("closed reports past 90 days are dropped the next time one is filed",
+      raw("SELECT COUNT(*) FROM chat_reports WHERE reported_name = 'bob' AND resolved_at > 0")[0][0] == 0,
+      raw("SELECT COUNT(*) FROM chat_reports WHERE reported_name = 'bob' AND resolved_at > 0"))
+check("  but an open one is never dropped, however old",
+      raw("SELECT COUNT(*) FROM chat_reports WHERE resolved_at = 0")[0][0] == kept_open + 1,
+      raw("SELECT COUNT(*) FROM chat_reports WHERE resolved_at = 0"))
+check("  and what staff decided is still in the log",
+      raw("SELECT COUNT(*) FROM staff_actions WHERE action = 'report' AND target_name = 'bob'")[0][0] >= 1)
+
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

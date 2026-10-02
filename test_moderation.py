@@ -510,6 +510,34 @@ code, body = get_log(OWNER, action="ban")
 check("action= lists one kind", body.get("actions") and all(e["action"] == "ban" for e in body["actions"]),
       body.get("actions"))
 
+# THE LOG OPENS ON MODERATION. The server switches and the testing tools are
+# kept out of it, and "Everything" is the other choice - nothing is hidden.
+for kind, target, detail in [("grant", "thedev", "12 x jadesword"), ("teleport", "rowdy", "-> field"),
+                             ("pvp", "server", "on"), ("maintenance", "server", "closed")]:
+    sql("INSERT INTO staff_actions (actor_id, actor_name, action, target_id, target_name, detail, created_at)"
+        " VALUES (NULL, 'thedev', ?, (SELECT id FROM users WHERE username = ?), ?, ?, ?)",
+        (kind, target, target, detail, int(time.time())))
+code, body = get_log(OWNER, action="moderation", limit=200)
+seen = {e["action"] for e in body.get("actions", [])}
+check("action=moderation leaves out grants, teleports and the server switches",
+      code == 200 and seen and not seen & {"grant", "teleport", "pvp", "maintenance", "minbuild"}
+      and seen <= set(app_module.STAFF_ACTION_GROUPS["moderation"]), seen)
+code, body = get_log(MOD, player="rowdy", action="moderation")
+check("  and keeps the bans, kicks, notes and warnings",
+      {"ban", "kick", "note", "warn"} <= {e["action"] for e in body.get("actions", [])}, body.get("actions"))
+check("  the groups are the server's, for the client's dropdown",
+      body.get("groups", {}).get("moderation") == list(app_module.STAFF_ACTION_GROUPS["moderation"]),
+      body.get("groups"))
+check("  and every kind in a group is a kind the log knows",
+      all(k in app_module.STAFF_ACTION_KINDS for g in app_module.STAFF_ACTION_GROUPS.values() for k in g))
+code, body = get_log(OWNER, limit=200)
+check("  Everything still has them", {"grant", "pvp"} <= {e["action"] for e in body.get("actions", [])})
+code, body = get_log(MOD, player="rowdy", action="moderation")
+check("a player's record on moderation leaves out the teleport and keeps the tally whole",
+      "teleport" not in [e["action"] for e in body.get("actions", [])]
+      and body.get("summary", {}).get("teleport") == 1 and body.get("summary", {}).get("ban") == 1,
+      (body.get("actions"), body.get("summary")))
+
 for label, params in [
     ("an action that is not a kind", {"action": "smite"}),
     ("a negative cursor", {"before": -1}),

@@ -4420,6 +4420,17 @@ REPORT_REASONS = ("spam", "harassment", "hate", "cheating", "other")
 # Per reporter. Far above anybody reporting what they see; below somebody
 # using the button to flood the staff panel.
 REPORTS_PER_HOUR = 20
+# CLOSED REPORTS ARE KEPT THIS LONG, then dropped the next time a report is
+# filed or closed. What staff decided stays in staff_actions for good (one
+# "report" line per close); this table only holds the evidence a question
+# about that decision would need, and 90 days is longer than any mute or
+# temporary ban a mod can give.
+REPORT_KEEP_SECONDS = 90 * 24 * 60 * 60
+# ONE CARD PER REPORTED PLAYER on the Reports tab, worst first, and the newest
+# few of their lines on it. Twenty lines from one spammer are one thing to do,
+# not twenty.
+REPORT_PLAYERS_SHOWN = 50
+REPORT_LINES_PER_PLAYER = 10
 # A mod's mute is at most a day - longer is a ban's job, and a ban has a rank
 # ladder of its own. Dev and the owner can go to thirty days.
 MUTE_MAX_MINUTES_MOD = 24 * 60
@@ -4480,6 +4491,45 @@ def _open_report_count(db):
     at - three reports of one line are one thing to do."""
     return int(db.execute("SELECT COUNT(DISTINCT message_id) FROM chat_reports"
                           " WHERE resolved_at = 0").fetchone()[0] or 0)
+
+
+def _open_report_players(db):
+    """Players with an open report - the Staff button's number. Twenty lines
+    from one spammer are one player to deal with, and a count of lines made a
+    single bad afternoon read as a crisis."""
+    return int(db.execute("SELECT COUNT(DISTINCT reported_id) FROM chat_reports"
+                          " WHERE resolved_at = 0").fetchone()[0] or 0)
+
+
+def _prune_reports(db, now):
+    """Closed reports past REPORT_KEEP_SECONDS. Pruned on write, like chat:
+    no sweeper job to forget to run. Open ones are never pruned - a report
+    nobody has looked at is still waiting, however old it is."""
+    db.execute("DELETE FROM chat_reports WHERE resolved_at > 0 AND resolved_at < ?",
+               (now - REPORT_KEEP_SECONDS,))
+
+
+def _close_reports_about(db, actor, user_id, outcome, now):
+    """Close every open report about one account. Returns how many LINES that
+    was. Called by the Reports tab's per-player buttons, and by a mute, kick or
+    ban - acting on somebody answers what they were reported for, so staff do
+    not have to come back and tidy the tab afterwards."""
+    lines = int(db.execute(
+        "SELECT COUNT(DISTINCT message_id) FROM chat_reports"
+        " WHERE reported_id = ? AND resolved_at = 0", (int(user_id),)).fetchone()[0] or 0)
+    if lines:
+        db.execute("UPDATE chat_reports SET resolved_at = ?, resolved_by = ?, outcome = ?"
+                   " WHERE reported_id = ? AND resolved_at = 0",
+                   (now, actor["username"], outcome, int(user_id)))
+    return lines
+
+
+def _closed_words(lines):
+    """What a sanction's log line adds when it closed reports: the log says
+    why they left the Reports tab."""
+    if lines <= 0:
+        return ""
+    return " - closed %d reported line%s" % (lines, "" if lines == 1 else "s")
 
 
 def _friend_ids(db, user_id):
@@ -9651,9 +9701,11 @@ def ban_account():
     # keeps playing until it expires, which on this server is thirty days.
     db.execute("DELETE FROM sessions WHERE user_id = ?", (target["id"],))
 
+    closed = _close_reports_about(db, g.user, target["id"], "actioned", now)
     log_staff_action(
         g.user, "ban", target["username"], target["id"],
-        "permanent: %s" % reason if permanent else "%d days: %s" % (parse_stat(raw_days), reason),
+        ("permanent: %s" % reason if permanent else "%d days: %s" % (parse_stat(raw_days), reason))
+        + _closed_words(closed),
     )
     db.commit()
 
@@ -9664,6 +9716,7 @@ def ban_account():
         "expires_at": expires_at,
         "reason": reason,
         "banned_by": g.user["username"],
+        "reports_closed": closed,
     }, 200
 
 
@@ -9743,9 +9796,10 @@ def kick_account():
     # but leaving it behind means "signed out everywhere" is not quite true.
     db.execute("DELETE FROM sessions WHERE user_id = ?", (target["id"],))
 
+    closed = _close_reports_about(db, g.user, target["id"], "actioned", int(time.time()))
     log_staff_action(
         g.user, "kick", target["username"], target["id"],
-        "%d session(s)%s" % (live, (": " + reason) if reason else ""),
+        "%d session(s)%s%s" % (live, (": " + reason) if reason else "", _closed_words(closed)),
     )
     db.commit()
 
@@ -9754,6 +9808,7 @@ def kick_account():
         "sessions_ended": live,
         "banned": False,
         "by": g.user["username"],
+        "reports_closed": closed,
     }, 200
 
 
@@ -10418,6 +10473,20 @@ STAFF_ACTION_KINDS = (
     "maintenance", "minbuild", "pvp",
 )
 
+# NAMED SETS OF KINDS the log can be asked for by one name (?action=moderation).
+#
+# "moderation" IS WHAT THE LOG AND A PLAYER'S RECORD OPEN ON: what staff did
+# about players and what players said. Left out are the server switches
+# (maintenance, minbuild, pvp) and the testing tools (grant, teleport) - the
+# owner granting himself twelve swords while testing a shop is not something
+# a mod looking for "has anybody warned this player" should scroll past.
+# "Everything" is still one choice away; nothing is hidden from anybody who
+# could read it before.
+STAFF_ACTION_GROUPS = {
+    "moderation": ("ban", "unban", "kick", "warn", "note", "role", "chat_delete",
+                   "mute", "unmute", "report", "guild_rename", "guild_disband"),
+}
+
 # WRITTEN FOR THE PEOPLE WHO CAN ACT ON THE ACCOUNT, NOT FOR THE ACCOUNT.
 #
 # A note or a warning is an opinion about a person, kept so the next member of
@@ -10736,7 +10805,11 @@ def _staff_log_query(viewer, player="", staff="", kind="", before=0, limit=STAFF
                    + " AND ".join(where) + " GROUP BY sa.action")
     summary_params = list(params)
 
-    if kind:
+    if kind in STAFF_ACTION_GROUPS:
+        group = STAFF_ACTION_GROUPS[kind]
+        where.append("sa.action IN (%s)" % ",".join("?" * len(group)))
+        params += list(group)
+    elif kind:
         where.append("sa.action = ?")
         params.append(kind)
     if before:
@@ -10776,7 +10849,7 @@ def staff_action_log():
       - in: query
         name: action
         type: string
-        description: "Only this kind - one of the response's `kinds`."
+        description: "Only this kind - one of the response's `kinds` - or a set by name, one of `groups` (moderation)."
       - in: query
         name: before
         type: integer
@@ -10806,8 +10879,9 @@ def staff_action_log():
     before = _query_int("before", 0, 0, 2 ** 62)
     limit = _query_int("limit", STAFF_PAGE_DEFAULT, 1, STAFF_PAGE_MAX)
 
-    if kind and kind not in STAFF_ACTION_KINDS:
-        return bad_request("action must be one of: %s" % ", ".join(STAFF_ACTION_KINDS))
+    if kind and kind not in STAFF_ACTION_KINDS and kind not in STAFF_ACTION_GROUPS:
+        return bad_request("action must be one of: %s" % ", ".join(
+            list(STAFF_ACTION_GROUPS) + list(STAFF_ACTION_KINDS)))
     if before is None:
         return bad_request("before must be a whole number, 0 or more")
     if limit is None:
@@ -10835,6 +10909,7 @@ def staff_action_log():
         "more": more,
         "next_before": entries[-1]["id"] if more else None,
         "kinds": list(STAFF_ACTION_KINDS),
+        "groups": {name: list(group) for name, group in STAFF_ACTION_GROUPS.items()},
         "now": int(time.time()),
     }
 
@@ -11710,6 +11785,9 @@ def read_broadcasts():
         # LINES WAITING FOR STAFF, for staff only - a report nobody sees is a
         # report nobody reads. 0 for everyone else, not absent.
         "open_reports": _open_report_count(db) if role_at_least(g.user, "mod") else 0,
+        # AND HOW MANY PLAYERS THOSE LINES ARE ABOUT, which is the number on
+        # the Staff button: one card each on the Reports tab.
+        "open_report_players": _open_report_players(db) if role_at_least(g.user, "mod") else 0,
     }, 200
 
 
@@ -12671,6 +12749,7 @@ def report_chat_line():
         return {"error": "Too Many Requests",
                 "message": "You have sent a lot of reports this hour. Staff have them - "
                            "try again later."}, 429
+    _prune_reports(db, now)
     db.execute(
         "INSERT INTO chat_reports (message_id, reporter_id, reporter_name, reported_id,"
         " reported_name, channel, body, image_id, said_at, reason, created_at)"
@@ -12687,7 +12766,7 @@ def report_chat_line():
 @require_role("mod")
 def staff_reports():
     """
-    Reported chat lines, one entry per line
+    Reported chat lines - one card per reported player, and one entry per line
     ---
     tags:
       - Moderation
@@ -12702,7 +12781,7 @@ def staff_reports():
         description: "open (the default) or all"
     responses:
       200:
-        description: '{"reports": [...], "open": n, "now": t}'
+        description: '{"players": [...], "reports": [...], "open": n, "open_players": n, "now": t}'
       400:
         description: A state that is neither open nor all
     """
@@ -12713,27 +12792,46 @@ def staff_reports():
     where = "WHERE resolved_at = 0" if state == "open" else ""
     rows = db.execute("SELECT * FROM chat_reports %s ORDER BY created_at DESC, id DESC LIMIT 500"
                       % where).fetchall()
+    # ONE ENTRY PER LINE - the shape every build before the per-player cards
+    # reads, kept so a staff member on an older build still sees their tab.
+    out = _report_lines(db, rows, 100)
+    return {
+        "players": _report_players(db, state),
+        "reports": out,
+        "open": _open_report_count(db),
+        "open_players": _open_report_players(db),
+        "now": int(time.time()),
+    }, 200
+
+
+def _report_lines(db, rows, most):
+    """Report rows, newest first, folded into one entry per reported line -
+    at most `most` lines."""
     grouped = {}
     order = []
     for row in rows:
         key = int(row["message_id"])
         if key not in grouped:
-            if len(order) >= 100:
+            if len(order) >= most:
                 continue
             order.append(key)
             grouped[key] = {"rows": []}
         grouped[key]["rows"].append(row)
     out = []
+    users = {}
     for key in order:
         group = grouped[key]["rows"]
         first = group[-1]
-        reported = _user_by_name(first["reported_name"])
+        name = first["reported_name"]
+        if name not in users:
+            users[name] = _user_by_name(name)
+        reported = users[name]
         reasons = {}
         for row in group:
             reasons[row["reason"]] = reasons.get(row["reason"], 0) + 1
         out.append({
             "message_id": key,
-            "reported": first["reported_name"],
+            "reported": name,
             "reported_role": role_for(reported) if reported is not None else "player",
             "channel": first["channel"],
             "body": first["body"],
@@ -12753,7 +12851,61 @@ def staff_reports():
             "line_exists": db.execute("SELECT 1 FROM chat_messages WHERE id = ?",
                                       (key,)).fetchone() is not None,
         })
-    return {"reports": out, "open": _open_report_count(db), "now": int(time.time())}, 200
+    return out
+
+
+def _report_players(db, state):
+    """One card per reported player: who, how many lines and how many people,
+    every reason, and their newest lines.
+
+    WORST FIRST: the most different people reporting them, then the most
+    recent report. Ten players reporting one person outranks one player
+    reporting ten lines - the second is as likely a grudge as a problem.
+
+    COUNTED IN SQL, ACROSS EVERY OPEN REPORT, not over a fetched page: a
+    spammer with three hundred reported lines is one card that says 300, and
+    does not push everybody else off the end of a 500-row read."""
+    where = "WHERE resolved_at = 0" if state == "open" else ""
+    heads = db.execute(
+        "SELECT reported_id, MAX(reported_name) AS reported_name,"
+        " COUNT(DISTINCT message_id) AS lines, COUNT(*) AS reports,"
+        " COUNT(DISTINCT reporter_id) AS people,"
+        " MIN(created_at) AS first_at, MAX(created_at) AS last_at"
+        " FROM chat_reports %s GROUP BY reported_id"
+        " ORDER BY people DESC, last_at DESC LIMIT ?" % where,
+        (REPORT_PLAYERS_SHOWN,)).fetchall()
+    players = []
+    for head in heads:
+        reported_id = int(head["reported_id"])
+        clause = "reported_id = ?" + (" AND resolved_at = 0" if state == "open" else "")
+        reasons = {
+            r["reason"]: int(r["n"]) for r in db.execute(
+                "SELECT reason, COUNT(*) AS n FROM chat_reports WHERE %s GROUP BY reason"
+                " ORDER BY n DESC, reason" % clause, (reported_id,)).fetchall()}
+        reporters = [r[0] for r in db.execute(
+            "SELECT DISTINCT reporter_name FROM chat_reports WHERE %s"
+            " ORDER BY reporter_name LIMIT 20" % clause, (reported_id,)).fetchall()]
+        rows = db.execute(
+            "SELECT * FROM chat_reports WHERE %s ORDER BY created_at DESC, id DESC LIMIT ?" % clause,
+            (reported_id, REPORT_LINES_PER_PLAYER * 20)).fetchall()
+        lines = _report_lines(db, rows, REPORT_LINES_PER_PLAYER)
+        reported = _user_by_name(head["reported_name"])
+        players.append({
+            "reported": head["reported_name"],
+            "reported_role": role_for(reported) if reported is not None else "player",
+            "actionable": reported is not None and can_act_on(g.user, reported),
+            "line_count": int(head["lines"]),
+            "reports": int(head["reports"]),
+            "people": int(head["people"]),
+            "reporters": reporters,
+            "reasons": reasons,
+            "first_at": int(head["first_at"]),
+            "last_at": int(head["last_at"]),
+            # The newest REPORT_LINES_PER_PLAYER of them; line_count says how
+            # many there are in all.
+            "lines": lines,
+        })
+    return players
 
 
 @app.post("/api/staff/reports/resolve")
@@ -12761,7 +12913,7 @@ def staff_reports():
 @require_role("mod")
 def resolve_reports():
     """
-    Close every open report on one line
+    Close every open report on one line, or every open report about one player
     ---
     tags:
       - Moderation
@@ -12775,9 +12927,10 @@ def resolve_reports():
         required: true
         schema:
           type: object
-          required: [message_id, outcome]
+          required: [outcome]
           properties:
-            message_id: {type: integer}
+            message_id: {type: integer, description: "One line. Give this or username."}
+            username:   {type: string, description: "Everything open about this player - their card on the Reports tab."}
             outcome:    {type: string, enum: [dismissed, actioned]}
     responses:
       200:
@@ -12785,19 +12938,21 @@ def resolve_reports():
       400:
         description: A bad id or outcome
       404:
-        description: No open report on that line, or one about somebody you cannot act on
+        description: No open report on that line or player, or one about somebody you cannot act on
     """
     payload = request.get_json(silent=True) or {}
+    outcome = str(payload.get("outcome", "")).strip().lower()
+    if outcome not in ("dismissed", "actioned"):
+        return bad_request("outcome must be dismissed or actioned")
+    db = get_db()
+    if "username" in payload and "message_id" not in payload:
+        return _resolve_reports_about(db, str(payload.get("username") or "").strip(), outcome)
     try:
         message_id = int(payload.get("message_id", 0))
     except (TypeError, ValueError):
         message_id = 0
     if message_id <= 0:
         return bad_request("message_id must be a whole number")
-    outcome = str(payload.get("outcome", "")).strip().lower()
-    if outcome not in ("dismissed", "actioned"):
-        return bad_request("outcome must be dismissed or actioned")
-    db = get_db()
     first = db.execute("SELECT * FROM chat_reports WHERE message_id = ? AND resolved_at = 0"
                        " ORDER BY id LIMIT 1", (message_id,)).fetchone()
     not_found = ({"error": "Not Found", "message": "No open report on that line."}, 404)
@@ -12812,8 +12967,35 @@ def resolve_reports():
                         (now, g.user["username"], outcome, message_id)).rowcount
     log_staff_action(g.user, "report", first["reported_name"], first["reported_id"],
                      "%s: %s" % (outcome, str(first["body"] or "(a picture)")[:100]))
+    _prune_reports(db, now)
     db.commit()
     return {"message_id": message_id, "outcome": outcome, "closed": closed}, 200
+
+
+def _resolve_reports_about(db, username, outcome):
+    """Every open report about one player, closed together - the Dismiss on
+    their card. ONE line in the log for the lot, not one per reported line:
+    the log is read by people, and twenty "dismissed" lines say one thing."""
+    not_found = ({"error": "Not Found", "message": "No open report about that player."}, 404)
+    if not username or len(username) > 64:
+        return not_found
+    reported = _user_by_name(username)
+    # THE SAME 404 for nobody, nothing open, and somebody out of your reach,
+    # as the one-line close gives.
+    if reported is None or not can_act_on(g.user, reported):
+        return not_found
+    newest = db.execute("SELECT body FROM chat_reports WHERE reported_id = ? AND resolved_at = 0"
+                        " ORDER BY created_at DESC, id DESC LIMIT 1", (int(reported["id"]),)).fetchone()
+    if newest is None:
+        return not_found
+    now = int(time.time())
+    lines = _close_reports_about(db, g.user, reported["id"], outcome, now)
+    log_staff_action(g.user, "report", reported["username"], reported["id"],
+                     "%s %d line%s, newest: %s" % (outcome, lines, "" if lines == 1 else "s",
+                                                   str(newest["body"] or "(a picture)")[:100]))
+    _prune_reports(db, now)
+    db.commit()
+    return {"username": reported["username"], "outcome": outcome, "lines": lines}, 200
 
 
 @app.post("/api/staff/mute")
@@ -12869,11 +13051,12 @@ def mute_account():
     until = int(time.time()) + minutes * 60
     db.execute("UPDATE users SET chat_muted_until = ?, chat_mute_reason = ?, chat_muted_by = ?"
                " WHERE id = ?", (until, reason, g.user["username"], target["id"]))
+    closed = _close_reports_about(db, g.user, target["id"], "actioned", int(time.time()))
     log_staff_action(g.user, "mute", target["username"], target["id"],
-                     "%s: %s" % (_wait_words(minutes * 60), reason))
+                     "%s: %s%s" % (_wait_words(minutes * 60), reason, _closed_words(closed)))
     db.commit()
     return {"username": target["username"], "muted": True, "until": until,
-            "reason": reason, "muted_by": g.user["username"]}, 200
+            "reason": reason, "muted_by": g.user["username"], "reports_closed": closed}, 200
 
 
 @app.post("/api/staff/unmute")

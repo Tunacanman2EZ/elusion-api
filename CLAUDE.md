@@ -682,11 +682,31 @@ routes after `chat_delete`); `test_chatsafety.py` holds all three.
   `_can_read_chat_row()` is the read's own rules, one line at a time: you can
   only report a line you were shown, so the route is not a way to find out
   which ids are other people's whispers. One report per reporter per line,
-  `REPORTS_PER_HOUR` per reporter. Staff get one entry per LINE with a count;
-  resolving closes every report on the line; `chat_delete` closes them as
-  `deleted`. `open_reports` rides the broadcast poll for mod and up (0 for
-  everyone else). A mod cannot close a report about another mod - the same
+  `REPORTS_PER_HOUR` per reporter. `chat_delete` closes a line's reports as
+  `deleted`. A mod cannot close a report about another mod - the same
   `can_act_on()` as every sanction.
+- **Staff see a card per reported PLAYER** (day 1: the tab would flood).
+  `GET /api/staff/reports` answers `players` - who, `line_count`, `people`,
+  `reasons`, `reporters` and their newest `REPORT_LINES_PER_PLAYER` lines -
+  counted in SQL over every open report (`_report_players()`), worst first:
+  the most different people reporting them, then the newest. Ten people about
+  one line outrank one person about ten. The per-line `reports` list stays
+  for older builds. `resolve` takes `username` as well as `message_id` and
+  closes everything open about that player with ONE line in the log.
+- **Acting on somebody closes their reports.** A mute, kick or ban calls
+  `_close_reports_about()` (outcome `actioned`), says so in the sanction's
+  log line ("closed 5 reported lines") and answers `reports_closed`. Nobody
+  has to come back and tidy the tab.
+- **Closed reports are kept 90 days** (`REPORT_KEEP_SECONDS`), pruned on the
+  next report filed or closed (`_prune_reports()`), like chat. What staff
+  decided stays in `staff_actions` for good. An open report is never pruned.
+- `open_reports` (lines) and `open_report_players` ride the broadcast poll for
+  mod and up (0 for everyone else); the Staff button counts players.
+- **The log opens on moderation.** `STAFF_ACTION_GROUPS["moderation"]` is
+  what staff did about players (bans, kicks, mutes, warnings, notes, ranks,
+  reports, deletions, guild renames): `?action=moderation` leaves out the
+  server switches and the testing tools (grant, teleport). The answer carries
+  `groups` for the client's dropdown. A player's record asks for it too.
 - **A mute is three columns on users** (`chat_muted_until`, reason, by), read
   by `chat_mute_state()`, refused in `chat_send` before the flood bucket so a
   muted player's attempts cost nothing. A mod's longest is a day
