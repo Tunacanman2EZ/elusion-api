@@ -277,7 +277,7 @@ Anything not on this list that later turns out to be true belongs on it.
 
 | For | Read |
 |---|---|
-| Threat model, and every finding E-1…E-15 with what happened to it | [`SECURITY_NOTES.md`](SECURITY_NOTES.md) |
+| Threat model, and every finding E-1…E-20 with what happened to it | [`SECURITY_NOTES.md`](SECURITY_NOTES.md) |
 | Who owns which field, and the exact request/response of every route | [`docs/apicontract.md`](../../Elusion_RPG/docs/apicontract.md) *(game repo)* |
 | TLS, the proxy setting, secrets, backups, monitoring, "before the first stranger connects" | [`DEPLOY.md`](DEPLOY.md) |
 | Ranks, conventions, and the traps that cost a day each | [`CLAUDE.md`](CLAUDE.md) |

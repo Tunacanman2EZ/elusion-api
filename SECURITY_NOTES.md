@@ -1,7 +1,7 @@
 # Security Notes — Elusion API
 
 > **Looking for the security model?** It is one page: **[SECURITY.md](SECURITY.md)**
-> — the premise, who is trusted with what, sixteen invariants each naming the test
+> — the premise, who is trusted with what, the invariants, each naming the test
 > that holds it, and the honest limits. This file is the *findings log* behind it:
 > every finding, what it let an attacker do, and what happened to it since. Long
 > on purpose, and not the place to start.
@@ -38,12 +38,16 @@ lives.
 | E-14 | A kick or a ban never reached a game that was already running | medium (moderation) | **Closed** | A kicked or banned player keeps playing for as long as they leave the game open. | **Heartbeat.** The game re-checks its session every 15 seconds and on any 401, and a dead session sends it to the login screen — a kick lands in about a second. Only a 401 signs anyone out, so a server restart is never a mass kick. |
 | E-15 | Broken access control (IDOR) — can you name a row that is not yours? | critical if present | **Audited, nothing found** — one adjacent gap closed | A player sends somebody else's record id and edits, empties or deletes it. One Postman request, no modified client needed. | **Structural, two ways.** Every id a client may name is scoped inside the query, so "not yours" and "does not exist" are one 404; and the highest-value rows (trades) accept no id at all — every route resolves them from the caller. `test_ownership.py` runs the attack on every surface and enforces the convention on the source. The gap that was real: a deleted chat message left its picture being served. |
 | E-16 | **The death screen's other exit was never migrated** | **high (balance + economy)** | **Closed** | Accepting death healed the character on the player's own machine and zeroed the carry gold locally — so the refill was unauthorised, and the penalty never reached the server at all. Death took your items, refunded your gold, and left you on 52 hp. | **Server-side authority.** `POST /api/character/respawn` refuses a living character, burns the carried gold through `gold_delta()` under the reason `death`, empties `carry_items`, refills the three pools from the class curve and writes the grant E-9's reconciler reads. Found by a player report, not by an audit — see below. |
+| E-17 | **Two requests sent together could both spend the same thing** | **critical (economy)** | **Closed** | Two requests arriving at once both read the old balance: one loot cell paid five times, one purse was deposited into the bank twice, one potion explained five heals. Two clicks or a short script mints items and gold. | **Serialisation.** Every write request takes SQLite's write lock (`BEGIN IMMEDIATE`) before its first read and holds it to the end; nine slow routes are named exceptions. `test_concurrency.py` fires real requests together on threads. Found by playing: one sword swing killed two enemies and one kill's XP vanished. |
+| E-18 | **Accept agreed to whatever was on the table when the trade ran** | **high (economy)** | **Closed** | The other player could swap the sword for a stick between your look and your click, and your accept went through. And the first to accept could lose what they received on their next ordinary save. | **Compare-and-set.** Accept names the revision of the offer it drew, and the write is conditioned on it. Both bags are flagged in the trade's own transaction, and a whole-bag save built before the trade is refused with the bag the server holds. `test_trades.py`. |
+| E-19 | Two games on one account each saved their own bag | medium (integrity) | **Closed** | Two copies of the game on one account overwrote each other's bag and lost items, and a stolen token kept working beside the owner's. | **One session at a time.** A login that gets its token, or a game resuming a remembered one, ends every other session on the account; resuming keeps the original end date. `test_accounts.py`. |
+| E-20 | **A staff password was the only thing between a guesser and the moderation desk** | **high (moderation)** | **Closed** — with a named limit | Staff names are public (the crown, the MOD and DEV badges), so their passwords are the ones worth guessing; one guessed password gives bans, notes and IP addresses. | **Second factor.** A staff login with a confirmed recovery address answers 202 and emails a six-digit code; only the code gets a token. A computer that proved itself is trusted for 30 days, at the rank it was trusted at. With no address or no mail it stands aside and says so. `test_staffcode.py`. |
 
-Fifteen findings: fourteen closed, one open. Plus E-15, an audit that went
+Nineteen findings: eighteen closed, one open. Plus E-15, an audit that went
 looking and came back empty — kept, because a search that finds nothing is
 still a result and the reasoning is the point.
 
-**The Fix column has a shape.** Six of the sixteen fixes are *server-side
+**The Fix column has a shape.** Six of the twenty fixes are *server-side
 authority* — something the client could write, which the server now owns. The
 rest are limits on rate, checks on what is plausible, and tooling for staff.
 Read down that column before reading anything else in this file.
@@ -78,14 +82,14 @@ owned. After two, the question stopped being "is this endpoint safe" and became
 **"which fields can a client still write, and who decided that?"** — and the
 answer for the rest is now a list rather than an assumption.
 
-Covered by twelve suites, all green together — 1,635 checks, run with one
-command (`run_tests.ps1`):
-`test_api.py` (454) · `test_economy.py` (295) · `test_security.py` (248) ·
-`test_equipment.py` (197) · `test_loot.py` (182) · `test_throttle.py` (55) ·
-`test_settings.py` (49) · `test_map.py` (48) · `test_gathering.py` (44) ·
-`test_healing.py` (28) · `test_equipmove.py` (22) · `test_catalogue.py` (13).
+Covered by every suite in the folder, all green together, run with one command
+(`run_tests.ps1`), which prints how many suites and checks there are at the top
+of every run. **No count is written here on purpose.** This paragraph used to
+give one (twelve suites, 1,635 checks) and both numbers had more than doubled by
+the time anybody read it again; CLAUDE.md gives the same rule for the same
+reason.
 
-`test_catalogue.py` is the odd one and deliberately so. The other nine point
+`test_catalogue.py` is the odd one and deliberately so. The others point
 `ELUSION_GAMEDATA` at a fixture they build themselves, which is correct — a
 test of the spawn ceiling should control how many of an enemy exist. It also
 means none of them ever read the file that ships, which is exactly how E-13
@@ -1023,6 +1027,16 @@ Twelve checks in `test_security.py`, and most of them assert what a kick does
 does not reach further than a ban would, and kicking an account with nothing
 live reports zero rather than erroring.
 
+**Since then the ladder has a rung below the kick, and players can point at
+what needs it.** A **mute** stops a player speaking in world chat, whispers
+and their guild, and nothing else: they keep playing. A mod can mute for at
+most a day (`MUTE_MAX_MINUTES_MOD`), a dev for longer, under the same reach as
+every sanction. A **report** names one chat line, and only a line the reporter
+was shown, so the route cannot be used to find out which ids are other people's
+whispers. Staff see one card per reported player; a mute, kick or ban closes
+that player's reports, and every one of those actions is in the moderation log.
+`test_chatsafety.py`, and SECURITY.md invariants 23 and 26.
+
 ### E-13 — Four protections were unarmed against the shipped catalogue · CLOSED
 
 Not an attack. Found by reading the file the server actually loads, while
@@ -1331,6 +1345,10 @@ Worth being explicit so the migration does not accidentally regress them:
 - **The vendor destroys gold rather than moving it**, and the kingdom board sums
   the ledger on request instead of keeping a running total. A second place the
   truth lives is a first disagreement nobody can resolve.
+- **Two requests cannot spend the same thing** — every write holds the
+  database's write lock from its first read (E-17).
+- **Staff logins take a second factor** when there is an address to send it to
+  (E-20).
 - **`.gitignore`** uses prefix patterns (`*.db.*`) precisely because a plain
   `*.db` once let a `.db.before-…` backup slip into a commit. That lesson is
   written into the file itself.
@@ -1410,6 +1428,105 @@ wrong first time round — it measured the character whose only burn *was* the
 death, so a `lost` column summing every burn passed it; `tradealice`, who has
 spent and never respawned, is the control that separates them.
 
+### E-17 — Two requests sent together could both spend the same thing · CLOSED
+
+**Found by playing.** A warrior's slash wave killed two enemies at once, the
+game sent both kill reports together, and one kill's XP was gone. Six kills
+sent together banked 99 XP of the 676 their answers had promised; the game
+added up all 676, levelled up before the server did, refilled its mana, and
+the heal check (E-9) clamped that as a cheat.
+
+**The cause was one shape in many routes.** sqlite3 opens a transaction at the
+first INSERT, UPDATE or DELETE, not at the first SELECT. A route that read a
+balance, worked out the new one in Python and wrote it back could run twice at
+once, and both copies read the old figure. Lost XP was the harmless version.
+The same shape let **one loot cell pay out five times, one purse be deposited
+into the bank twice, and one potion explain five heals**. That is item and gold
+duplication for anyone who can send two requests at once, which is anyone.
+
+**The fix is one rule, not a list.** `get_db()` runs `BEGIN IMMEDIATE` for
+every POST, PUT, PATCH and DELETE before the route reads anything, and
+`_WriteLockedConnection` takes the lock again after each `commit()`, so a route
+that commits part-way is still covered (THE WRITE LOCK in app.py). A new write
+route gets it without anyone remembering. Nine routes opt out with
+`@no_write_lock` because they do slow work first, a password hash or a picture
+fetch; `test_concurrency.py` names all nine, so a tenth fails the suite until
+somebody writes down why. It cost nothing measurable: `loadtest.py` on the kill
+route ran at about 550 writes a second before and after.
+
+**What holds it.** `test_concurrency.py` sends real requests together on real
+threads against a real server, and holds each route's read-to-write window open
+for 50 ms, so the old race fails every run rather than now and then.
+
+**The honest limit is the database.** The lock is SQLite's. A move to Postgres
+or anything else has to keep this promise with row locks or serialisable
+transactions, because Postgres, like most databases, does not make every write
+wait its turn by default. Run `test_concurrency.py` against the new database
+before anything else.
+
+### E-18 — Accept agreed to whatever was on the table when the trade ran · CLOSED
+
+Found by driving a trade between two real accounts, as were the other trade
+fixes in CLAUDE.md.
+
+**The swap.** Accept meant "run the trade as it stands", not "run the trade I
+looked at". An offer changed a moment before the click was accepted anyway, so
+the other side could turn "accept the sword" into "accept the stick" by being
+faster than a poll. `trades.revision` now moves on every real change, and
+`POST /api/trade/confirm` must name the revision the client drew. The UPDATE is
+conditioned on it: a compare-and-set, not a read-then-write.
+
+**The lost item.** Whoever accepted first is not the one whose request runs the
+trade, so their game was told nothing, and its next whole-bag save deleted what
+they had just received. Both characters are now flagged in the trade's own
+transaction, a whole-bag save is refused while the flag is up and answered with
+the bag the server holds, and the trade poll and the broadcast poll both
+deliver it.
+
+`test_trades.py`; SECURITY.md invariants 19 and 20.
+
+### E-19 — Two games on one account each saved their own bag · CLOSED
+
+Each copy of the game held its own bag, and the bag write replaces the whole
+bag, so two games on one account overwrote each other and lost items. The same
+gap let a stolen token keep working beside the owner's own.
+
+**One login at a time.** A login that gets its token ends every other session
+on the account, and so does `POST /api/auth/resume`, which a game calls on boot
+with a remembered token. Resuming keeps the login's original end date, so a
+remembered login cannot renew itself forever. The ended token's hash is kept
+for a day so its next request can be told `signed_in_elsewhere` rather than a
+bare 401. A wrong password, a ban or a staff code still owed ends nothing.
+
+`test_accounts.py`; SECURITY.md invariant 22.
+
+### E-20 — A staff password was the only thing between a guesser and the moderation desk · CLOSED
+
+The lockout (E-5) slows guessing; it does not change whose password is worth
+guessing, and staff names are on every screen. One guessed mod password is the
+staff desk: bans, notes, linked accounts and IP addresses.
+
+**A second factor.** For a mod, dev or the owner with a confirmed recovery
+address, a correct password answers **202** with no token and emails a
+six-digit code; the same login sent with the code gets the token. Codes are
+hashed, live 15 minutes, burn after five misses, and count toward the account
+lockout; at most one is sent a minute. A wrong code is 400, never 401, which
+the game would read as a wrong password. Nothing is sent before the password
+and the ban check pass.
+
+**Once per computer, not once per login.** A login that got in with a code is
+given a device token, stored as a hash. The same computer sending it back needs
+no code for 30 days (`TRUSTED_DEVICE_DAYS`), and only at the rank it was
+trusted at, so a promotion or demotion asks again. A password change, a
+recovery reset and "log out everywhere" forget every computer.
+
+**The named limit.** With no confirmed address, no mail on the server, or
+`ELUSION_STAFF_LOGIN_CODES=off`, the step stands aside rather than lock the
+owner out of their own server. The login answer says so (`staff_unprotected`),
+the game tells that player once, and the boot log says it for the server.
+
+`test_staffcode.py`; SECURITY.md invariant 21 and its honest limits.
+
 ---
 
 ## The security bot — attacking a running server, not the source
@@ -1470,6 +1587,10 @@ done:
    local play, wrong for anything public.
 3. **Set `ELUSION_TRUSTED_PROXIES`** to match the deployment, or the per-IP
    throttle is either useless or catastrophic — see E-5.
+4. **If the database changes, the write lock has to come with it.** E-17's fix
+   is SQLite's `BEGIN IMMEDIATE`. On another database it must become row locks
+   or serialisable transactions, proven by running `test_concurrency.py`
+   against it before the first player connects.
 
 ---
 
@@ -1611,8 +1732,8 @@ player-run client, the server is the only place that authority can live.
 
 ## Fix roadmap — what is left
 
-The original roadmap had six steps. Five are done; this is what remains, in
-the order it should happen.
+The original roadmap had six steps and grew to ten. Every step but the last is
+done.
 
 1. ~~`debug=False` by default~~ → **E-4 closed.**
 2. ~~Close the client-side item-granting paths~~ → done; every legitimate gain
@@ -1632,9 +1753,11 @@ the order it should happen.
    evidence for tightening it later. The one follow-up worth remembering is not
    code: **watch that band, and lower `HEAL_CLAMP_MARGIN` to 1.25 once it has
    stayed empty across real play.**
-9. **Give defense, agility and magic server-observed events** to grant against.
-   Not a heuristic — see the note under E-2 above on why a character-level bound
-   is wrong for skills that train on movement and damage taken.
+9. ~~Give defense, agility and magic server-granted XP~~ → done, as E-2
+   records: the client reports raw activity to `/api/skill/train` and the
+   server clamps each skill to a per-second ceiling times elapsed time. That is
+   a bound, not an observed event; server-observed events arrive with the same
+   encounter state that step 10 needs.
 10. **Verify the kill** — server-side encounter state → closes **E-3**, the
     last one open. Note that tying kills to the character's *area* is not a
     substitute: `saves.area` is written by the client, so a client that wants
