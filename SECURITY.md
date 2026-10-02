@@ -32,8 +32,8 @@ Role definitions, the ladder and how the owner is named: [`CLAUDE.md` → Ranks]
 |---|---|---|
 | **Anonymous** | `GET /api/status`, register, log in | Any state at all. Three routes, and `/api/status` exists because a login screen has to ask "are you there?" before anyone has logged in |
 | **Logged-in player** | Move, chat, save, and *request* loot, trades, purchases, revives, cooking, fishing — each as a claim the server re-derives | Their own level, XP, stat maxima, loot rolls, gold totals, lusion totals, any of the six skills, or any row that is not theirs |
-| **Mod** | Kick, ban up to 30 days, take a chat line down, read the staff user list, the moderation log and linked accounts, write staff-only notes and warnings | Banning at or above their own rank, banning permanently, granting a rank at or above their own, touching the economy |
-| **Dev** | Everything a mod can, plus permanent bans, teleporting a player, reading economy supply | Granting dev or owner, moving the whole server, minting gold, the metrics endpoint |
+| **Mod** | Kick, ban up to 30 days, mute up to a day, take a chat line down, read and close chat reports, read the staff user list, the moderation log and linked accounts, write staff-only notes and warnings | Banning at or above their own rank, banning permanently, granting a rank at or above their own, touching the economy |
+| **Dev** | Everything a mod can, plus permanent bans, longer mutes, teleporting a player, reading economy supply | Granting dev or owner, moving the whole server, minting gold, the metrics endpoint |
 | **Owner** | Everything, incl. broadcast, maintenance, metrics, moving everyone | Being stored anywhere. `ELUSION_OWNER` is an environment variable, so no request writes it and no database backup carries it |
 | **The server** | Owns level, XP, derived maxima, loot rolls and loot bag contents; sole author of the gold and lusion ledgers | Knowing whether the client is honest, or whether the IP it sees is the player's. Both are assumed false |
 
@@ -202,7 +202,23 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     five heals, one purse deposited twice put the gold in the bank twice, and
     kills sent together lost each other's XP. The only write routes left out are
     nine that hash a password or fetch a picture, and the suite names them.
+    **The lock is SQLite's** (`BEGIN IMMEDIATE`). A move to another database
+    has to keep this promise with row locks or serialisable transactions,
+    because Postgres, like most databases, does not make every write wait its
+    turn by default. This suite, run against the new database, is how to know it
+    did.
     → Held by: `test_concurrency.py` — "one take paid and the rest found nothing", "one drink went through", "one deposit was paid and the other refused", "every XP point the answers promised is stored", "the only ones left out are the slow ones named here"
+25. **Ignoring someone stops them reaching you, and never stops staff.** An
+    ignore hides their lines from you, old ones included, and refuses their
+    whispers, friend requests and trades to you. Staff and the owner cannot be
+    ignored, so a warning always arrives.
+    → Held by: `test_chatsafety.py` — "bob's whisper to ann is refused", "bob cannot ask ann to be friends", "bob cannot open a trade with ann", "staff cannot be ignored"
+    → and in the game: `src/tools/testrunner.gd` — `_test_chat_safety_menu()`
+26. **A mute silences chat, not play, and only within reach.** A muted player
+    cannot speak in world chat, whispers or their guild, and still plays. A mod
+    can mute for at most a day and never another mod or the owner; a player can
+    mute nobody.
+    → Held by: `test_chatsafety.py` — "he still plays - a mute is not a ban", "a mod cannot mute for more than a day", "a mod cannot mute another mod", "a player cannot mute anybody"
 
 ---
 
