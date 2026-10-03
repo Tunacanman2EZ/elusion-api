@@ -375,7 +375,10 @@ updating the maxima it implies.
   ownership bug needs an id to tamper with, and these routes have none to offer.
   A check can be forgotten on the route added next month; a missing parameter
   cannot. `POST /api/staff/gold` is the same idea: owner-only and *still* unable
-  to name another account.
+  to name another account. So is `POST /api/staff/level` (day 2, so the owner
+  can test level 22 gear): it sets the caller's own character, does what a
+  level-up does to XP, maxima and pools, records the refill as a level-up
+  grant, and logs a `level` line; `test_ownership.py` O-7 holds it.
 - **`GET /api/chat/image/<image_id>` has no ownership check on purpose**, and it
   is the only route that does not. The id is the SHA-256 of the bytes, so 256
   unguessable bits *are* the permission. That argument rests entirely on

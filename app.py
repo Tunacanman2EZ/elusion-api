@@ -10055,6 +10055,131 @@ def staff_gold():
     }, 200
 
 
+# The highest level the owner's level tool sets - the client's sanity clamp on a
+# loaded save (CharacterData.MAX_LEVEL). There is no level cap in the game; this
+# only stops a typo making a character the server's curve cannot describe.
+STAFF_LEVEL_MAX = 99
+
+
+@app.post("/api/staff/level")
+@require_auth
+@require_owner
+def staff_level():
+    """
+    Set your own character's level, for testing (owner only)
+    ---
+    tags:
+      - Staff
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        schema:
+          type: object
+          required: [slot, level]
+          properties:
+            slot:  {type: integer, example: 0}
+            level: {type: integer, example: 22}
+    responses:
+      200:
+        description: The character's new level, XP and maxima
+      400:
+        description: Bad slot or level
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: Not the owner, or no character in that slot
+    """
+    # WHY THIS EXISTS. Day 2: tier 6 weapons that need level 22, and eight
+    # hours of play between a new character and level 22. The person who has
+    # to test them cannot, and the gold grant above is the precedent: the owner
+    # may set up his own server's test fixtures.
+    #
+    # OWNER ONLY, SELF ONLY - like the gold grant, and for the same reason. It
+    # takes a slot and a level and changes THE CALLER's character; there is no
+    # target parameter, and a username in the payload is ignored.
+    #
+    # A LEVEL SET IS A LEVEL-UP OR A LEVEL-DOWN, done the way the kill route
+    # does one: XP to zero and the curve's xp_to_next for the new level, the
+    # maxima derived from the level and what is worn, and the pools full. The
+    # refill is recorded as a level-up grant, so the healing check does not
+    # read the client's full bars as a cheat. Logged as "level", in the same
+    # transaction, like every staff action.
+    payload = request.get_json(silent=True) or {}
+    user_id = g.user["id"]
+
+    slot = parse_slot(payload.get("slot"))
+    if slot is None:
+        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+
+    raw = payload.get("level")
+    if isinstance(raw, bool):
+        return bad_request("level must be a whole number")
+    try:
+        level = int(raw)
+    except (TypeError, ValueError):
+        return bad_request("level must be a whole number")
+    if level < 1 or level > STAFF_LEVEL_MAX:
+        return bad_request("level must be 1-%d" % STAFF_LEVEL_MAX)
+
+    db = get_db()
+    row = db.execute("SELECT * FROM saves WHERE user_id = ? AND slot = ?",
+                     (user_id, slot)).fetchone()
+    if row is None:
+        return {"error": "Not Found",
+                "message": "No character in slot %d." % slot}, 404
+
+    was = int(row["level"] or 1)
+    derived = _derived_stats(row, level=level)
+    if derived is None:
+        return bad_request("that character's class has no level curve")
+    xp_to_next = int(gamedata.xp_needed_for_level(level))
+
+    db.execute(
+        """
+        UPDATE saves
+           SET level = ?, xp = 0, xp_to_next = ?,
+               max_hp = ?, max_mana = ?, max_stamina = ?,
+               hp = ?, mana = ?, stamina = ?, updated_at = ?
+         WHERE user_id = ? AND slot = ?
+        """,
+        (level, xp_to_next,
+         derived["max_hp"], derived["max_mana"], derived["max_stamina"],
+         derived["max_hp"], derived["max_mana"], derived["max_stamina"],
+         int(time.time()), user_id, slot),
+    )
+    db.execute(
+        "INSERT INTO consume_grants (user_id, slot, item_id, target, amount, at) "
+        "VALUES (?, ?, ?, '', 0, ?)",
+        (user_id, slot, LEVELUP_GRANT_ID, int(time.time())),
+    )
+    log_staff_action(
+        g.user, "level", g.user["username"], g.user["id"],
+        "slot %d: level %d -> %d" % (slot, was, level),
+    )
+    db.commit()
+
+    return {
+        "slot": slot,
+        "level": level,
+        "was": was,
+        "xp": 0,
+        "xp_to_next": xp_to_next,
+        "max_hp": derived["max_hp"],
+        "max_mana": derived["max_mana"],
+        "max_stamina": derived["max_stamina"],
+        # What is stored now, so the client copies the server's pools rather
+        # than refilling its own.
+        "hp": derived["max_hp"],
+        "mana": derived["max_mana"],
+        "stamina": derived["max_stamina"],
+    }, 200
+
+
 @app.post("/api/staff/grant")
 @require_auth
 @require_role("mod")
@@ -10414,6 +10539,8 @@ def staff_powers():
             "Exempt from the maintenance switch: never locked out or disconnected by it.",
             "The only rank the owner panel opens for - it also holds the"
             " maintenance switch and the gold grant.",
+            "Sets the level of their own characters for testing, and spawns"
+            " any item from the in-game item menu.",
         ],
     }
 
@@ -10468,7 +10595,7 @@ STAFF_LIST_SHOWS = ("all", "online", "banned", "staff")
 # log_staff_action() call in this file and fails on a name missing from here.
 STAFF_ACTION_KINDS = (
     "ban", "unban", "kick", "warn", "note", "role",
-    "grant", "teleport", "chat_delete", "mute", "unmute", "report",
+    "grant", "level", "teleport", "chat_delete", "mute", "unmute", "report",
     "guild_rename", "guild_disband",
     "maintenance", "minbuild", "pvp",
 )
@@ -10477,7 +10604,7 @@ STAFF_ACTION_KINDS = (
 #
 # "moderation" IS WHAT THE LOG AND A PLAYER'S RECORD OPEN ON: what staff did
 # about players and what players said. Left out are the server switches
-# (maintenance, minbuild, pvp) and the testing tools (grant, teleport) - the
+# (maintenance, minbuild, pvp) and the testing tools (grant, level, teleport) - the
 # owner granting himself twelve swords while testing a shop is not something
 # a mod looking for "has anybody warned this player" should scroll past.
 # "Everything" is still one choice away; nothing is hidden from anybody who

@@ -34,7 +34,7 @@ Role definitions, the ladder and how the owner is named: [`CLAUDE.md` → Ranks]
 | **Logged-in player** | Move, chat, save, and *request* loot, trades, purchases, revives, cooking, fishing — each as a claim the server re-derives | Their own level, XP, stat maxima, loot rolls, gold totals, lusion totals, any of the six skills, or any row that is not theirs |
 | **Mod** | Kick, ban up to 30 days, mute up to a day, take a chat line down, read and close chat reports, read the staff user list, the moderation log and linked accounts, write staff-only notes and warnings | Banning at or above their own rank, banning permanently, granting a rank at or above their own, touching the economy |
 | **Dev** | Everything a mod can, plus permanent bans, longer mutes, teleporting a player, reading economy supply | Granting dev or owner, moving the whole server, minting gold, the metrics endpoint |
-| **Owner** | Everything, incl. broadcast, maintenance, metrics, moving everyone | Being stored anywhere. `ELUSION_OWNER` is an environment variable, so no request writes it and no database backup carries it |
+| **Owner** | Everything, incl. broadcast, maintenance, metrics, moving everyone, and test fixtures on their own characters only (gold, level) | Being stored anywhere. `ELUSION_OWNER` is an environment variable, so no request writes it and no database backup carries it |
 | **The server** | Owns level, XP, derived maxima, loot rolls and loot bag contents; sole author of the gold and lusion ledgers | Knowing whether the client is honest, or whether the IP it sees is the player's. Both are assumed false |
 
 Two cells are deliberately weaker than they look, and both are covered under

@@ -716,6 +716,75 @@ check("and the stale rows are pruned on the next delete, not by a sweeper job",
       int(stale) == 0, stale)
 
 
+# =============================================================================
+section("O-7  THE OWNER'S LEVEL TOOL SETS THE OWNER'S OWN CHARACTER")
+# =============================================================================
+# Day 2: tier 6 weapons need level 22, and the owner has to be able to test
+# them. /api/staff/level is the gold grant's shape: owner only, and it changes
+# the caller's character - a username in the payload is ignored.
+import gamedata as _gd  # noqa: E402
+
+res = client.post("/api/staff/level", headers=alice, json={"slot": 0, "level": 22})
+check("a player is told the level tool does not exist", res.status_code == 404, res.status_code)
+res = client.post("/api/staff/level", headers=mod, json={"slot": 0, "level": 22})
+check("so is a mod - it is the owner's", res.status_code == 404, res.status_code)
+
+res = client.post("/api/staff/level", headers=owner,
+                  json={"username": "alice", "slot": 0, "level": 22})
+body = res.get_json() or {}
+db = raw_db()
+mine = db.execute("SELECT level, xp, xp_to_next, max_hp, hp, max_mana, mana FROM saves"
+                  " WHERE user_id = ? AND slot = 0", (uid("boss"),)).fetchone()
+hers = db.execute("SELECT level FROM saves WHERE user_id = ? AND slot = 0",
+                  (uid("alice"),)).fetchone()
+logged = db.execute("SELECT detail FROM staff_actions WHERE action = 'level' AND actor_id = ?"
+                    " ORDER BY id DESC LIMIT 1", (uid("boss"),)).fetchone()
+granted = db.execute("SELECT COUNT(*) AS n FROM consume_grants WHERE user_id = ? AND slot = 0"
+                     " AND item_id = ?", (uid("boss"), app_module.LEVELUP_GRANT_ID)).fetchone()
+db.close()
+curve = _gd.max_stats_for("warrior", 22)
+check("the owner sets his own character to level 22", res.status_code == 200
+      and body.get("level") == 22 and mine is not None and int(mine["level"]) == 22, body)
+check("  with XP from zero and the curve's next step, like a level-up",
+      int(mine["xp"]) == 0 and int(mine["xp_to_next"]) == _gd.xp_needed_for_level(22), dict(mine))
+check("  the maxima of a level 22 warrior, and full pools",
+      int(mine["max_hp"]) == curve["max_hp"] and int(mine["hp"]) == curve["max_hp"]
+      and int(mine["mana"]) == int(mine["max_mana"]) == curve["max_mana"], dict(mine))
+check("  the refill recorded as a level-up, so the heal check does not clamp it",
+      int(granted["n"]) >= 1, int(granted["n"]))
+check("  and a line in the staff log", logged is not None
+      and logged["detail"] == "slot 0: level 1 -> 22", dict(logged) if logged else None)
+check("alice, who was named in the payload, is still level 1",
+      hers is not None and int(hers["level"]) == 1, dict(hers) if hers else None)
+
+res = client.post("/api/staff/level", headers=owner, json={"slot": 0, "level": 5})
+db = raw_db()
+down = db.execute("SELECT level, max_hp, hp FROM saves WHERE user_id = ? AND slot = 0",
+                  (uid("boss"),)).fetchone()
+db.close()
+check("it sets a level down as well, and the maxima follow",
+      res.status_code == 200 and int(down["level"]) == 5
+      and int(down["max_hp"]) == _gd.max_stats_for("warrior", 5)["max_hp"] == int(down["hp"]),
+      dict(down))
+
+for label, body_in in [("level 0", {"slot": 0, "level": 0}),
+                       ("level 100", {"slot": 0, "level": 100}),
+                       ("a level that is not a number", {"slot": 0, "level": "high"}),
+                       ("true as a level", {"slot": 0, "level": True}),
+                       ("no level at all", {"slot": 0}),
+                       ("a slot that is not one", {"slot": 9, "level": 10})]:
+    res = client.post("/api/staff/level", headers=owner, json=body_in)
+    check("%s is refused" % label, res.status_code == 400, res.status_code)
+res = client.post("/api/staff/level", headers=owner, json={"slot": 2, "level": 10})
+check("an empty slot is a 404", res.status_code == 404, res.status_code)
+
+powers = client.get("/api/staff/powers", headers=owner).get_json() or {}
+owner_routes = [r.get("path") for rank in powers.get("ladder", [])
+                if rank.get("rank") == "owner" for r in rank.get("routes", [])]
+check("the powers list shows it under the owner, so it surprises nobody",
+      "/api/staff/level" in owner_routes, owner_routes)
+
+
 print("\n" + "=" * 70)
 print("  %d passed, %d failed" % (passed, failed))
 if failures:
