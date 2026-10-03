@@ -587,6 +587,148 @@ finally:
 check("a pet, when one drops, is the first thing in the bag", _first_bad == 0, _first_bad)
 check("and coins always come after the items", _order_bad == 0, _order_bad)
 
+
+# =============================================================================
+section("A MYTHIC CAN COME FROM ANYTHING, AND THE TOUGHER THE BETTER")
+# =============================================================================
+# Day 2, the owner: regular mobs and bosses both drop the mythic weapons,
+# "mixed rarity but it should be super rewarding getting 1". No tier_odds
+# reaches tier 6. Each enemy carries "one in N" odds instead (mythic_odds,
+# worked out in the game by EnemyData.mythic_odds() and exported), and
+# roll_mythic() rolls them at every kill, beside the bag.
+MYTHIC_TIER = gamedata.mythic_tier()
+_odds = {eid: int(e.get("mythic_odds", 0)) for eid, e in ENEMIES.items()}
+_bosses = {eid for eid, e in REWARDING.items() if e.get("slots_are_gear")}
+_normals = {eid for eid in REWARDING if eid not in _bosses}
+# The small slimes: what a large splits into, and the poison slime's small,
+# which poisonslime.gd splits in code rather than through split_into.
+_smalls = {e.get("split_into") for e in ENEMIES.values() if e.get("split_into")} | {"poisonslimesmall"}
+
+check("the mythic tier is 6", MYTHIC_TIER == 6, MYTHIC_TIER)
+check("every enemy that pays rewards has mythic odds",
+      all(_odds[eid] > 0 for eid in REWARDING), sorted(e for e in REWARDING if _odds[e] <= 0))
+check("and one that pays nothing has none",
+      all(_odds[eid] == 0 for eid in ENEMIES if eid not in REWARDING),
+      sorted(e for e in ENEMIES if e not in REWARDING and _odds[e]))
+check("the Crowned is the best mythic hunt in the game",
+      _odds["boss"] == min(_odds[e] for e in REWARDING), _odds["boss"])
+check("every boss beats every regular enemy",
+      max(_odds[e] for e in _bosses) < min(_odds[e] for e in _normals),
+      (max(_odds[e] for e in _bosses), min(_odds[e] for e in _normals)))
+check("a tier 6 boss beats a tier 5 one",
+      all(_odds[a] < _odds[b] for a in _bosses for b in _bosses
+          if a != "boss" and int(ENEMIES[a]["max_loot_tier"]) > int(ENEMIES[b]["max_loot_tier"])))
+
+# THE TOUGHER THE BETTER, band by band, among the regular enemies.
+_by_band = defaultdict(set)
+for _eid in _normals - _smalls:
+    _by_band[int(ENEMIES[_eid]["max_loot_tier"])].add(_odds[_eid])
+check("regular enemies of one band share one rate",
+      all(len(v) == 1 for v in _by_band.values()), dict(_by_band))
+_bands = sorted(_by_band)
+check("and a higher band always has the better odds",
+      all(min(_by_band[_bands[i]]) < min(_by_band[_bands[i - 1]]) for i in range(1, len(_bands))),
+      {b: sorted(v) for b, v in _by_band.items()})
+check("a small slime is a quarter of its band's ticket (one large releases eight)",
+      all(_odds[s] == 4 * min(_by_band[int(ENEMIES[s]["max_loot_tier"])]) for s in _smalls if s in REWARDING),
+      {s: _odds[s] for s in _smalls})
+
+# WHAT THAT COMES TO, so the numbers in GameConstants' comment stay true.
+# Five kills a minute is the pace the level curve is built on (test_pacing);
+# the Crowned is a kill every three minutes or so with its two-minute respawn.
+_dark = min(_by_band[5])
+check("the dark band is about one mythic in 65 hours (40 to 100)",
+      40 <= _dark / 300.0 <= 100, round(_dark / 300.0, 1))
+check("the Crowned is about one in 8 hours (6 to 10)",
+      6 <= _odds["boss"] * 3 / 60.0 <= 10, round(_odds["boss"] * 3 / 60.0, 1))
+check("light and wind are a lottery ticket: over a thousand hours",
+      min(_by_band[1]) / 300.0 > 1000, min(_by_band[1]) / 300.0)
+
+# THE ROLL READS THOSE ODDS. A die that remembers what it was asked, as with
+# the jackpot above: randint(1, N) wins on N.
+class _OddsDie:
+    def __init__(self, win, pick=0):
+        self.win = win
+        self.pick = pick
+        self.asked = []
+
+    def randint(self, low, high):
+        self.asked.append((low, high))
+        return high if self.win else low
+
+    def randrange(self, n):
+        return self.pick % n
+
+
+_saved_roll = gamedata._rng
+_wrong = []
+try:
+    for _eid in sorted(REWARDING):
+        gamedata._rng = _OddsDie(win=False)
+        _got = gamedata.roll_mythic(ENEMIES[_eid], "mage")
+        if _got != "" or gamedata._rng.asked != [(1, _odds[_eid])]:
+            _wrong.append((_eid, _got, gamedata._rng.asked))
+finally:
+    gamedata._rng = _saved_roll
+check("every enemy rolls its own odds once, and a miss is nothing", not _wrong, _wrong[:3])
+
+# A WIN IS YOUR OWN CLASS'S PIECE.
+MYTHIC_FOR = {"mage": "meteorite", "warrior": "doubleaxe", "tank": "dynamite"}
+_pool = gamedata.mythic_pool("")
+check("the mythic pool is the three weapons", sorted(_pool) == sorted(MYTHIC_FOR.values()), _pool)
+try:
+    for _cls, _item in sorted(MYTHIC_FOR.items()):
+        _seen = set()
+        for _pick in range(6):
+            gamedata._rng = _OddsDie(win=True, pick=_pick)
+            _seen.add(gamedata.roll_mythic(ENEMIES["darksprite"], _cls))
+        check("a %s who wins gets the %s, every time" % (_cls, ITEMS[_item]["display_name"]),
+              _seen == {_item}, sorted(_seen))
+    _healer = set()
+    for _pick in range(6):
+        gamedata._rng = _OddsDie(win=True, pick=_pick)
+        _healer.add(gamedata.roll_mythic(ENEMIES["darksprite"], "healer"))
+finally:
+    gamedata._rng = _saved_roll
+check("a healer, with no mythic of their own yet, can get any of the three",
+      _healer == set(MYTHIC_FOR.values()), sorted(_healer))
+
+# MEASURED, not only reasoned about: the real roll at the advertised rate.
+gamedata._rng = _random.Random(20261003)
+for _eid in ("boss", "lightboss"):
+    _n = 300 * _odds[_eid]
+    _wins = sum(1 for _ in range(_n) if gamedata.roll_mythic(ENEMIES[_eid], "tank"))
+    check("%s pays a mythic about 1 in %d" % (_eid, _odds[_eid]), 240 <= _wins <= 360,
+          "%d in %d" % (_wins, _n))
+
+# A MYTHIC MAKES A BAG, AND NOTHING PUSHES IT OUT.
+_saved_odds = dict(_odds)
+_missing = _cut = _flagged = 0
+try:
+    for _eid in sorted(REWARDING):
+        ENEMIES[_eid]["mythic_odds"] = 1
+        for _ in range(40):
+            _r = gamedata.roll_kill_rewards(_eid, "warrior")
+            _ids = [c["item_id"] for c in _r["contents"]]
+            if _r["mythic"] != "doubleaxe":
+                _flagged += 1
+            if "doubleaxe" not in _ids:
+                _missing += 1
+            elif _ids.index("doubleaxe") != (1 if _r["pet_won"] else 0):
+                _cut += 1
+finally:
+    for _eid, _o in _saved_odds.items():
+        ENEMIES[_eid]["mythic_odds"] = _o
+check("a kill that wins a mythic says so", _flagged == 0, _flagged)
+check("and always has a bag with it in, even when the bag roll said no", _missing == 0, _missing)
+check("and it comes first in the bag, after a pet, where no cell limit can cut it", _cut == 0, _cut)
+ENEMIES["darksprite"]["mythic_odds"] = 0
+try:
+    _quiet = [gamedata.roll_kill_rewards("darksprite", "mage")["mythic"] for _ in range(200)]
+finally:
+    ENEMIES["darksprite"]["mythic_odds"] = _saved_odds["darksprite"]
+check("odds of 0 never pay", set(_quiet) == {""}, set(_quiet))
+
 gamedata._rng = _saved_rng
 
 print("\n" + "=" * 60)

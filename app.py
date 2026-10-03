@@ -9445,7 +9445,9 @@ def combat_kill():
 
     # ---- everything above this line is validation; everything below commits --
 
-    rewards = gamedata.roll_kill_rewards(enemy_id)
+    # The killer's class goes in for the mythic roll: a win is their own
+    # class's piece. See gamedata.roll_mythic().
+    rewards = gamedata.roll_kill_rewards(enemy_id, row["class_id"])
 
     level, xp, xp_to_next, levels_gained = gamedata.apply_xp(
         int(row["level"]), int(row["xp"]), int(row["xp_to_next"]), rewards["xp"]
@@ -9552,6 +9554,22 @@ def combat_kill():
     # what the client renders into its grid and what it sends back to take
     # anything out. The roll itself is never returned: position is not a detail
     # the two sides should be inferring separately.
+    # A MYTHIC IS TOLD TO EVERYONE ONLINE, through the broadcast poll every
+    # client already runs, as kind "mythic". The game draws that as a red
+    # banner, and the finder, whose game is already celebrating, keeps only
+    # the chat line (it matches "by" to its own name).
+    #
+    # Before _create_loot_bag(), so the notice and the bag land in one commit
+    # (post_broadcast() leaves the commit to its caller). It cannot announce
+    # a piece the bag then dropped: rarest_first() ranks a mythic with the pet,
+    # ahead of everything LOOT_BAG_CAPACITY could cut.
+    mythic = rewards.get("mythic", "")
+    if mythic:
+        post_broadcast(mythic_find_text(g.user["username"], mythic, enemy_id),
+                       MYTHIC_BROADCAST_KIND, g.user["username"])
+        app.logger.info("mythic: %s (slot %d, %s) found %s on %s",
+                        g.user["username"], slot, row["class_id"], mythic, enemy_id)
+
     bag_id, stored = _create_loot_bag(user_id, slot, enemy_id, rewards["contents"])
 
     return {
@@ -9571,8 +9589,31 @@ def combat_kill():
         "xp": xp,
         "xp_to_next": xp_to_next,
         "pet_won": rewards["pet_won"],
+        # The mythic item_id in this bag, or "". The game celebrates on it.
+        "mythic": mythic,
         "contents": stored,
     }, 200
+
+
+# THE KIND A MYTHIC'S NOTICE IS POSTED UNDER. The game draws it as the red
+# banner. The staff broadcast route accepts only "system" and "shout", so
+# nobody can type one.
+MYTHIC_BROADCAST_KIND = "mythic"
+
+
+def mythic_find_text(username, item_id, enemy_id):
+    """
+    "Tunacan found the Meteorite on a Dark Sprite!" The enemy is named because
+    a mythic off a light slime is a story worth telling. A boss is a name
+    ("The Crowned", "Fire The Crowned") and takes no article.
+    """
+    item = gamedata.ITEMS.get(item_id, {})
+    enemy = gamedata.ENEMIES.get(enemy_id, {})
+    what = item.get("display_name") or item_id
+    who = enemy.get("display_name") or enemy_id
+    if not enemy.get("slots_are_gear"):
+        who = ("an " if who[:1].lower() in ("a", "e", "i", "o", "u") else "a ") + who
+    return "%s found the %s on %s!" % (username, what, who)
 
 
 # =============================================================================

@@ -998,6 +998,57 @@ def pick_pet_id(enemy):
     return common
 
 
+def mythic_tier():
+    """The tier the mythic roll pays out from. GameConstants.MYTHIC_TIER."""
+    return int(CONSTANTS.get("mythic_tier", 6))
+
+
+def mythic_pool(class_id=""):
+    """
+    The mythic pieces a character of this class can be given, in id order so a
+    seeded roll is repeatable: droppable weapons and armour at mythic_tier()
+    that this class may wear (required_classes names it, or is empty).
+
+    A CLASS WITH NONE OF ITS OWN GETS ALL OF THEM. On day 2 the healer has no
+    mythic yet, and a win that turned into nothing would be the worst thing
+    this roll could do. The day a healer piece exists, healers get that.
+    """
+    tier = mythic_tier()
+    every = sorted(
+        item["item_id"] for item in ITEMS.values()
+        if int(item.get("tier", 0)) == tier and _droppable(item)
+        and item["type_name"] in LOOT_GEAR_TYPES
+    )
+    own = [
+        item_id for item_id in every
+        if not ITEMS[item_id].get("required_classes")
+        or class_id in ITEMS[item_id].get("required_classes")
+    ]
+    return own or every
+
+
+def roll_mythic(enemy, class_id=""):
+    """
+    Did this kill drop a mythic, and which one? "" for no.
+
+    A ROLL OF ITS OWN, BESIDE THE BAG'S. No enemy's tier_odds reaches the
+    mythic tier; each enemy carries "one in N" odds instead (mythic_odds, worked
+    out by EnemyData.mythic_odds() in the game and exported). The owner's call
+    on day 2: regular mobs and bosses both drop them, the tougher the better,
+    "super rewarding getting 1". A win is the killer's own class's piece, so it
+    is never a weapon they can only sell.
+    """
+    odds = int(enemy.get("mythic_odds", 0) or 0)
+    if odds <= 0:
+        return ""
+    if _rng.randint(1, odds) != odds:
+        return ""
+    pool = mythic_pool(class_id)
+    if not pool:
+        return ""
+    return pool[_rng.randrange(len(pool))]
+
+
 def build_bag_contents(enemy):
     """Port of BaseEnemy._build_bag_contents()."""
     contents = []
@@ -1220,7 +1271,8 @@ def rarest_first(contents):
     def rank(entry):
         item = ITEMS.get(entry.get("item_id", ""), {})
         kind = item.get("type_name", "")
-        if kind == "PET":
+        # A mythic is cut by nothing, like the pet.
+        if kind == "PET" or (kind in LOOT_GEAR_TYPES and int(item.get("tier", 0)) >= mythic_tier()):
             return 0
         if kind == "CURRENCY":
             return 2
@@ -1228,10 +1280,11 @@ def rarest_first(contents):
     return sorted(contents, key=rank)
 
 
-def roll_kill_rewards(enemy_id):
+def roll_kill_rewards(enemy_id, class_id=""):
     """
     The whole reward for one kill. Port of BaseEnemy._die() plus
     _roll_and_spawn_loot(), minus everything to do with spawning a node.
+    class_id is the killer's, for the mythic roll (roll_mythic()).
 
     Returns:
         {
@@ -1239,11 +1292,13 @@ def roll_kill_rewards(enemy_id):
           "xp":         int,
           "attack_xp":  int,
           "pet_won":    bool,
+          "mythic":     str,    the mythic item_id in the bag, or ""
           "contents":   [{"item_id": str, "quantity": int}, ...],
         }
 
     An empty `contents` is a normal outcome, not a failure - most kills drop
-    nothing at all.
+    nothing at all. A mythic, like a pet, makes a bag even when the bag roll
+    said no.
     """
     enemy = ENEMIES.get(enemy_id)
     if enemy is None:
@@ -1251,12 +1306,15 @@ def roll_kill_rewards(enemy_id):
 
     pet_won = roll_pet(enemy)
     bag_drops = _rng.random() <= float(enemy.get("bag_drop_chance", 0.0))
+    mythic = roll_mythic(enemy, class_id)
 
     contents = []
-    if bag_drops or pet_won:
+    if bag_drops or pet_won or mythic:
         contents = build_bag_contents(enemy)
         if pet_won:
             contents.append({"item_id": pick_pet_id(enemy), "quantity": 1})
+        if mythic:
+            contents.append({"item_id": mythic, "quantity": 1})
         contents = rarest_first(contents)
 
     return {
@@ -1264,5 +1322,6 @@ def roll_kill_rewards(enemy_id):
         "xp": int(enemy.get("xp_reward", 0)),
         "attack_xp": int(enemy.get("attack_xp_reward", 0)),
         "pet_won": pet_won,
+        "mythic": mythic,
         "contents": contents,
     }

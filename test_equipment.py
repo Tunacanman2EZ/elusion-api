@@ -895,9 +895,10 @@ section("THE MYTHIC WEAPONS")
 # =============================================================================
 # Day 2: three tier 6 weapons that bring their own attack - the Meteorite
 # (mage), the Double Axe (warrior) and Dynamite (tank). The attack is the
-# game's business; what the server owns is who may wear one, and that nobody
-# is handed one yet: the owner sets the drop odds later, and until then the
-# staff grant is the only way in.
+# game's business; what the server owns is who may wear one, and how one is
+# found: not on any tier ladder, but on a roll of its own at every kill
+# (gamedata.roll_mythic, held in test_loot.py), ending with a notice to
+# everyone online.
 import gamedata as _gd  # noqa: E402
 
 MYTHIC = {"meteorite": "mage", "doubleaxe": "warrior", "dynamite": "tank"}
@@ -912,11 +913,12 @@ _sold = [(_shop, _item) for _shop, _def in _gd.SHOPS.items()
          for _item in MYTHIC if _item in _def.get("stock", [])]
 check("no shop sells them", not _sold, _sold)
 
-# NOBODY ROLLS TIER 6. Rolled, not reasoned about: every enemy, many times,
-# through the same roll_loot_tier() a kill uses.
+# NO TIER LADDER REACHES TIER 6. Rolled, not reasoned about: every enemy, many
+# times, through the same roll_loot_tier() a kill uses. A mythic comes only
+# from its own roll, so its odds are one number per enemy and nothing else.
 _tier6 = sorted({_e["enemy_id"] for _e in _gd.ENEMIES.values() for _ in range(400)
                  if _gd.roll_loot_tier(_e) >= 6})
-check("and no enemy can roll tier 6 yet, so none of them drops", not _tier6, _tier6)
+check("no enemy's tier ladder rolls tier 6 - a mythic is its own roll", not _tier6, _tier6)
 
 # WHO MAY WEAR ONE, through the same endpoint as everything else.
 _reg = client.post("/api/auth/register",
@@ -941,6 +943,72 @@ res = client.post("/api/character/equip", headers=MH, json={"slot": 0, "item_id"
 _worn = client.get("/api/character?slot=0", headers=MH).get_json().get("equipment", {})
 check("and wears the Meteorite at 22", res.status_code == 200 and _worn.get("weapon") == "meteorite",
       [res.status_code, _worn])
+
+# A MYTHIC FROM A KILL, end to end: the roll, the bag, the take and the notice
+# everyone online is sent. The odds are set to 1 on one enemy for these kills,
+# so the win is certain. The app reads the same gamedata module object, so the
+# patch is the server's own.
+_myth_saved = int(_gd.ENEMIES["darksprite"].get("mythic_odds", 0))
+_gd.ENEMIES["darksprite"]["mythic_odds"] = 1
+try:
+    _since = client.get("/api/server/broadcasts?since=0", headers=MH).get_json()["latest_id"]
+    res = client.post("/api/combat/kill", headers=MH, json={"slot": 0, "enemy_id": "darksprite"})
+    _kill = res.get_json() or {}
+finally:
+    _gd.ENEMIES["darksprite"]["mythic_odds"] = _myth_saved
+_cells = _kill.get("contents", [])
+check("a mage's mythic kill answers with the Meteorite",
+      res.status_code == 200 and _kill.get("mythic") == "meteorite", [res.status_code, _kill.get("mythic")])
+check("in a bag, in its first cell", bool(_kill.get("bag_id")) and _cells
+      and _cells[0]["item_id"] == "meteorite" and _cells[0]["position"] == 0, _cells)
+
+_news = client.get("/api/server/broadcasts?since=%d" % _since, headers=MH).get_json()["messages"]
+_myth_news = [m for m in _news if m["kind"] == "mythic"]
+check("and everyone online is told, once, by name",
+      len(_myth_news) == 1 and _myth_news[0]["by"] == "mythcheck"
+      and _myth_news[0]["body"] == "mythcheck found the Meteorite on a Dark Sprite!", _news)
+check("the notice is on the poll another player reads too",
+      any(m["kind"] == "mythic" for m in client.get(
+          "/api/server/broadcasts?since=%d" % _since, headers=H).get_json()["messages"]))
+
+# Five more, so a roll that ignored the class could not pass by luck: a third
+# of a random pick is a Meteorite, five in a row is one in 243.
+_gd.ENEMIES["darksprite"]["mythic_odds"] = 1
+try:
+    _more = [(client.post("/api/combat/kill", headers=MH, json={"slot": 0, "enemy_id": "darksprite"})
+              .get_json() or {}).get("mythic") for _ in range(5)]
+finally:
+    _gd.ENEMIES["darksprite"]["mythic_odds"] = _myth_saved
+check("and every one a mage wins is the Meteorite, never another class's",
+      _more == ["meteorite"] * 5, _more)
+
+res = client.post("/api/loot/take", headers=MH, json={"bag_id": _kill.get("bag_id"), "position": 0})
+check("taking it puts it in the backpack like any other drop", res.status_code == 200
+      and any(c.get("item_id") == "meteorite" for c in (res.get_json() or {}).get("inventory", [])),
+      [res.status_code, res.get_json()])
+
+_gd.ENEMIES["darksprite"]["mythic_odds"] = 0
+try:
+    _since = client.get("/api/server/broadcasts?since=0", headers=MH).get_json()["latest_id"]
+    res = client.post("/api/combat/kill", headers=MH, json={"slot": 0, "enemy_id": "darksprite"})
+finally:
+    _gd.ENEMIES["darksprite"]["mythic_odds"] = _myth_saved
+check("a kill that wins nothing says so, and tells nobody",
+      res.status_code == 200 and res.get_json().get("mythic") == ""
+      and not [m for m in client.get("/api/server/broadcasts?since=%d" % _since, headers=MH).get_json()["messages"]
+               if m["kind"] == "mythic"], res.get_json())
+
+# THE KIND IS THE SERVER'S. The owner's announcement route takes "system" and
+# "shout" only, so not even the owner can type a fake find into the red banner.
+_owner_tok = client.post("/api/auth/register", json={
+    "username": os.environ["ELUSION_OWNER"], "password": "Sufficiently-Long-1"}).get_json() or {}
+if not _owner_tok.get("token"):
+    _owner_tok = client.post("/api/auth/login", json={
+        "username": os.environ["ELUSION_OWNER"], "password": "Sufficiently-Long-1"}).get_json() or {}
+res = client.post("/api/server/broadcast", headers={"Authorization": "Bearer %s" % _owner_tok.get("token")},
+                  json={"body": "simowner found the Meteorite on The Crowned!", "kind": "mythic"})
+check("the owner's broadcast route refuses kind 'mythic'", res.status_code == 400
+      and app.MYTHIC_BROADCAST_KIND == "mythic", [res.status_code, res.get_json()])
 _eq.close()
 
 # Verdict first, housekeeping after, and housekeeping cannot change the verdict

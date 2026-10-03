@@ -929,15 +929,34 @@ pet odds - unchanged. `test_rewards.py` measures the rates with the real roll.
 `test_api.py` holds that a boss bag with a pet never loses the pet or its gear
 to the cell limit.
 
-**Tier 6 is mythic, and nothing drops it yet.** Day 2 filled it with three
+**Tier 6 is mythic, and it is a roll of its own.** Day 2 filled it with three
 weapons that bring their own attack - the Meteorite (mage), the Double Axe
-(warrior) and Dynamite (tank), level 22 - and the owner has not set their odds.
-Every boss whose `max_loot_tier` is 6 has a zero first in `tier_odds`, and no
-enemy has a `tier_up_chance` past ember, so the only way in is
-`/api/staff/grant`. Setting the odds is that one number on the Crowned.
-`test_equipment.py` rolls every enemy to hold the zero and checks the class
-and level gates; their damage follows the ladder with the Double Axe as the
-tier's sword.
+(warrior) and Dynamite (tank), level 22. No `tier_odds` reaches tier 6 (every
+boss whose `max_loot_tier` is 6 has a zero first). Instead every enemy row
+carries `mythic_odds`, "one in N", which the game works out
+(`EnemyData.mythic_odds()`: a table by tier, bosses apart, and an override) and
+exports. The owner's call: regular mobs and bosses both drop them, "mixed
+rarity but it should be super rewarding getting 1".
+
+- **`gamedata.roll_mythic(enemy, class_id)`** runs at every kill, beside the
+  bag. A win is the killer's own class's piece (`mythic_pool()`). A class with
+  no mythic of its own, the healer for now, gets any of them.
+- **A win makes a bag** even when the bag roll said no, as a pet does, and
+  `rarest_first()` ranks it with the pet, so the cell limit never cuts it.
+- **The kill answers `mythic`**, and posts a broadcast of kind `"mythic"`
+  (`MYTHIC_BROADCAST_KIND`, `by` = the finder), in the same commit as the bag.
+  The game draws it as a red banner for everyone online. The owner's
+  announcement route takes only `system` and `shout`, so nobody can type one.
+- **The rates**: the Crowned 1 in 150 (about 8 hours of farming it), the
+  other bosses 300 to 600, then 20,000 for the dark band down to 500,000 for
+  light and wind, with small slimes a quarter of their band's ticket.
+  `test_loot.py` holds the order, the rates and the roll; `test_equipment.py`
+  holds the kill, the bag, the take and the notice, plus the class and level
+  gates. The weapons' damage follows the ladder with the Double Axe as the
+  tier's sword.
+- **The kill is still the client's word** (SECURITY_NOTES E-3). The ceiling
+  bounds how many kills a modified client can claim, so it bounds its mythic
+  rolls too, but it does not stop them.
 
 ## The store sells iron to amethyst
 
