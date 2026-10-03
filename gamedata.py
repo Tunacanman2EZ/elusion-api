@@ -948,8 +948,8 @@ def pick_loot_item(tier, kind="any"):
     this kind, at the nearest tier BELOW that does. Returns "" only when
     nothing at or below the tier qualifies.
 
-    Stepping down, never up: a tier-6 boss has no tier-6 gear, and the honest
-    answer is its best tier-5 piece, not nothing and not something above it.
+    Stepping down, never up: a roll at a tier with nothing in it gets the best
+    piece of the tier below, not nothing and not something above it.
     """
     for t in range(int(tier), 0, -1):
         pool = loot_pool(t, kind)

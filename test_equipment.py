@@ -344,6 +344,19 @@ for tier in TIERS:
               % item_id, abs(got - ideal) <= 0.5 + 1e-9,
               [got, round(ideal, 3)])
 
+# THE MYTHIC TIER CLIMBS THE SAME LADDER. There is no healer weapon yet, and
+# the three that exist are named for what they are rather than for a material,
+# so they are matched by hand: the Double Axe is the tier's sword, and the
+# Meteorite and Dynamite add the same share of their class's dps as it does.
+# Dynamite throws a stick a second worth four aura ticks, which is why its
+# number is a tick's, the maul's, and not a stick's.
+for class_id, item_id in (("mage", "meteorite"), ("tank", "dynamite")):
+    sword = C.ITEMS["doubleaxe"]["damage"]
+    got = C.ITEMS[item_id]["damage"]
+    ideal = sword * PERIOD[class_id] * (base_dps(class_id) / base_dps("warrior"))
+    check("%s adds the same share of its class's dps as the Double Axe does"
+          % item_id, abs(got - ideal) <= 0.5 + 1e-9, [got, round(ideal, 3)])
+
 # THE CONSEQUENCE, stated as the thing anyone would actually check: gear lifts
 # every class's dps by the same multiple, so whatever the relationship between
 # the four classes is today, it is the same afterwards. Gear is a ladder
@@ -394,7 +407,9 @@ for tier in TIERS:
 weapons = [i for i in C.ITEMS.values() if i["damage"] > 0]
 check("every weapon in the game rolls rather than repeats",
       all(i.get("damage_spread", 0) > 0 for i in weapons), len(weapons))
-check("and there are twenty of them", len(weapons) == 20, len(weapons))
+# Twenty on the ladder - five tiers, four classes - and the three mythic
+# weapons of day 2, which bring their own attack.
+check("and there are twenty-three of them", len(weapons) == 23, len(weapons))
 
 lo = int(20 * 0.75)
 hi = -(-int(20 * 1.25) // 1)
@@ -873,6 +888,60 @@ for label, equipment in [
 check("and not one refusal disturbed what was stored",
       len(server_slot().get("equipment", {})) == 8,
       server_slot().get("equipment"))
+
+
+# =============================================================================
+section("THE MYTHIC WEAPONS")
+# =============================================================================
+# Day 2: three tier 6 weapons that bring their own attack - the Meteorite
+# (mage), the Double Axe (warrior) and Dynamite (tank). The attack is the
+# game's business; what the server owns is who may wear one, and that nobody
+# is handed one yet: the owner sets the drop odds later, and until then the
+# staff grant is the only way in.
+import gamedata as _gd  # noqa: E402
+
+MYTHIC = {"meteorite": "mage", "doubleaxe": "warrior", "dynamite": "tank"}
+for _item, _cls in MYTHIC.items():
+    _row = C.ITEMS.get(_item, {})
+    check("%s is a tier 6 %s weapon at level 22 in the server's catalogue" % (_item, _cls),
+          _row.get("tier") == 6 and _row.get("required_level") == 22
+          and _row.get("required_classes") == [_cls]
+          and _row.get("equip_slot_name") == "WEAPON", _row)
+
+_sold = [(_shop, _item) for _shop, _def in _gd.SHOPS.items()
+         for _item in MYTHIC if _item in _def.get("stock", [])]
+check("no shop sells them", not _sold, _sold)
+
+# NOBODY ROLLS TIER 6. Rolled, not reasoned about: every enemy, many times,
+# through the same roll_loot_tier() a kill uses.
+_tier6 = sorted({_e["enemy_id"] for _e in _gd.ENEMIES.values() for _ in range(400)
+                 if _gd.roll_loot_tier(_e) >= 6})
+check("and no enemy can roll tier 6 yet, so none of them drops", not _tier6, _tier6)
+
+# WHO MAY WEAR ONE, through the same endpoint as everything else.
+_reg = client.post("/api/auth/register",
+                   json={"username": "mythcheck", "password": "Sufficiently-Long-1"})
+MH = {"Authorization": "Bearer %s" % _reg.get_json()["token"]}
+client.put("/api/save", headers=MH, json=C.save_body(0, {"character": "mage", "level": 1}))
+_eq = _eqsq.connect(_db)
+_myth_uid = _eq.execute("SELECT id FROM users WHERE username = 'mythcheck'").fetchone()[0]
+for _pos, _item in enumerate(["meteorite", "doubleaxe"]):
+    _eq.execute("INSERT OR REPLACE INTO carry_items (user_id, slot, position,"
+                " item_id, quantity) VALUES (?, 0, ?, ?, 1)", (_myth_uid, _pos, _item))
+_eq.execute("UPDATE saves SET level = 21 WHERE user_id = ? AND slot = 0", (_myth_uid,))
+_eq.commit()
+
+res = client.post("/api/character/equip", headers=MH, json={"slot": 0, "item_id": "meteorite"})
+check("a level 21 mage is refused the Meteorite", res.status_code in (400, 403), res.status_code)
+_eq.execute("UPDATE saves SET level = 22 WHERE user_id = ? AND slot = 0", (_myth_uid,))
+_eq.commit()
+res = client.post("/api/character/equip", headers=MH, json={"slot": 0, "item_id": "doubleaxe"})
+check("a level 22 mage is refused the warrior's Double Axe", res.status_code in (400, 403), res.status_code)
+res = client.post("/api/character/equip", headers=MH, json={"slot": 0, "item_id": "meteorite"})
+_worn = client.get("/api/character?slot=0", headers=MH).get_json().get("equipment", {})
+check("and wears the Meteorite at 22", res.status_code == 200 and _worn.get("weapon") == "meteorite",
+      [res.status_code, _worn])
+_eq.close()
 
 # Verdict first, housekeeping after, and housekeeping cannot change the verdict
 # - see the note at the end of test_healing.py, which is where deleting the

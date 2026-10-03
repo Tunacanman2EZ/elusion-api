@@ -926,6 +926,16 @@ pet odds - unchanged. `test_rewards.py` measures the rates with the real roll.
 `test_api.py` holds that a boss bag with a pet never loses the pet or its gear
 to the cell limit.
 
+**Tier 6 is mythic, and nothing drops it yet.** Day 2 filled it with three
+weapons that bring their own attack - the Meteorite (mage), the Double Axe
+(warrior) and Dynamite (tank), level 22 - and the owner has not set their odds.
+Every boss whose `max_loot_tier` is 6 has a zero first in `tier_odds`, and no
+enemy has a `tier_up_chance` past ember, so the only way in is
+`/api/staff/grant`. Setting the odds is that one number on the Crowned.
+`test_equipment.py` rolls every enemy to hold the zero and checks the class
+and level gates; their damage follows the ladder with the Double Axe as the
+tier's sword.
+
 ## The store sells iron to amethyst
 
 Decided by the owner on day 1: the general store stocks every weapon and armour

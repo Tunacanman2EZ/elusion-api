@@ -484,9 +484,13 @@ check("every item in a tier comes up about equally often",
       _pool and all(abs(_hits[i] - _expected) < _expected * 0.35 for i in _pool),
       {i: _hits[i] for i in _pool})
 
+# TIER 7, AND IT WAS 6. Tier 6 was the empty tier above ember until day 2, when
+# the three mythic weapons filled it - so the empty tier this asks about is the
+# one above that now.
 check("a tier with nothing of that kind steps DOWN to the nearest that has some",
-      gamedata.pick_loot_item(6, "gear") in gamedata.loot_pool(5, "gear"),
-      gamedata.pick_loot_item(6, "gear"))
+      not gamedata.loot_pool(7, "gear")
+      and gamedata.pick_loot_item(7, "gear") in gamedata.loot_pool(6, "gear"),
+      gamedata.pick_loot_item(7, "gear"))
 check("and never up", gamedata.pick_loot_item(0) == "")
 
 
