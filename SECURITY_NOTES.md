@@ -22,7 +22,7 @@ lives.
 
 | # | Finding | Severity | Status | Risk if exploited | Fix |
 |---|---------|----------|--------|-------------------|-----|
-| E-1 | Inventory is client-authoritative | critical (economy) | **Closed** | A modified client can write any item into its bag or bank — the best gear in the game, in any quantity — on its next save. | **Server-side authority.** Every save is reconciled against what the server actually granted and fabricated items are trimmed away; run in log-only shadow mode first, enforced once the comparison was proven. |
+| E-1 | Inventory is client-authoritative | critical (economy) | **Closed** | A modified client can write any item into its bag or bank — the best gear in the game, in any quantity — on its next save. | **Server-side authority.** Every save was reconciled against what the server actually granted and fabricated items trimmed away (shadow mode first, enforced once proven). Since then the bag and bank are the server's outright: every move, bin and cashed pile is its own request, and a player's whole-bag write is ignored. |
 | E-2 | Skills are client-authoritative and uncapped | critical (balance) | **Closed** — all 6 skills server-owned | A player can claim any skill level and skip all progression — level-99 attack on a character made a minute ago. | **Server-side authority.** All six skills are granted only by the server and dropped from client saves. Fishing, cooking and attack ride their own events; defense, agility and magic report activity to `/api/skill/train`, which clamps each to a generous per-second ceiling × elapsed time and applies class proficiency itself. A client claim earns nothing. |
 | E-3 | The kill *event* is asserted, not verified | high | **Open** — named, rate-limited, not fixed | A script can report kills it never fought and farm XP and loot without playing. | **Rate limit + content bound — not a fix.** The server rolls its own rewards, refuses reward-less enemies, rate-limits with a token bucket, and caps kills at what the world's respawners can produce (18,000/hr down to 5,208). Closing it needs server-side encounter state. |
 | E-4 | `app.run(debug=True)` | critical if exposed | **Closed** — every door, not only `python app.py` (E-4c) | Any crash on a reachable server hands an attacker a Python shell on the machine holding every password hash. | **Safe default + refusal.** The debugger is off unless `ELUSION_DEBUG=1`; the server refuses to start if `FLASK_DEBUG` or `flask run --debugger` asks for it instead, or if any debug flag is set behind a proxy; and it refuses every request if the interactive debugger is attached some other way. |
@@ -32,11 +32,11 @@ lives.
 | E-8 | **A client could set its own gold** | **critical (economy)** | **Closed** | A player can mint infinite gold, destroying the economy and progression. | **Server-side authority.** `gold` joined `SERVER_OWNED_STATS` on the status endpoint (ignored, not refused); `test_economy.py` now attacks it directly and holds the gold ledger to its invariant. |
 | E-9 | Current hp/mana/stamina are client-written | high | **Closed** — clamped; a rate bound, not a proof | A patched client heals to full whenever it likes and can never die. | **Extra check (clamp).** Every rise is reconciled against what regeneration plus authorised potions could produce; anything past a 3x margin is trimmed and the save still goes through. Measured log-only before it was enforced. |
 | E-10 | **Lusions were client-written, so dying was free** | **high (balance)** | **Closed** | A player can set their own revive currency, so death costs nothing. | **Server-side authority.** Lusion writes are ignored; `POST /api/character/revive` charges the server's own balance, only for a character the server knows is dead, and records the grant. |
-| E-11 | A banned player could sign straight back up | medium (moderation) | **Closed** — as far as addresses honestly allow | A ban lasts about thirty seconds — the time it takes to register a new account. | **Extra check + visibility.** Registration is refused from an address holding a live ban; staff see linked accounts rated strong or weak, and nothing is banned automatically. A VPN still defeats it, and this file says so. |
+| E-11 | A banned player could sign straight back up | medium (moderation) | **Closed** — as far as addresses and computers honestly allow | A ban lasts about thirty seconds — the time it takes to register a new account. | **Extra check + visibility.** Registration is refused from an address or a computer (the game's install id) holding a live ban; staff see linked accounts rated strong or weak, and nothing is banned automatically. A VPN no longer defeats it; deleting the game's install file still does, and this file says so. |
 | E-12 | The sanction ladder had only one rung | low (moderation) | **Closed** — a kick is not a ban | Staff had to ban someone to remove them, so the smallest available response was the harshest. | **New tool.** `POST /api/staff/kick` ends every session without banning, under the same rank rules and audit log as a ban. |
 | E-13 | **Four protections were unarmed against the shipped catalogue** | **high** | **Closed** — and it is the reason this table needed a footnote | Four fixes marked Closed were silently off in production, so everything they block was open with every test green. | **Deployment check.** `test_catalogue.py` asserts the shipped `gamedata.json` arms each protection, and the server logs an error at boot for any control running unarmed. |
 | E-14 | A kick or a ban never reached a game that was already running | medium (moderation) | **Closed** | A kicked or banned player keeps playing for as long as they leave the game open. | **Heartbeat.** The game re-checks its session every 15 seconds and on any 401, and a dead session sends it to the login screen — a kick lands in about a second. Only a 401 signs anyone out, so a server restart is never a mass kick. |
-| E-15 | Broken access control (IDOR) — can you name a row that is not yours? | critical if present | **Audited, nothing found** — one adjacent gap closed | A player sends somebody else's record id and edits, empties or deletes it. One Postman request, no modified client needed. | **Structural, two ways.** Every id a client may name is scoped inside the query, so "not yours" and "does not exist" are one 404; and the highest-value rows (trades) accept no id at all — every route resolves them from the caller. `test_ownership.py` runs the attack on every surface and enforces the convention on the source. The gap that was real: a deleted chat message left its picture being served. |
+| E-15 | Broken access control (IDOR) — can you name a row that is not yours? | critical if present | **Audited, nothing found** — one adjacent gap closed | A player sends somebody else's record id and edits, empties or deletes it. One Postman request, no modified client needed. | **Structural, two ways.** Every id a client may name is scoped inside the query, so "not yours" and "does not exist" are one 404; and the highest-value rows (trades) accept no id at all — every route resolves them from the caller. `test_ownership.py` runs the attack on every surface and enforces the convention on the source. The gap that was real: a deleted chat message left its picture being served. Since closed as well: the picture route now checks that the caller could see a line showing the picture, and private lines get their own copy. |
 | E-16 | **The death screen's other exit was never migrated** | **high (balance + economy)** | **Closed** | Accepting death healed the character on the player's own machine and zeroed the carry gold locally — so the refill was unauthorised, and the penalty never reached the server at all. Death took your items, refunded your gold, and left you on 52 hp. | **Server-side authority.** `POST /api/character/respawn` refuses a living character, burns the carried gold through `gold_delta()` under the reason `death`, empties `carry_items`, refills the three pools from the class curve and writes the grant E-9's reconciler reads. Found by a player report, not by an audit — see below. |
 | E-17 | **Two requests sent together could both spend the same thing** | **critical (economy)** | **Closed** | Two requests arriving at once both read the old balance: one loot cell paid five times, one purse was deposited into the bank twice, one potion explained five heals. Two clicks or a short script mints items and gold. | **Serialisation.** Every write request takes SQLite's write lock (`BEGIN IMMEDIATE`) before its first read and holds it to the end; nine slow routes are named exceptions. `test_concurrency.py` fires real requests together on threads. Found by playing: one sword swing killed two enemies and one kill's XP vanished. |
 | E-18 | **Accept agreed to whatever was on the table when the trade ran** | **high (economy)** | **Closed** | The other player could swap the sword for a stick between your look and your click, and your accept went through. And the first to accept could lose what they received on their next ordinary save. | **Compare-and-set.** Accept names the revision of the offer it drew, and the write is conditioned on it. Both bags are flagged in the trade's own transaction, and a whole-bag save built before the trade is refused with the bag the server holds. `test_trades.py`. |
@@ -120,6 +120,25 @@ The sequence mattered. `_report_unexplained_gains()` ran in **shadow mode**
 first — comparing the claim to the record and *logging* the difference while
 refusing nothing. Shipping the refusal before the log had proven the comparison
 was right would have broken honest saves for real players.
+
+**Later: the bag stopped being claimed at all.** The ledger above caught a
+*gain*. The arrangement and every *loss* were still the client's word — an
+empty array emptied the bag — and `SECURITY.md` listed "the backpack ledger is
+still client-declared" as an honest limit until the owner chose to close it.
+Every act on a grid turned out to be discrete: a drag is
+`POST /api/character/inventory/move` (move, merge up to the stack limit, or
+swap, exactly as the game draws it), the bin is `.../discard`, a pile of coins
+is `.../cash` (which also fixed a pile being destroyed when used: the purse was
+never the client's to raise, so its gold was dropped and the emptied cell was
+not), and the bank has `/api/bank/move` and `/api/bank/discard`. Each names the
+item the game saw in the cell; a cell holding anything else is a 409 that
+carries the grid, so a drag made just after a trade landed cannot move or
+destroy the wrong thing. A player's `PUT /api/character/inventory` and
+`PUT /api/account/bank` are answered with the server's grid and `ignored`, and
+the game no longer sends them; staff still write a bag whole, for tooling.
+`_reconcile_inventory()` and `_reconcile_bank()` are gone with nothing left to
+call them. `test_bagmoves.py` holds it, and `test_security.py` E-1 runs the old
+exploits again (they now write nothing, a fabricated loss included).
 
 ### E-2 — Skills · CLOSED
 
@@ -712,9 +731,10 @@ anything at all.
 ---
 
 **How it closed.** `_report_unexplained_heals()` is `_reconcile_heals()` now —
-renamed because it no longer only reports, and because it does the same job as
+renamed because it no longer only reports, and because it did the same job as
 `_reconcile_bank()` and `_reconcile_inventory()`: compare the claim to the
-record and correct it.
+record and correct it. (Those two have since gone: the bag and the bank are no
+longer claimed by the client at all - E-1.)
 
 **There are two lines, and that is the whole design.**
 
@@ -975,6 +995,35 @@ itself, the linked account is not banned by having been linked. A narrowness
 guarantee cannot be demonstrated by the blocking behaviour — only by the people
 who still get through.
 
+**4 · Later: the computer, because a VPN changes the address and not the
+machine.** "A VPN defeats ban evasion" was the honest limit on all of the
+above, and the owner chose to close as much of it as can honestly be closed.
+The game now makes a random install id the first time it runs, keeps it in
+`user://install.cfg` (apart from the session, so logging out does not reset
+it), and sends it with every login, registration and resume.
+`account_installs` is `account_ips` for computers, holding only the SHA-256 of
+the id, and `_install_evasion_state()` is `_ban_evasion_state()` for them:
+registration only, expiring with the ban, inert above
+`EVASION_BLOCK_MAX_ACCOUNTS` accounts (a library computer), and refused with
+"from this computer" so a sibling knows why. The link view merges both sources
+into one entry per account, with `shared_computers` beside `shared_addresses`;
+a computer link is strong unless the computer itself is crowded.
+
+Two decisions worth keeping. **A banned login with the right password still
+records the computer** — a player banned before install ids existed has none on
+file until they try once more, and they always do — while a wrong password
+records nothing, or typing a banned name would get any computer blocked. And
+**`/api/auth/resume` records too**, the address as well as the computer:
+"Remember me" carries a player thirty days without `/login`, and recording
+only there left that month out of the link view.
+
+What it is not: the id is whatever the client sends. Deleting the file, a
+second browser for the web build, or a modified game sending a fresh id gets
+past it, and a game that sends none (an older build) is not refused. It turns
+"buy a VPN" from the whole answer into half of one. `test_security.py` E-5f
+holds it, narrowness first; the game's `_test_install_id_is_kept_and_sent()`
+holds the client half.
+
 ### E-12 — The sanction ladder had only one rung · CLOSED
 
 Not a vulnerability. A moderation tool that made overreacting the cheapest
@@ -1215,20 +1264,48 @@ Even the owner's debug mint follows it. `POST /api/staff/gold` is owner-only and
 the caller. Passing `username` does nothing, which is a test in
 `test_ownership.py` rather than a claim here.
 
-#### The one route with no ownership check, and why that is sound
+#### The route that had no ownership check, and why it has one now
 
-`GET /api/chat/image/<image_id>` serves any stored picture to any signed-in
-caller. It is **capability-based**: the id is the SHA-256 of the bytes, so 256
-unguessable bits *are* the permission — you cannot hold an id without having been
-shown it, and the only way to be shown it is to have received the chat line
-carrying it. Being signed in is what keeps it from being a public file host run by
-accident.
+`GET /api/chat/image/<image_id>` used to serve any stored picture to any
+signed-in caller. It was **capability-based**: the id is the SHA-256 of the
+bytes, so 256 unguessable bits *were* the permission — you could not hold an id
+without having been shown it. Being signed in kept it from being a public file
+host run by accident.
 
-That argument rests entirely on properties of the id, so the properties are the
-test. If the ids ever become sequential, or the hash is truncated to something
-brute-forceable, this route turns into the exercise's flaw without a line of it
-changing. `test_ownership.py` O-3 asserts the id is 64 hex characters, is 256 bits
-rather than a truncation, and **equals the SHA-256 of the bytes actually served**.
+That argument held for *guessing* and had two holes, both written down as
+honest limits in `SECURITY.md` until they were closed:
+
+- **A whispered picture was only as private as its bytes were rare.** The store
+  deduplicates on the content hash, so the same image posted in world chat was
+  the same row and the same id, and the whisper was never private.
+- **An id, once seen, worked for as long as the row lived.** A player who left a
+  guild, or stopped being somebody's friend, kept loading what had been posted
+  there.
+
+**Now the route asks the read's own question.** `_may_see_image()` serves a
+picture to someone who could read a line showing it, by the chat read's own
+rules (`_can_read_chat_row`, the same function a report uses); to an account
+that uploaded those bytes (`chat_image_holders`, one row per uploader, because
+the shared row's `created_by` remembers only the first); or to a mod judging a
+report of it. Anything else is the same 404 as a missing picture. And
+`POST /api/chat/send` gives every whisper, friends or guild line **its own copy
+under a random id**, so a private picture never shares an id with a world one,
+and refuses an id the sender could not see — otherwise an id glimpsed in a log
+could be posted to world and served to everyone. `Cache-Control` went from
+`public` to `private`, because the answer now depends on who is asking.
+
+The cost: a picture lasts as long as a line showing it (the chat's 24 hours)
+rather than until the 128 MB store happened to evict it. The game fetches a
+picture when it draws the line and keeps it in memory, so nothing on screen
+goes missing.
+
+The id properties are still tested — 64 hex, 256 bits, and **equal to the
+SHA-256 of the bytes served** for a world picture — because they are still what
+stops guessing. `test_ownership.py` O-3 holds the rest: bob holding alice's id
+is refused until a line he can read shows it, the whisper's id is new and random,
+carol (who uploaded the very same file) is refused the whisper's copy, the owner
+is refused it until it is reported, and bob stops being served a friends-channel
+picture the moment he unfriends its poster.
 
 #### The gap that was real: delete was not revocation
 
@@ -1252,11 +1329,8 @@ the row on the first delete would blank the picture under a second, innocent lin
 The route counts the remaining `chat_messages` rows naming that image and deletes
 it only at zero, reporting `image_dropped` either way.
 
-Worth stating because content addressing has a consequence nobody wrote down: a
-whispered picture is only as private as its bytes are rare. Post the same image in
-world chat and it is the same row and the same id, so the whisper was never
-private. That is inherent to deduplicating on a hash, it is the right trade for a
-game chat, and it should be a known one rather than a surprise.
+A row deleted this way takes its `chat_image_holders` rows with it, so
+revocation reaches the uploaders too.
 
 #### And the same idea one layer up: the feed could not be moderated
 

@@ -111,23 +111,30 @@ def put_skills(headers, skills, slot=0):
                       json={"slot": slot, "skills": skills})
 
 
-print("\n=== E-1  BACKPACK IS SERVER-AUTHORITATIVE OVER GAINS ===\n")
+print("\n=== E-1  THE BACKPACK IS SERVER-OWNED ===\n")
+#
+# It used to be server-authoritative over GAINS: the whole bag the client sent
+# was written, trimmed to what the server had granted. The arrangement and every
+# loss were the client's word. Now a player's whole-bag write changes nothing -
+# every change is its own request (test_bagmoves.py) - and these are the old
+# exploits, run again against that.
 
 player = register("mallory")
 make_char(player)
 
-# The core exploit: claim items never granted. Accepted as a request (200) but
-# trimmed to nothing, because the server recorded no such items.
+# The core exploit: claim items never granted. Accepted as a request (200), so
+# a game from before the change does not see an error on every save, and
+# nothing is written.
 #
 # QUANTITY 1, NOT 99, AND THE REASON MATTERS. embersword has max_stack = 1, so a
-# claim of 99 is refused at 400 by SHAPE validation - before the ledger is ever
-# consulted. That made this test pass for the wrong reason: the 400 left the
-# backpack empty, so the "trimmed to nothing" check below agreed, and the pair
-# reported that server authority worked without once exercising it. A test of
+# claim of 99 is refused at 400 by SHAPE validation - before anything else is
+# consulted. That once made this test pass for the wrong reason. A test of
 # provenance has to send something WELL-FORMED and unearned.
 r = put_inventory(player, [{"item_id": "embersword", "quantity": 1}])
 check("a fabricated backpack is accepted as a request", r.status_code == 200, r.status_code)
-check("but the fabricated items are trimmed to nothing", carried(player) == {}, carried(player))
+check("but nothing in it is written", carried(player) == {}, carried(player))
+check("and the answer says the bag was ignored",
+      (r.get_json() or {}).get("ignored") == ["inventory"], r.get_json())
 
 # And the shape rule that masked this, asserted on its own terms so it can never
 # quietly stand in for the authority check again.
@@ -140,29 +147,31 @@ grant_directly("mallory", 0, [("ironsword", 1)])
 put_inventory(player, [{"item_id": "ironsword", "quantity": 1}])
 check("a server-granted item survives the sync", carried(player) == {"ironsword": 1}, carried(player))
 
-# The granted item stays; fabricated excess alongside it is trimmed.
 put_inventory(player, [{"item_id": "ironsword", "quantity": 1},
                        {"item_id": "embersword", "quantity": 1}])
-check("granted item kept, fabricated excess trimmed",
+check("granted item kept, fabricated one not written",
       carried(player) == {"ironsword": 1}, carried(player))
 
-# Claiming MORE of a granted item than was granted is trimmed to the granted amount.
 put_inventory(player, [{"item_id": "ironsword", "quantity": 99}])
-check("over-claiming a granted item clamps to the granted amount",
+check("over-claiming a granted item changes nothing",
       carried(player) == {"ironsword": 1}, carried(player))
 
-# Reductions and drops are always honest and pass through.
+# THE HALF THE LEDGER NEVER CHECKED. A loss used to be the client's word: an
+# empty array emptied the bag. It is a request now too (discard, consume, a
+# deposit, a sale), so a whole write that leaves things out destroys nothing.
 put_inventory(player, [])
-check("dropping/using items (a reduction) is allowed", carried(player) == {}, carried(player))
+check("a player's empty bag write destroys nothing",
+      carried(player) == {"ironsword": 1}, carried(player))
 
-# Rearranging a granted item to another cell is not a gain.
 grant_directly("mallory", 0, [("smallhealthpotion", 5)])
 put_inventory(player, [None, None, {"item_id": "smallhealthpotion", "quantity": 5}])
-check("rearranging a granted item is not a gain", carried(player) == {"smallhealthpotion": 5},
-      carried(player))
+_cells = client.get("/api/character?slot=0", headers=player).get_json()["inventory"]
+check("rearranging by a whole write moves nothing - a drag is POST .../move",
+      _cells[0] == {"item_id": "smallhealthpotion", "quantity": 5} and _cells[2] is None,
+      _cells[:3])
 
 
-print("\n=== E-1  STAFF BYPASS (a mod+ can already self-grant) ===\n")
+print("\n=== E-1  STAFF STILL WRITE A BAG WHOLE (a mod+ can already self-grant) ===\n")
 
 owner = register("boss")            # matches ELUSION_OWNER
 make_char(owner)
@@ -174,13 +183,13 @@ check("the owner may set an arbitrary backpack", carried(owner) == {"embersword"
 
 
 
-print("\n=== E-1  THE BANK IS SERVER-AUTHORITATIVE TOO ===\n")
+print("\n=== E-1  THE BANK IS SERVER-OWNED TOO ===\n")
 
-# The backpack's remaining sibling. PUT /api/account/bank replaced the whole
-# bank with whatever arrived, so anything in gamedata.json could be fabricated
-# straight into storage. Every legitimate way IN already writes bank_items
-# server-side (POST /api/bank/items handles deposit and withdraw), so what is
-# left for this endpoint is reordering.
+# The backpack's sibling. PUT /api/account/bank replaced the whole bank with
+# whatever arrived, then trimmed it to the record. Every legitimate way IN
+# already wrote bank_items server-side (POST /api/bank/items), and now so does
+# every rearrangement (POST /api/bank/move) and every bin (POST /api/bank/discard),
+# so a player's whole write is ignored.
 
 def put_bank(headers, cells):
     return client.put("/api/account/bank", headers=headers,
@@ -213,14 +222,15 @@ make_char(banker)
 
 r = put_bank(banker, [{"item_id": "embersword", "quantity": 1}])
 check("a fabricated bank is accepted as a request", r.status_code == 200, r.status_code)
-check("but the fabricated item is trimmed to nothing", banked(banker) == {}, banked(banker))
+check("but nothing in it is written", banked(banker) == {}, banked(banker))
+check("and the answer says the bank was ignored",
+      (r.get_json() or {}).get("ignored") == ["bank_inventory"], (r.get_json() or {}).get("ignored"))
 
-# A server-banked item survives a sync, and may be REORDERED - that is the only
-# thing this endpoint is still for.
+# A server-banked item survives a sync. Reordering it is POST /api/bank/move.
 bank_directly("banker", [("ironsword", 1), ("smallhealthpotion", 5)])
 put_bank(banker, [None, {"item_id": "smallhealthpotion", "quantity": 5},
                   {"item_id": "ironsword", "quantity": 1}])
-check("server-banked items survive a reorder",
+check("server-banked items survive a whole write",
       banked(banker) == {"ironsword": 1, "smallhealthpotion": 5}, banked(banker))
 
 # Over-claiming a real holding clamps to what was banked.
@@ -231,22 +241,23 @@ check("server-banked items survive a reorder",
 # and the assertion measuring nothing. A provenance test must send a
 # WELL-FORMED claim; the stack ceiling is a different rule with its own check.
 put_bank(banker, [{"item_id": "smallhealthpotion", "quantity": 20}])
-check("over-claiming a banked item clamps to what was banked",
-      banked(banker) == {"smallhealthpotion": 5}, banked(banker))
+check("over-claiming a banked item changes nothing",
+      banked(banker) == {"ironsword": 1, "smallhealthpotion": 5}, banked(banker))
 
 r = put_bank(banker, [{"item_id": "smallhealthpotion", "quantity": 99}])
 check("a bank claim above max_stack is refused on shape, before provenance",
       r.status_code == 400, r.status_code)
 
-# Withdrawals and drops are honest reductions and always pass.
+# A loss is a request too: a withdrawal, or the bin.
 put_bank(banker, [])
-check("emptying the bank is allowed", banked(banker) == {}, banked(banker))
+check("a player's empty bank write destroys nothing",
+      banked(banker) == {"ironsword": 1, "smallhealthpotion": 5}, banked(banker))
 
-# The bank is account-wide, so the trim must not be fooled by a second slot.
+# Claimed twice in one write - once a trim, now simply not written.
 bank_directly("banker", [("ironsword", 1)])
 put_bank(banker, [{"item_id": "ironsword", "quantity": 1},
                   {"item_id": "ironsword", "quantity": 1}])
-check("the same item claimed twice is capped in total, not per cell",
+check("the same item claimed twice is not two of it",
       banked(banker) == {"ironsword": 1}, banked(banker))
 
 put_bank(owner, [{"item_id": "embersword", "quantity": 1}])
@@ -1045,6 +1056,162 @@ _edge_code = reg_from("edgenew", EDGE)
 check("an address exactly at the limit is still treated as a household",
       _edge_code == 403,
       "%d at exactly EVASION_BLOCK_MAX_ACCOUNTS accounts" % _edge_code)
+
+
+print("\n=== E-5f  A BANNED COMPUTER CANNOT SIGN UP AGAIN, WHATEVER ITS ADDRESS ===\n")
+#
+# E-5e's honest limit was the VPN: a new address is a new person. The game now
+# keeps a random install id and sends it with every login and registration
+# (INSTALL IDS in app.py), so a banned player who changes their address is
+# still at the same computer.
+#
+# THE SAME NARROWNESS AS THE ADDRESS, asserted the same way: registration only,
+# the sibling on the family computer keeps playing, it expires with the ban, and
+# a crowded public machine is not a weapon. And the honest part: the id is what
+# the client sends, so a game that sends none is not refused - this stops the
+# VPN, not a modified client.
+
+def pc_register(name, ip, install=None):
+    body = {"username": name, "password": "password123"}
+    if install is not None:
+        body["install"] = install
+    return client.post("/api/auth/register", json=body, environ_base={"REMOTE_ADDR": ip})
+
+
+def pc_login(name, ip, install=None, password="password123"):
+    body = {"username": name, "password": password}
+    if install is not None:
+        body["install"] = install
+    return client.post("/api/auth/login", json=body, environ_base={"REMOTE_ADDR": ip})
+
+
+def install_rows(name):
+    con = sqlite3.connect(DB_PATH)
+    try:
+        return [r[0] for r in con.execute(
+            "SELECT a.install_hash FROM account_installs a JOIN users u ON u.id = a.user_id"
+            " WHERE u.username = ?", (name,)).fetchall()]
+    finally:
+        con.close()
+
+
+PC_FAMILY = "ab" * 32                 # the family computer
+PC_OTHER = "cd" * 32                  # somebody else's computer
+pc_register("pcevader", "203.0.113.31", PC_FAMILY)
+pc_login("pcevader", "203.0.113.31", PC_FAMILY)
+pc_register("pcsibling", "203.0.113.31", PC_FAMILY)
+ban_directly("pcevader", 3600)
+
+# THE VPN: a fresh address nobody has used, the same computer.
+_vpn = pc_register("pcvpn", "198.51.100.231", PC_FAMILY)
+check("a banned computer cannot register from a brand-new address",
+      _vpn.status_code == 403,
+      "%d - a VPN is still a new person to this server" % _vpn.status_code)
+check("...and is told it is this computer, not this connection",
+      "computer" in str((_vpn.get_json() or {}).get("message", "")), _vpn.get_json())
+check("the response does not name the banned account",
+      "pcevader" not in json.dumps(_vpn.get_json() or {}))
+
+# THE NARROWNESS HALF.
+check("the sibling on the family computer still logs in",
+      pc_login("pcsibling", "203.0.113.31", PC_FAMILY).status_code == 200,
+      "banning one account took out the family computer")
+check("another computer on that same VPN address registers",
+      pc_register("pcvpnfriend", "198.51.100.232", PC_OTHER).status_code == 201)
+check("AND A GAME THAT SENDS NO ID IS NOT REFUSED - the stated limit, not a hole",
+      pc_register("pcnoid", "198.51.100.233").status_code == 201,
+      "an older build, or a modified one, sends nothing; refusing that would "
+      "lock out every player who has not updated")
+check("junk in the field is ignored, never refused",
+      pc_register("pcjunk", "198.51.100.234", "not-hex!").status_code == 201
+      and install_rows("pcjunk") == [])
+
+# STORED AS A HASH, RETURNED BY NOTHING.
+_rows = install_rows("pcsibling")
+check("the server keeps the SHA-256 of the id, not the id",
+      _rows == [hashlib.sha256(PC_FAMILY.encode()).hexdigest()], _rows)
+_view = json.dumps(staff_view(owner, "pcsibling").get_json())
+check("and no staff view carries either one",
+      PC_FAMILY not in _view and _rows[0] not in _view)
+
+# EXPIRY AND PERMANENCE, through ban_state() like the address.
+ban_directly("pcevader", -10)
+check("a served sentence stops blocking the computer",
+      pc_register("pcafter", "198.51.100.235", PC_FAMILY).status_code == 201)
+ban_directly("pcevader", None)
+check("a permanent ban keeps blocking it",
+      pc_register("pcperm", "198.51.100.236", PC_FAMILY).status_code == 403)
+
+# BANNED BEFORE INSTALL IDS EXISTED. Such an account has no computer on file.
+# Its holder trying once more - the right password, refused for the ban - is
+# what links it; a wrong password links nothing.
+PC_OLD = "ef" * 32
+PC_GUESS = "12" * 32
+pc_register("pcoldban", "198.51.100.237")
+ban_directly("pcoldban", None)
+check("a banned account's login is refused as before",
+      pc_login("pcoldban", "198.51.100.237", PC_OLD).status_code == 403)
+check("but that try links the computer: no new account from it",
+      pc_register("pcoldnew", "198.51.100.238", PC_OLD).status_code == 403)
+check("a WRONG password on a banned account links nothing",
+      pc_login("pcoldban", "198.51.100.239", PC_GUESS, password="wrongpass99").status_code == 401
+      and pc_register("pcguessnew", "198.51.100.240", PC_GUESS).status_code == 201,
+      "anyone could otherwise get any computer blocked by typing a banned name")
+
+# A REMEMBERED LOGIN LINKS TOO. "Remember me" can go thirty days without
+# /login, so /api/auth/resume records the computer as well.
+PC_RESUME = "34" * 32
+_tok = pc_login("pcnoid", "198.51.100.233").get_json()["token"]
+client.post("/api/auth/resume", json={"install": PC_RESUME},
+            headers={"Authorization": "Bearer " + _tok},
+            environ_base={"REMOTE_ADDR": "198.51.100.233"})
+check("a resumed session records the computer",
+      install_rows("pcnoid") == [hashlib.sha256(PC_RESUME.encode()).hexdigest()],
+      install_rows("pcnoid"))
+
+# STAFF SEE IT. pcevader and pcsibling share an address too, so the proof is
+# an account that shares ONLY the computer: pcafter, registered from a VPN
+# address after the ban ran out.
+_pc_links = {a["username"]: a for a in links_for("pcevader")["accounts"]}
+check("an account on the same computer is linked, with no address in common",
+      "pcafter" in _pc_links and _pc_links["pcafter"]["shared_addresses"] == 0,
+      sorted(_pc_links))
+check("...as one computer, and strong",
+      _pc_links.get("pcafter", {}).get("shared_computers") == 1
+      and _pc_links.get("pcafter", {}).get("strength") == "strong",
+      _pc_links.get("pcafter"))
+check("an address-and-computer sibling is one entry, not two",
+      _pc_links.get("pcsibling", {}).get("shared_addresses") == 1
+      and _pc_links.get("pcsibling", {}).get("shared_computers") == 1,
+      _pc_links.get("pcsibling"))
+
+# A PUBLIC MACHINE IS NOT A WEAPON. Each account from its own address, so it is
+# the computer and only the computer that is crowded.
+PC_LIBRARY = "56" * 32
+for i in range(app_module.EVASION_BLOCK_MAX_ACCOUNTS + 2):
+    pc_register("libpc%02d" % i, "192.0.2.%d" % (100 + i), PC_LIBRARY)
+ban_directly("libpc03", None)
+check("one banned account cannot stop a library computer making accounts",
+      pc_register("libpcnew", "192.0.2.150", PC_LIBRARY).status_code == 201)
+_lib = {a["username"]: a for a in links_for("libpc03")["accounts"]}
+check("and its strangers are linked weak, not as alts",
+      _lib and all(a["strength"] == "weak" for a in _lib.values()),
+      [(n, a["strength"]) for n, a in list(_lib.items())[:4]])
+
+PC_EDGE = "78" * 32
+for i in range(app_module.EVASION_BLOCK_MAX_ACCOUNTS):
+    pc_register("edgepc%02d" % i, "192.0.2.%d" % (200 + i), PC_EDGE)
+ban_directly("edgepc00", None)
+check("a computer exactly at the limit is still treated as a household",
+      pc_register("edgepcnew", "192.0.2.240", PC_EDGE).status_code == 403)
+
+_con = sqlite3.connect(DB_PATH)
+_pc_refusals = _con.execute("SELECT COUNT(*) FROM login_attempts"
+                            " WHERE reason = 'register-ban-evasion-install'").fetchone()[0]
+_con.close()
+# EXACTLY FOUR: pcvpn, pcperm, pcoldnew and edgepcnew.
+check("each computer refusal is logged under its own reason",
+      _pc_refusals == 4, "%d rows, expected 4" % _pc_refusals)
 
 
 print("\n=== E-7  ITEM USE IS SERVER-AUTHORITATIVE ===\n")

@@ -1157,6 +1157,23 @@ def init_db():
         -- which the primary key's leading user_id cannot serve.
         CREATE INDEX IF NOT EXISTS idx_account_ips_ip ON account_ips(ip);
 
+        -- WHICH COPIES OF THE GAME AN ACCOUNT HAS SIGNED IN FROM - the same
+        -- question as account_ips, asked of the computer instead of the
+        -- connection, because a VPN changes the address and not the computer.
+        -- The game keeps a random install id in its own folder and sends it
+        -- with every login; only its SHA-256 is stored, and no route ever
+        -- returns it. See INSTALL IDS for what it does and does not stop.
+        CREATE TABLE IF NOT EXISTS account_installs (
+            user_id      INTEGER NOT NULL,
+            install_hash TEXT    NOT NULL,
+            first_seen   INTEGER NOT NULL,
+            last_seen    INTEGER NOT NULL,
+            PRIMARY KEY (user_id, install_hash),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_account_installs_hash
+            ON account_installs(install_hash);
+
         -- EVERY LOGIN ATTEMPT, GOOD AND BAD.
         --
         -- Two jobs, and it is one table because they need the same rows.
@@ -1775,6 +1792,19 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_chat_images_age
             ON chat_images(created_at);
 
+        -- WHO PUT EACH PICTURE ON THE SERVER, one row per account. Not a column
+        -- on chat_images, because the store deduplicates on the content hash:
+        -- when two players upload the same file it is ONE row, and created_by
+        -- only remembers the first. The second uploader still has to be able
+        -- to see and send what they uploaded - see WHO MAY SEE A PICTURE.
+        -- Removed with the picture (eviction, or a mod deleting its last line).
+        CREATE TABLE IF NOT EXISTS chat_image_holders (
+            image_id   TEXT    NOT NULL,
+            user_id    INTEGER NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (image_id, user_id)
+        );
+
         -- A DELETION IS AN EVENT, AND THE FEED HAD NO WAY TO CARRY ONE.
         --
         -- GET /api/chat answers "messages with id greater than `since`", which is
@@ -2186,6 +2216,11 @@ def init_db():
     _migrate_add_column(db, "chat_messages", "channel", "TEXT NOT NULL DEFAULT 'world'")
     _migrate_add_column(db, "chat_messages", "target_id", "INTEGER NOT NULL DEFAULT 0")
     _migrate_add_column(db, "chat_messages", "image_id", "TEXT NOT NULL DEFAULT ''")
+    # Which lines show a picture: _may_see_image() asks it on every picture
+    # fetched. After the column it indexes, for the same reason as
+    # idx_sessions_seen - in the schema block it would stop an old database
+    # from booting.
+    db.execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_image ON chat_messages(image_id)")
 
     # DEFAULTS TO png, WHICH IS WHAT EVERY EXISTING ROW REALLY IS. Stills are
     # now kept as WebP when WebP is smaller, and it usually is by a lot - a
@@ -3021,6 +3056,87 @@ def _record_account_ip(db, user_id, ip, now):
     db.commit()
 
 
+# =============================================================================
+# INSTALL IDS
+# =============================================================================
+# The address check below stops the lazy evader - banned, new account, same
+# connection - and a VPN walks straight past it, which SECURITY.md used to list
+# as an honest limit. An install id is the other half: a random id the game
+# makes the first time it runs and keeps in its own folder (user://install.cfg),
+# sent with every login, registration and resume. A VPN changes the address;
+# it does not change that file.
+#
+# THE SAME RULES AS THE ADDRESS, ON PURPOSE:
+#   - Registration only. A family computer is a household: the sibling who
+#     shares it keeps logging in to their own account.
+#   - It expires with the ban, through ban_state().
+#   - A crowded computer is not a person. Above EVASION_BLOCK_MAX_ACCOUNTS
+#     (a library, an internet cafe) it blocks nothing, so getting yourself
+#     banned on a public machine cannot lock out everyone who uses it.
+#   - Staff see the link (_linked_accounts), and a human decides.
+#
+# WHAT IT IS NOT. The id is whatever the client sends, so it is a speed bump
+# and not a lock: deleting the file, a second browser for the web build, or a
+# modified game sending a fresh id each time gets past it. It stops the evader
+# who tries a VPN and nothing else, and the staff link view still shows the
+# rest. Stored as SHA-256 and never returned by any route, so nobody can read
+# somebody else's id out of the server and send it to frame them.
+
+def _install_hash(raw):
+    """SHA-256 of a well-formed install id, or "" for anything else - absent,
+    an older game that does not send one, or junk. Ignored, never refused:
+    a login does not fail over a field that only exists for moderation."""
+    clean = str(raw or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{32,128}", clean):
+        return ""
+    return hashlib.sha256(clean.encode()).hexdigest()
+
+
+def _record_account_install(db, user_id, install_hash, now):
+    """Remember that this account has signed in from this copy of the game.
+    The same upsert as _record_account_ip: one row per (account, install),
+    first_seen kept, last_seen moving."""
+    if not install_hash or not user_id:
+        return
+    db.execute(
+        """
+        INSERT INTO account_installs (user_id, install_hash, first_seen, last_seen)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id, install_hash) DO UPDATE SET last_seen = excluded.last_seen
+        """,
+        (user_id, install_hash, now, now),
+    )
+    db.commit()
+
+
+def _install_evasion_state(db, install_hash):
+    """Has a currently-banned account signed in from this copy of the game?
+    The banned username, or None. _ban_evasion_state() below, for the
+    computer instead of the connection - read its notes; the crowd rule and
+    the u.* are there for the same reasons."""
+    if not install_hash:
+        return None
+    crowd = db.execute(
+        "SELECT COUNT(DISTINCT user_id) AS n FROM account_installs WHERE install_hash = ?",
+        (install_hash,),
+    ).fetchone()
+    if int(crowd["n"] or 0) > EVASION_BLOCK_MAX_ACCOUNTS:
+        return None
+    for candidate in db.execute(
+        """
+        SELECT u.*
+        FROM account_installs a
+        JOIN users u ON u.id = a.user_id
+        WHERE a.install_hash = ? AND u.is_banned = 1
+        ORDER BY a.last_seen DESC
+        """,
+        (install_hash,),
+    ).fetchall():
+        if ban_state(candidate) is not None:
+            return candidate["username"]
+    return None
+
+
 def _ban_evasion_state(db, ip, now):
     """Has a currently-banned account logged in from this address?
 
@@ -3190,7 +3306,74 @@ def _linked_accounts(db, user_id):
             "strength": "weak" if quietest >= SHARED_ADDRESS_ACCOUNTS else "strong",
             "first_linked": int(row["first_linked"] or 0),
             "last_linked": int(row["last_linked"] or 0),
+            "shared_computers": 0,
+            "quietest_computer_accounts": 0,
         })
+
+    # THE SAME COMPUTER, which a VPN does not change - see INSTALL IDS. Merged
+    # into the list above rather than shown as a second one: "same address and
+    # same computer" is one sibling, not two findings. A computer link is
+    # STRONG unless the computer itself is crowded (a library machine links
+    # strangers exactly the way a carrier address does).
+    by_name = {entry["username"]: entry for entry in linked}
+    for row in db.execute(
+        """
+        SELECT u.id, u.username, u.role,
+               u.is_banned, u.ban_expires_at, u.ban_reason,
+               u.banned_by, u.banned_at,
+               COUNT(DISTINCT mine.install_hash) AS computers,
+               MIN(crowd.n)            AS quietest,
+               MIN(theirs.first_seen)  AS first_linked,
+               MAX(theirs.last_seen)   AS last_linked
+        FROM account_installs mine
+        JOIN account_installs theirs
+             ON theirs.install_hash = mine.install_hash AND theirs.user_id != mine.user_id
+        JOIN users u ON u.id = theirs.user_id
+        JOIN (
+            SELECT install_hash, COUNT(DISTINCT user_id) AS n
+            FROM account_installs
+            WHERE install_hash IN (SELECT install_hash FROM account_installs WHERE user_id = ?)
+            GROUP BY install_hash
+        ) crowd ON crowd.install_hash = mine.install_hash
+        WHERE mine.user_id = ?
+        GROUP BY u.id
+        ORDER BY quietest ASC, last_linked DESC
+        LIMIT ?
+        """,
+        (user_id, user_id, LINKED_ACCOUNT_LIMIT + 1),
+    ).fetchall():
+        quiet_computer = int(row["quietest"] or 0)
+        entry = by_name.get(row["username"])
+        if entry is None:
+            entry = {
+                "username": row["username"],
+                "role": role_for(row),
+                "ban": ban_state(row),
+                "shared_addresses": 0,
+                "quietest_address_accounts": 0,
+                "busiest_address_accounts": 0,
+                "strength": "weak",
+                "first_linked": int(row["first_linked"] or 0),
+                "last_linked": int(row["last_linked"] or 0),
+            }
+            by_name[row["username"]] = entry
+            linked.append(entry)
+        entry["shared_computers"] = int(row["computers"] or 0)
+        entry["quietest_computer_accounts"] = quiet_computer
+        if quiet_computer < SHARED_ADDRESS_ACCOUNTS:
+            entry["strength"] = "strong"
+        entry["first_linked"] = min(entry["first_linked"] or int(row["first_linked"] or 0),
+                                    int(row["first_linked"] or 0))
+        entry["last_linked"] = max(entry["last_linked"], int(row["last_linked"] or 0))
+
+    # BANNED FIRST, then the strong links, then the rest - the order the
+    # address list already had, kept now that two sources feed it.
+    linked.sort(key=lambda e: (e["ban"] is None, e["strength"] != "strong",
+                               -e["shared_computers"], e["quietest_address_accounts"],
+                               -e["last_linked"]))
+    if len(linked) > LINKED_ACCOUNT_LIMIT:
+        truncated = True
+        linked = linked[:LINKED_ACCOUNT_LIMIT]
 
     return linked, truncated
 
@@ -3622,7 +3805,11 @@ CLIENT_BUILD_HEADER = "X-Elusion-Build"
 # "older than", and integers answer that without a parser. A display version
 # lives beside it in the client for humans; this is the one the server compares,
 # and it never needs to know how the humans are numbering things.
-CURRENT_CLIENT_BUILD = 1
+#
+# 2: the backpack and bank became server-owned (ONE CELL AT A TIME). A build-1
+# game still plays, but its drags and its bin are never saved - its whole-bag
+# writes are ignored - so this is the first build worth setting as the minimum.
+CURRENT_CLIENT_BUILD = 2
 
 MAINTENANCE_DEFAULT_MESSAGE = "Update in progress - please come back later."
 
@@ -4940,8 +5127,9 @@ def decode_relayed_image(raw):
     return record, None
 
 
-def store_relayed_image(record, source_url, by):
-    """Keep it, evicting the oldest while the store is over its cap."""
+def store_relayed_image(record, source_url, by, by_id=0):
+    """Keep it, evicting the oldest while the store is over its cap, and note
+    `by_id` as one of the accounts that put it here."""
     db = get_db()
     now = int(time.time())
     db.execute(
@@ -4954,9 +5142,16 @@ def store_relayed_image(record, source_url, by):
          str(source_url)[:400], str(by)[:64], now,
          record.get("format", "png"), record["data"]),
     )
+    if int(by_id or 0) > 0:
+        db.execute("INSERT OR IGNORE INTO chat_image_holders (image_id, user_id, created_at)"
+                   " VALUES (?, ?, ?)", (record["id"], int(by_id), now))
 
-    # OLDEST OUT UNTIL IT FITS. A loop rather than one DELETE, because "enough
-    # rows to get under a byte total" is not something SQL answers in one go.
+    _evict_images(db)
+
+
+def _evict_images(db):
+    """OLDEST OUT UNTIL IT FITS. A loop rather than one DELETE, because "enough
+    rows to get under a byte total" is not something SQL answers in one go."""
     for _ in range(64):
         total = db.execute(
             "SELECT COALESCE(SUM(bytes), 0) AS n FROM chat_images").fetchone()["n"]
@@ -4966,7 +5161,80 @@ def store_relayed_image(record, source_url, by):
             "SELECT id FROM chat_images ORDER BY created_at ASC LIMIT 1").fetchone()
         if oldest is None:
             break
-        db.execute("DELETE FROM chat_images WHERE id = ?", (oldest["id"],))
+        _drop_image(db, oldest["id"])
+
+
+def _drop_image(db, image_id):
+    """A picture and the record of who put it here, together."""
+    db.execute("DELETE FROM chat_images WHERE id = ?", (image_id,))
+    db.execute("DELETE FROM chat_image_holders WHERE image_id = ?", (image_id,))
+
+
+# =============================================================================
+# WHO MAY SEE A PICTURE
+# =============================================================================
+# A picture used to be a pure capability: any signed-in player holding its id
+# was served it, because 256 unguessable bits could only have come from being
+# shown it. Two honest limits followed from that, and both are closed here.
+#
+#   - A PRIVATE PICTURE GETS ITS OWN ROW. The store deduplicates on the content
+#     hash, so a picture whispered and the same picture in world chat were one
+#     row with one id. Sending a picture to whispers, friends or a guild now
+#     makes a copy under a fresh random id (_private_image_copy), so a private
+#     picture never shares an id with anything else.
+#   - FETCHING ONE IS CHECKED. GET /api/chat/image/<id> serves a picture only
+#     to someone who could read a line showing it, by the read's own rules
+#     (_can_read_chat_row); to an account that put those bytes on the server
+#     (chat_image_holders); or to a mod looking at a report of it. A player
+#     who leaves a guild stops being able to load its pictures, a picture
+#     reposted by id elsewhere still needs a line its reader can see, and a
+#     deleted line stops serving its picture to the people it was deleted for.
+#
+# What it costs: a picture now lasts as long as a line showing it, which is the
+# chat's own 24 hours, instead of until the 128 MB store happened to evict it.
+# The game fetches a picture when it draws the line and keeps it in memory, so
+# nothing on screen goes missing.
+#
+# Refused is the same 404 as missing, so the route still says nothing about
+# which ids exist.
+
+def _may_see_image(db, user_row, image_id):
+    """True when `user_row` could read a line showing `image_id`, put those
+    bytes on the server themselves, or is staff with a report about it."""
+    uid = int(user_row["id"])
+    for line in db.execute(
+            "SELECT user_id, channel, target_id FROM chat_messages WHERE image_id = ?",
+            (image_id,)).fetchall():
+        if _can_read_chat_row(db, uid, line):
+            return True
+    if db.execute("SELECT 1 FROM chat_image_holders WHERE image_id = ? AND user_id = ?",
+                  (image_id, uid)).fetchone() is not None:
+        return True
+    # A REPORT IS A LINE STAFF WERE SHOWN. Somebody reported a whisper with a
+    # picture in it; the mod judging it has to be able to look at it.
+    return role_at_least(user_row, "mod") and db.execute(
+        "SELECT 1 FROM chat_reports WHERE image_id = ? LIMIT 1", (image_id,)).fetchone() is not None
+
+
+def _private_image_copy(db, image_id, by_row):
+    """A copy of a stored picture under a fresh, random id, for one private
+    line. The id is SHA-256 of 32 random bytes and the picture, so it is as
+    unguessable as a content id and shared with nothing."""
+    row = db.execute("SELECT data FROM chat_images WHERE id = ?", (image_id,)).fetchone()
+    new_id = hashlib.sha256(secrets.token_bytes(32) + bytes(row["data"])).hexdigest()
+    now = int(time.time())
+    db.execute(
+        "INSERT INTO chat_images"
+        " (id, kind, width, height, frames, columns, frame_ms, bytes,"
+        "  source, created_by, created_at, format, data)"
+        " SELECT ?, kind, width, height, frames, columns, frame_ms, bytes,"
+        "  source, ?, ?, format, data FROM chat_images WHERE id = ?",
+        (new_id, str(by_row["username"])[:64], now, image_id),
+    )
+    db.execute("INSERT OR IGNORE INTO chat_image_holders (image_id, user_id, created_at)"
+               " VALUES (?, ?, ?)", (new_id, int(by_row["id"]), now))
+    _evict_images(db)
+    return new_id
 
 
 def chat_image_cooldown(now):
@@ -5061,7 +5329,7 @@ def keep_relayed_image(raw, source):
     if record is None:
         return bad_request(why)
 
-    store_relayed_image(record, source, g.user["username"])
+    store_relayed_image(record, source, g.user["username"], g.user["id"])
     get_db().commit()
 
     answer = relayed_image_dict({
@@ -5458,6 +5726,9 @@ def register():
               type: string
             password:
               type: string
+            install:
+              type: string
+              description: "This copy of the game's install id (64 hex). Optional; see INSTALL IDS"
     responses:
       201:
         description: Account created, returns a session token
@@ -5584,6 +5855,18 @@ def register():
             "message": "New accounts cannot be created from this connection.",
         }, 403
 
+    # AND FROM THE SAME COMPUTER, whatever its address - see INSTALL IDS. The
+    # VPN half of the same check, refused the same way and logged under its
+    # own reason, so staff can tell which of the two caught somebody.
+    install_hash = _install_hash((data or {}).get("install"))
+    evader = _install_evasion_state(db, install_hash)
+    if evader is not None:
+        _record_login_attempt(db, username, ip, False, "register-ban-evasion-install")
+        return {
+            "error": "Forbidden",
+            "message": "New accounts cannot be created from this computer.",
+        }, 403
+
     password_hash = generate_password_hash(data["password"])
 
     try:
@@ -5627,6 +5910,7 @@ def register():
     # account that registers and is banned before it ever logs in still carries
     # the link that makes its next sibling visible.
     _record_account_ip(db, user_id, ip, now)
+    _record_account_install(db, user_id, install_hash, now)
 
     # THE SAME SHAPE AS LOGIN AND SESSION. This used to omit keys that those
     # two returned, so a client that read the response after registering got a
@@ -5847,6 +6131,9 @@ def login():
               type: string
             password:
               type: string
+            install:
+              type: string
+              description: "This copy of the game's install id (64 hex). Optional; see INSTALL IDS"
     responses:
       200:
         description: Logged in
@@ -5981,7 +6268,14 @@ def login():
     # hide behind a 404, a banned player has every right to know they are
     # banned and why. Silence there reads as the game being broken.
     ban = ban_state(row)
+    install_hash = _install_hash(data.get("install"))
     if ban is not None:
+        # THE COMPUTER IS RECORDED EVEN THOUGH THE LOGIN IS REFUSED. The
+        # password was right, so this is the account's holder at their own
+        # machine - and a player banned before install ids existed has no
+        # computer on file until they try once more, which they always do.
+        # The address is not recorded here; that rule is older and unchanged.
+        _record_account_install(db, row["id"], install_hash, now)
         _record_login_attempt(db, row["username"], ip, False, "banned")
         return {
             "error": "Forbidden",
@@ -6018,6 +6312,7 @@ def login():
     # reaches here, so a ban cannot keep refreshing its own address history and
     # extending the block on everyone who shares the connection.
     _record_account_ip(db, row["id"], ip, now)
+    _record_account_install(db, row["id"], install_hash, now)
 
     return {
         "user_id": row["id"],
@@ -6147,6 +6442,14 @@ def resume_session():
     token, expires_at = issue_token(g.user["id"], int(g.user["expires_at"]))
     _end_other_sessions(db, g.user["id"], token)
     db.commit()
+    # A REMEMBERED LOGIN IS STILL A LOGIN from this computer and this address.
+    # "Remember me" can carry a player for thirty days without a password, and
+    # recording only on /login left that whole month out of the link view.
+    now = int(time.time())
+    _record_account_ip(db, g.user["id"], client_ip(), now)
+    _record_account_install(db, g.user["id"],
+                            _install_hash((request.get_json(silent=True) or {}).get("install")),
+                            now)
     return {
         "user_id": g.user["id"],
         "username": g.user["username"],
@@ -8125,9 +8428,10 @@ def _reconcile_heals(db, user_id, slot, before, after):
     to apply, empty when there is nothing to correct.
 
     RENAMED FROM _report_unexplained_heals, because it no longer only reports.
-    It sits beside _reconcile_bank() and _reconcile_inventory() now, does the
-    same job as those two - compare the claim to the record and correct it -
-    and is named for it.
+    It sat beside _reconcile_bank() and _reconcile_inventory() when it was
+    named, did the same job as those two - compare the claim to the record and
+    correct it - and is named for it. (Those two are gone: the bag and the bank
+    are no longer claimed by the client at all. See ONE CELL AT A TIME.)
 
     TWO LINES, NOT ONE, AND THAT IS THE WHOLE DESIGN.
 
@@ -8152,8 +8456,8 @@ def _reconcile_heals(db, user_id, slot, before, after):
     CLAMPS, DOES NOT REFUSE. A 400 here fails the whole save, and the save
     carries XP, gold, position and inventory - punishing a suspicious hp figure
     by discarding a legitimate half-hour of play is a worse bug than the cheat.
-    Trimmed to what the player could have earned, exactly as
-    _reconcile_inventory() trims a bag, and the write proceeds.
+    Trimmed to what the player could have earned, the way the old bag ledger
+    trimmed a bag, and the write proceeds.
 
     WHAT IT STILL DOES NOT DO. It bounds the RATE of unexplained healing, not
     its existence: measured against a 180 hp pool, roughly 7 hp per save slips
@@ -8705,6 +9009,116 @@ def _apply_cell_changes(table, key_columns, key_values, changes):
             )
 
 
+# =============================================================================
+# ONE CELL AT A TIME - moving and discarding inside a grid
+# =============================================================================
+# THE BACKPACK AND THE BANK ARE SERVER-OWNED. They used to be whatever the game
+# last sent as a whole array, trimmed to what the server had granted
+# (_reconcile_inventory, E-1): a gain was caught, but the arrangement and every
+# loss were the client's word. Now each thing a player does to a grid is one
+# request the server carries out on its own copy - move, discard, use a pile -
+# and answers with the grid as it stands. The whole-array writes are kept for
+# staff tooling only (see write_inventory()).
+#
+# THE CLIENT NAMES WHAT IT SAW. A move or a discard says which item it expects
+# in the source cell. When the server's cell holds something else, the
+# client's picture is out of date - a trade finished, a loot take landed - and
+# acting on the cell would move or destroy the wrong thing. That is a 409 that
+# carries the grid, so the game adopts it in the same breath, and nothing is
+# changed.
+
+def _grid_cells(table, key_columns, key_values, positions):
+    """{position: (item_id, quantity)} for the named cells that hold anything."""
+    where = " AND ".join("%s = ?" % column for column in key_columns)
+    marks = ", ".join("?" for _ in positions)
+    rows = get_db().execute(
+        "SELECT position, item_id, quantity FROM %s WHERE %s AND position IN (%s)"
+        % (table, where, marks),
+        (*key_values, *positions),
+    ).fetchall()
+    return {int(r["position"]): (r["item_id"], int(r["quantity"])) for r in rows}
+
+
+def _grid_rewrite(table, key_columns, key_values, positions, after):
+    """Replace the named cells with `after` ({position: (item_id, quantity)})."""
+    db = get_db()
+    where = " AND ".join("%s = ?" % column for column in key_columns)
+    marks = ", ".join("?" for _ in positions)
+    db.execute("DELETE FROM %s WHERE %s AND position IN (%s)" % (table, where, marks),
+               (*key_values, *positions))
+    columns = ", ".join(key_columns)
+    holes = ", ".join("?" for _ in key_columns)
+    for position, (item_id, quantity) in sorted(after.items()):
+        db.execute(
+            "INSERT INTO %s (%s, position, item_id, quantity) VALUES (%s, ?, ?, ?)"
+            % (table, columns, holes),
+            (*key_values, position, item_id, int(quantity)),
+        )
+
+
+def _grid_move(table, key_columns, key_values, source, target, item_id):
+    """
+    The drag the game has always drawn, done on the server's copy: onto an
+    empty cell it MOVES, onto the same stackable item it MERGES up to the stack
+    limit (the rest stays where it was), onto anything else it SWAPS.
+
+    Returns "moved", or "stale" when `source` does not hold `item_id` - see ONE
+    CELL AT A TIME. Nothing is written for a stale move.
+    """
+    cells = _grid_cells(table, key_columns, key_values, (source, target))
+    moving = cells.get(source)
+    if moving is None or moving[0] != item_id:
+        return "stale"
+    if source == target:
+        return "moved"
+    there = cells.get(target)
+    if there is None:
+        after = {target: moving}
+    elif there[0] == moving[0] and _stack_limit(item_id) > 1:
+        room = max(0, _stack_limit(item_id) - there[1])
+        shifted = min(room, moving[1])
+        after = {target: (item_id, there[1] + shifted)}
+        if moving[1] - shifted > 0:
+            after[source] = (item_id, moving[1] - shifted)
+    else:
+        after = {target: moving, source: there}
+    _grid_rewrite(table, key_columns, key_values, (source, target), after)
+    return "moved"
+
+
+def _grid_discard(table, key_columns, key_values, position, item_id):
+    """Destroy the whole stack in one cell. "discarded", or "stale" when the
+    cell does not hold `item_id`. Returns the stack it removed as well."""
+    held = _grid_cells(table, key_columns, key_values, (position,)).get(position)
+    if held is None or held[0] != item_id:
+        return "stale", None
+    _grid_rewrite(table, key_columns, key_values, (position,), {})
+    return "discarded", held
+
+
+def parse_grid_cell(payload, key, capacity):
+    """A required cell index named `key`: (cell, None) or (None, a 400). The
+    same rules as parse_cell(), but the cell is not optional here."""
+    raw = payload.get(key)
+    if raw is None or isinstance(raw, bool):
+        return None, bad_request("%s must be an integer 0-%d" % (key, capacity - 1))
+    try:
+        cell = int(raw)
+    except (TypeError, ValueError):
+        return None, bad_request("%s must be an integer 0-%d" % (key, capacity - 1))
+    if cell < 0 or cell >= capacity:
+        return None, bad_request("%s must be an integer 0-%d" % (key, capacity - 1))
+    return cell, None
+
+
+def parse_item_id(payload):
+    """The item a request names: (item_id, None) or (None, a 400)."""
+    item_id = str(payload.get("item_id", "")).strip()
+    if not item_id or len(item_id) > 64:
+        return None, bad_request("item_id must be 1-64 characters")
+    return item_id, None
+
+
 def lusion_delta(db, user_id, slot, delta, reason, detail=""):
     """
     THE ONLY WAY LUSIONS MAY CHANGE, and the twin of gold_delta().
@@ -8953,16 +9367,16 @@ def write_bank():
     if error is not None:
         return error
 
-    # PROVENANCE, AFTER SHAPE. Everything above answers "is this a valid bank?"
-    # and nothing above asks "did this player come by these items legitimately?"
-    # - which is the distinction SECURITY_NOTES.md is built around, and the one
-    # this endpoint used to miss entirely. See _reconcile_bank().
-    #
-    # ACCEPTED AND TRIMMED, NOT REFUSED. Same choice as the backpack: a 400 here
-    # would break an honest client that is one item out of step for any innocent
-    # reason, and a modified client learns nothing from a silent trim that it
-    # would not learn faster from an error naming the field.
-    parsed = _reconcile_bank(g.user, parsed)
+    # A PLAYER'S BANK IS NOT WRITTEN HERE ANY MORE, for the backpack's reasons
+    # - see ONE CELL AT A TIME and write_inventory(). Items come and go through
+    # POST /api/bank/items, and rearranging is POST /api/bank/move; a whole
+    # bank from the client was only ever trimmed to the record (E-1), never
+    # derived from it. Ignored rather than refused, with the bank the server
+    # holds in the answer; staff still write it whole, for tooling.
+    if not role_at_least(g.user, "mod"):
+        body = account_payload(user_id)
+        body["ignored"] = ["bank_inventory"]
+        return body, 200
 
     db = get_db()
     db.execute("DELETE FROM bank_items WHERE user_id = ?", (user_id,))
@@ -9366,6 +9780,121 @@ KILL_TOKENS_PER_SECOND = 5.0
 KILL_WINDOW_SECONDS = 300
 KILL_RESPAWN_FLOOR_SECONDS = 30.0
 
+
+
+def _bank_resync(user_id):
+    """The bank route's 409 for an out-of-date picture: the account as the
+    server holds it, under `account`, so the game reloads the grid."""
+    return {"error": "Conflict",
+            "message": "The bank changed on the server. It has been reloaded.",
+            "account": account_payload(user_id)}, 409
+
+
+@app.post("/api/bank/move")
+@require_auth
+def move_banked():
+    """
+    Move, merge or swap one bank cell onto another
+    ---
+    tags:
+      - Account
+    consumes:
+      - application/json
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [from, to, item_id]
+          properties:
+            from:    {type: integer, example: 0}
+            to:      {type: integer, example: 12}
+            item_id: {type: string, example: ironsword, description: "What the game saw in `from`"}
+    responses:
+      200:
+        description: The account afterwards, bank included. The same move, merge and swap rules as the backpack.
+      400:
+        description: Bad cell or item id
+      409:
+        description: "`from` does not hold that item. Carries the account under `account`; nothing moved."
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+    user_id = g.user["id"]
+    _ensure_account(user_id)
+    item_id, error = parse_item_id(payload)
+    if error is not None:
+        return error
+    source, error = parse_grid_cell(payload, "from", BANK_CAPACITY)
+    if error is not None:
+        return error
+    target, error = parse_grid_cell(payload, "to", BANK_CAPACITY)
+    if error is not None:
+        return error
+    if _grid_move("bank_items", ("user_id",), (user_id,), source, target, item_id) == "stale":
+        return _bank_resync(user_id)
+    get_db().commit()
+    return account_payload(user_id), 200
+
+
+@app.post("/api/bank/discard")
+@require_auth
+def discard_banked():
+    """
+    Destroy the whole stack in one bank cell
+    ---
+    tags:
+      - Account
+    consumes:
+      - application/json
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [position, item_id]
+          properties:
+            position: {type: integer, example: 9}
+            item_id:  {type: string, example: rawshrimp}
+    responses:
+      200:
+        description: The account afterwards, and what was destroyed
+      400:
+        description: Bad cell or item id
+      409:
+        description: "The cell does not hold that item. Carries the account; nothing was destroyed."
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+    user_id = g.user["id"]
+    _ensure_account(user_id)
+    item_id, error = parse_item_id(payload)
+    if error is not None:
+        return error
+    position, error = parse_grid_cell(payload, "position", BANK_CAPACITY)
+    if error is not None:
+        return error
+    outcome, held = _grid_discard("bank_items", ("user_id",), (user_id,), position, item_id)
+    if outcome == "stale":
+        return _bank_resync(user_id)
+    get_db().commit()
+    body = account_payload(user_id)
+    body["discarded"] = {"item_id": held[0], "quantity": held[1]}
+    return body, 200
 
 @app.post("/api/combat/kill")
 @require_auth
@@ -12173,10 +12702,14 @@ def chat_send():
     # THE PICTURE MUST ALREADY HAVE BEEN RELAYED. A client cannot name an id
     # this server has not fetched and decoded for itself - which is what stops
     # the field being a way to point everyone at an arbitrary URL after all.
+    #
+    # AND THE SENDER MUST BE ABLE TO SEE IT. Otherwise an id glimpsed somewhere
+    # - a report, a log - could be posted to world and served to everyone. The
+    # same answer as a missing picture, so the refusal says nothing either.
     if image_id != "":
         held = db.execute(
             "SELECT id FROM chat_images WHERE id = ?", (image_id,)).fetchone()
-        if held is None:
+        if held is None or not _may_see_image(db, g.user, image_id):
             return bad_request("that picture is not on this server")
 
     target_row = None
@@ -12222,6 +12755,12 @@ def chat_send():
             return {"error": "Conflict",
                     "message": GUILD_CHAT_NO_GUILD}, 409
         target_id = int(seat["guild_id"])
+
+    # A PRIVATE LINE GETS ITS OWN COPY of the picture - see WHO MAY SEE A
+    # PICTURE. After every refusal above, so a send that is turned away never
+    # leaves a copy behind.
+    if image_id != "" and channel != "world":
+        image_id = _private_image_copy(db, image_id, g.user)
 
     new_id = post_chat(g.user, text, channel, target_id, image_id)
 
@@ -12638,7 +13177,13 @@ def chat_read_image(image_id):
     if not re.fullmatch(r"[0-9a-f]{64}", clean):
         return {"error": "Not Found", "message": "No such picture."}, 404
 
-    row = get_db().execute(
+    # ONLY TO SOMEONE WHO COULD SEE IT - see WHO MAY SEE A PICTURE. The same
+    # 404 as a missing row, so this cannot be used to learn which ids exist.
+    db = get_db()
+    if not _may_see_image(db, g.user, clean):
+        return {"error": "Not Found", "message": "No such picture."}, 404
+
+    row = db.execute(
         "SELECT data, format FROM chat_images WHERE id = ?", (clean,)).fetchone()
     if row is None:
         return {"error": "Not Found", "message": "No such picture."}, 404
@@ -12649,11 +13194,13 @@ def chat_read_image(image_id):
     # browser does not guess, and it would be odd to guess here instead.
     kind = "webp" if str(row["format"] or "png") == "webp" else "png"
 
-    # IMMUTABLE, AND IT REALLY IS: the id is the hash of these exact bytes, so
-    # a client that has one can keep it forever.
+    # IMMUTABLE, AND IT REALLY IS: an id names these exact bytes for as long
+    # as the row lives, so a client that has one can keep it. PRIVATE, because
+    # who may fetch it now depends on who is asking - a shared cache must never
+    # hand one player's answer to another.
     return bytes(row["data"]), 200, {
         "Content-Type": "image/%s" % kind,
-        "Cache-Control": "public, max-age=31536000, immutable",
+        "Cache-Control": "private, max-age=31536000, immutable",
         "Content-Disposition": "inline",
         "X-Content-Type-Options": "nosniff",
     }
@@ -12763,7 +13310,7 @@ def chat_delete():
             "SELECT COUNT(*) AS n FROM chat_messages WHERE image_id = ?", (image_id,)
         ).fetchone()["n"]
         if int(still_shown or 0) == 0:
-            db.execute("DELETE FROM chat_images WHERE id = ?", (image_id,))
+            _drop_image(db, image_id)
             image_dropped = True
 
     log_staff_action(g.user, "chat_delete", row["username"], row["user_id"],
@@ -13344,13 +13891,15 @@ def unmute_account():
 # itself on login. So the key is (user_id, slot, position) - one item per cell,
 # which is exactly the invariant the inventory UI already enforces.
 #
-# WHY BOTH ENDPOINTS REPLACE RATHER THAN PATCH
-# --------------------------------------------
-# The bank has per-operation endpoints because a deposit is a discrete act the
-# server can reason about. An inventory is not: it is the result of picking
-# things up, dropping them, dragging them around and using them, and the client
-# always holds the whole picture. Twenty cells is small enough to send in full,
-# and a whole-array replace has no partial-failure state to reconcile.
+# WHY THE BAG IS CHANGED ONE CELL AT A TIME, AND WAS NOT ALWAYS
+# --------------------------------------------------------------
+# This said an inventory was not a discrete act the server could reason about -
+# the client held the whole picture, twenty cells were small enough to send in
+# full, and a whole-array replace had no partial-failure state. All true, and it
+# left the arrangement and every loss on the client's word, with the server
+# trimming only gains. Every act on a bag turned out to be discrete after all:
+# a drag is a move, the bin is a discard, a pile is cashed. So each is now its
+# own request (ONE CELL AT A TIME), and the whole-array writes are staff-only.
 
 # The client's backpack is twenty cells. Kept here rather than inferred from
 # whatever arrives so an oversized array is a 400 rather than a slow leak into
@@ -13463,133 +14012,12 @@ def _parse_positional_items(cells, field):
     return parsed, None
 
 
-def _inventory_totals(user_id, slot, below=None):
-    """item_id -> total quantity the server currently records for this slot.
-
-    `below` counts only cells at positions under it - the cells a backpack
-    write is replacing. See write_inventory() for why that matters."""
-    totals = {}
-    if below is None:
-        below = CARRY_CAPACITY
-    rows = get_db().execute(
-        "SELECT item_id, quantity FROM carry_items WHERE user_id = ? AND slot = ? AND position < ?",
-        (user_id, slot, int(below)),
-    ).fetchall()
-    for row in rows:
-        totals[row["item_id"]] = totals.get(row["item_id"], 0) + int(row["quantity"])
-    return totals
-
-
-def _bank_totals(user_id):
-    """item_id -> total quantity the server currently records in the bank.
-
-    ACCOUNT-WIDE, NOT PER SLOT. The bank is shared between a player's four
-    characters, which is the one structural difference from the backpack and the
-    reason this cannot just be _inventory_totals with a slot passed in.
-    """
-    totals = {}
-    rows = get_db().execute(
-        "SELECT item_id, quantity FROM bank_items WHERE user_id = ?",
-        (user_id,),
-    ).fetchall()
-    for row in rows:
-        totals[row["item_id"]] = totals.get(row["item_id"], 0) + int(row["quantity"])
-    return totals
-
-
-def _trim_to_recorded(claimed, recorded):
-    """
-    THE TRIMMING ITSELF, shared by the backpack and the bank.
-
-    Walks the claimed cells in order, hands each one as much of its item as the
-    record still has unallotted, and returns (kept_cells, trims). Position is
-    preserved, so reordering is free; quantity is capped, so a gain is not.
-
-    ONE FUNCTION BECAUSE IT IS ONE RULE. The bank version started as a copy of
-    the backpack loop, which is how this codebase has already been burned twice:
-    the character XP formula lived in two places, drifted, and the sanitizer
-    rewrote honest saves; the six skill growth factors then did it again in
-    player.gd. A second hand-kept copy of the AUTHORITY rule would be that same
-    mistake in the place it matters most.
-    """
-    running = {}
-    kept = []
-    trims = {}
-    for position, item_id, quantity in claimed:
-        room = max(int(recorded.get(item_id, 0)) - running.get(item_id, 0), 0)
-        granted = min(quantity, room)
-        if granted > 0:
-            kept.append((position, item_id, granted))
-            running[item_id] = running.get(item_id, 0) + granted
-        if quantity > granted:
-            trims[item_id] = trims.get(item_id, 0) + (quantity - granted)
-    return kept, trims
-
-
-def _reconcile_bank(user, claimed):
-    """
-    SERVER AUTHORITY OVER THE BANK - the backpack's remaining sibling.
-
-    PUT /api/account/bank replaced the whole bank with whatever arrived, which
-    is exactly the hole E-1 described for the backpack: the shape was validated
-    impeccably and provenance was never asked about, so a modified client could
-    fabricate anything in gamedata.json straight into storage.
-
-    SAFE FOR THE SAME REASON THE BACKPACK WAS, and this was checked rather than
-    assumed: every legitimate way an item ENTERS the bank already writes
-    bank_items server-side first. POST /api/bank/items handles both deposit and
-    withdraw. There is no honest client-side path that puts something in the
-    bank, so an honest sync always matches the record. What is left for this
-    endpoint is REORDERING, which passes through untouched - position is kept
-    and only quantity is capped.
-
-    Staff are exempt for the same reason as the backpack: a mod can already
-    self-grant through POST /api/staff/grant, so clamping them closes no door.
-    """
-    if role_at_least(user, "mod"):
-        return claimed
-
-    kept, trims = _trim_to_recorded(claimed, _bank_totals(user["id"]))
-    if trims:
-        detail = ", ".join("%s -%d" % (i, q) for i, q in sorted(trims.items()))
-        print("[LEDGER] trimmed unearned bank items for %s: %s"
-              % (user["username"], detail))
-    return kept
-
-
-def _reconcile_inventory(user, slot, claimed, covered=None):
-    """
-    SERVER AUTHORITY OVER GAINS. Returns the claimed backpack with any item the
-    client holds MORE of than the server recorded trimmed back down to what the
-    server recorded, and logs the trim. Reordering and reductions pass through
-    untouched. This is the enforce half of what used to be a shadow log.
-
-    WHY THIS IS SAFE FOR THE LIVE CLIENT. Every legitimate way to GAIN an item
-    already writes carry_items on the server BEFORE the client would sync the
-    bag back: loot (POST /api/loot/take), bank withdrawals (POST /api/bank/items),
-    and the staff grant (POST /api/staff/grant). The client only ever holds what
-    one of those wrote, so an honest sync always matches the record and is never
-    trimmed. Shops, crafting and cooking do not exist server-side yet; the day
-    they do, each must grant through the server the same way - and until then
-    there is no honest client-side gain for this to catch by mistake.
-
-    A client holding LESS is honest (ate a potion, deposited, dropped) and passes.
-    A client holding MORE than the server ever granted is a modified client, and
-    the excess is trimmed to what was actually granted - usually to nothing.
-
-    STAFF ARE EXEMPT. A mod or above can already grant themselves anything via
-    POST /api/staff/grant, so clamping them closes no door - it would only make
-    staff tooling and the test fixtures fight the server for zero security gain.
-    """
-    if role_at_least(user, "mod"):
-        return claimed
-
-    kept, trims = _trim_to_recorded(claimed, _inventory_totals(user["id"], slot, covered))
-    if trims:
-        detail = ", ".join("%s -%d" % (i, q) for i, q in sorted(trims.items()))
-        print("[LEDGER] trimmed unearned items for %s slot %d: %s"
-              % (user["username"], slot, detail))
-    return kept
+# _reconcile_inventory() and _reconcile_bank() WERE HERE - the E-1 ledger that
+# trimmed a whole bag from the client to what the server had granted. Nothing
+# calls them now: a player's bag and bank are never written whole (see ONE
+# CELL AT A TIME), and staff were always exempt. Removed rather than left
+# reachable, so the next route cannot quietly lean on a check that only ever
+# caught gains.
 
 
 def _slot_exists(user_id, slot):
@@ -13695,7 +14123,7 @@ def shop_buy():
           description: Missing, invalid or expired token
     """
     # WHY THIS EXISTS AT ALL, rather than the client taking gold and adding an
-    # item locally. _reconcile_inventory() trims a client holding MORE of an
+    # item locally. The old bag ledger trimmed a client holding MORE of an
     # item than the server granted - but a client-side shop asserts both halves
     # of the trade, the item gained AND the gold spent, and the trim only
     # checks the first. A shop that ran on the client would be an item printer
@@ -17077,12 +17505,26 @@ def write_inventory():
     if error is not None:
         return error
 
-    # SERVER AUTHORITY. Trim any item claimed beyond what the server granted,
-    # down to the granted amount. Honest syncs (reorders, using/dropping, and
-    # items the server itself wrote via loot/bank/staff) pass through unchanged;
-    # a modified client's fabricated excess is dropped here. See
-    # _reconcile_inventory() and SECURITY_NOTES.md (E-1).
-    items = _reconcile_inventory(g.user, slot, items, covered)
+    # A PLAYER'S BAG IS NOT WRITTEN HERE ANY MORE - see ONE CELL AT A TIME.
+    # Every change a player makes is its own request now (move, discard, use a
+    # pile, and the routes that always were: loot, the bank, the shop, trades,
+    # equip, consume, catches and cooking), so this array is never the truth
+    # about anything. It used to be trimmed to what the server had granted
+    # (E-1), which caught a gain and took the arrangement and every loss on
+    # the client's word.
+    #
+    # IGNORED, NOT REFUSED, like gold and lusions before it: a game from before
+    # the change still sends its whole bag on a routine save, and a 400 would
+    # turn that into an error on screen. It gets the bag the server holds, and
+    # `ignored` says why its own did not stick.
+    #
+    # STAFF STILL WRITE IT WHOLE, for tooling and tests. A mod or above can
+    # already put anything in a bag with POST /api/staff/grant, so this closes
+    # no door by staying open to them - the same reasoning the ledger used for
+    # exempting them.
+    if not role_at_least(g.user, "mod"):
+        return {"slot": slot, "inventory": inventory_payload(user_id, slot),
+                "ignored": ["inventory"]}, 200
 
     parsed = [(user_id, slot, index, item_id, quantity)
               for index, item_id, quantity in items]
@@ -17102,6 +17544,226 @@ def write_inventory():
     db.commit()
 
     return {"slot": slot, "inventory": inventory_payload(user_id, slot)}, 200
+
+
+def _carry_resync(user_id, slot, reason="stale_save"):
+    """The 409 a carry route sends when the client's picture is out of date:
+    the bag and purse the server holds, in the shape apply_server_carry()
+    already adopts from a stale save."""
+    purse = get_db().execute("SELECT gold FROM saves WHERE user_id = ? AND slot = ?",
+                             (user_id, slot)).fetchone()
+    return {"error": "Conflict",
+            "message": "Your backpack changed on the server. It has been reloaded.",
+            "resync": {"slot": slot, "gold": int(purse["gold"] or 0) if purse else 0,
+                       "inventory": inventory_payload(user_id, slot), "trade": None,
+                       "reason": reason}}, 409
+
+
+def _carry_request():
+    """slot and item_id, shared by every one-cell carry route: (payload, slot,
+    item_id, None) or (..., an error response)."""
+    payload = request.get_json(silent=True) or {}
+    slot = parse_slot(payload.get("slot"))
+    if slot is None:
+        return payload, None, None, bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+    if not _slot_exists(g.user["id"], slot):
+        return payload, None, None, ({"error": "Not Found",
+                                      "message": "No character in slot %d." % slot}, 404)
+    item_id, error = parse_item_id(payload)
+    return payload, slot, item_id, error
+
+
+@app.post("/api/character/inventory/move")
+@require_auth
+def move_carried():
+    """
+    Move, merge or swap one carried cell onto another
+    ---
+    tags:
+      - Character
+    consumes:
+      - application/json
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [slot, from, to, item_id]
+          properties:
+            slot:    {type: integer, example: 0}
+            from:    {type: integer, example: 3, description: "The cell dragged (0-19 bag, 20-29 hotbar)"}
+            to:      {type: integer, example: 21, description: "The cell it was dropped on"}
+            item_id: {type: string, example: smallhealthpotion, description: "What the game saw in `from`"}
+    responses:
+      200:
+        description: "The carry afterwards: onto an empty cell it moved, onto the same stackable item it merged up to the stack limit, onto anything else it swapped"
+      400:
+        description: Bad slot, cell or item id
+      404:
+        description: That slot is empty
+      409:
+        description: "`from` does not hold that item - the game's picture is out of date. Carries resync: the bag the server holds. Nothing moved."
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload, slot, item_id, error = _carry_request()
+    if error is not None:
+        return error
+    source, error = parse_grid_cell(payload, "from", CARRY_CAPACITY)
+    if error is not None:
+        return error
+    target, error = parse_grid_cell(payload, "to", CARRY_CAPACITY)
+    if error is not None:
+        return error
+    user_id = g.user["id"]
+    if _grid_move("carry_items", ("user_id", "slot"), (user_id, slot),
+                  source, target, item_id) == "stale":
+        return _carry_resync(user_id, slot)
+    get_db().commit()
+    return {"slot": slot, "inventory": inventory_payload(user_id, slot)}, 200
+
+
+@app.post("/api/character/inventory/discard")
+@require_auth
+def discard_carried():
+    """
+    Destroy the whole stack in one carried cell
+    ---
+    tags:
+      - Character
+    consumes:
+      - application/json
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [slot, position, item_id]
+          properties:
+            slot:     {type: integer, example: 0}
+            position: {type: integer, example: 7}
+            item_id:  {type: string, example: rawshrimp, description: "What the game saw in that cell"}
+    responses:
+      200:
+        description: The carry afterwards, and what was destroyed
+      400:
+        description: Bad slot, cell or item id
+      404:
+        description: That slot is empty
+      409:
+        description: "The cell does not hold that item. Carries resync; nothing was destroyed."
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload, slot, item_id, error = _carry_request()
+    if error is not None:
+        return error
+    position, error = parse_grid_cell(payload, "position", CARRY_CAPACITY)
+    if error is not None:
+        return error
+    user_id = g.user["id"]
+    outcome, held = _grid_discard("carry_items", ("user_id", "slot"), (user_id, slot),
+                                  position, item_id)
+    if outcome == "stale":
+        return _carry_resync(user_id, slot)
+    get_db().commit()
+    return {"slot": slot, "inventory": inventory_payload(user_id, slot),
+            "discarded": {"item_id": held[0], "quantity": held[1]}}, 200
+
+
+@app.post("/api/character/inventory/cash")
+@require_auth
+def cash_carried_pile():
+    """
+    Turn a carried pile of gold coins, or of lusions, into the balance
+    ---
+    tags:
+      - Character
+    consumes:
+      - application/json
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [slot, position, item_id]
+          properties:
+            slot:     {type: integer, example: 0}
+            position: {type: integer, example: 4}
+            item_id:  {type: string, example: goldcoin}
+    responses:
+      200:
+        description: The carry, the purse and the lusions afterwards
+      400:
+        description: Bad slot, cell or item id
+      404:
+        description: That slot is empty
+      409:
+        description: "That is not money, or the cell does not hold it (then with resync)"
+      401:
+        description: Missing, invalid or expired token
+    """
+    # THE ONE CLIENT PATH THAT USED TO ADD GOLD LOCALLY. inventoryscreen.gd
+    # added the pile's worth to its own purse and emptied the cell; the server
+    # has ignored a client's gold since E-8, so the cell's loss was saved and
+    # the gold was not - using a pile destroyed it. Now the server empties the
+    # cell and credits the balance in one transaction, through the ledgers.
+    # Piles reach a bag only through a staff grant or a trade of one.
+    payload, slot, item_id, error = _carry_request()
+    if error is not None:
+        return error
+    position, error = parse_grid_cell(payload, "position", CARRY_CAPACITY)
+    if error is not None:
+        return error
+    premium = gamedata.CONSTANTS.get("lusions_item_id", LUSIONS_ITEM_ID)
+    if item_id == premium:
+        per = max(1, int((gamedata.ITEMS.get(item_id) or {}).get("value", 1) or 1))
+    else:
+        per = gold_item_value(item_id)
+        if per <= 0:
+            return {"error": "Conflict", "message": "That is not money."}, 409
+
+    user_id = g.user["id"]
+    db = get_db()
+    outcome, held = _grid_discard("carry_items", ("user_id", "slot"), (user_id, slot),
+                                  position, item_id)
+    if outcome == "stale":
+        return _carry_resync(user_id, slot)
+    worth = int(held[1]) * per
+    detail = "%s x%d" % (item_id, held[1])
+    if item_id == premium:
+        _ensure_account(user_id)
+        lusion_delta(db, user_id, slot, worth, "pile", detail)
+    else:
+        gold_delta(db, user_id, slot, worth, "pile", detail)
+    db.commit()
+
+    purse = db.execute("SELECT gold FROM saves WHERE user_id = ? AND slot = ?",
+                       (user_id, slot)).fetchone()
+    account = account_payload(user_id)
+    return {"slot": slot, "inventory": inventory_payload(user_id, slot),
+            "gold": int(purse["gold"] or 0), "lusions": int(account.get("lusions", 0)),
+            "cashed": {"item_id": item_id, "quantity": held[1],
+                       "currency": "lusions" if item_id == premium else "gold",
+                       "amount": worth}}, 200
 
 
 @app.put("/api/character/skills")
@@ -17782,6 +18444,10 @@ def character_consume():
         # own copy. It still owns the effect - hp is client-written, see E-9 -
         # but there is no reason for the two to disagree about the size of it.
         "restores": {"target": target, "amount": int(amount)},
+        # THE BAG AFTERWARDS, like every other route that changes it. The game
+        # used to take one off its own copy and save the whole bag; the bag is
+        # the server's now, so it adopts this instead.
+        "inventory": inventory_payload(user_id, slot),
     }, 200
 
 

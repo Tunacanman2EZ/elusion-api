@@ -1,10 +1,15 @@
 # Moving the backpack to server authority
 
-The server owns kills, loot rolls and loot bags. It does not own the backpack:
-`PUT /api/character/inventory` takes whatever array the client sends and stores
-it. A modified client can hand itself twenty stacks of anything real.
+**Done.** The backpack and the bank are the server's: every change is its own
+request, and a player's whole-array writes are ignored. Kept as the plan it was,
+with each stage marked, because the order is the useful part - see stage 4 for
+how it ended.
 
-This is the plan for closing that. It is staged so every stage leaves the game
+The server owned kills, loot rolls and loot bags. It did not own the backpack:
+`PUT /api/character/inventory` took whatever array the client sent and stored
+it. A modified client could hand itself twenty stacks of anything real.
+
+This was the plan for closing that. It is staged so every stage leaves the game
 playable, because a half-migrated inventory is worse than an unmigrated one.
 
 ## The rule, for everything not yet built
@@ -56,14 +61,23 @@ Losses are not logged. A client holding less ate something or deposited it. A
 client holding more got it from somewhere the server did not see, and that is
 the entire question.
 
-### 1. Bank transfers
+### 1. Bank transfers — DONE, as `POST /api/bank/items` (op deposit / withdraw)
 
 `PUT /api/account/bank` is the same blanket push as the backpack. Replace with
 `POST /api/bank/deposit` and `POST /api/bank/withdraw`, each moving quantities
 between `carry_items` and `bank_items` in one transaction. Removes a whole class
 of `[LEDGER]` noise and is self-contained.
 
-### 2. Inventory mutations
+### 2. Inventory mutations — DONE
+
+Built as `POST /api/character/inventory/move` (move, merge or swap - a drag),
+`.../discard` (the bin, whole stack), `.../cash` (a pile of coins or lusions),
+`POST /api/character/consume` (which already existed, and now answers with the
+bag), and `/api/bank/move` and `/api/bank/discard`. No split: the game has no
+split-stack control, so there is nothing to send. Each names the item the game
+saw in the cell and answers 409 with the grid when that is out of date.
+
+As first planned:
 
 The operations the client does locally and then pushes:
 
@@ -75,16 +89,23 @@ The operations the client does locally and then pushes:
 Each returns the resulting inventory. After this the client never needs to send
 a whole array for an ordinary action.
 
-### 3. The three unbuilt systems
+### 3. The three unbuilt systems — DONE (shop, fishing, cooking)
 
 Shops, fishing, cooking — built to the rule at the top of this page.
 
-### 4. Retire the blanket write
+### 4. Retire the blanket write — DONE, differently
 
 `PUT /api/character/inventory` becomes an error rather than a store. Do this
 LAST and only once `[LEDGER]` has been quiet through a full play session,
 because the day it starts refusing is the day every path that still needs it
 breaks at once.
+
+**What shipped instead of an error:** a player's write is answered 200 with the
+server's bag and `"ignored": ["inventory"]` (the bank the same, with
+`bank_inventory`), the convention gold and lusions already used. An older game
+sends it on every save, and an error would have put a failure on screen for
+nothing. Staff may still write a bag whole, for tooling: a mod can grant
+anything already. Build 2 of the game sends neither array.
 
 ## What this does not fix
 

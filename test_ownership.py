@@ -24,22 +24,25 @@ them is the lesson's:
      these routes do not have one to offer. That is the strongest version of the
      lesson and it is not what the lesson teaches.
 
-THE ONE ROUTE WITH NO OWNERSHIP CHECK IS GET /api/chat/image/<image_id>, and it
-is deliberate. The id is the SHA-256 of the bytes, so 256 unguessable bits ARE
-the permission: you cannot hold an id without having been shown it. O-3 pins that
-property rather than calling it a bug - if the ids were ever sequential, or the
-hash were ever truncated, the argument collapses and the route becomes the
-textbook flaw.
+GET /api/chat/image/<image_id> USED TO BE THE ONE ROUTE WITH NO OWNERSHIP
+CHECK, on purpose. The id is the SHA-256 of the bytes, so 256 unguessable bits
+were the permission: you could not hold an id without having been shown it.
+That stops guessing, and it was not enough. The store deduplicates on the hash,
+so a whispered picture and the same file in world chat shared one id; and an id
+seen once worked for as long as the row lived - after the player left the guild
+it was posted in, or stopped being friends with whoever posted it. Now the route serves a picture
+only to someone who could read a line showing it, to an account that uploaded
+those bytes, or to staff looking at a report of it, and every private line gets
+its own copy under a random id. O-3 is that rule; the id properties stay pinned
+beside it, because they are still what stops guessing.
 
-What that argument CANNOT do is take a picture back, and that was a real gap.
-/api/chat/delete removed the message and left the image being served, immutable,
-for a year, to everyone who was in the channel when it was posted. O-4 covers the
-fix, including the reference count it needs - the store deduplicates on the
-content hash, so one row can be under two messages.
+Deleting a picture's line used to leave the picture being served, immutable,
+for a year. O-4 covers the fix, including the reference count it needs - the
+store deduplicates on the content hash, so one row can be under two messages.
 
   O-1  every row a client can name is scoped to the caller
   O-2  the trade routes cannot be addressed at all
-  O-3  the image id is a capability: 256 bits, and it is the hash of the bytes
+  O-3  a picture is served only to someone who could see it; whispers get a copy
   O-4  deleting a message now revokes its picture, unless another line shows it
   O-5  the convention is enforced on the source, for the route added next month
 
@@ -350,19 +353,39 @@ client.post("/api/trade/cancel", headers=alice, json={})
 
 
 # =============================================================================
-section("O-3  THE IMAGE ID IS A CAPABILITY, NOT A ROW NUMBER")
+section("O-3  A PICTURE IS SERVED ONLY TO SOMEONE WHO COULD SEE IT")
 # =============================================================================
-# GET /api/chat/image/<image_id> serves any row to any signed-in caller, and this
-# is the one place in the server with no ownership check. It is defensible, and
-# ONLY because of the properties below - so they are the check. If an id ever
-# becomes sequential, or the hash gets truncated to something brute-forceable,
-# this route turns into the exercise's flaw without a line of it changing.
+# GET /api/chat/image/<image_id> used to serve any row to any signed-in caller:
+# the id was the SHA-256 of the bytes, so 256 unguessable bits WERE the
+# permission. That held for guessing and failed twice in practice. The store
+# deduplicates on the hash, so a picture whispered and the same file posted to
+# world were one row with one id; and an id, once seen, worked forever, for a
+# player who had since left the guild it was posted in.
+#
+# Now the route asks the read's own question - could the caller read a line
+# showing this picture? - and a private line gets its own copy under a random
+# id. The id properties are still checked, because they are still what stops
+# guessing; they are just no longer the only thing.
 
 try:
     from PIL import Image
     have_pillow = True
 except ImportError:
     have_pillow = False
+
+
+def fresh_cooldowns():
+    """The upload and world-picture cooldowns are real seconds. This suite is
+    about who may SEE a picture, not how often one may be sent."""
+    db = raw_db()
+    db.execute("UPDATE users SET last_image_at = 0, last_world_image_at = 0")
+    db.commit()
+    db.close()
+
+
+def picture(headers, picture_id):
+    return client.get("/api/chat/image/%s" % picture_id, headers=headers)
+
 
 image_id = ""
 image_bytes = b""
@@ -382,26 +405,32 @@ if image_id:
     check("the id is 64 hex characters", re.fullmatch(r"[0-9a-f]{64}", image_id) is not None,
           image_id)
 
-    served = client.get("/api/chat/image/%s" % image_id, headers=alice)
-    check("and it serves", served.status_code == 200, served.status_code)
+    served = picture(alice, image_id)
+    check("alice, who uploaded it, is served it", served.status_code == 200, served.status_code)
     image_bytes = served.data
 
     check("THE ID IS THE SHA-256 OF THE BYTES SERVED",
           hashlib.sha256(image_bytes).hexdigest() == image_id,
-          "if the id is not derived from the content, it is a row number and this "
-          "route has no access control at all")
+          "if the id is not derived from the content, it is a row number")
 
     check("...which is 256 bits of it, not a truncation",
           len(image_id) * 4 == 256, len(image_id))
 
-    # Deliberate, and stated so nobody reads the next line as a finding: any
-    # signed-in caller who HAS an id may fetch it. That is what a capability is.
-    other = client.get("/api/chat/image/%s" % image_id, headers=bob)
-    check("bob, holding the id, is served it - by design", other.status_code == 200,
-          "capability, not ownership: he could only have got the id from the channel")
+    # THE CHANGE. Holding an id is no longer enough: nothing bob can read shows
+    # this picture yet, so for bob it does not exist.
+    other = picture(bob, image_id)
+    check("bob, holding the id, is NOT served it - no line he can read shows it",
+          other.status_code == 404,
+          "got %d - the id alone is a capability again" % other.status_code)
+
+    res = client.post("/api/chat/send", headers=bob, json={"body": "found this", "image": image_id})
+    check("and he cannot post it to world to make it visible",
+          res.status_code == 400 and "not on this server" in msg(res),
+          "got %d %s - an id glimpsed anywhere would publish the picture"
+          % (res.status_code, res.get_json()))
 
     anon = client.get("/api/chat/image/%s" % image_id)
-    check("but an unauthenticated caller is refused", anon.status_code == 401,
+    check("an unauthenticated caller is refused", anon.status_code == 401,
           "got %d - otherwise this is a public file host run by accident"
           % anon.status_code)
 
@@ -409,6 +438,90 @@ if image_id:
         res = client.get("/api/chat/image/%s" % bad, headers=alice)
         check("a malformed id (%r) is 404, never a lookup" % bad[:18],
               res.status_code == 404, res.status_code)
+
+    check("an id nobody uploaded is the same 404 as a refused one",
+          picture(alice, "0" * 64).status_code == 404)
+
+    # TWO UPLOADERS, ONE ROW. The store keeps one row per file, and created_by
+    # only remembers the first - so the second uploader is in chat_image_holders.
+    # Without it, carol could not send or even preview a file she uploaded.
+    fresh_cooldowns()
+    res = client.post("/api/chat/image/upload", headers=carol, data=payload_png,
+                      content_type="application/octet-stream")
+    check("carol uploads the same file and gets the same id",
+          str((res.get_json() or {}).get("id", "")) == image_id, res.get_json())
+    check("...and she is served it, though alice's name is on the row",
+          picture(carol, image_id).status_code == 200,
+          "the second uploader of a file would be locked out of their own picture")
+
+    # --- a whisper ---------------------------------------------------------
+    res = client.post("/api/chat/send", headers=alice,
+                      json={"body": "just for you", "image": image_id,
+                            "channel": "private", "to": "bob"})
+    check("alice whispers the picture to bob", res.status_code == 200, res.get_json())
+    whisper_id = str((res.get_json() or {}).get("image", ""))
+
+    check("THE WHISPER CARRIES ITS OWN COPY, under a new id",
+          re.fullmatch(r"[0-9a-f]{64}", whisper_id) is not None and whisper_id != image_id,
+          "%s - sharing the world id is how a private picture used to leak" % whisper_id)
+    check("...a random one, not the hash of the bytes",
+          whisper_id != hashlib.sha256(image_bytes).hexdigest(),
+          "a content id would collide with anyone else posting the same file")
+
+    got = picture(bob, whisper_id)
+    check("bob is served the whispered copy", got.status_code == 200, got.status_code)
+    check("...and it is the same picture", got.data == image_bytes)
+    check("alice, who sent it, is served it too", picture(alice, whisper_id).status_code == 200)
+
+    check("THE ORIGINAL STILL IS NOT bob's: the whisper showed him the copy",
+          picture(bob, image_id).status_code == 404)
+
+    check("carol, outside the whisper, gets 404 for the copy",
+          picture(carol, whisper_id).status_code == 404,
+          "she uploaded the very same file - and that gives her that file, not this line")
+    check("so does the owner, with no report to look at",
+          picture(owner, whisper_id).status_code == 404,
+          "staff see a private picture through a report, not by rank")
+
+    res = client.post("/api/chat/send", headers=carol, json={"body": "look", "image": whisper_id})
+    check("carol cannot post the whispered id to world", res.status_code == 400,
+          "got %d %s" % (res.status_code, res.get_json()))
+
+    check("the cache header says private, never public",
+          "private" in got.headers.get("Cache-Control", "")
+          and "public" not in got.headers.get("Cache-Control", ""),
+          got.headers.get("Cache-Control"))
+
+    # A REPORT IS A LINE STAFF WERE SHOWN.
+    db = raw_db()
+    whisper_line = int(db.execute("SELECT id FROM chat_messages WHERE image_id = ?",
+                                  (whisper_id,)).fetchone()["id"])
+    db.close()
+    res = client.post("/api/chat/report", headers=bob, json={"id": whisper_line, "reason": "other"})
+    check("bob reports the whisper", res.status_code == 200, res.get_json())
+    check("and now the owner, judging the report, is served the picture",
+          picture(owner, whisper_id).status_code == 200,
+          "a mod cannot judge a reported picture they cannot open")
+    check("...but a report gives a PLAYER nothing",
+          picture(carol, whisper_id).status_code == 404)
+
+    # --- friends -------------------------------------------------------------
+    res = client.post("/api/chat/send", headers=alice,
+                      json={"body": "friends only", "image": image_id, "channel": "friends"})
+    check("alice posts it to her friends", res.status_code == 200, res.get_json())
+    friends_id = str((res.get_json() or {}).get("image", ""))
+    check("...as another copy, shared with neither the world id nor the whisper",
+          friends_id not in ("", image_id, whisper_id), friends_id)
+    check("bob, her friend, is served it", picture(bob, friends_id).status_code == 200)
+    check("carol, who is not, gets 404", picture(carol, friends_id).status_code == 404)
+
+    res = client.post("/api/friends/remove", headers=bob, json={"username": "alice"})
+    check("bob unfriends alice", res.status_code == 200, res.get_json())
+    check("AND STOPS BEING SERVED HER FRIENDS' PICTURE - the id he kept is not a key",
+          picture(bob, friends_id).status_code == 404,
+          "seeing it once used to mean seeing it for as long as the row lived")
+    check("while the whisper, which was to him, still is",
+          picture(bob, whisper_id).status_code == 200)
 
 
 # =============================================================================
@@ -423,8 +536,14 @@ client.put("/api/staff/role", headers=owner, json={"username": "carol", "role": 
 mod = auth("carol")
 
 if image_id:
+    fresh_cooldowns()
     res = client.post("/api/chat/send", headers=alice, json={"body": "look", "image": image_id})
     check("alice posts the picture to chat", res.status_code in (200, 201), res.get_json())
+    check("a world line ships the content id itself, no copy",
+          (res.get_json() or {}).get("image") == image_id, res.get_json())
+    check("and NOW bob is served it - a line he can read shows it",
+          picture(bob, image_id).status_code == 200,
+          "O-3 refused him; the world line is what changed")
 
     db = raw_db()
     first_msg = int(db.execute("SELECT id FROM chat_messages WHERE image_id = ?"
@@ -465,12 +584,21 @@ if image_id:
     check("a delete is now a revocation, not a hide", gone.status_code == 404,
           "got %d - the bytes outlived the message they were posted with"
           % gone.status_code)
+    # `mod` is carol, signed in again after her promotion ended her session.
+    check("...from its uploaders too", picture(alice, image_id).status_code == 404
+          and picture(mod, image_id).status_code == 404,
+          (picture(alice, image_id).status_code, picture(mod, image_id).status_code))
 
     db = raw_db()
     rows = db.execute("SELECT COUNT(*) AS n FROM chat_images WHERE id = ?",
                       (image_id,)).fetchone()["n"]
     db.close()
     check("and the row is gone from the store", int(rows) == 0, rows)
+    db = raw_db()
+    holders = db.execute("SELECT COUNT(*) AS n FROM chat_image_holders WHERE image_id = ?",
+                         (image_id,)).fetchone()["n"]
+    db.close()
+    check("...with the record of who uploaded it", int(holders) == 0, holders)
 
 # A line with no picture must not trip any of it.
 res = client.post("/api/chat/send", headers=alice, json={"body": "just words"})
@@ -563,6 +691,9 @@ SWEEPS_ALLOWED = [
     # while every one of these statements keeps working. O-1's "bob taking from
     # alice\'s bag is refused" is the check that would go red.
     ("loot_bags", "bag_id =", "gated by the SELECT above it - see O-1"),
+    # a picture's uploaders go with the picture: eviction, or a mod deleting
+    # the last line that shows it (O-4)
+    ("chat_image_holders", "image_id =", "a picture's uploaders go with the picture"),
 ]
 
 unscoped = []

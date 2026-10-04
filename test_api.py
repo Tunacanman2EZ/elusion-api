@@ -1564,11 +1564,11 @@ check("a rejected write changed NOTHING",
 # THE HOTBAR IS CARRIED
 # =============================================================================
 # The ten keys hold real items: carry_items rows at positions INVENTORY_CAPACITY
-# and up. Dragging a potion onto key 2 is a reorder of one array, so everything
+# and up. Dragging a potion onto key 2 is a move like any other, so everything
 # below leans on rules the backpack already had - and the checks are about the
-# three places the hotbar could have broken them: a write that does not reach
-# the keys, placement that must never land on one, and a take that must spend
-# the cell the player actually used.
+# places the hotbar could have broken them: placement that must never land on
+# one, a take that must spend the cell the player actually used, and (for the
+# whole-bag write only staff still have) a write that does not reach the keys.
 
 section("CHARACTER - THE HOTBAR IS CARRIED")
 
@@ -1578,8 +1578,8 @@ check("the bag is twenty cells and the hotbar ten more",
       BAG == 20 and app_module.HOTBAR_SIZE == 10 and CARRY == BAG + 10,
       (BAG, app_module.HOTBAR_SIZE, CARRY))
 
-# A PLAYER, not the owner: the owner is exempt from the ledger, and half of
-# this section is about the ledger.
+# A PLAYER, not the owner: the owner may still write a bag whole, and half of
+# this section is about what a player's whole write does not do.
 _hb_reg = client.post("/api/auth/register",
                       json={"username": "keyholder", "password": "password123"})
 HB = {"Authorization": "Bearer " + _hb_reg.get_json()["token"]}
@@ -1630,49 +1630,66 @@ seed_cells("keyholder", {0: ("tinyhealthpotion", 5)})
 inv = carry(HB)
 check("a read hands back the bag and the keys together", len(inv) == CARRY, len(inv))
 
-# ---- moving to a key and back is a reorder, and the ledger lets it through --
+# ---- moving to a key and back is a move: one request, done by the server ----
+def move(headers, source, target, item_id):
+    return client.post("/api/character/inventory/move", headers=headers, json={
+        "slot": 0, "from": source, "to": target, "item_id": item_id})
+
+
 body = status("drag five potions from bag cell 0 onto key 2",
-              put_carry(HB, layout({BAG + 1: ("tinyhealthpotion", 5)})), 200)
+              move(HB, 0, BAG + 1, "tinyhealthpotion"), 200)
 inv = body["inventory"]
 check("they are on the key", cell(inv, BAG + 1) == ("tinyhealthpotion", 5), inv[BAG:])
 check("and gone from the bag - one place, not two", cell(inv, 0) is None, inv[0])
 check("and there are still exactly five", total(inv, "tinyhealthpotion") == 5)
 
 inv = status("and drag them back into bag cell 3",
-             put_carry(HB, layout({3: ("tinyhealthpotion", 5)})), 200)["inventory"]
+             move(HB, BAG + 1, 3, "tinyhealthpotion"), 200)["inventory"]
 check("back in the bag", cell(inv, 3) == ("tinyhealthpotion", 5), inv[:4])
 check("and the key is empty again", cell(inv, BAG + 1) is None, inv[BAG:])
 
-# ---- a key is not a way round the ledger ------------------------------------
-inv = status("claim a sword on key 5 that the server never granted",
-             put_carry(HB, layout({3: ("tinyhealthpotion", 5),
-                                   BAG + 4: ("embersword", 1)})), 200)["inventory"]
-check("the invented sword is trimmed off the key", cell(inv, BAG + 4) is None, inv[BAG:])
+# ---- a player's whole-bag write changes nothing, keys included -------------
+# The bag is the server's (ONE CELL AT A TIME in app.py). The write is still
+# answered 200 - a build from before the change sends it on every save - with
+# the bag the server holds and `ignored` saying why.
+body = status("claim a sword on key 5 that the server never granted",
+              put_carry(HB, layout({3: ("tinyhealthpotion", 5),
+                                    BAG + 4: ("embersword", 1)})), 200)
+inv = body["inventory"]
+check("the invented sword is not on the key", cell(inv, BAG + 4) is None, inv[BAG:])
+check("because a player's whole-bag write is ignored, and the answer says so",
+      body.get("ignored") == ["inventory"], body.get("ignored"))
 
-# ---- a write that stops at the bag leaves the keys alone --------------------
 seed_cells("keyholder", {0: ("ironsword", 1), BAG + 1: ("tinyhealthpotion", 5)})
-inv = status("a twenty-cell write that moves the sword",
+inv = status("a player's twenty-cell write that would move the sword",
              put_carry(HB, [None, {"item_id": "ironsword", "quantity": 1}] + [None] * (BAG - 2)),
+             200)["inventory"]
+check("moves nothing - the sword is where the server put it",
+      cell(inv, 0) == ("ironsword", 1) and cell(inv, 1) is None, inv[:2])
+inv = status("a player's empty array", put_carry(HB, []), 200)["inventory"]
+check("empties nothing either", cell(inv, 0) == ("ironsword", 1)
+      and cell(inv, BAG + 1) == ("tinyhealthpotion", 5), inv)
+status("a player's write of every carried cell, all empty", put_carry(HB, [None] * CARRY), 200)
+check("and that one does not reach the keys", cell(carry(HB), BAG + 1) == ("tinyhealthpotion", 5),
+      carry(HB)[BAG:])
+
+# ---- staff still write it whole, and the hotbar rule holds for them --------
+# Kept for tooling: a mod can grant anything already. The rule that a write
+# stopping at the bag leaves the keys alone is theirs now.
+seed_cells("checker", {0: ("ironsword", 1), BAG + 1: ("tinyhealthpotion", 5)})
+inv = status("the owner's twenty-cell write that moves the sword",
+             put_carry(H, [None, {"item_id": "ironsword", "quantity": 1}] + [None] * (BAG - 2)),
              200)["inventory"]
 check("moves the sword", cell(inv, 1) == ("ironsword", 1) and cell(inv, 0) is None, inv[:2])
 check("AND LEAVES THE POTIONS ON THE KEY - it never mentioned them",
       cell(inv, BAG + 1) == ("tinyhealthpotion", 5), inv[BAG:])
-
-inv = status("a twenty-cell write claiming those same potions in the bag",
-             put_carry(HB, [{"item_id": "tinyhealthpotion", "quantity": 5}] + [None] * (BAG - 1)),
-             200)["inventory"]
-check("CANNOT DUPLICATE THEM: the key's five are not in the ledger it spends",
-      total(inv, "tinyhealthpotion") == 5, inv)
-check("the key still has them", cell(inv, BAG + 1) == ("tinyhealthpotion", 5), inv[BAG:])
-
-inv = status("an empty array", put_carry(HB, []), 200)["inventory"]
+inv = status("an empty array from staff", put_carry(H, []), 200)["inventory"]
 check("still empties the bag, as it always has",
       all(c is None for c in inv[:BAG]), inv[:BAG])
 check("and still leaves the keys", cell(inv, BAG + 1) == ("tinyhealthpotion", 5), inv[BAG:])
-
-status("a write of exactly every carried cell", put_carry(HB, [None] * CARRY), 200)
+status("a staff write of exactly every carried cell", put_carry(H, [None] * CARRY), 200)
 check("which does reach the keys, and empties them",
-      all(c is None for c in carry(HB)), carry(HB))
+      all(c is None for c in carry(H)), carry(H))
 
 # ---- nothing is PLACED on a key ---------------------------------------------
 # A bank withdrawal runs the same _add_to_backpack() as loot, the shop, a trade,

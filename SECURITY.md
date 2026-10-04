@@ -35,11 +35,10 @@ Role definitions, the ladder and how the owner is named: [`CLAUDE.md` → Ranks]
 | **Mod** | Kick, ban up to 30 days, mute up to a day, take a chat line down, read and close chat reports, read the staff user list, the moderation log and linked accounts, write staff-only notes and warnings | Banning at or above their own rank, banning permanently, granting a rank at or above their own, touching the economy |
 | **Dev** | Everything a mod can, plus permanent bans, longer mutes, teleporting a player, reading economy supply | Granting dev or owner, moving the whole server, minting gold, the metrics endpoint |
 | **Owner** | Everything, incl. broadcast, maintenance, metrics, moving everyone, and test fixtures on their own characters only (gold, level) | Being stored anywhere. `ELUSION_OWNER` is an environment variable, so no request writes it and no database backup carries it |
-| **The server** | Owns level, XP, derived maxima, loot rolls and loot bag contents; sole author of the gold and lusion ledgers | Knowing whether the client is honest, or whether the IP it sees is the player's. Both are assumed false |
+| **The server** | Owns level, XP, derived maxima, loot rolls and loot bag contents, and every backpack and bank cell; sole author of the gold and lusion ledgers | Knowing whether the client is honest, or whether the IP it sees is the player's. Both are assumed false |
 
-Two cells are deliberately weaker than they look, and both are covered under
-[Honest limits](#honest-limits): the server does **not** own kill *events*, and
-the backpack ledger is still whatever the client pushes.
+One cell is deliberately weaker than it looks, and it is covered under
+[Honest limits](#honest-limits): the server does **not** own kill *events*.
 
 ---
 
@@ -73,10 +72,15 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
    server itself recorded; a client-sent total is dropped, and the ledger is held
    to its invariant so nothing is minted by a purchase or a trade.
    → Held by: `test_economy.py` — "injected gold is reported as drift", "nothing was minted by a purchase"
-5. **A fabricated backpack or bank is trimmed to nothing.** The claim is accepted
-   as a *request* — a 400 would break every honest save — and reconciled against
-   what the server actually granted.
-   → Held by: `test_security.py` — "but the fabricated items are trimmed to nothing"
+5. **A backpack or a bank changes only when the server changes it.** Every
+   change a player makes is its own request - a drag is a move, the bin is a
+   discard, a pile of coins is cashed - carried out on the server's cells and
+   answered with the grid, and refused (409, with the grid) when the game's
+   picture was out of date. A player's whole-bag write is answered and ignored,
+   so a fabricated bag writes nothing, and neither does a fabricated loss.
+   → Held by: `test_security.py` — "but nothing in it is written", "a player's empty bag write destroys nothing"
+   → and: `test_bagmoves.py` — "a move naming the wrong item is a 409", "onto the same stackable item it merges up to the stack limit", "THE LEDGER STILL BALANCES: every gold minted is gold somebody holds"
+   → and in the game: `src/tools/testrunner.gd` — `_test_the_bag_is_the_servers()`
 6. **All six skills are server-owned.** `PUT /api/character/skills` drops every
    skill name it accepts, so a client claim earns nothing.
    → Held by: `test_gathering.py` — "every skill the route accepts is a skill it drops"
@@ -110,12 +114,16 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     `trade_id`; every one resolves the trade from the caller. An ownership bug
     needs an id to tamper with.
     → Held by: `test_ownership.py` — "no trade route accepts a trade_id from the client"
-14. **A picture id is a capability, not a row number.** `GET /api/chat/image/<id>`
-    has no ownership check, and that is sound only because the id is the SHA-256
-    of the bytes — 256 unguessable bits *are* the permission. If the ids ever
-    become sequential or the hash is truncated, this route becomes a textbook
-    IDOR without a line of it changing, so the properties of the id are the test.
-    → Held by: `test_ownership.py` — "THE ID IS THE SHA-256 OF THE BYTES SERVED"
+14. **A picture is served only to someone who could see it.**
+    `GET /api/chat/image/<id>` asks the chat read's own question — could the
+    caller read a line showing this picture? — and otherwise answers only an
+    account that uploaded those bytes, or staff judging a report of it. A
+    whisper, friends or guild line gets its own copy under a random id, so a
+    private picture never shares an id with a world one, and a player who
+    leaves the guild or the friendship stops being served what was posted
+    there. Refused is the same 404 as missing. The id is still 256 bits (the
+    SHA-256 of the bytes, for a world picture), so it cannot be guessed either.
+    → Held by: `test_ownership.py` — "bob, holding the id, is NOT served it - no line he can read shows it", "THE WHISPER CARRIES ITS OWN COPY, under a new id", "AND STOPS BEING SERVED HER FRIENDS' PICTURE - the id he kept is not a key", "THE ID IS THE SHA-256 OF THE BYTES SERVED"
 15. **Delete means revoke, in chat.** Taking a line down removes it from the
     screens that already have it within one poll (~3s), and drops the picture
     from the store entirely once no remaining line shows it.
@@ -160,7 +168,8 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     characters are flagged in the trade's own transaction; until the new bag
     has been delivered, a whole-bag save from that client is refused with the
     bag the server holds, so what a trade gave cannot be deleted by the
-    receiver's next ordinary save.
+    receiver's next ordinary save. (A current game sends no bag at all -
+    invariant 5 - so this now guards a build from before that.)
     → Held by: `test_trades.py` — "a whole-bag save built before the trade is refused", "the sword he received survives it"
     → and in the game: `src/tools/testrunner.gd` — `_test_trades_reach_the_right_people()`
 21. **A staff password alone opens nothing.** Staff names are public - the crown,
@@ -226,6 +235,15 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     were hashed in place, and the players holding them stayed signed in.
     → Held by: `test_accounts.py` — "and no cell anywhere in the table is a live token", "what a leak would hand over does not log anyone in (401)"
     → and: `test_api.py` — "and the stored token was replaced by its SHA-256", "so the player signed in before the update is still signed in"
+28. **A ban follows the computer, not only the connection.** The game keeps a
+    random install id and sends it with every login, registration and resume;
+    a new account is refused from a computer a live-banned account has used,
+    whatever address it comes from. Like the address check it is registration
+    only (the sibling on the family computer keeps playing), it ends with the
+    ban, a crowded public computer blocks nothing, and the id is kept only as a
+    hash that no route returns.
+    → Held by: `test_security.py` — "a banned computer cannot register from a brand-new address", "the sibling on the family computer still logs in", "one banned account cannot stop a library computer making accounts", "the server keeps the SHA-256 of the id, not the id"
+    → and in the game: `src/tools/testrunner.gd` — `_test_install_id_is_kept_and_sent()`
 
 ---
 
@@ -233,9 +251,6 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
 
 No comforting lies. These are known, named and open.
 
-- **The backpack ledger is still client-declared.** `POST /api/loot/take` closed
-  where items *come from*; the bag they land in is whatever the client pushes on
-  save, reconciled against server grants rather than derived from them.
 - **Kill events are asserted, not proven** (E-3, the deepest one still open). The
   server rolls its own rewards, refuses reward-less enemies, rate-limits with a
   token bucket and caps kills at what the world's respawners can physically
@@ -244,9 +259,12 @@ No comforting lies. These are known, named and open.
 - **hp, mana and stamina are clamped, not verified** (E-9). Every rise is
   reconciled against what regeneration plus authorised potions could produce and
   trimmed past a 3× margin. A bound, not a proof.
-- **A VPN defeats ban evasion** (E-11). Registration is refused from an address
-  holding a live ban, and staff see linked accounts rated strong or weak. A new
-  address is a new person as far as this server can tell.
+- **A new computer defeats ban evasion** (E-11). A new account is refused from
+  an address or a computer holding a live ban, and staff see linked accounts
+  rated strong or weak. But the install id is whatever the game sends:
+  deleting its file, a second browser for the web build, or a modified game
+  that sends a fresh id each time gets past it. It stops the VPN, not someone
+  who knows where to look - the staff link view is still what catches them.
 - **A patched client can ignore a 401 and keep drawing the world.** What it
   cannot do is **save, trade, loot, or report a kill the server will accept** —
   all four are authenticated server-side. The heartbeat fixes the honest client
@@ -268,13 +286,10 @@ No comforting lies. These are known, named and open.
 - **`/register` answers "does this name exist" outright**, with 409 against 201,
   because a signup form has to say when a name is taken. `REGISTER_MAX_CONFLICTS`
   stops it being an unlimited oracle; it does not stop it being an oracle.
-- **A whispered picture is only as private as its bytes are rare.** The image
-  store deduplicates on the content hash, so the same image posted in world chat
-  is the same row and the same id. Inherent to content addressing, and the right
-  trade for a game chat.
-- **Anyone holding a picture id may fetch it, for as long as the row exists.**
-  That is what a capability means; see invariant 14 for why the id cannot be
-  guessed, and invariant 15 for the one way it is taken back.
+- **A picture lasts as long as a line showing it**, which is the chat's own 24
+  hours, not until the store needs the room. And anyone who was shown it can
+  keep a copy: deleting the line takes it off screens and off the server
+  (invariant 15), not off somebody's disk.
 
 Anything not on this list that later turns out to be true belongs on it.
 

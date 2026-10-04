@@ -179,10 +179,12 @@ check("the actors table has a 'not trusted with' column",
 
 # The limits section is the one a reader cannot verify and most needs to be
 # honest, so pin the entries that are known-open rather than counting bullets.
+# An entry leaves this list only with the fix that closed it: the backpack
+# ledger went when the bag became the server's (invariant 5, test_bagmoves.py),
+# and the VPN became "a new computer" when bans followed the install id.
 for open_item, why in [
-    ("backpack ledger", "still client-declared"),
     ("E-3", "the kill event is asserted, not proven"),
-    ("VPN", "defeats ban evasion"),
+    ("new computer", "defeats ban evasion"),
     ("patched client", "can ignore a 401 and keep drawing the world"),
 ]:
     check("the limits still name %s (%s)" % (open_item, why),

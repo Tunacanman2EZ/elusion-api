@@ -169,32 +169,24 @@ produced a `NameError` on startup once.
 
 ### A whole-bag save built before another change undoes it
 
-`PUT /api/character/inventory` replaces the whole carry. Every other route that
-changes the carry - a loot take, a cook, a catch, a purchase, an equip, a
-consume - writes it too, and the game saves on a two-second debounce. So a save
-built after one of those and landing after the next one undid the next one: on
-day 1, cooking a stack of twelve, a save built after cook five and sent during
-cook six deleted the fish cook six had made. A loss, so it went through; the
-following save's copy of the fish was then trimmed as a gain. One cooked fish
-in every few was gone, measured in the game.
+`PUT /api/character/inventory` replaced the whole carry, and every other route
+that changes the carry - a loot take, a cook, a catch, a purchase, an equip, a
+consume - writes it too, while the game saved on a two-second debounce. So a
+save built after one of those and landing after the next undid the next one:
+on day 1, cooking a stack of twelve, one cooked fish in every few was gone.
+`based_on` fixed it then (the save named the bag it was built on, and a stale
+one got 409 and the server's bag); `test_gathering.py` still reproduces it.
 
-**The fix is `based_on`.** The save names the bag it was built on:
-`bag_fingerprint()` of the last bag the server gave the client, which it works
-out from the array every one of those routes already answers with, so no
-answer gained a field. The server compares it with what it holds and refuses
-with 409 and the bag it does hold (`resync`, `reason: "stale_save"`), the shape
-the trade rule already sent, which the game already adopted. A body with no
-`based_on` is taken as before, so an older client still saves.
-`test_gathering.py`, "A SAVE BUILT BEFORE A COOK CANNOT UNDO IT", reproduces
-the loss and pins the fingerprint to the same string the game's suite does.
-
-**The same trap waits for any whole-row replace.** `PUT /api/account/bank` is
-the other one, and `POST /api/bank/items` changes the bank on the server, so in
-principle a stale bank save can undo a deposit. It has no `based_on` yet: four
-deposits in a row, half a second and two seconds apart, all reached the server
-on day 1, because the bank panel copies every server array into the save at
-once (`_on_bank_changed()`). If a bank item ever goes missing, this is the first
-place to look, and the fix is the same field.
+**Then the trap was removed rather than guarded.** The bag and the bank are
+the server's now (ONE CELL AT A TIME in app.py): a drag is
+`POST /api/character/inventory/move`, the bin is `.../discard`, a pile is
+`.../cash`, and the bank has `/api/bank/move` and `/api/bank/discard`. A
+player's whole-bag and whole-bank writes are answered with the server's grid
+and `ignored`; build 2 of the game does not send them. The `based_on` and
+trade-resync 409s are still in `write_inventory()` for a build-1 game. **A new
+route that changes a grid takes one cell and the item the game saw in it** -
+`_grid_move()` / `_grid_discard()`, and `_carry_resync()` / `_bank_resync()`
+for the 409 - and answers with the whole grid. `test_bagmoves.py`.
 
 ### A read before the first write is outside the transaction
 
@@ -389,13 +381,17 @@ updating the maxima it implies.
   can test level 22 gear): it sets the caller's own character, does what a
   level-up does to XP, maxima and pools, records the refill as a level-up
   grant, and logs a `level` line; `test_ownership.py` O-7 holds it.
-- **`GET /api/chat/image/<image_id>` has no ownership check on purpose**, and it
-  is the only route that does not. The id is the SHA-256 of the bytes, so 256
-  unguessable bits *are* the permission. That argument rests entirely on
-  properties of the id, so `test_ownership.py` asserts them: 64 hex, 256 bits not
-  a truncation, and equal to the hash of the bytes served. Make the ids
-  sequential or truncate the hash and the route becomes a textbook IDOR without
-  a line of it changing.
+- **`GET /api/chat/image/<image_id>` is served only to someone who could see
+  it** (`_may_see_image`): a line the caller could read shows it, by
+  `_can_read_chat_row`; or the caller uploaded those bytes
+  (`chat_image_holders`, not `created_by`, which only remembers the first of
+  two uploaders of one file); or a mod is judging a report of it. Whisper,
+  friends and guild lines get their own copy under a random id
+  (`_private_image_copy`), and `/api/chat/send` refuses an id the sender could
+  not see. World pictures keep the content id, SHA-256 of the bytes, and
+  `test_ownership.py` O-3 still pins that it is 64 hex and the hash of what is
+  served. Drop a picture with `_drop_image()`, never a bare DELETE, so its
+  holders go with it.
 - **Login and unknown-username return byte-identical 401s.** A distinguishable
   answer turns the route into a username enumerator. There is a test asserting
   the two responses are equal.
@@ -645,6 +641,18 @@ not in the schema block: on a database from before presence existed, the schema
 block would fail on "no such column" and take the boot with it. The MIGRATION
 section in `test_api.py` boots exactly that shape, and fails if the index moves back.
 
+**Ban evasion is checked twice at registration: the address and the computer.**
+`_ban_evasion_state()` asks `account_ips`; `_install_evasion_state()` asks
+`account_installs`, which holds the SHA-256 of the install id the game sends
+as `install` on login, register and resume (INSTALL IDS in app.py). Same rules
+for both - registration only, ends with the ban, inert above
+`EVASION_BLOCK_MAX_ACCOUNTS` - and `_linked_accounts()` merges both into one
+entry per account (`shared_addresses`, `shared_computers`). A missing or
+malformed `install` is ignored, never refused: older builds send none. Record
+it with `_record_account_install()` wherever `_record_account_ip()` runs, plus
+on a banned login with the right password (never a wrong one).
+`test_security.py` E-5f.
+
 ## Chat is one line, as typed, and a whisper finds you
 
 **`clean_player_text(raw, limit)`** is the one rule for text other players
@@ -790,8 +798,8 @@ start a class again.
   write. A restore is a decision made by hand, not a route.
 - **A stale save cannot bring it back.** `PUT /api/character/inventory` answers
   404 for a slot with no save, and a character made again is a new row at
-  level 1 with full pools; a bag saved over it is trimmed like any other
-  unexplained gain.
+  level 1 with full pools; a player's bag sent over it is ignored, like any
+  player's whole-bag write.
 - **`parse_slot()` refuses a fractional slot now.** `int(1.5)` is 1, so
   "delete slot 1.5" deleted slot 1. 1.0 is still slot 1, because Godot sends
   every number as a float.
@@ -1207,14 +1215,13 @@ client sync would otherwise overwrite a grant made seconds earlier. They are the
 worked example for every skill that still needs this. Shops are the remaining
 one. See `docs/inventoryauthority.md`.
 
-`PUT /api/character/inventory` predated the rule and has since been brought
-under it: `_report_unexplained_gains()` ran in SHADOW MODE first - logging
-`[LEDGER]` lines and refusing nothing - until the comparison had been proven
-right against real play, and only then started trimming. Shipping the refusal
-first would have broken honest saves. `PUT /api/account/bank` has since had the same
-treatment and reconciles against `bank_items`: it can reorder the bank, not
-stock it. Both share one `_trim_to_recorded()` rather than two copies of the
-rule.
+`PUT /api/character/inventory` predated the rule and was brought under it in
+two steps. First a ledger: `_report_unexplained_gains()` ran in SHADOW MODE -
+logging `[LEDGER]` lines and refusing nothing - until the comparison had been
+proven right against real play, and only then trimmed gains (the bank PUT got
+the same treatment). Then the rule itself: a player's bag and bank are never
+written whole any more, and every change is a one-cell route (ONE CELL AT A
+TIME). The ledger functions went with it.
 
 ## Known gaps
 

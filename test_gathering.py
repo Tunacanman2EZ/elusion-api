@@ -384,9 +384,13 @@ now = bag_of(chef)
 moved = list(now)
 moved[5], moved[0] = moved[0], None
 r = save_bag(chef, moved, fp(now))
-check("a save built on the bag the server holds goes through, rearranged",
-      r.status_code == 200 and bag_of(chef)[5] == now[0] and bag_of(chef)[0] is None, (r.status_code, r.get_json()))
-check("  and its answer is the new bag, to build the next save on",
+# A CURRENT SAVE IS ANSWERED, AND CHANGES NOTHING. The bag is the server's now
+# (test_bagmoves.py): a drag is POST /api/character/inventory/move, so a whole
+# write from a player is read back to it with `ignored`, rearranged or not.
+check("a save built on the bag the server holds is answered 200 - and moves nothing",
+      r.status_code == 200 and bag_of(chef) == now
+      and (r.get_json() or {}).get("ignored") == ["inventory"], (r.status_code, r.get_json()))
+check("  and its answer is the bag the server holds, to build the next one on",
       fp(r.get_json()["inventory"]) == fp(bag_of(chef)))
 check("a based_on that is not a string is a 400",
       save_bag(chef, bag_of(chef), 12345).status_code == 400)
