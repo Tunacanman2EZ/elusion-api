@@ -11,7 +11,7 @@ that derives a maximum reads what the character is wearing.
 The amulet families follow their colour: green is health (Vitality), blue is
 mana (Arcana), crimson is damage (Fury), purple is armour (Ward).
 """
-import importlib.util, os, re, sqlite3, sys, tempfile
+import importlib.util, json, os, re, sqlite3, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -286,7 +286,7 @@ check("and gains nothing from holding it",
 
 
 # =============================================================================
-section("DYING, COMING BACK AND LEVELLING ALL KEEP THE BONUS")
+section("A REVIVE AND A LEVEL KEEP THE BONUS")
 # =============================================================================
 D = account("amuletdier")
 client.put("/api/save", headers=D, json={"slot": 0, "class_id": "warrior", "name": "Dier"})
@@ -295,16 +295,11 @@ give("amuletdier", "exaltedvitalityamulet")
 equip(D, "exaltedvitalityamulet")
 r = client.put("/api/player/status", headers=D, json={"slot": 0, "hp": 0})
 check("the character dies", r.status_code == 200 and status(D)["hp"] == 0, r.data[:160])
-r = client.post("/api/character/respawn", headers=D, json={"slot": 0})
-check("respawn -> 200", r.status_code == 200, r.data[:200])
-s = status(D)
-check("respawn fills to the maximum WITH the amulet",
-      s["hp"] == s["max_hp"] == BASE22["max_hp"] + 60, (s["hp"], s["max_hp"]))
 
-# A PAID REVIVE fills to the same maximum. Lusions are written straight onto
-# the account: what is under test is the ceiling the revive fills to, not the
-# price, which test_economy.py covers.
-r = client.put("/api/player/status", headers=D, json={"slot": 0, "hp": 0})
+# A PAID REVIVE keeps what is worn and fills to the maximum it sets. Lusions
+# are written straight onto the account: what is under test is the ceiling the
+# revive fills to, not the price, which test_economy.py covers. (Accepting
+# death instead takes the amulet - see the section below.)
 conn = db()
 conn.execute("INSERT OR IGNORE INTO accounts (user_id) VALUES (?)", (uid_of("amuletdier"),))
 conn.execute("UPDATE accounts SET lusions = ? WHERE user_id = ?",
@@ -315,6 +310,9 @@ check("revive -> 200", r.status_code == 200, r.data[:200])
 s = status(D)
 check("a revive fills to the maximum WITH the amulet",
       s["hp"] == s["max_hp"] == BASE22["max_hp"] + 60, (s["hp"], s["max_hp"]))
+check("  and the amulet is still worn",
+      json.loads(row_of("amuletdier")["equipment"]) == {"amulet": "exaltedvitalityamulet"},
+      row_of("amuletdier")["equipment"])
 
 # A LEVEL EARNED FROM A KILL re-derives the maxima in the kill route itself.
 # One XP short of the curve's requirement: the kill route derives xp_to_next
@@ -331,6 +329,61 @@ check("the kill levelled the character", int(row["level"]) > before_level, row["
 check("and the new max_hp includes the amulet",
       int(row["max_hp"]) == curve("warrior", int(row["level"]))["max_hp"] + 60,
       (row["max_hp"], curve("warrior", int(row["level"]))["max_hp"]))
+
+
+# =============================================================================
+section("ACCEPTING DEATH TAKES EVERYTHING WORN")
+# =============================================================================
+# Day 2, the owner: "gear is not dropping on full death". It never had: the
+# respawn took the bag and the purse and left every worn piece on. His call:
+# worn gear is lost with the bag, and nothing is safe, mythic weapons included.
+T = account("geartaker")
+client.put("/api/save", headers=T, json={"slot": 0, "class_id": "warrior", "name": "Taker"})
+set_row("geartaker", level=22, hp=BASE22["max_hp"], max_hp=BASE22["max_hp"])
+WORN = {"weapon": "doubleaxe", "helm": "emberhelm", "chest": "emberchest",
+        "shield": "embershield", "amulet": "exaltedvitalityamulet"}
+for item_id in WORN.values():
+    give("geartaker", item_id)
+    equip(T, item_id)
+check("five pieces worn, a mythic among them",
+      json.loads(row_of("geartaker")["equipment"]) == WORN, row_of("geartaker")["equipment"])
+dressed_max = int(row_of("geartaker")["max_hp"])
+check("  and they lift the maximum", dressed_max > BASE22["max_hp"], dressed_max)
+
+client.put("/api/player/status", headers=T, json={"slot": 0, "hp": 0})
+r = client.post("/api/character/respawn", headers=T, json={"slot": 0})
+body = r.get_json() or {}
+check("respawn -> 200", r.status_code == 200, r.data[:200])
+check("the answer names every piece lost",
+      body.get("gear_lost") == sorted(WORN.values()) and body.get("equipment") == {},
+      [body.get("gear_lost"), body.get("equipment")])
+check("nothing is worn any more, on the server",
+      json.loads(row_of("geartaker")["equipment"]) == {}, row_of("geartaker")["equipment"])
+s = status(T)
+check("the pools fill to the BARE maximum, not the one the gear set",
+      s["hp"] == s["max_hp"] == BASE22["max_hp"], (s["hp"], s["max_hp"], dressed_max))
+conn = db()
+held = conn.execute("SELECT COUNT(*) FROM carry_items WHERE user_id = ?",
+                    (uid_of("geartaker"),)).fetchone()[0]
+conn.close()
+check("  and none of it went back into the bag", held == 0, held)
+
+# A SAVE BUILT BEFORE THE DEATH CANNOT DRESS THEM AGAIN. /api/save ignores
+# equipment from a client; this holds that for the case that matters most.
+r = client.put("/api/save", headers=T, json={"slot": 0, "class_id": "warrior", "name": "Taker",
+                                            "equipment": WORN})
+check("a stale save naming the old gear changes nothing",
+      r.status_code == 200 and json.loads(row_of("geartaker")["equipment"]) == {}
+      and "equipment" in (r.get_json() or {}).get("ignored", []),
+      [r.status_code, row_of("geartaker")["equipment"]])
+r = unequip(T, "weapon")
+check("  and there is no weapon left to take off", r.status_code != 200, r.status_code)
+
+# Wearing nothing, a full death loses nothing more and says so.
+client.put("/api/player/status", headers=T, json={"slot": 0, "hp": 0})
+r = client.post("/api/character/respawn", headers=T, json={"slot": 0})
+check("a death with nothing worn -> gear_lost []",
+      r.status_code == 200 and (r.get_json() or {}).get("gear_lost") == [], r.data[:200])
 
 
 # =============================================================================

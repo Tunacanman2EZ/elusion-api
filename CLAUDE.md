@@ -130,9 +130,19 @@ was noticed:
 
 `POST /api/character/respawn` is the other half of the migration. It refuses a
 living character (409, same as revive), burns the carry gold through
-`gold_delta()` under the reason `death`, empties `carry_items`, refills the
-three pools from the class curve, and writes a `consume_grants` row so the
-client's next sync is explained instead of clamped.
+`gold_delta()` under the reason `death`, empties `carry_items`, takes off and
+destroys everything worn (`saves.equipment` becomes `{}`, named in `gear_lost`),
+refills the three pools to the **bare** class curve, and writes a
+`consume_grants` row so the client's next sync is explained instead of clamped.
+
+**Worn gear is lost with the bag** since day 2. The owner, after dying: "gear
+is not dropping on full death" - it never had. Nothing is exempt, mythic weapons
+included; a paid revive keeps everything, and the bank is the only thing a full
+death cannot reach. The maxima are derived as if wearing nothing, because after
+the commit that is the truth: deriving from the row would refill to a ceiling an
+amulet set and leave hp above the new one. `test_gearbonus.py`, "ACCEPTING DEATH
+TAKES EVERYTHING WORN", holds it, including a stale save that names the old
+gear and changes nothing.
 
 **The lesson is about forks, not about death.** When a decision moves from the
 client to the server, the thing to grep for is not the function you moved - it

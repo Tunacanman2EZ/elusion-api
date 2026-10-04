@@ -17983,7 +17983,7 @@ def character_revive():
 @require_auth
 def character_respawn():
     """
-    Accept death: lose what was carried, come back at full health
+    Accept death: lose what was carried and worn, come back at full health
     ---
     tags:
       - Character
@@ -18003,7 +18003,7 @@ def character_respawn():
             slot: {type: integer, example: 0}
     responses:
       200:
-        description: Carry gold and carry items destroyed, the three pools refilled
+        description: Carry gold, carry items and worn gear destroyed, the three pools refilled to the bare maxima
       404:
         description: No character in that slot
       409:
@@ -18060,7 +18060,20 @@ def character_respawn():
     if int(row["hp"] or 0) > 0:
         return {"error": "Conflict", "message": "That character is not dead."}, 409
 
-    derived = _derived_stats(row)
+    # WORN GEAR GOES TOO. Day 2, the owner: "gear is not dropping on full
+    # death". It never had - this route took the bag and the purse and left
+    # everything worn on, so a full death cost nothing to a character who kept
+    # their best things on their back. His call: worn gear is lost with the bag,
+    # and nothing is exempt, mythic weapons included. A paid revive keeps it all;
+    # the bank is the only thing a full death cannot reach.
+    #
+    # THE MAXIMA ARE DERIVED BARE, because that is what the character is
+    # wearing once this commits. Deriving them from the row would refill to a
+    # ceiling a Vitality amulet set and then leave hp above the new one.
+    worn = _stored_json(row["equipment"], {})
+    gear_lost = sorted(str(item_id) for item_id in worn.values() if item_id)
+    derived = _derived_stats({"class_id": row["class_id"], "level": row["level"],
+                              "equipment": "{}"})
     if derived is None:
         app.logger.error("respawn: no stat curve for class '%s'", row["class_id"])
         return {"error": "Conflict", "message": "That character cannot respawn."}, 409
@@ -18090,7 +18103,7 @@ def character_respawn():
                (user_id, slot))
 
     db.execute(
-        "UPDATE saves SET hp = ?, mana = ?, stamina = ?, "
+        "UPDATE saves SET equipment = '{}', hp = ?, mana = ?, stamina = ?, "
         "max_hp = ?, max_mana = ?, max_stamina = ?, updated_at = ?, pools_at = ? "
         "WHERE user_id = ? AND slot = ?",
         (derived["max_hp"], derived["max_mana"], derived["max_stamina"],
@@ -18111,6 +18124,8 @@ def character_respawn():
         "slot": slot,
         "respawned": True,
         "gold_lost": burned,
+        "gear_lost": gear_lost,
+        "equipment": {},
         "status": status_payload(user_id, slot),
     }, 200
 
