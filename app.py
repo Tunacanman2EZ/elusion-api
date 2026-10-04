@@ -1,3 +1,12 @@
+# THE .env IS READ BEFORE ANYTHING ELSE, and that ordering is the fix for a real
+# bug. It used to be read by a helper four hundred lines down, after
+# `import gamedata` had taken ELUSION_GAMEDATA, DB_PATH had taken ELUSION_DB and
+# TRUSTED_PROXY_HOPS had taken ELUSION_TRUSTED_PROXIES - so those three in a
+# .env were silently ignored. Nothing goes above these two lines. See envfile.py;
+# test_deploy.py boots this file with only a .env and checks every setting.
+import envfile
+envfile.load()
+
 from flask import Flask, request, g, has_request_context
 from flask.json.provider import DefaultJSONProvider
 from flasgger import Swagger
@@ -398,51 +407,16 @@ REQUIRED_FIELDS = ["username", "password"]
 #     cmd          set ELUSION_OWNER=yourname
 #     bash         export ELUSION_OWNER=yourname
 #
-# ...or put it in a .env file next to this one, which is what _load_dotenv()
-# below is for. The variable has to be set in the EXACT shell that launches the
-# server, every time, and forgetting is silent: the server starts fine, nobody
-# is the owner, and the only symptom is that your debug keys stop working. That
-# happened, which is why the boot line below now says who the owner is.
+# ...or put it in a .env file next to this one, which envfile.load() at the
+# very top of this file reads. The variable has to be set in the EXACT shell
+# that launches the server, every time, and forgetting is silent: the server
+# starts fine, nobody is the owner, and the only symptom is that your debug
+# keys stop working. That happened, which is why the boot line below now says
+# who the owner is.
 #
 # Unset means no owner, and every owner check fails closed - a server with no
 # configured owner has no owner, rather than everyone being one.
 
-
-def _load_dotenv():
-    """
-    Read KEY=value lines from a .env beside this file into the environment.
-
-    A REAL ENVIRONMENT VARIABLE ALWAYS WINS. This only fills in what the shell
-    did not set, so an explicit `$env:ELUSION_OWNER = "..."` still overrides the
-    file and there is no way for a stale .env to quietly take precedence over
-    what someone just typed.
-
-    No dependency: python-dotenv would do this better, but it is one more thing
-    to install for eight lines, and requirements.txt being two entries long is
-    worth more than the polish.
-
-    .env is gitignored, which is the point - ELUSION_OWNER must not live in the
-    repository any more than it lives in the database.
-    """
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    if not os.path.exists(path):
-        return
-    try:
-        with open(path, encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                if key and key not in os.environ:
-                    os.environ[key] = value
-    except OSError as exc:
-        print(f"[BOOT] could not read .env ({exc}); using the shell environment only")
-
-
-_load_dotenv()
 
 OWNER_USERNAME = os.environ.get("ELUSION_OWNER", "").strip()
 
@@ -537,8 +511,9 @@ def debugger_permitted(env, argv=()):
     return _flag(env.get("ELUSION_DEBUG")) and debugger_refusal(env, argv) is None
 
 
-# AFTER _load_dotenv(), so a debug flag in .env is judged exactly like one in
-# the shell - a .env copied from a dev machine is the likeliest way to ship one.
+# After envfile.load() (top of the file), so a debug flag in .env is judged
+# exactly like one in the shell - a .env copied from a dev machine is the
+# likeliest way to ship one.
 _DEBUGGER_REFUSAL = debugger_refusal(os.environ, sys.argv)
 if _DEBUGGER_REFUSAL is not None:
     raise SystemExit("[BOOT] refusing to start: " + _DEBUGGER_REFUSAL)

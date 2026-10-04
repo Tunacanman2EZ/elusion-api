@@ -2138,8 +2138,13 @@ check("the real gamedata.json beside app.py passes the preflight",
 # gamedata.json with equip_slot_name stripped out of every item, in a throwaway
 # directory beside copies of the modules wsgi.py imports. Python puts cwd on
 # sys.path, so the child picks these up instead of the real ones.
+#
+# envfile.py IS ONE OF THEM since wsgi.py reads the .env first. Without it the
+# child died on "No module named 'envfile'", which is also a non-zero exit - so
+# the check above passed for the wrong reason and only the wording check below
+# noticed.
 _stale_dir = tempfile.mkdtemp(prefix="elusion_stale_")
-for _mod in ("wsgi.py", "app.py", "gamedata.py"):
+for _mod in ("wsgi.py", "app.py", "gamedata.py", "envfile.py"):
     shutil.copy(os.path.join(HERE, _mod), _stale_dir)
 
 with open(os.path.join(HERE, "gamedata.json")) as _fh:

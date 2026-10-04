@@ -5,7 +5,9 @@ Everything here is about one transition: **from "only I can reach it" to
 was for, and it is also what turns several currently-harmless settings into
 real problems.
 
-Nothing in this file is done yet. It is the checklist, not a record.
+**The live server** below is the record of what runs at elusionrpg.com, set up
+on 4 October 2026. Everything after it is the checklist and the reasons behind
+it, and it still applies: a change to the server is checked against it.
 
 ---
 
@@ -36,6 +38,15 @@ waitress-serve --listen=127.0.0.1:5000 wsgi:application
 
 `wsgi.py` checks all of these at boot and says which one is wrong.
 
+**Where they go.** On a server, in the environment the service manager gives
+the process - the live box uses systemd's `EnvironmentFile` (below). On a PC, a
+`.env` beside `app.py` works: `envfile.py` reads it before anything else, and a
+real environment variable always wins over the file. Until October 2026 the
+`.env` was read too late for `ELUSION_DB`, `ELUSION_TRUSTED_PROXIES` and
+`ELUSION_GAMEDATA`, which were silently ignored there, and `wsgi.py`'s
+preflight saw none of it; `test_deploy.py` now boots both files with nothing
+but a `.env`.
+
 **`--preload`, or the first boot after an update can take the server down.**
 Without it every gunicorn worker imports app.py at the same moment, and each one
 runs the migrations in `init_db()` against the same database file. Two workers
@@ -59,6 +70,139 @@ is four times what you set — fine as a DoS ceiling, not a precise fair-use
 limit. Start generous (a value no real player hits in a burst), watch the logs,
 and tighten with data. For a precise limit shared across all four workers, move
 the counter to Redis or the `login_attempts` SQLite pattern.
+
+---
+
+## The live server
+
+One small droplet holds the API, the proxy and the browser build.
+
+| Piece | Where |
+|---|---|
+| Machine | DigitalOcean droplet `elusion-1`, region SFO2, Ubuntu 24.04: 1 vCPU, 1 GB RAM, 25 GB disk, plus a 1 GB swap file |
+| Names | `api.elusionrpg.com` and `play.elusionrpg.com`: A records at Namecheap pointing at the droplet. The bare domain and `www` stay on Netlify, which serves the website |
+| Firewall | ufw allows OpenSSH, 80 and 443, nothing else. SSH takes keys only (`PasswordAuthentication no`) |
+| Proxy and TLS | Caddy, from Caddy's own apt repository. It fetches and renews the certificates itself |
+| Service | systemd unit `elusion-api`, run as the system user `elusion` |
+| Code | `/opt/elusion/api`, a git clone of this repository, owned by `elusion` |
+| Python | `/opt/elusion/venv`: `requirements.txt` plus gunicorn |
+| Settings | `/etc/elusion/elusion.env`, owned by root, `chmod 600` |
+| Database | `/var/lib/elusion/elusion.db`; the folder is `elusion`'s, mode 750 |
+| Backups | `/var/backups/elusion` (mode 700), nightly; log in `/var/log/elusion-backup.log` |
+| Browser build | `/srv/elusion-web`, a placeholder page until the first upload |
+
+**The settings file** is the only place the secrets live. systemd reads it as
+root and hands the values to the service, so the `elusion` user cannot read the
+file itself, and nothing in it is in the repository. Names only here:
+
+```
+ELUSION_OWNER=<the owner's username>
+ELUSION_DB=/var/lib/elusion/elusion.db
+ELUSION_TRUSTED_PROXIES=1
+ELUSION_SMTP_HOST=<mail server>
+ELUSION_SMTP_PORT=587
+ELUSION_SMTP_USER=<the sending address>
+ELUSION_SMTP_PASSWORD=<typed on the server, never pasted anywhere else>
+ELUSION_MAIL_FROM="Elusion RPG <the sending address>"
+```
+
+The proxy count is 1 because Caddy is the one hop. Edit the file with
+`sudo nano /etc/elusion/elusion.env`, then `sudo systemctl restart elusion-api`;
+nothing reads it until the restart.
+
+**The unit**, `/etc/systemd/system/elusion-api.service`, the lines that matter:
+
+```ini
+[Service]
+User=elusion
+WorkingDirectory=/opt/elusion/api
+EnvironmentFile=/etc/elusion/elusion.env
+ExecStart=/opt/elusion/venv/bin/gunicorn --preload -w 2 --threads 4 -b 127.0.0.1:5000 wsgi:application
+Restart=on-failure
+```
+
+Two workers on one core, four threads each: a request mostly waits on SQLite,
+and SQLite has one writer whatever the worker count (**Sizing**, below). The
+boot log line to look for is `[DEPLOY] preflight passed (trusted proxy hops: 1)`
+(`journalctl -u elusion-api -n 30 --no-pager`).
+
+**Caddy**, `/etc/caddy/Caddyfile`:
+
+```caddy
+api.elusionrpg.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:5000
+}
+
+play.elusionrpg.com {
+    encode zstd gzip
+    handle /api/* {
+        reverse_proxy 127.0.0.1:5000
+    }
+    handle {
+        root * /srv/elusion-web
+        header Cache-Control "no-cache"
+        file_server
+    }
+}
+```
+
+`sudo caddy validate --config /etc/caddy/Caddyfile` before
+`sudo systemctl reload caddy`. **The browser build**, below, says why the play
+site carries the API too.
+
+**The nightly backup**, `/etc/cron.d/elusion-backup` (one line; the droplet's
+clock is UTC, so 10:15 is 4:15 in the morning in New Mexico, 3:15 in winter):
+
+```
+15 10 * * * elusion /usr/bin/python3 /opt/elusion/api/backup_db.py --db /var/lib/elusion/elusion.db --out /var/backups/elusion --keep 14 >> /var/log/elusion-backup.log 2>&1
+```
+
+It runs the copy of `backup_db.py` in the clone, so a `git pull` updates it.
+These backups are on the same disk as the database; **Backups**, below, covers
+getting copies off the machine.
+
+### Updating the server
+
+After pushing to GitHub, from an SSH session on the droplet:
+
+```
+cd /opt/elusion/api
+sudo -u elusion git pull
+sudo systemctl restart elusion-api
+sudo journalctl -u elusion-api -n 30 --no-pager
+curl -s https://api.elusionrpg.com/api/status
+```
+
+- **`sudo -u elusion`** because the clone is that user's. git refuses to work in
+  a folder another user owns ("dubious ownership"), and a pull as root would
+  leave root-owned files the service then cannot replace.
+- **When `requirements.txt` changed**, before the restart:
+  `sudo -u elusion /opt/elusion/venv/bin/pip install -r requirements.txt`.
+- **When the game's catalogue changed**, the new `gamedata.json` has to be
+  committed here first (the exporter writes into the game repo, not this one);
+  the pull then brings it. `/api/status` shows the item and enemy counts.
+- `--preload` runs the migrations once, in the parent, so a restart onto a
+  new schema is safe while the database is live. The restart itself takes a
+  few seconds, and a request landing in them fails, so pick a quiet moment.
+
+### Running a tool against the live database
+
+`set_role.py`, `canary.py`, `killwatch.py` and `deathwatch.py` read
+`ELUSION_DB` or take `--db`. Give it to them, and run them **as `elusion`**:
+
+```
+sudo -u elusion env ELUSION_DB=/var/lib/elusion/elusion.db /opt/elusion/venv/bin/python /opt/elusion/api/set_role.py --list
+sudo -u elusion /opt/elusion/venv/bin/python /opt/elusion/api/canary.py --db /var/lib/elusion/elusion.db
+```
+
+- **Without the path**, a tool looks for `elusion.db` beside itself, in
+  `/opt/elusion/api`, finds nothing and says so. None of them creates a
+  database, so the mistake is loud rather than a second, empty database.
+- **Not as root.** The database runs in WAL mode, and a writer can create
+  `elusion.db-wal` and `elusion.db-shm` beside it. Created by root, they are
+  files the service cannot write, and its requests fail until they are gone.
+  Run as `elusion`, anything created is the service's own.
 
 ---
 
@@ -130,6 +274,8 @@ address that changes every request, means it is not.
       scrypt hashes of real passwords. `wsgi.py` catches the obvious paths, not
       every arrangement.
 - [ ] **`.env` is not in the repo** and not readable by other users on the box.
+      On the live server there is no `.env`: the settings are in
+      `/etc/elusion/elusion.env`, root's, mode 600.
 - [ ] **Backups of `elusion.db`**, somewhere off the box — losing it loses every
       account. Run `backup_db.py` on a schedule (see **Backups** below); it takes
       a consistent snapshot while the server is live and verifies it before
@@ -182,8 +328,9 @@ address that changes every request, means it is not.
       that box.
 
       **If mail breaks after launch, you are still the owner of the machine.**
-      Put `ELUSION_STAFF_LOGIN_CODES=off` in `.env`, restart, log in on the
-      password, fix the mail settings, take the line out and restart again.
+      Put `ELUSION_STAFF_LOGIN_CODES=off` in `.env` (on the live server,
+      `/etc/elusion/elusion.env`), restart, log in on the password, fix the
+      mail settings, take the line out and restart again.
       Staff sessions that are already open keep working the whole time; the
       step only gates new logins.
 
@@ -348,14 +495,29 @@ python3 backup_db.py --db /path/to/elusion.db --out /var/backups/elusion --keep 
 
 It reopens the copy it just wrote, runs `integrity_check`, and reads a real row
 before trusting it, and it **exits non-zero** if anything fails — so a scheduler
-knows the night it matters. Send the backups somewhere **off the box**: a backup
-on the same disk as the database dies with it.
+knows the night it matters.
 
-**Linux (cron)** — nightly at 03:15:
+**Each backup is one file.** The live database runs in WAL mode and the backup
+API copies that mode along with the pages, so until October 2026 every copy was
+a WAL database too - and opening one at all, even read-only to verify it, makes
+SQLite create a `-wal` and a `-shm` beside it. The first night on the live
+server left three files where one was meant, and pruning only knew about the
+`.db`. Each copy is now switched to `journal_mode=DELETE` before it is closed,
+`verify()` refuses one still in WAL mode, and every run settles an older copy
+that has sidecars (keeping its date) and removes sidecars whose backup is gone.
+It only ever touches names it writes, `<db name>-<YYYYMMDD>-<HHMMSS>.db`, so a
+folder shared with anything else is safe. The live database is never touched
+and stays in WAL. `test_deploy.py`.
+
+**Linux (cron)** — the live server's line is under **The live server**, above.
+The shape, for another box:
 
 ```
-15 3 * * * cd /srv/elusion && /usr/bin/python3 backup_db.py --db elusion.db --out /var/backups/elusion --keep 30 >> /var/log/elusion-backup.log 2>&1
+15 3 * * * elusion /usr/bin/python3 /path/to/backup_db.py --db /path/to/elusion.db --out /var/backups/elusion --keep 30 >> /var/log/elusion-backup.log 2>&1
 ```
+
+(That is the `/etc/cron.d/` form, with the user to run as after the time. In a
+personal `crontab -e` the user field is left out.)
 
 **Windows (Task Scheduler)** — a daily task that runs:
 
@@ -363,8 +525,42 @@ on the same disk as the database dies with it.
 python C:\path\to\backup_db.py --db C:\path\to\elusion.db --out D:\backups\elusion --keep 30
 ```
 
-**Test the restore, once.** A backup you have never restored is a rumour: copy a
-backup file to a scratch path, point a throwaway server at it, and log in.
+### Off the machine
+
+**A backup on the same disk as the database dies with it.** A deleted droplet,
+a botched resize, a compromised box: the nightly copies in
+`/var/backups/elusion` go too. Two layers, cheapest first:
+
+1. **DigitalOcean's droplet backups** (the droplet's **Backups & Snapshots**
+   tab). An image of the whole disk - system, settings, code, database and the
+   nightly copies - kept by DigitalOcean apart from the droplet, weekly or
+   daily, for a share of the droplet's price. A restore brings back the whole
+   machine as it was. It is a disk image taken while the server runs, so the
+   database inside it is crash-consistent rather than a clean snapshot; the
+   nightly `backup_db.py` copies inside the same image are the clean ones.
+2. **A copy outside DigitalOcean.** The disk images live in the same account,
+   so a lost or locked account takes them with it. Pull the newest nightly copy
+   to a machine you own from time to time:
+
+   ```
+   ssh root@YOUR_SERVER_IP ls -t /var/backups/elusion
+   scp root@YOUR_SERVER_IP:/var/backups/elusion/elusion-YYYYMMDD-HHMMSS.db .
+   ```
+
+   The first line lists the copies newest first; the second fetches one into
+   the folder you are in (Windows has both commands built in). The folder is
+   mode 700 and `elusion`'s, so root can read it and no other user can. Treat the
+   copy like the database it is: real password hashes, never in a repo, never
+   in a synced folder you share.
+
+**Test the restore.** A backup you have never restored is a rumour.
+`restore_drill.py` does the whole round trip on a copy - reads it cold, serves
+it with a real server, registers, logs in, checks the accounts survived - and
+never touches the live file:
+
+```
+sudo -u elusion /opt/elusion/venv/bin/python /opt/elusion/api/restore_drill.py --dir /var/backups/elusion
+```
 
 ---
 
@@ -480,8 +676,9 @@ is needed to launch.
 `elusion.db-shm`. Keep them on the same filesystem as the database (they are, by
 construction) and never back up the `.db` alone by copying it — `backup_db.py`
 uses SQLite's online-backup API, which captures the WAL correctly; a bare `cp`
-would not. `canary.py`, `backup_db.py` and `security_bot.py` all read the live
-WAL database `mode=ro` without trouble.
+would not. Its copies are single files in the ordinary journal mode (**Backups**,
+above), so they carry no sidecars of their own. `canary.py`, `backup_db.py` and
+`security_bot.py` all read the live WAL database `mode=ro` without trouble.
 
 The `login_attempts` table prunes itself on the login path
 (`LOGIN_LOG_RETENTION_SECONDS`, 14 days), so it will not grow without bound.

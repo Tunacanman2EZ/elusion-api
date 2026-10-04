@@ -52,12 +52,14 @@
 #
 # THE DATABASE IS SAFE, AND HERE IS WHY RATHER THAN AN ASSURANCE
 # --------------------------------------------------------------
-# app.py line 31: DB_PATH = os.environ.get("ELUSION_DB", <this folder>\elusion.db)
+# app.py CONFIG: DB_PATH = os.environ.get("ELUSION_DB", <this folder>\elusion.db)
 # Every suite that touches a database sets ELUSION_DB to a temp file first, and
-# _load_dotenv() only fills in keys NOT already in the environment, so .env
-# cannot drag a run back onto the live file. elusion.db is never opened by a
-# test. That is worth knowing rather than trusting, because the one time it is
-# wrong it is wrong about real accounts and password hashes.
+# envfile.load() only fills in keys NOT already in the environment, so .env
+# cannot drag a run back onto the live file - and since ELUSION_DB in a .env
+# now really is read (it was ignored until envfile.py), that sentence carries
+# weight. test_deploy.py checks a real variable beats the file. elusion.db is
+# never opened by a test. That is worth knowing rather than trusting, because
+# the one time it is wrong it is wrong about real accounts and password hashes.
 #
 #
 # ASCII ONLY. Windows PowerShell 5.1 reads a BOM-less .ps1 as CP1252, where the

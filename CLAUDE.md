@@ -167,6 +167,33 @@ Helpers defined further down the file do not exist yet when it runs. Table
 creation belongs in the schema block, not in a function called from it. This
 produced a `NameError` on startup once.
 
+### A setting read before the .env is a setting the .env cannot set
+
+app.py read its `.env` with a helper four hundred lines down. `import gamedata`
+at the top had already taken `ELUSION_GAMEDATA`, `DB_PATH` had taken
+`ELUSION_DB` and `TRUSTED_PROXY_HOPS` had taken `ELUSION_TRUSTED_PROXIES`, so
+those three in a `.env` did nothing, and `wsgi.py`'s preflight - which reads
+everything before importing app - saw none of the file. Found standing up the
+live server; the server itself was fine, because systemd sets the environment
+before Python starts.
+
+`envfile.py` is the fix, and it is a module so the rule is about position, not
+discipline: `import envfile; envfile.load()` are the first two statements of
+app.py and come before the preflight in wsgi.py. **Nothing goes above them.**
+A real environment variable still wins over the file. `test_deploy.py` checks
+the order with `ast` and boots a copy of both files with nothing but a `.env`.
+
+### A WAL database copied is a WAL database
+
+The live database runs in WAL mode, and SQLite's backup API copies the mode with
+the pages. Opening a WAL file at all, even read-only, creates a `-wal` and a
+`-shm` beside it, so the first night's backup on the live server was three
+files and the pruning only knew about one. `backup_db.py` switches every copy to
+`journal_mode=DELETE`, reads the header bytes before `verify()` opens anything,
+and settles or sweeps leftovers - but only under names it writes, because a
+lone `elusion.db-wal` in somebody's folder may be a live database's unfolded
+transactions. `test_deploy.py`.
+
 ### A whole-bag save built before another change undoes it
 
 `PUT /api/character/inventory` replaced the whole carry, and every other route
@@ -1127,6 +1154,8 @@ summon - stepping through is the consent, and it sorts the audience for free.
 
 ```
 app.py          every route, the schema, the migrations
+envfile.py      reads a .env beside the code; first thing app.py and wsgi.py do
+wsgi.py         what gunicorn serves: a preflight of the settings, then app
 gamedata.py     loot rolls, XP curve, stat curves - the game's rules
 gamedata.json   exported from the Godot project, NOT hand-edited
 test_*.py       discovered and run by run_tests.ps1, which prints how many.
@@ -1159,9 +1188,13 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
   maintenance   the kill switch and its countdown
   security_doc  the docs against the code: SECURITY.md's claims, and that
                 DEPLOY.md names the runner rather than a list of suites
+  deploy        what the first live deploy found: the .env read first, and
+                backups that are one file each
   guilds / friends / mail / map / teleport / recovery / settings /
   healing / equipmove / skill_train / catalogue / killwatch
 set_role.py     sets an account's rank; --list shows every account
+backup_db.py    the nightly snapshot: consistent, verified, one file each
+restore_drill.py  serves a backup copy with a real server and logs in to it
 canary.py       reads the LIVE database on a schedule: do the numbers add up
 killwatch.py    reads the LIVE database on a schedule: is anyone claiming kills
                 the world cannot produce

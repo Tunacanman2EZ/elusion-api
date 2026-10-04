@@ -59,6 +59,15 @@
 import os
 import sys
 
+# THE .env FIRST, OR THE PREFLIGHT JUDGES A SERVER THAT IS NOT THE ONE STARTING.
+# Every check below reads the environment before app.py (which reads the .env)
+# is imported, so it used to warn "ELUSION_OWNER is not set" about an owner the
+# .env named, and pass a proxy count of 0 that the .env had set to 1. A real
+# environment variable still wins; under systemd there is no .env at all and
+# this sets nothing. See envfile.py.
+import envfile
+envfile.load()
+
 # THE PREFLIGHT RUNS BEFORE app IS IMPORTED, and that ordering is the point.
 #
 # app.py calls init_db() at import time. With a bad ELUSION_DB the import dies
