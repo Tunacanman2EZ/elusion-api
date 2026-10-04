@@ -26,10 +26,22 @@ import killwatch
 import gamedata
 
 # Real enemies, chosen for what they prove:
-#   boss              placed=2, 5200 hp  -> a boss; ceiling 22 / 300s
-#   bushmage          placed=1,  175 hp  -> ordinary; ceiling 11 / 300s
+#   boss              a boss
+#   bushmage          ordinary; its ceiling is read from gamedata.json below
 #   poisonslimesmall  placed=0           -> ceiling-EXEMPT (runtime-spawned)
 #   poisonslimelarge  placed=0, rewards=false -> the reward-less enemy
+#
+# THE BURST IS THE CEILING PLUS FOUR, NOT A NUMBER. This said "15 bushmage;
+# ceiling is 11" while one bush mage stood in the world. Day 2 the Big Field
+# placed four more, the ceiling became 55, fifteen kills breached nothing, and
+# four checks failed on a world that had simply grown.
+BURST_ENEMY = "bushmage"
+BURST_CEILING = killwatch._ceiling_for(
+    int(gamedata.ENEMIES[BURST_ENEMY]["placed_count"]),
+    killwatch.KILL_WINDOW_SECONDS, killwatch.KILL_RESPAWN_FLOOR_SECONDS)
+BURST = BURST_CEILING + 4
+BURST_GAP = 4      # seconds apart, so the whole burst sits inside one window
+assert BURST * BURST_GAP < killwatch.KILL_WINDOW_SECONDS, (BURST, BURST_GAP)
 # PLACED AND PAYING. A large slime is placed and grants nothing - it bursts
 # into smalls - so a kill claim for one is the reward-less IMPOSSIBLE below, not
 # an honest farm.
@@ -91,10 +103,11 @@ for i in range(30):
 d = killwatch.analyze(con)
 check("honest player raises no finding", 1 not in d, "found %s" % signals(d, 1))
 
-# 2. SPAWN-CEILING BREACH (H1). 15 bushmage inside 60s; ceiling is 11 / 300s.
+# 2. SPAWN-CEILING BREACH (H1). Four more bush mages than the world can produce
+#    in one window, all inside it.
 con = fresh(); add_user(con, 2, "burst")
-for i in range(15):
-    kill(con, 2, "bushmage", 200000 + i * 4)
+for i in range(BURST):
+    kill(con, 2, BURST_ENEMY, 200000 + i * BURST_GAP)
 d = killwatch.analyze(con)
 check("ceiling breach -> IMPOSSIBLE", "IMPOSSIBLE" in tiers(d, 2))
 check("ceiling breach names the right signal", "spawn ceiling breached" in signals(d, 2),
@@ -199,7 +212,7 @@ def run_cli(rows, extra=()):
     return r.returncode, r.stdout
 
 clean_rows = [(1, "ok", "bushmage", 100000 + i * 45, 30) for i in range(10)]
-breach_rows = [(2, "bad", "bushmage", 200000 + i * 4, 30) for i in range(15)]
+breach_rows = [(2, "bad", BURST_ENEMY, 200000 + i * BURST_GAP, 30) for i in range(BURST)]
 soft_rows = [(4, "farmer", PLACED[i % len(PLACED)], 400000 + i * 2, 40) for i in range(250)]
 
 rc, out = run_cli(clean_rows)

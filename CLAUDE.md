@@ -1022,6 +1022,14 @@ gamedata.json's `xp_base` / `xp_growth`.
   to health only for a catalogue without the field.
 - **A small slime's kill ceiling is eight per placed large** (the exporter's
   `placed_count`). The large grants nothing and a kill claim for it is 400.
+- **`placed_count` is every scene added together.** Day 2 the game gained a
+  second field, the Big Field, and most ceilings rose about fivefold (one
+  light sprite in the world became five). A player is only ever in one area,
+  so this loosens the ceiling and never refuses an honest kill. Copy the new
+  gamedata.json across whenever a scene gains enemies, or the server judges
+  that scene's kills against the old, lower ceiling. A test that needs a
+  breach works it out from the file: `test_killwatch.py` said "15 kills, the
+  ceiling is 11" and went quiet the day the ceiling became 55.
 
 `test_pacing.py` holds all of it, including the eight hours.
 
