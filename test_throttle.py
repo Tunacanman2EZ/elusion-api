@@ -12,6 +12,7 @@
 # It builds its own database from scratch and never touches elusion.db.
 
 import os
+import hashlib
 import sys
 import sqlite3
 import tempfile
@@ -294,9 +295,9 @@ section("REVOCATION - what makes a 30-day token defensible")
 # every row the account holds, however it got there.
 second = "stray-bystander-device"
 _c = db()
-_c.execute("INSERT INTO sessions (token, user_id, expires_at, last_seen_at)"
+_c.execute("INSERT INTO sessions (token_hash, user_id, expires_at, last_seen_at)"
            " VALUES (?, (SELECT id FROM users WHERE username = 'bystander'), ?, ?)",
-           (second, int(_time.time()) + 3600, int(_time.time())))
+           (hashlib.sha256(second.encode()).hexdigest(), int(_time.time()) + 3600, int(_time.time())))
 _c.commit(); _c.close()
 
 # SCOPED TO THIS USER. Counting every row in sessions also counts realuser's,
@@ -351,9 +352,9 @@ first = r.get_json()["token"]
 # end `first`, which is ONE LOGIN AT A TIME working, not a device to revoke.
 elsewhere = "stray-rotator-device"
 _c = db()
-_c.execute("INSERT INTO sessions (token, user_id, expires_at, last_seen_at)"
+_c.execute("INSERT INTO sessions (token_hash, user_id, expires_at, last_seen_at)"
            " VALUES (?, (SELECT id FROM users WHERE username = 'rotator'), ?, ?)",
-           (elsewhere, int(_time.time()) + 3600, int(_time.time())))
+           (hashlib.sha256(elsewhere.encode()).hexdigest(), int(_time.time()) + 3600, int(_time.time())))
 _c.commit(); _c.close()
 
 

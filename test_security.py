@@ -16,6 +16,7 @@ so it never touches elusion.db. Run: python test_security.py
 """
 
 import importlib.util
+import hashlib
 import os
 import json
 import shutil
@@ -469,8 +470,8 @@ kicked = register("kickme")
 def _stray_session(name, tag):
     _c = sqlite3.connect(DB_PATH)
     _uid = _c.execute("SELECT id FROM users WHERE username = ?", (name,)).fetchone()[0]
-    _c.execute("INSERT INTO sessions (token, user_id, expires_at, last_seen_at) VALUES (?, ?, ?, ?)",
-               ("stray-" + tag, _uid, int(time.time()) + 3600, int(time.time())))
+    _c.execute("INSERT INTO sessions (token_hash, user_id, expires_at, last_seen_at) VALUES (?, ?, ?, ?)",
+               (hashlib.sha256(("stray-" + tag).encode()).hexdigest(), _uid, int(time.time()) + 3600, int(time.time())))
     _c.commit(); _c.close()
     return {"Authorization": "Bearer stray-" + tag}
 _dev2 = _stray_session("kickme", "kick2")

@@ -23,6 +23,7 @@ Run: python test_playing.py
 """
 
 import importlib.util
+import hashlib
 import os
 import re
 import sqlite3
@@ -86,7 +87,7 @@ def uid(name):
 def character(token, slot, class_id, name, area, saved_at, level=1):
     client.put("/api/save", headers=auth(token),
                json={"slot": slot, "class_id": class_id, "name": name})
-    who = sql("SELECT user_id FROM sessions WHERE token = ?", (token,))[0]["user_id"]
+    who = sql("SELECT user_id FROM sessions WHERE token_hash = ?", (hashlib.sha256(token.encode()).hexdigest(),))[0]["user_id"]
     sql("UPDATE saves SET area = ?, updated_at = ?, level = ? WHERE user_id = ? AND slot = ?",
         (area, saved_at, level, who, slot))
 

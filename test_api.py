@@ -19,6 +19,7 @@ Exits 0 if everything passes, 1 if anything fails.
 """
 
 import importlib.util
+import hashlib
 import json
 import os
 import sys
@@ -2106,13 +2107,13 @@ check("gone quiet past the window reads offline, though the session is alive",
       client.get("/api/character", headers=_PRESENT_H).status_code != 401,
       "a thirty-day token must not keep someone on the kick list")
 
-_expiry_before = _one_row("SELECT expires_at FROM sessions WHERE token = ?",
-                          (_present["token"],))[0]
+_expiry_before = _one_row("SELECT expires_at FROM sessions WHERE token_hash = ?",
+                          (hashlib.sha256(_present["token"].encode()).hexdigest(),))[0]
 status("the heartbeat", client.get("/api/auth/session", headers=_PRESENT_H), 200)
 check("brings them back online", _listed("present")["online"] is True, _listed("present"))
 check("and does NOT extend the login",
-      _one_row("SELECT expires_at FROM sessions WHERE token = ?",
-               (_present["token"],))[0] == _expiry_before,
+      _one_row("SELECT expires_at FROM sessions WHERE token_hash = ?",
+               (hashlib.sha256(_present["token"].encode()).hexdigest(),))[0] == _expiry_before,
       "a heartbeat proves the game is running, not that the login is fresh")
 
 # ONLY THE SESSION THAT BEAT. A second session on the account must not be
@@ -2121,14 +2122,14 @@ check("and does NOT extend the login",
 # the second row is put in the table by hand.
 _second = {"token": "stray-present-device"}
 _conn = _owner_sq.connect(DB_PATH)
-_conn.execute("INSERT INTO sessions (token, user_id, expires_at, last_seen_at)"
+_conn.execute("INSERT INTO sessions (token_hash, user_id, expires_at, last_seen_at)"
               " VALUES (?, (SELECT id FROM users WHERE username = 'present'), ?, ?)",
-              (_second["token"], int(time.time()) + 3600, int(time.time())))
+              (hashlib.sha256(_second["token"].encode()).hexdigest(), int(time.time()) + 3600, int(time.time())))
 _conn.commit(); _conn.close()
 _age_heartbeats("present", 10_000)
 client.get("/api/auth/session", headers=_PRESENT_H)
 _rows = {
-    tok: _one_row("SELECT last_seen_at FROM sessions WHERE token = ?", (tok,))[0]
+    tok: _one_row("SELECT last_seen_at FROM sessions WHERE token_hash = ?", (hashlib.sha256(tok.encode()).hexdigest(),))[0]
     for tok in (_present["token"], _second["token"])
 }
 check("the heartbeat stamps its own session and no other",
@@ -2319,6 +2320,10 @@ _legacy.execute("INSERT INTO saves (user_id,slot,class_id,name,bank_gold) VALUES
 _legacy.execute("INSERT INTO bank_items VALUES (1,0,'smallhealthpotion',6)")
 _legacy.execute("INSERT INTO bank_items VALUES (1,1,'smallhealthpotion',4)")
 _legacy.execute("INSERT INTO bank_items VALUES (1,0,'ironsword',1)")
+# A LIVE SESSION STORED THE OLD WAY, the token itself as the key. Hashing tokens
+# at rest must not sign out everybody who was playing when the server updated.
+_LEGACY_TOKEN = "legacy-live-session-token"
+_legacy.execute("INSERT INTO sessions VALUES (?, 1, ?)", (_LEGACY_TOKEN, int(time.time()) + 3600))
 _legacy.commit()
 _legacy.close()
 
@@ -2359,6 +2364,21 @@ check("users gained the role column", "role" in _user_cols, _user_cols)
 # 500 on the real elusion.db while this suite, building fresh, stayed green.
 check("sessions gained the last_seen_at column",
       "last_seen_at" in [row[1] for row in _db.execute("PRAGMA table_info(sessions)")])
+
+# SESSION TOKENS HASHED AT REST, on a table that stored them as issued.
+_session_cols = [row[1] for row in _db.execute("PRAGMA table_info(sessions)")]
+check("sessions.token became sessions.token_hash",
+      "token_hash" in _session_cols and "token" not in _session_cols, _session_cols)
+_legacy_digest = hashlib.sha256(_LEGACY_TOKEN.encode()).hexdigest()
+check("and the stored token was replaced by its SHA-256",
+      _db.execute("SELECT token_hash FROM sessions").fetchall() == [(_legacy_digest,)],
+      _db.execute("SELECT token_hash FROM sessions").fetchall())
+check("so the player signed in before the update is still signed in",
+      _migrated.app.test_client().get(
+          "/api/auth/session", headers={"Authorization": "Bearer " + _LEGACY_TOKEN}).status_code == 200)
+_migrated._migrate_hash_session_tokens(_db)
+check("and booting again does not hash the hash",
+      _db.execute("SELECT token_hash FROM sessions").fetchall() == [(_legacy_digest,)])
 
 _ranks = dict(_db.execute("SELECT username, role FROM users").fetchall())
 check("an is_admin=1 account became dev", _ranks.get("legacyflagged") == "dev", _ranks)

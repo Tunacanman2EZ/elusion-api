@@ -20,6 +20,7 @@ section below holds one of them:
        nothing - and the login screen does not let anyone past that prompt.
 """
 import importlib.util, os, sqlite3, sys, tempfile, time
+import hashlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_accounts_test.db")
@@ -146,8 +147,8 @@ ip_staff = fresh_ip()
 register("modwatch", ip_staff)
 raw("UPDATE users SET role = 'mod', email = 'mod@example.com', email_verified = 1 WHERE username = 'modwatch'")
 staff_live = "stray-modwatch-session"
-raw("INSERT INTO sessions (token, user_id, expires_at, last_seen_at) VALUES (?, ?, ?, ?)",
-    (staff_live, uid("modwatch"), int(time.time()) + 3600, int(time.time())))
+raw("INSERT INTO sessions (token_hash, user_id, expires_at, last_seen_at) VALUES (?, ?, ?, ?)",
+    (hashlib.sha256(staff_live.encode()).hexdigest(), uid("modwatch"), int(time.time()) + 3600, int(time.time())))
 r = login("modwatch", ip_staff)
 check("a staff login is asked for its code (202)", r.status_code == 202, r.get_json())
 check("and that half-login signs nobody out",
@@ -187,7 +188,7 @@ remembered = login("opener", ip).get_json()["token"]
 # A login from a while ago - so "ends when it would have" cannot be told apart
 # from "a fresh thirty days" by both landing in the same second.
 expiry = int(time.time()) + 3 * 86400
-raw("UPDATE sessions SET expires_at = ? WHERE token = ?", (expiry, remembered))
+raw("UPDATE sessions SET expires_at = ? WHERE token_hash = ?", (expiry, hashlib.sha256(remembered.encode()).hexdigest()))
 r = client.post("/api/auth/resume", headers=bearer(remembered))
 body = r.get_json() or {}
 check("a remembered login is resumed", r.status_code == 200, body)
@@ -201,7 +202,7 @@ check("and the remembered one - which another copy of the game would also be hol
       r.status_code == 401 and (r.get_json() or {}).get("signed_in_elsewhere") is True, r.get_json())
 check("the login still ends when it would have: resuming does not renew it",
       body.get("expires_at") == expiry
-      and raw("SELECT expires_at FROM sessions WHERE token = ?", (resumed,))[0][0] == expiry,
+      and raw("SELECT expires_at FROM sessions WHERE token_hash = ?", (hashlib.sha256(resumed.encode()).hexdigest(),))[0][0] == expiry,
       (body.get("expires_at"), expiry))
 r = client.post("/api/auth/resume", headers=bearer("no-such-token"))
 check("a token nobody issued cannot resume", r.status_code == 401, r.status_code)
@@ -268,6 +269,40 @@ r = client.post("/api/account/email", headers=bearer(r.get_json()["token"]),
                 json={"email": "withmail@example.com", "password": PW})
 check("and giving one sends the code", r.status_code == 200 and SENT[-1]["to"] == "withmail@example.com",
       r.get_json())
+MAIL["on"] = False
+
+
+# =============================================================================
+section("A-5  a leaked database holds no working login")
+# =============================================================================
+# Found on day 2, auditing the server for the owner's security course:
+# passwords were scrypt hashes, but sessions.token held every live token as it
+# was issued, so a copy of elusion.db logged its holder in as anybody signed in.
+# The table now keeps only the SHA-256. Every check here reads what the
+# DATABASE holds, because that is what leaks; the game never sees the hash.
+ip = fresh_ip()
+register("leakproof", ip)
+live = login("leakproof", ip).get_json()["token"]
+digest = hashlib.sha256(live.encode()).hexdigest()
+columns = [row[1] for row in raw("PRAGMA table_info(sessions)")]
+check("the sessions table has no column for the token itself",
+      "token" not in columns and "token_hash" in columns, columns)
+stored = raw("SELECT * FROM sessions WHERE user_id = ?", (uid("leakproof"),))
+check("the row holds the token's SHA-256",
+      len(stored) == 1 and digest in stored[0], stored)
+everything = [cell for row in raw("SELECT * FROM sessions") for cell in row]
+check("and no cell anywhere in the table is a live token", live not in everything)
+r = client.get("/api/account", headers=bearer(digest))
+check("what a leak would hand over does not log anyone in (401)", r.status_code == 401, r.status_code)
+check("while the token the game holds still works",
+      client.get("/api/account", headers=bearer(live)).status_code == 200)
+resumed = client.post("/api/auth/resume", headers=bearer(live)).get_json()["token"]
+check("reopening the game stores the new token as a hash too",
+      raw("SELECT token_hash FROM sessions WHERE user_id = ?", (uid("leakproof"),))
+      == [(hashlib.sha256(resumed.encode()).hexdigest(),)])
+client.post("/api/auth/logout", headers=bearer(resumed))
+check("and logging out removes the row it hashed to",
+      raw("SELECT COUNT(*) FROM sessions WHERE user_id = ?", (uid("leakproof"),))[0][0] == 0)
 
 
 print("\n%d passed, %d failed" % (passed, failed))

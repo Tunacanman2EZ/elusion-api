@@ -757,6 +757,15 @@ held by `test_accounts.py`.
   so a typo in your own name made a new account. `/api/auth/register` is
   called only by the "Create an account" form now, so its 409 means what it
   says.
+- **A session is stored as its token's SHA-256** (`sessions.token_hash`,
+  SECURITY_NOTES E-21, day 2). The game holds the token; the database holds
+  nothing that logs anyone in. `_token_hash()` is the one function, defined
+  above `init_db()` because the migration that hashed the old rows runs at
+  import. **Any query that finds a session by its token hashes it first**, and a
+  test that puts a session in the table by hand inserts the hash, not the token
+  (every suite that does was changed with it). A query that compares the raw
+  token finds nothing and fails quietly, as a 401 or a heartbeat that stamps no
+  row - the five ways this was broken on purpose all looked like that.
 
 ## Deleting a character
 

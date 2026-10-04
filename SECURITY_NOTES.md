@@ -42,6 +42,7 @@ lives.
 | E-18 | **Accept agreed to whatever was on the table when the trade ran** | **high (economy)** | **Closed** | The other player could swap the sword for a stick between your look and your click, and your accept went through. And the first to accept could lose what they received on their next ordinary save. | **Compare-and-set.** Accept names the revision of the offer it drew, and the write is conditioned on it. Both bags are flagged in the trade's own transaction, and a whole-bag save built before the trade is refused with the bag the server holds. `test_trades.py`. |
 | E-19 | Two games on one account each saved their own bag | medium (integrity) | **Closed** | Two copies of the game on one account overwrote each other's bag and lost items, and a stolen token kept working beside the owner's. | **One session at a time.** A login that gets its token, or a game resuming a remembered one, ends every other session on the account; resuming keeps the original end date. `test_accounts.py`. |
 | E-20 | **A staff password was the only thing between a guesser and the moderation desk** | **high (moderation)** | **Closed** — with a named limit | Staff names are public (the crown, the MOD and DEV badges), so their passwords are the ones worth guessing; one guessed password gives bans, notes and IP addresses. | **Second factor.** A staff login with a confirmed recovery address answers 202 and emails a six-digit code; only the code gets a token. A computer that proved itself is trusted for 30 days, at the rank it was trusted at. With no address or no mail it stands aside and says so. `test_staffcode.py`. |
+| E-21 | **Session tokens were stored as issued** | **high (accounts)** | **Closed** | A copy of `elusion.db` - a backup, a leaked file - logged its holder in as every player signed in, for up to 30 days, with no password needed. | **Hashing at rest.** `sessions` keeps only each token's SHA-256 (`token_hash`) and every lookup hashes the token it is sent, as `trusted_devices` and `ended_sessions` already did and as passwords always were (scrypt). A boot migration hashed every stored token in place, so nobody was signed out. `test_accounts.py` A-5, `test_api.py` MIGRATION. |
 
 Nineteen findings: eighteen closed, one open. Plus E-15, an audit that went
 looking and came back empty — kept, because a search that finds nothing is
@@ -1528,6 +1529,44 @@ the game tells that player once, and the boot log says it for the server.
 `test_staffcode.py`; SECURITY.md invariant 21 and its honest limits.
 
 ---
+
+### E-21 — Session tokens were stored as issued · CLOSED
+
+Found on day 2 by the owner's security course, which asked for an audit of how
+credentials are stored. Passwords passed: scrypt, salted, never logged, the same
+cost for a wrong name as a wrong password. Recovery codes, staff login codes,
+trusted-device tokens and the record of ended sessions were all hashes too.
+The one secret that logs a player straight in was not: `sessions.token` held
+every live bearer token exactly as `issue_token()` minted it.
+
+**What it cost if exploited.** Anyone holding a copy of the database - a backup
+sent somewhere, a disk image, a file read through some other hole - could send
+any stored token as `Authorization: Bearer` and be that player, for the rest of
+the token's thirty days. Staff included, and a staff token skips the emailed
+code (E-20), because the code guards the login, not the session. E-6's rotation
+and E-19's one-session rule shortened the window; neither closed it.
+
+**The fix.** `sessions.token_hash` holds `SHA-256(token)`; `issue_token()`
+stores the hash and returns the token, and every lookup - `user_for_token()`,
+the presence stamp, logout, `_end_other_sessions()` - hashes what it was sent.
+SHA-256 rather than scrypt on purpose: a token is 32 random bytes, so there is
+nothing to guess and nothing a slow hash would protect, and it is checked on
+every request.
+
+**Nobody was signed out.** `_migrate_hash_session_tokens()` replaces each stored
+token with its own hash and renames the column, in one transaction, so every
+game that was open keeps working. It was run on a database with eight live
+sessions and a login made on the old code: the same token was accepted
+afterwards, no raw token was left in the table, and the next login still told
+the old game it had been signed in somewhere else.
+
+**Held by.** `test_accounts.py` A-5 reads the table the way a thief would: no
+`token` column, the row holds the SHA-256, no cell anywhere is a live token, and
+the stored hash sent as a bearer token gets 401. `test_api.py` MIGRATION boots
+an old-shaped table holding a raw token and checks it is hashed, still signs in,
+and is not hashed twice on the next boot. Broken five ways on purpose (raw token
+stored, migration skipped, renamed without hashing, the kept session compared
+unhashed, the heartbeat stamping by the raw token) - each one went red.
 
 ## The security bot — attacking a running server, not the source
 

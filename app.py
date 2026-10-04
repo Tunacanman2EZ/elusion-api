@@ -1098,8 +1098,11 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_staff_actions_action
             ON staff_actions(action);
 
+        -- token_hash, NOT the token - see _migrate_hash_session_tokens(). The
+        -- game holds the token; this holds only its SHA-256, so a database
+        -- that leaks hands over no working logins.
         CREATE TABLE IF NOT EXISTS sessions (
-            token        TEXT    PRIMARY KEY,
+            token_hash   TEXT    PRIMARY KEY,
             user_id      INTEGER NOT NULL,
             expires_at   INTEGER NOT NULL,
             -- The last time this client proved it was running. See
@@ -2247,6 +2250,9 @@ def init_db():
     # Which character this session is playing, as the client last said on its
     # poll. NULL until it has said - see _playing_slot().
     _migrate_add_column(db, "sessions", "playing_slot", "INTEGER")
+    # After every other sessions migration: it renames the key column, and the
+    # ones above add columns beside it.
+    _migrate_hash_session_tokens(db)
     # SUPERSEDED by idx_trades_a_recent / idx_trades_b_recent, which are these
     # with updated_at on the end. A prefix index beside its own extension is
     # a second write on every trade for nothing.
@@ -2661,6 +2667,52 @@ def _migrate_add_column(db, table, column, definition):
     db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, column, definition))
 
 
+# =============================================================================
+# SESSION TOKENS ARE STORED AS HASHES
+# =============================================================================
+# The game holds its bearer token; the server holds only the token's SHA-256.
+# Every lookup hashes the token it was sent and searches for that.
+#
+# WHY. Passwords were always scrypt hashes, recovery codes too, trusted devices
+# and ended sessions SHA-256 - and the one secret that logs a player straight in
+# sat in `sessions.token` as it was issued. Found on day 2, auditing the server
+# for the owner's security course: a copy of elusion.db - a backup, a leaked
+# file - handed over a working login for every player signed in, for up to
+# thirty days.
+#
+# SHA-256, NOT SCRYPT, on purpose. A password is short and guessable, so its
+# hash has to be slow. A token is 32 random bytes from secrets.token_urlsafe:
+# there is nothing to guess, and it is checked on every request, so a fast hash
+# loses nothing and costs nothing.
+#
+# DEFINED HERE, ABOVE init_db(), because the migration below runs at import
+# time and a helper defined further down the file does not exist yet then.
+
+def _token_hash(token):
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+
+def _migrate_hash_session_tokens(db):
+    """
+    sessions.token (the token itself) -> sessions.token_hash (its SHA-256).
+
+    Every live session survives: each stored token is replaced by its own hash,
+    which is exactly what a lookup of that token computes, so nobody is signed
+    out. Idempotent - a table that already has token_hash is left alone.
+
+    THE HASHING BEFORE THE RENAME, in one transaction. The UPDATEs open it and
+    the ALTER joins it (Python's sqlite3 no longer commits before DDL), and
+    init_db() commits at its end - so a crash part-way leaves the old table as
+    it was, never a column called token_hash holding raw tokens.
+    """
+    existing = {row[1] for row in db.execute("PRAGMA table_info(sessions)")}
+    if "token_hash" in existing or "token" not in existing:
+        return
+    for (token,) in db.execute("SELECT token FROM sessions").fetchall():
+        db.execute("UPDATE sessions SET token = ? WHERE token = ?", (_token_hash(token), token))
+    db.execute("ALTER TABLE sessions RENAME COLUMN token TO token_hash")
+
+
 init_db()
 
 
@@ -2717,10 +2769,12 @@ def issue_token(user_id, expires_at=None):
 
     db = get_db()
     # Seen NOW: whoever just logged in is, by definition, at the keyboard.
+    # Only the hash is stored - see SESSION TOKENS ARE STORED AS HASHES. The
+    # token itself leaves in the answer and is never written down here.
     db.execute(
-        "INSERT INTO sessions (token, user_id, expires_at, last_seen_at)"
+        "INSERT INTO sessions (token_hash, user_id, expires_at, last_seen_at)"
         " VALUES (?, ?, ?, ?)",
-        (token, user_id, expires_at, now),
+        (_token_hash(token), user_id, expires_at, now),
     )
     db.commit()
 
@@ -2745,20 +2799,18 @@ def issue_token(user_id, expires_at=None):
 # THE OLD SESSION IS DELETED, like a kick deletes it, so the other game cannot
 # write anything from that moment on - not after its next heartbeat, now.
 # ended_sessions keeps a hash of it for a day so the 401 can say "somewhere
-# else" instead of "signed out by the server".
-
-def _token_hash(token):
-    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
-
+# else" instead of "signed out by the server". _token_hash() is defined above
+# init_db(); sessions are stored by the same hash.
 
 def _end_other_sessions(db, user_id, keep_token):
     """Ends every session `user_id` holds except `keep_token`. Caller commits."""
     now = int(time.time())
-    for row in db.execute("SELECT token FROM sessions WHERE user_id = ? AND token != ?",
-                          (user_id, keep_token)).fetchall():
+    keep = _token_hash(keep_token)
+    for row in db.execute("SELECT token_hash FROM sessions WHERE user_id = ? AND token_hash != ?",
+                          (user_id, keep)).fetchall():
         db.execute("INSERT OR REPLACE INTO ended_sessions (token_hash, user_id, ended_at)"
-                   " VALUES (?, ?, ?)", (_token_hash(row["token"]), user_id, now))
-    db.execute("DELETE FROM sessions WHERE user_id = ? AND token != ?", (user_id, keep_token))
+                   " VALUES (?, ?, ?)", (row["token_hash"], user_id, now))
+    db.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?", (user_id, keep))
 
 
 def _ended_elsewhere(token):
@@ -2788,9 +2840,9 @@ def user_for_token(token):
                s.expires_at
         FROM sessions s
         JOIN users u ON u.id = s.user_id
-        WHERE s.token = ?
+        WHERE s.token_hash = ?
         """,
-        (token,),
+        (_token_hash(token),),
     ).fetchone()
 
     if row is None:
@@ -2798,7 +2850,7 @@ def user_for_token(token):
 
     if row["expires_at"] < int(time.time()):
         # expired - clean it up rather than leaving dead rows around
-        db.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        db.execute("DELETE FROM sessions WHERE token_hash = ?", (_token_hash(token),))
         db.commit()
         return None
 
@@ -2840,7 +2892,7 @@ def stamp_presence(db, slot=None):
     the player was offline - including, visibly, a guild panel reporting
     "0 online of 1" to the one person in the guild, who was looking at it.
 
-    ONE UPDATE BY PRIMARY KEY. The token is the row, so this touches exactly the
+    ONE UPDATE BY PRIMARY KEY. The token's hash is the row, so this touches exactly the
     session asking and nothing else. expires_at is NOT extended: a beat proves
     the client is running, not that the login is fresher.
 
@@ -2854,13 +2906,13 @@ def stamp_presence(db, slot=None):
     """
     if slot is None:
         db.execute(
-            "UPDATE sessions SET last_seen_at = ? WHERE token = ?",
-            (int(time.time()), bearer_token()),
+            "UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?",
+            (int(time.time()), _token_hash(bearer_token())),
         )
         return
     db.execute(
-        "UPDATE sessions SET last_seen_at = ?, playing_slot = ? WHERE token = ?",
-        (int(time.time()), int(slot), bearer_token()),
+        "UPDATE sessions SET last_seen_at = ?, playing_slot = ? WHERE token_hash = ?",
+        (int(time.time()), int(slot), _token_hash(bearer_token())),
     )
 
 
@@ -3808,7 +3860,7 @@ def maintenance_disconnect(user):
         return None
 
     db = get_db()
-    db.execute("DELETE FROM sessions WHERE token = ?", (bearer_token(),))
+    db.execute("DELETE FROM sessions WHERE token_hash = ?", (_token_hash(bearer_token()),))
     db.commit()
     return {
         "error": "Unauthorized",
@@ -6036,7 +6088,7 @@ def session_info():
     #   the stamp below is how staff see who is actually playing. A session
     #   lasts thirty days, so "holds a session" is not "online".
     #
-    # ONE UPDATE BY PRIMARY KEY. The token is the row, so this touches exactly
+    # ONE UPDATE BY PRIMARY KEY. The token's hash is the row, so this touches exactly
     # the session asking and nothing else. expires_at is NOT extended: a
     # heartbeat proves the client is running, not that the login is fresher.
     db = get_db()
@@ -6130,7 +6182,7 @@ def logout():
         description: Missing, invalid or expired token
     """
     db = get_db()
-    db.execute("DELETE FROM sessions WHERE token = ?", (bearer_token(),))
+    db.execute("DELETE FROM sessions WHERE token_hash = ?", (_token_hash(bearer_token()),))
     db.commit()
     return "", 204
 
@@ -11337,7 +11389,7 @@ def staff_read_user(username):
     # a session that is not there. _prune_sessions() clears them on the login
     # path anyway; this simply does not count on that having run.
     # NO issued_at, BECAUSE THE TABLE DOES NOT HOLD ONE. sessions is
-    # (token, user_id, expires_at) and nothing else, so "when did they sign in"
+    # (token_hash, user_id, expires_at, presence) and nothing else, so "when did they sign in"
     # would have to be derived as expires_at - TOKEN_TTL - which is right only
     # for rows issued under the CURRENT ttl and silently wrong for every row
     # issued before it last changed. A migration could add the column; it is

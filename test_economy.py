@@ -15,6 +15,7 @@ Exits 0 if everything passes, 1 if anything fails.
 """
 
 import importlib.util
+import hashlib
 import os
 import sqlite3
 import sys
@@ -1537,8 +1538,8 @@ check("bob returns to the list",
 # ONE ROW PER CHARACTER, not one per session. An account with two live tokens
 # would otherwise appear twice, and the panel would draw the same person twice.
 conn = db_conn()
-conn.execute("INSERT INTO sessions (token, user_id, expires_at) VALUES ('extra-token', ?, ?)",
-             (uid, 4000000000))
+conn.execute("INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+             (hashlib.sha256('extra-token'.encode()).hexdigest(), uid, 4000000000))
 conn.commit(); conn.close()
 body = status("with bob logged in twice", client.get(
     "/api/players/nearby", headers=P1, query_string={"slot": 0}), 200)

@@ -104,8 +104,8 @@ def stray_session(username):
     try:
         uid = db.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()[0]
         token = "stray-%s-%d" % (username, db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0])
-        db.execute("INSERT INTO sessions (token, user_id, expires_at, last_seen_at)"
-                   " VALUES (?, ?, ?, ?)", (token, uid, int(time.time()) + 3600, int(time.time())))
+        db.execute("INSERT INTO sessions (token_hash, user_id, expires_at, last_seen_at)"
+                   " VALUES (?, ?, ?, ?)", (hashlib.sha256(token.encode()).hexdigest(), uid, int(time.time()) + 3600, int(time.time())))
         db.commit()
     finally:
         db.close()
@@ -177,8 +177,8 @@ db = sqlite3.connect(DB_PATH)
 uid = db.execute("SELECT id FROM users WHERE username = ?", ("griefer",)).fetchone()[0]
 smuggled = "smuggled-token-r2"
 db.execute(
-    "INSERT INTO sessions (token, user_id, expires_at, last_seen_at) VALUES (?, ?, ?, ?)",
-    (smuggled, uid, int(time.time()) + 3600, int(time.time())),
+    "INSERT INTO sessions (token_hash, user_id, expires_at, last_seen_at) VALUES (?, ?, ?, ?)",
+    (hashlib.sha256(smuggled.encode()).hexdigest(), uid, int(time.time()) + 3600, int(time.time())),
 )
 db.commit()
 db.close()

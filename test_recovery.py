@@ -21,6 +21,7 @@ Exits 0 if everything passes, 1 if anything fails.
 """
 
 import importlib.util
+import hashlib
 import os
 import re
 import sqlite3
@@ -232,9 +233,9 @@ check("and says nothing useful about why",
 # second LOGIN would end the player's own session (one login at a time), and
 # "and so is the player's own" below would then pass before the reset ran.
 intruder = "stray-intruder-session"
-raw_sql("INSERT INTO sessions (token, user_id, expires_at, last_seen_at)"
+raw_sql("INSERT INTO sessions (token_hash, user_id, expires_at, last_seen_at)"
         " VALUES (?, (SELECT id FROM users WHERE username = 'victim'), ?, ?)",
-        (intruder, int(_time_now()) + 3600, int(_time_now())))
+        (hashlib.sha256(intruder.encode()).hexdigest(), int(_time_now()) + 3600, int(_time_now())))
 check("intruder holds a live session",
       client.get("/api/auth/session", headers=auth(intruder)).status_code == 200)
 check("and so does the player, until the reset",

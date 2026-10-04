@@ -543,7 +543,11 @@ SWEEPS_ALLOWED = [
     # function of each row's own level, so it cannot move a value between users.
     ("saves", "level = ? AND xp_to_next !=", "migration: xp_to_next from the curve"),
     # your own row, addressed by a credential only you hold
-    ("sessions", "token =", "your own session, by the bearer token"),
+    ("sessions", "token_hash =", "your own session, by the hash of its bearer token"),
+    # a boot-time migration: every stored token replaced by its own SHA-256, once.
+    # It rewrites each row's key from that row's own value, so it moves nothing
+    # between users. See _migrate_hash_session_tokens().
+    ("sessions", " token = ?", "migration: session tokens hashed at rest"),
     # staff acting on somebody else's row ON PURPOSE. The rank decorator is the
     # access control here, and test_refusals.py is what holds it.
     ("chat_messages", "id =", "@require_role('mod') - staff take a line down"),

@@ -219,6 +219,13 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     can mute for at most a day and never another mod or the owner; a player can
     mute nobody.
     → Held by: `test_chatsafety.py` — "he still plays - a mute is not a ban", "a mod cannot mute for more than a day", "a mod cannot mute another mod", "a player cannot mute anybody"
+27. **A copy of the database holds no working login.** Passwords are scrypt
+    hashes, and every token that signs someone in - sessions, trusted devices,
+    recovery and staff codes - is stored only as a hash, so a leaked
+    `elusion.db` or a backup logs nobody in. Sessions stored before this rule
+    were hashed in place, and the players holding them stayed signed in.
+    → Held by: `test_accounts.py` — "and no cell anywhere in the table is a live token", "what a leak would hand over does not log anyone in (401)"
+    → and: `test_api.py` — "and the stored token was replaced by its SHA-256", "so the player signed in before the update is still signed in"
 
 ---
 
@@ -277,7 +284,7 @@ Anything not on this list that later turns out to be true belongs on it.
 
 | For | Read |
 |---|---|
-| Threat model, and every finding E-1…E-20 with what happened to it | [`SECURITY_NOTES.md`](SECURITY_NOTES.md) |
+| Threat model, and every finding E-1…E-21 with what happened to it | [`SECURITY_NOTES.md`](SECURITY_NOTES.md) |
 | Who owns which field, and the exact request/response of every route | [`docs/apicontract.md`](../../Elusion_RPG/docs/apicontract.md) *(game repo)* |
 | TLS, the proxy setting, secrets, backups, monitoring, "before the first stranger connects" | [`DEPLOY.md`](DEPLOY.md) |
 | Ranks, conventions, and the traps that cost a day each | [`CLAUDE.md`](CLAUDE.md) |
