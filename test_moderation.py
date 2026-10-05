@@ -21,6 +21,8 @@ and warnings staff leave each other.
   M-8  every action the server logs is a kind the log can be filtered by
   M-9  built for scale: the queries these routes run use their indexes, read
        from SQLite's own plan for the very statement the route executes
+  M-10 the powers list says in words what each rank may do: every route has a
+       sentence, and every limit in the notes is read from its constant
 
 Runs against a THROWAWAY database in the temp folder, like every other suite,
 so it never touches elusion.db. Run: python test_moderation.py
@@ -709,6 +711,93 @@ with app_module.app.test_request_context():
 
 lines = plan(app_module.STAFF_ONLINE_COUNT_SQL, (0, 0))
 check("so does the online count", any("idx_sessions_seen" in line for line in lines), lines)
+
+
+# =============================================================================
+print("\n=== M-10  THE POWERS LIST SAYS IT IN WORDS ===\n")
+# =============================================================================
+# The Powers window showed "POST /api/staff/ban" for every power and never the
+# sentence beside it, and its notes still sent the owner to "the in-game item
+# menu" a day after the menu moved into the GM panel. The routes are derived
+# from the decorators and cannot go stale; these checks are for the words.
+
+def powers(headers):
+    res = client.get("/api/staff/powers", headers=headers)
+    body = res.get_json(silent=True) or {}
+    return {rank.get("rank"): rank for rank in body.get("ladder", [])}
+
+
+ladder = powers(OWNER)
+every_route = [route for rank in ladder.values() for route in rank.get("routes", [])]
+check("the powers list has routes to describe", len(every_route) > 20, len(every_route))
+undescribed = [r.get("path") for r in every_route
+               if not r.get("what") or r.get("what", "").startswith("---")]
+check("every route on it says what it does in a sentence", undescribed == [], undescribed)
+supply = [r for r in every_route if r.get("path") == "/api/economy/supply"]
+check("  including the gold supply, whose summary was below its --- and showed as \"---\"",
+      supply and supply[0].get("what", "").startswith("Gold supply"), supply)
+
+notes = {name: rank.get("notes", []) for name, rank in ladder.items()}
+words = app_module._days_words
+check("a limit is said as a person says it",
+      [words(24 * 60), words(30 * 24 * 60), words(60), words(90)]
+      == ["a day", "30 days", "an hour", "90 minutes"])
+check("the mod's longest ban is the constant's",
+      any(n.startswith("Ban for at most %s" % words(app_module.MAX_MOD_BAN_DAYS * 24 * 60))
+          for n in notes.get("mod", [])), notes.get("mod"))
+check("and so is the mod's longest mute",
+      any(n.startswith("Mute for at most %s" % words(app_module.MUTE_MAX_MINUTES_MOD))
+          for n in notes.get("mod", [])), notes.get("mod"))
+check("and the dev's",
+      any(n.startswith("Mute for up to %s" % words(app_module.MUTE_MAX_MINUTES))
+          for n in notes.get("dev", [])), notes.get("dev"))
+
+was = app_module.MUTE_MAX_MINUTES_MOD
+app_module.MUTE_MAX_MINUTES_MOD = 90
+try:
+    moved = powers(OWNER).get("mod", {}).get("notes", [])
+finally:
+    app_module.MUTE_MAX_MINUTES_MOD = was
+check("  read from the constant, not retyped: change it and the note follows",
+      "Mute for at most 90 minutes - longer is refused." in moved, moved)
+
+# What signing in is like for staff depends on this server's switch and mail.
+real_codes, real_mail = app_module.STAFF_LOGIN_CODES, app_module.mail_can_send
+try:
+    app_module.STAFF_LOGIN_CODES = True
+    app_module.mail_can_send = lambda: True
+    with_mail = app_module._staff_login_note()
+    app_module.mail_can_send = lambda: False
+    without_mail = app_module._staff_login_note()
+    app_module.STAFF_LOGIN_CODES = False
+    switched_off = app_module._staff_login_note()
+finally:
+    app_module.STAFF_LOGIN_CODES, app_module.mail_can_send = real_codes, real_mail
+check("staff sign in with an emailed code, once per computer, on a server that sends mail",
+      "every %d days" % app_module.TRUSTED_DEVICE_DAYS in with_mail, with_mail)
+check("  and the list says so when this server cannot send it",
+      "cannot send mail" in without_mail, without_mail)
+check("  or has the step switched off", "ELUSION_STAFF_LOGIN_CODES is off" in switched_off,
+      switched_off)
+check("the mod's notes carry this server's answer",
+      app_module._staff_login_note() in notes.get("mod", []), notes.get("mod"))
+
+all_notes = " ".join(n for rank in notes.values() for n in rank)
+check("the debug keys are said to need a debug build",
+      any("debug item keys" in n and "debug build" in n for n in notes.get("mod", [])),
+      notes.get("mod"))
+check("the owner's tools are where they are now: the GM panel's Testing tab",
+      any("GM panel" in n for n in notes.get("owner", []))
+      and any(n.startswith("Testing tab") and "item catalogue" in n and "level" in n
+              for n in notes.get("owner", [])), notes.get("owner"))
+gone = [place for place in ("item menu", "owner panel") if place in all_notes.lower()]
+check("  and no note sends anybody to a place the game no longer has", gone == [], gone)
+
+seen = client.get("/api/staff/powers", headers=MOD2).get_json(silent=True) or {}
+check("a mod reads the same list, and is told what they may grant",
+      [r.get("rank") for r in seen.get("ladder", [])] == list(ladder.keys())
+      and seen.get("you_are") == "mod" and seen.get("you_may_grant") == ["player"],
+      seen.get("you_may_grant"))
 
 
 print("\n" + "=" * 70)

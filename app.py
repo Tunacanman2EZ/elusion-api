@@ -11048,6 +11048,32 @@ def acknowledge_teleport():
     return {"cleared": cursor.rowcount > 0}, 200
 
 
+def _days_words(minutes):
+    """"a day", "30 days", "90 minutes" - a limit as a person says it."""
+    minutes = int(minutes)
+    if minutes % (24 * 60) == 0:
+        days = minutes // (24 * 60)
+        return "a day" if days == 1 else "%d days" % days
+    if minutes % 60 == 0:
+        hours = minutes // 60
+        return "an hour" if hours == 1 else "%d hours" % hours
+    return "%d minutes" % minutes
+
+
+def _staff_login_note():
+    """What signing in is like for staff on THIS server, read from the switch
+    and the mail settings - staff_login_protected() is the same three facts
+    plus the account's own confirmed address."""
+    if not STAFF_LOGIN_CODES:
+        return ("Staff logins take no emailed code on this server:"
+                " ELUSION_STAFF_LOGIN_CODES is off.")
+    if not mail_can_send():
+        return ("Staff logins would take a code from their email, but this"
+                " server cannot send mail, so for now they do not.")
+    return ("Signs in with a code from their email, once per computer every"
+            " %d days - needs a confirmed recovery address." % TRUSTED_DEVICE_DAYS)
+
+
 @app.get("/api/staff/powers")
 @require_auth
 @require_role("mod")
@@ -11104,18 +11130,31 @@ def staff_powers():
         buckets[name].sort(key=lambda row: row["path"])
 
     # THE THINGS THAT ARE NOT ROUTES. A rank is more than the endpoints it
-    # opens, and these three are the ones that would surprise an owner handing
-    # the rank out. Pulled from the constants that enforce them rather than
-    # retyped, so the numbers cannot drift either.
+    # opens, and these are the ones that would surprise an owner handing the
+    # rank out. Every number is pulled from the constant that enforces it
+    # rather than retyped, so the figures cannot drift; the words can, and
+    # did - this list said "the in-game item menu" for a day after the menu
+    # moved into the GM panel. test_moderation.py M-10 holds what it can.
     extras = {
         "player": [],
         "mod": [
-            "Ban for at most %d days - a longer or permanent ban is refused." % MAX_MOD_BAN_DAYS,
-            "Exempt from the anti-cheat clamps on skill level and backpack contents.",
-            "May use the in-game debug item keys.",
+            "Ban for at most %s - a longer or permanent ban is refused."
+            % _days_words(MAX_MOD_BAN_DAYS * 24 * 60),
+            "Mute for at most %s - longer is refused." % _days_words(MUTE_MAX_MINUTES_MOD),
+            "Cannot be ignored in chat - a player's ignore refuses staff, so"
+            " what a mod says always arrives.",
+            _staff_login_note(),
+            "May write a whole bag or bank at once (players move one cell at a"
+            " time), and is not held to the skill-level ceiling.",
+            # CLIENT-SIDE, like god mode below. player.gd checks
+            # OS.is_debug_build() as well as the rank, and the browser game is a
+            # release export, so on play.elusionrpg.com these keys do nothing.
+            "The debug item keys, in a debug build of the game only - never in"
+            " a release export such as the browser game.",
         ],
         "dev": [
             "Ban permanently, and for any number of days.",
+            "Mute for up to %s." % _days_words(MUTE_MAX_MINUTES),
             # CLIENT-SIDE, AND SAID SO. Everything else on this list is something
             # the SERVER enforces; god mode is a switch in the game client, and a
             # rank the client checks is only ever worth what an honest build is
@@ -11129,15 +11168,15 @@ def staff_powers():
             # hp is client-written anyway (E-9), so a modified client could
             # always refuse to die - this changes what an HONEST build can do.
             "In-game god mode (client-side): takes no damage, and earns no"
-            " defense XP while it is on.",
+            " defense XP while it is on. A key in a debug build; the owner also"
+            " has a switch in the GM panel.",
         ],
         "owner": [
             "Cannot be granted or revoked - it comes from ELUSION_OWNER in the server's environment.",
             "Exempt from the maintenance switch: never locked out or disconnected by it.",
-            "The only rank the owner panel opens for - it also holds the"
-            " maintenance switch and the gold grant.",
-            "Sets the level of their own characters for testing, and spawns"
-            " any item from the in-game item menu.",
+            "The only rank the GM panel opens for: its Account, Testing and Server tabs.",
+            "Testing tab: gold, any item by id or from the item catalogue, and"
+            " the level of their own character.",
         ],
     }
 
@@ -17248,20 +17287,28 @@ def _kingdom_board_shared(db):
 @require_role("dev")
 def economy_supply():
     """
+    Gold supply and the ledger invariant: is every coin accounted for
     ---
-    get:
-      summary: Gold supply and the ledger invariant
-      description: >
-        What the server recorded creating and destroying, against what players
-        actually hold. balanced=false means gold moved without going through
-        gold_delta() - a bug or a dupe - and drift says by how much.
-      responses:
-        200:
-          description: The current supply figures
-        404:
-          description: >
-            Not staff. require_role answers 404 rather than 403 on purpose - a
-            403 confirms the route exists to someone who may not know it does.
+    tags:
+      - Economy
+    description: >
+      What the server recorded creating and destroying, against what players
+      actually hold. balanced=false means gold moved without going through
+      gold_delta() - a bug or a dupe - and drift says by how much.
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+    responses:
+      200:
+        description: The current supply figures
+      404:
+        description: >
+          Not staff. require_role answers 404 rather than 403 on purpose - a
+          403 confirms the route exists to someone who may not know it does.
+      401:
+        description: Missing, invalid or expired token
     """
     # DEV AND ABOVE, not mod. This is the audit instrument: it says how much
     # currency exists and whether the books are straight, and a moderator needs

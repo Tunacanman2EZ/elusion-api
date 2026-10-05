@@ -553,6 +553,18 @@ constraint cannot be relied on.
 **Ranks are set from the machine holding the database**, by `set_role.py`,
 never over the network. Keep that property in anything that replaces it.
 
+**`/api/staff/powers` is read by the owner, in words.** The routes on it come
+from the decorators and cannot go stale, but the game shows each one as the
+**first line of its docstring**, so that line is a sentence a person reads in
+the Powers window: "Ban an account", not a summary hidden below a `---` (the
+gold supply's was, and the window showed "---"). The notes under each rank -
+what a rank brings that is not a route - read every number from the constant
+that enforces it (`MAX_MOD_BAN_DAYS`, `MUTE_MAX_MINUTES_MOD`, `MUTE_MAX_MINUTES`,
+`TRUSTED_DEVICE_DAYS`) and say whether this server's staff logins take a code.
+The words are the part that can drift, and did: it sent the owner to "the
+in-game item menu" a day after the menu moved into the GM panel. When a tool
+moves in the game, read the notes. `test_moderation.py` M-10.
+
 ## Moderation
 
 Built. `POST /api/staff/ban`, `POST /api/staff/kick`, `POST /api/staff/unban`,
@@ -1167,7 +1179,8 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
   ownership     no route lets you name somebody else's row
   refusals      which code a refusal answers with, and why 404 not 403
   revocation    bans, demotions and what a token stops buying
-  moderation    the paged staff list, the moderation log, staff-only notes
+  moderation    the paged staff list, the moderation log, staff-only notes,
+                and the powers list in words
   namecolour    the colour each player chose, carried with every name
   guildlife     who guild members are playing, and the guild's own history
   throttle      login defences, rate limits, credential rotation, and
