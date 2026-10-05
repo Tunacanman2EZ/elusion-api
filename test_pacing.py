@@ -20,6 +20,13 @@ wrong here that the game never sees:
 The general store now sells every piece from iron to amethyst, so the last
 section checks the shelf against the catalogue and the saving pace: the next
 band's set should cost a few hours of the gold the current band pays.
+
+5 Oct, the owner's price pass: gear doubled and potions quadrupled. A few lucky
+kills or a good fishing trip made the old prices trivial, and a cooked fish
+cost about four times a potion for every point either healed. So a set is now
+5 to 9 hours of the band before it (it was 2 to 6, about 3 to 4 in practice),
+and a potion costs about what the cooked fish of its tier does per point
+healed.
 """
 import importlib.util, os, sqlite3, sys, tempfile
 
@@ -282,22 +289,75 @@ for tier in (2, 3, 4):
                   [MATERIAL[tier] + p for p in pieces if gamedata.shop_price("generalstore", MATERIAL[tier] + p) is None])
             continue
         hours = cost / gold_an_hour[tier - 1]
-        check("the %s %s set (%s gold) is %.1f hours of %s-band gold: between 2 and 6"
+        check("the %s %s set (%s gold) is %.1f hours of %s-band gold: between 5 and 9"
               % (MATERIAL[tier], name, "{:,}".format(cost), hours, MATERIAL[tier - 1]),
-              2.0 <= hours <= 6.0, (cost, round(gold_an_hour[tier - 1])))
+              5.0 <= hours <= 9.0, (cost, round(gold_an_hour[tier - 1])))
 plate_costs = [set_cost(t, PLATE_SET) for t in (1, 2, 3, 4)]
 check("each set costs more than the one before it",
       None not in plate_costs and all(plate_costs[i] > plate_costs[i - 1] for i in (1, 2, 3)), plate_costs)
+
+# SELLING IS A BONUS, NOT THE FARM. The shop buys now (5 Oct), and at
+# catalogue value an hour's gear drops are worth seven or eight times the
+# hour's coin - so the rate decides whether killing pays in gold or in junk.
+# Selling everything an hour drops should pay between a tenth of and the whole
+# of what the hour paid in coin, in every band; and even a player who sells
+# every piece is still four hours or more from the next set. At 0.1 that was
+# about four hours, which undid the price pass the same day; 0.05 is about five.
+sell_an_hour = {}
+_real_rng = gamedata._rng
+try:
+    gamedata._rng = random.Random(2027)
+    for el, fam in FAMILY.items():
+        for eid in fam:
+            for _ in range(3000):
+                bag = gamedata.roll_kill_rewards(eid)["contents"]
+                sell_an_hour.setdefault(BAND_OF[el], []).append(
+                    sum((gamedata.shop_sell_price("generalstore", c["item_id"]) or 0) * int(c["quantity"])
+                        for c in bag if c["item_id"] not in coin_ids))
+finally:
+    gamedata._rng = _real_rng
+sell_an_hour = {b: 300.0 * sum(v) / len(v) for b, v in sell_an_hour.items()}
+for band in sorted(sell_an_hour):
+    share = sell_an_hour[band] / gold_an_hour[band]
+    check("band %d: selling an hour's drops pays %s, %.0f%% of the hour's %s in coin"
+          % (band, "{:,}".format(round(sell_an_hour[band])), 100 * share, "{:,}".format(round(gold_an_hour[band]))),
+          0.10 <= share <= 1.0, round(share, 2))
+for tier in (2, 3, 4):
+    for name, pieces in (("plate", PLATE_SET), ("cloth", CLOTH_SET)):
+        cost = set_cost(tier, pieces)
+        hours = cost / (gold_an_hour[tier - 1] + sell_an_hour[tier - 1])
+        check("  selling everything too, the %s %s set is still %.1f hours away: between 4 and 9"
+              % (MATERIAL[tier], name, hours), 4.0 <= hours <= 9.0, round(hours, 2))
+
+# A POTION COSTS WHAT THE COOKED FISH OF ITS TIER DOES, PER POINT HEALED. Before
+# the 5 Oct pass a tiny potion was 2.5 gold a point and a cooked mudfish 9.6 -
+# the same gap at every tier - and the owner asked for them to line up.
+def gold_a_point(item_id):
+    record = gamedata.ITEMS[item_id]
+    return int(record["value"]) / int(record["restore_amount"])
+for potion, fish in (("tinyhealthpotion", "cookedmudfish"), ("smallhealthpotion", "cookedmarshcarp"),
+                     ("mediumhealthpotion", "cookedcopperscale"), ("largehealthpotion", "cookedsilverfin"),
+                     ("greaterhealthpotion", "cookedduskfin")):
+    ratio = gold_a_point(potion) / gold_a_point(fish)
+    check("a %s costs %.1f gold a point healed, a %s %.1f: within a fifth of each other"
+          % (gamedata.ITEMS[potion]["display_name"], gold_a_point(potion),
+             gamedata.ITEMS[fish]["display_name"], gold_a_point(fish)),
+          0.8 <= ratio <= 1.25, round(ratio, 2))
+check("mana and stamina potions cost what the health potion of their size does",
+      all(gamedata.ITEMS[size + kind + "potion"]["value"] == gamedata.ITEMS[size + "healthpotion"]["value"]
+          for size in ("tiny", "small", "medium", "large", "greater") for kind in ("mana", "stamina")))
 
 # BUY IT AT ANY LEVEL, WEAR IT AT ITS OWN. Through the real routes: the
 # purchase goes into the backpack, and the equip route refuses it until the
 # character reaches the level.
 conn = sqlite3.connect(DB_PATH)
-conn.execute("UPDATE saves SET level = 1, gold = 600 WHERE user_id = ? AND slot = 0", (uid,))
+sword = gamedata.shop_price("generalstore", "jadesword")
+conn.execute("UPDATE saves SET level = 1, gold = ? WHERE user_id = ? AND slot = 0", (sword, uid))
 conn.commit(); conn.close()
 r = client.post("/api/shop/buy", headers=H, json={"slot": 0, "shop_id": "generalstore", "item_id": "jadesword"})
 body = r.get_json() or {}
-check("a level 1 character may buy a jade sword, at 520", r.status_code == 200 and body.get("total_paid") == 520,
+check("a level 1 character may buy a jade sword, at %s" % "{:,}".format(sword),
+      r.status_code == 200 and body.get("total_paid") == sword == gamedata.ITEMS["jadesword"]["value"],
       (r.status_code, body))
 r = client.post("/api/character/equip", headers=H, json={"slot": 0, "item_id": "jadesword"})
 check("but may not wear it yet", r.status_code in (400, 403) and "level" in str(r.get_json()).lower(),
@@ -310,14 +370,15 @@ check("at level 5 the same sword goes on", r.status_code == 200, (r.status_code,
 r = client.post("/api/shop/buy", headers=H, json={"slot": 0, "shop_id": "generalstore", "item_id": "embersword"})
 check("and no amount of gold buys an ember sword", r.status_code == 400, r.status_code)
 conn = sqlite3.connect(DB_PATH)
-conn.execute("UPDATE saves SET gold = 2160 WHERE user_id = ? AND slot = 0", (uid,))
+rod = gamedata.shop_price("generalstore", "jadefishingrod")
+conn.execute("UPDATE saves SET gold = ? WHERE user_id = ? AND slot = 0", (480 + rod, uid))
 conn.commit(); conn.close()
 r = client.post("/api/shop/buy", headers=H,
                 json={"slot": 0, "shop_id": "generalstore", "item_id": "fishingworm", "quantity": 20})
 check("twenty worms cost 480", r.status_code == 200 and (r.get_json() or {}).get("total_paid") == 480,
       (r.status_code, r.get_json()))
 r = client.post("/api/shop/buy", headers=H, json={"slot": 0, "shop_id": "generalstore", "item_id": "jadefishingrod"})
-check("a jade rod costs 1,680", r.status_code == 200 and (r.get_json() or {}).get("total_paid") == 1680,
+check("a jade rod costs %s" % "{:,}".format(rod), r.status_code == 200 and (r.get_json() or {}).get("total_paid") == rod,
       (r.status_code, r.get_json()))
 r = client.post("/api/fishing/catch", headers=H, json={"slot": 0})
 check("and with them a fresh character can fish", r.status_code == 200, (r.status_code, r.get_json()))

@@ -717,11 +717,14 @@ check("a potion says what it restores",
       potion["Restores"] == ("20 HP", "GOOD"), potion.get("Restores"))
 check("and has no slot, damage or armour row",
       not {"Slot", "Damage", "Armour"} & set(potion), sorted(potion))
+# The price from the catalogue, not a literal: the owner reprices things.
+import gamedata as _priced  # noqa: E402
+_unit = int(_priced.ITEMS["tinyhealthpotion"]["value"])
 check("a stack prices the whole stack",
-      rows("tinyhealthpotion", 16)["Value"][0] == "50 gold  (800)",
+      rows("tinyhealthpotion", 16)["Value"][0] == "%d gold  (%d)" % (_unit, _unit * 16),
       rows("tinyhealthpotion", 16).get("Value"))
 check("a single one does not",
-      potion["Value"][0] == "50 gold", potion.get("Value"))
+      potion["Value"][0] == "%d gold" % _unit, potion.get("Value"))
 
 trophy = rows("bushamulet")
 check("the bush amulet now prints a slot like any other gear",
@@ -957,16 +960,20 @@ try:
 finally:
     _gd.ENEMIES["darksprite"]["mythic_odds"] = _myth_saved
 _cells = _kill.get("contents", [])
+# A MYTHIC ROLLS LIKE ANY DROP, so the id is the Meteorite's with its roll on
+# it ("meteorite~d97p103"). test_quality.py holds the roll itself.
+_myth_id = str(_kill.get("mythic", ""))
 check("a mage's mythic kill answers with the Meteorite",
-      res.status_code == 200 and _kill.get("mythic") == "meteorite", [res.status_code, _kill.get("mythic")])
+      res.status_code == 200 and _gd.base_id(_myth_id) == "meteorite", [res.status_code, _myth_id])
 check("in a bag, in its first cell", bool(_kill.get("bag_id")) and _cells
-      and _cells[0]["item_id"] == "meteorite" and _cells[0]["position"] == 0, _cells)
+      and _cells[0]["item_id"] == _myth_id and _cells[0]["position"] == 0, _cells)
 
 _news = client.get("/api/server/broadcasts?since=%d" % _since, headers=MH).get_json()["messages"]
 _myth_news = [m for m in _news if m["kind"] == "mythic"]
 check("and everyone online is told, once, by name",
       len(_myth_news) == 1 and _myth_news[0]["by"] == "mythcheck"
-      and _myth_news[0]["body"] == "mythcheck found the Meteorite on a Dark Sprite!", _news)
+      and _myth_news[0]["body"] == "mythcheck found the %s on a Dark Sprite!"
+      % (_gd.item_row(_myth_id) or {}).get("display_name"), _news)
 check("the notice is on the poll another player reads too",
       any(m["kind"] == "mythic" for m in client.get(
           "/api/server/broadcasts?since=%d" % _since, headers=H).get_json()["messages"]))
@@ -980,11 +987,11 @@ try:
 finally:
     _gd.ENEMIES["darksprite"]["mythic_odds"] = _myth_saved
 check("and every one a mage wins is the Meteorite, never another class's",
-      _more == ["meteorite"] * 5, _more)
+      [_gd.base_id(m or "") for m in _more] == ["meteorite"] * 5, _more)
 
 res = client.post("/api/loot/take", headers=MH, json={"bag_id": _kill.get("bag_id"), "position": 0})
 check("taking it puts it in the backpack like any other drop", res.status_code == 200
-      and any(c.get("item_id") == "meteorite" for c in (res.get_json() or {}).get("inventory", [])),
+      and any(c and c.get("item_id") == _myth_id for c in (res.get_json() or {}).get("inventory", [])),
       [res.status_code, res.get_json()])
 
 _gd.ENEMIES["darksprite"]["mythic_odds"] = 0

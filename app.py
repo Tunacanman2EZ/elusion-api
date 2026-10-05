@@ -3784,7 +3784,12 @@ CLIENT_BUILD_HEADER = "X-Elusion-Build"
 # 2: the backpack and bank became server-owned (ONE CELL AT A TIME). A build-1
 # game still plays, but its drags and its bin are never saved - its whole-bag
 # writes are ignored - so this is the first build worth setting as the minimum.
-CURRENT_CLIENT_BUILD = 2
+#
+# 3: dropped gear carries its quality roll in its id ("ironsword~d107", QUALITY
+# ROLLS in gamedata.py). A build-2 game has never seen one: its ItemRegistry
+# answers the error item for a rolled piece, so it cannot show, wear or sell
+# one. Set the minimum to 3 once the new game is out.
+CURRENT_CLIENT_BUILD = 3
 
 MAINTENANCE_DEFAULT_MESSAGE = "Update in progress - please come back later."
 
@@ -8074,7 +8079,7 @@ def gold_item_value(item_id):
     premium = gamedata.CONSTANTS.get("lusions_item_id", LUSIONS_ITEM_ID)
     if item_id == premium:
         return 0
-    record = gamedata.ITEMS.get(item_id) or {}
+    record = gamedata.item_row(item_id) or {}
     if str(record.get("type_name", "")) != "CURRENCY":
         # The two legacy ids are still honoured by name even if a data file
         # ever stops labelling them, because old bags and old saves hold them.
@@ -8865,7 +8870,7 @@ def _add_to_bank(user_id, item_id, quantity):
     quantity fits. A half-completed deposit is the shape of bug that ends with
     an item in neither the bag nor the bank.
     """
-    definition = gamedata.ITEMS.get(item_id, {})
+    definition = gamedata.item_row(item_id) or {}
     stackable = bool(definition.get("stackable", False))
     max_stack = int(definition.get("max_stack", 1)) if stackable else 1
     if max_stack < 1:
@@ -10163,7 +10168,7 @@ def mythic_find_text(username, item_id, enemy_id):
     a mythic off a light slime is a story worth telling. A boss is a name
     ("The Crowned", "Fire The Crowned") and takes no article.
     """
-    item = gamedata.ITEMS.get(item_id, {})
+    item = gamedata.item_row(item_id) or {}
     enemy = gamedata.ENEMIES.get(enemy_id, {})
     what = item.get("display_name") or item_id
     who = enemy.get("display_name") or enemy_id
@@ -10804,6 +10809,10 @@ def staff_grant():
             slot: {type: integer, example: 0}
             item_id: {type: string, example: "petsniper"}
             quantity: {type: integer, example: 1}
+            quality:
+              type: string
+              enum: [store, roll, perfect]
+              description: "store (the default) is the catalogue piece at 100%; roll rolls it like a drop; perfect gives the Perfect roll"
     responses:
       200:
         description: The backpack as stored, after the grant
@@ -10843,6 +10852,12 @@ def staff_grant():
     item_id = str(payload.get("item_id", "")).strip()
     if not item_id or len(item_id) > 64:
         return bad_request("item_id must be 1-64 characters")
+    # AN ID IS STILL NOT WHITELISTED, BUT A ROLL IS CHECKED. A grant of an
+    # unknown id stores it as typed (see "Item ids are not whitelisted" in
+    # CLAUDE.md); one that LOOKS like a roll and is not one - a stat the piece
+    # does not have, 300% - would be a piece every other route reads as nothing.
+    if gamedata.VARIANT_MARK in item_id and not gamedata.has_item(item_id):
+        return bad_request("'%s' is not a roll of any item" % item_id)
 
     raw_quantity = payload.get("quantity", 1)
     if isinstance(raw_quantity, bool):
@@ -10853,6 +10868,17 @@ def staff_grant():
         return bad_request("quantity must be a positive integer")
     if quantity <= 0:
         return bad_request("quantity must be a positive integer")
+
+    # WHAT THE PIECE ROLLS. "store" is what the shelf sells, the catalogue at
+    # 100%; "roll" is what a kill would have dropped; "perfect" is the 1 in
+    # QUALITY_PERFECT_ODDS, so the owner can see one without granting a
+    # hundred. Only a plain id is rolled: an id that already names a roll is
+    # granted as named. Anything with no stats to roll is granted as it is.
+    quality = str(payload.get("quality", "store") or "store").strip().lower()
+    if quality not in ("store", "roll", "perfect"):
+        return bad_request("quality must be store, roll or perfect")
+    if quality != "store" and gamedata.VARIANT_MARK not in item_id:
+        item_id = gamedata.roll_quality(item_id) if quality == "roll" else gamedata.perfect_id(item_id)
 
     # The same ceiling an ordinary write gets. Staff is not a reason to be
     # allowed to create a cell holding a billion potions - that is a corrupt
@@ -13966,7 +13992,7 @@ QUANTITY_CEILING = 9999
 
 def _stack_limit(item_id):
     """How many of item_id may sit in one cell."""
-    definition = gamedata.ITEMS.get(item_id)
+    definition = gamedata.item_row(item_id)
     if definition is None:
         return QUANTITY_CEILING
     if not definition.get("stackable", False):
@@ -14241,6 +14267,126 @@ def shop_buy():
     }, 200
 
 
+@app.post("/api/shop/sell")
+@require_auth
+def shop_sell():
+    """
+    Sell what is in one carried cell to a vendor
+    ---
+    tags:
+      - Shop
+    consumes:
+      - application/json
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [slot, shop_id, position, item_id]
+          properties:
+            slot:     {type: integer, example: 0}
+            shop_id:  {type: string,  example: generalstore}
+            position: {type: integer, example: 4, description: "The carried cell"}
+            item_id:  {type: string,  example: jadesword, description: "What the game saw in that cell"}
+            quantity: {type: integer, example: 1, description: "How many from the cell; the whole stack when left out"}
+    responses:
+      200:
+        description: Sold. The carry and the purse afterwards, and what was paid.
+      400:
+        description: Bad slot, cell, item, quantity or shop, or the shop does not buy it
+      404:
+        description: That slot is empty
+      409:
+        description: "The cell does not hold that item, or not that many. Carries resync; nothing was sold."
+      401:
+        description: Missing, invalid or expired token
+    """
+    # THE SHOP BUYS NOW (5 Oct, the owner: "we should be able to sell items to
+    # the shop"). Every piece of a tier was the same piece, so a second jade
+    # sword was worth nothing to its finder; now it is worth something.
+    #
+    # ONE CELL AND THE ITEM THE GAME SAW IN IT, like every carry route (ONE
+    # CELL AT A TIME): a sale names what it sells, the server checks the cell
+    # still holds it, prices it from its own catalogue and pays through
+    # gold_delta() in the same transaction. The request carries no price and
+    # would not be believed if it did.
+    #
+    # IT IS A FAUCET, on purpose and small: the gold is MINTED, reason
+    # shop_sell, so the supply report counts it and the invariant still holds.
+    # sell_multiplier (the game's ShopData, 0.05) keeps an hour's junk worth
+    # less than the hour's coin, and a set five hours away even for a player
+    # who sells everything - test_pacing.py measures both.
+    payload, slot, item_id, error = _carry_request()
+    if error is not None:
+        return error
+    position, error = parse_grid_cell(payload, "position", CARRY_CAPACITY)
+    if error is not None:
+        return error
+
+    shop_id = str(payload.get("shop_id", "")).strip()
+    if not shop_id or len(shop_id) > 64:
+        return bad_request("shop_id must be 1-64 characters")
+    if shop_id not in gamedata.SHOPS:
+        return bad_request("Unknown shop '%s'. Is gamedata.json current?" % shop_id)
+
+    unit_price = gamedata.shop_sell_price(shop_id, item_id)
+    if unit_price is None:
+        return bad_request("The shop does not buy that.")
+
+    raw_quantity = payload.get("quantity")
+    quantity = None
+    if raw_quantity is not None:
+        if isinstance(raw_quantity, bool):
+            return bad_request("quantity must be a positive integer")
+        try:
+            quantity = int(raw_quantity)
+        except (TypeError, ValueError):
+            return bad_request("quantity must be a positive integer")
+        if quantity <= 0 or float(raw_quantity) != quantity:
+            return bad_request("quantity must be a positive integer")
+
+    user_id = g.user["id"]
+    keys = (user_id, slot)
+    held = _grid_cells("carry_items", ("user_id", "slot"), keys, (position,)).get(position)
+    if held is None or held[0] != item_id:
+        return _carry_resync(user_id, slot)
+    if quantity is None:
+        quantity = held[1]
+    if quantity > held[1]:
+        # Asking for more than the cell holds is the game's picture being out
+        # of date, the same as a cell holding something else.
+        return _carry_resync(user_id, slot)
+
+    db = get_db()
+    left = held[1] - quantity
+    _grid_rewrite("carry_items", ("user_id", "slot"), keys, (position,),
+                  {position: (item_id, left)} if left > 0 else {})
+    total = unit_price * quantity
+    remaining = gold_delta(
+        db, user_id, slot, total, "shop_sell",
+        "%s x%d @%d to %s" % (item_id, quantity, unit_price, shop_id),
+    )
+    db.commit()
+
+    return {
+        "slot": slot,
+        "shop_id": shop_id,
+        "position": position,
+        "item_id": item_id,
+        "quantity": quantity,
+        "unit_price": unit_price,
+        "total_received": total,
+        "gold": remaining,
+        "inventory": inventory_payload(user_id, slot),
+    }, 200
+
+
 @app.get("/api/shop/<shop_id>")
 @require_auth
 def shop_catalogue(shop_id):
@@ -14267,7 +14413,7 @@ def shop_catalogue(shop_id):
     # different one and show a price the server refuses. One source.
     stock = []
     for item_id in shop.get("stock", []):
-        definition = gamedata.ITEMS.get(item_id)
+        definition = gamedata.item_row(item_id)
         if definition is None:
             continue
         stock.append({
@@ -14311,10 +14457,21 @@ def shop_catalogue(shop_id):
             "price": gamedata.shop_price(shop["shop_id"], item_id),
         })
 
+    # WHAT THE SHOP PAYS, for every item it would buy, from the same function
+    # /api/shop/sell prices with - so the Sell list shows the number the till
+    # pays, not one the panel worked out.
+    sell_prices = {}
+    for item_id in gamedata.ITEMS:
+        price = gamedata.shop_sell_price(shop["shop_id"], item_id)
+        if price is not None:
+            sell_prices[item_id] = price
+
     return {
         "shop_id": shop["shop_id"],
         "display_name": shop.get("display_name", "Shop"),
         "stock": stock,
+        "sell_multiplier": float(shop.get("sell_multiplier", 0.0) or 0.0),
+        "sell_prices": sell_prices,
     }, 200
 
 
@@ -15150,7 +15307,7 @@ def trade_update():
         item_id = str(entry.get("item_id", "")).strip()
         if not item_id or len(item_id) > 64:
             return bad_request("item_id must be 1-64 characters")
-        if item_id not in gamedata.ITEMS:
+        if not gamedata.has_item(item_id):
             return bad_request("No such item '%s'." % item_id)
         raw_qty = entry.get("quantity", 1)
         if isinstance(raw_qty, bool) or not isinstance(raw_qty, int) or raw_qty <= 0:
@@ -17757,7 +17914,7 @@ def cash_carried_pile():
         return error
     premium = gamedata.CONSTANTS.get("lusions_item_id", LUSIONS_ITEM_ID)
     if item_id == premium:
-        per = max(1, int((gamedata.ITEMS.get(item_id) or {}).get("value", 1) or 1))
+        per = max(1, int((gamedata.item_row(item_id) or {}).get("value", 1) or 1))
     else:
         per = gold_item_value(item_id)
         if per <= 0:
@@ -18179,7 +18336,7 @@ def equip_item():
     # works this way - "the square's name is ignored on purpose".
     target = gamedata.equip_slot_for(item_id)
     if not target:
-        if item_id not in gamedata.ITEMS:
+        if not gamedata.has_item(item_id):
             return bad_request("No such item '%s'." % item_id)
         return {"error": "Forbidden", "message": "That is not equipment."}, 403
 
@@ -19229,7 +19386,7 @@ def _best_rod_tier(user_id, slot):
         item_id = row["item_id"]
         if not item_id.endswith(FISHING_ROD_SUFFIX):
             continue
-        item = gamedata.ITEMS.get(item_id)
+        item = gamedata.item_row(item_id)
         if item is None:
             continue
         best = max(best, int(item["tier"]))
@@ -19335,7 +19492,7 @@ def _add_to_backpack(user_id, slot, item_id, quantity):
     stack on key 1 would be the server rearranging the one part of the carry
     the player arranges by hand. See CARRY_CAPACITY.
     """
-    definition = gamedata.ITEMS.get(item_id, {})
+    definition = gamedata.item_row(item_id) or {}
     stackable = bool(definition.get("stackable", False))
     max_stack = int(definition.get("max_stack", 1)) if stackable else 1
     if max_stack < 1:
@@ -19474,7 +19631,7 @@ def take_loot():
     slot = int(bag["slot"])
     item_id = item["item_id"]
     quantity = int(item["quantity"])
-    definition = gamedata.ITEMS.get(item_id, {})
+    definition = gamedata.item_row(item_id) or {}
     kind = definition.get("type_name", "")
 
     # WHAT WAS IN THE BAG vs WHAT THE PLAYER ACTUALLY GETS. Those are the same

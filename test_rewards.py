@@ -90,7 +90,7 @@ def gear_tiers(enemy_id, kills):
         if random.random() >= float(e.get("bag_drop_chance", 0)):
             continue
         for c in gamedata.build_bag_contents(e):
-            it = I.get(c["item_id"])
+            it = gamedata.item_row(c["item_id"])   # a dropped piece carries its roll
             if it and it["type_name"] in ("WEAPON", "ARMOR"):
                 seen[int(it["tier"])] = seen.get(int(it["tier"]), 0) + 1
     return seen

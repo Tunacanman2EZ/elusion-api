@@ -388,7 +388,12 @@ for _n in range(250):
                     json={"bag_id": killed["bag_id"], "position": piles[0]["position"]})
 purse = int(conn.execute("SELECT gold FROM saves WHERE slot = 0").fetchone()["gold"])
 conn.close()
-check("farmed enough to shop with", purse >= 300, "have %d" % purse)
+# THE PRICE IS READ, NOT TYPED. It was a literal 50 here, and the owner's 5 Oct
+# price pass (potions x4) turned five checks red that were only ever about the
+# ledger. What these checks hold is that the SERVER priced the purchase and
+# burned exactly that - whatever the catalogue says a potion costs this week.
+UNIT = int(app_module.gamedata.ITEMS["tinyhealthpotion"]["value"])
+check("farmed enough to shop with", purse >= 3 * UNIT, "have %d" % purse)
 
 status("a shop that does not exist", client.post(
     "/api/shop/buy", headers=H,
@@ -411,13 +416,13 @@ body = status("buy 3 tiny health potions", client.post(
     json={"slot": 0, "shop_id": "generalstore",
           "item_id": "tinyhealthpotion", "quantity": 3}), 200)
 
-check("the server priced it itself", body and body.get("unit_price") == 50, body)
-check("total is unit x quantity", body and body.get("total_paid") == 150, body)
+check("the server priced it itself", body and body.get("unit_price") == UNIT, body)
+check("total is unit x quantity", body and body.get("total_paid") == 3 * UNIT, body)
 
 after = supply()
-check("burned exactly what was paid", after["burned"] - before["burned"] == 150,
+check("burned exactly what was paid", after["burned"] - before["burned"] == 3 * UNIT,
       "burned delta=%d" % (after["burned"] - before["burned"]))
-check("held fell by the same amount", before["held"] - after["held"] == 150,
+check("held fell by the same amount", before["held"] - after["held"] == 3 * UNIT,
       "held delta=%d" % (before["held"] - after["held"]))
 check("nothing was minted by a purchase", after["minted"] == before["minted"])
 
@@ -426,7 +431,7 @@ row = conn.execute(
     "SELECT reason, delta FROM gold_ledger ORDER BY id DESC LIMIT 1").fetchone()
 conn.close()
 check("the burn was recorded with reason 'shop_buy'",
-      row and row["reason"] == "shop_buy" and int(row["delta"]) == -150,
+      row and row["reason"] == "shop_buy" and int(row["delta"]) == -3 * UNIT,
       dict(row) if row else None)
 
 balanced("a purchase")
@@ -1751,6 +1756,110 @@ balanced("a client trying to mint gold through /api/save")
 
 
 # =============================================================================
+
+# =============================================================================
+print("\n=== SELLING TO THE VENDOR ===\n")
+# =============================================================================
+# 5 Oct, the owner: "we should be able to sell items to the shop". Every piece
+# of a tier is the same piece, so a second jade sword was worth nothing to its
+# finder. POST /api/shop/sell takes one carried cell and the item the game saw
+# in it, prices it from the server's catalogue, and MINTS the gold through
+# gold_delta() - so it is a faucet, recorded as one, and the invariant holds.
+
+import math as _math
+
+SELLER = account("sellsam")
+status("sam makes a character", client.put(
+    "/api/save", headers=SELLER, json={"slot": 0, "class_id": "warrior", "name": "Sam"}), 200)
+
+
+def cell_of(username, item_id):
+    conn = db_conn()
+    row = conn.execute(
+        "SELECT position FROM carry_items JOIN users ON users.id = carry_items.user_id"
+        " WHERE users.username = ? AND slot = 0 AND item_id = ? ORDER BY position LIMIT 1",
+        (username, item_id)).fetchone()
+    conn.close()
+    return None if row is None else int(row["position"])
+
+
+def sell(headers, position, item_id, quantity=None, shop_id="generalstore"):
+    body = {"slot": 0, "shop_id": shop_id, "position": position, "item_id": item_id}
+    if quantity is not None:
+        body["quantity"] = quantity
+    return client.post("/api/shop/sell", headers=headers, json=body)
+
+
+gd = app_module.gamedata
+store = gd.SHOPS["generalstore"]
+rate = float(store.get("sell_multiplier", 0))
+check("the store buys at a twentieth of value, well under what it charges",
+      0 < rate < float(store.get("price_multiplier", 1.0)), (rate, store.get("price_multiplier")))
+offers = (client.get("/api/shop/generalstore", headers=SELLER).get_json() or {}).get("sell_prices", {})
+check("the catalogue says what the shop pays: a jade sword at its share of its value",
+      offers.get("jadesword") == _math.floor(int(gd.ITEMS["jadesword"]["value"]) * rate), offers.get("jadesword"))
+check("  for gear, potions, food, fish and the fishing kit",
+      all(i in offers for i in ("doubleaxe", "greaterhealthpotion", "cookedreefclown", "rawmudfish", "ironfishingrod")))
+check("  and not for money, pets or lusions",
+      not any(gd.ITEMS[i]["type_name"] in ("CURRENCY", "PET") for i in offers), sorted(offers)[:5])
+check("nothing sells for what the shop charges for it",
+      all(offers[i] < gd.shop_price("generalstore", i) for i in offers
+          if gd.shop_price("generalstore", i) is not None))
+
+give("sellsam", "jadesword", 1)
+give("sellsam", "tinyhealthpotion", 12)
+before, gold_before = supply(), purse("sellsam")
+sword_at = cell_of("sellsam", "jadesword")
+body = status("selling the jade sword", sell(SELLER, sword_at, "jadesword"), 200)
+paid = offers.get("jadesword", -1)
+check("paid what the catalogue said, into the purse",
+      body and body.get("total_received") == paid and purse("sellsam") == gold_before + paid,
+      (body or {}).get("total_received"))
+check("  and the sword is gone from its cell", holding("sellsam", "jadesword") == 0)
+after = supply()
+check("  the gold was minted, and recorded as a sale",
+      after["minted"] - before["minted"] == paid and ledger_rows("shop_sell") == 1)
+balanced("a sale")
+
+potions_at = cell_of("sellsam", "tinyhealthpotion")
+body = status("selling 5 of a stack of 12", sell(SELLER, potions_at, "tinyhealthpotion", 5), 200)
+check("  seven stay in the same cell, and five are paid for",
+      holding("sellsam", "tinyhealthpotion") == 7 and cell_of("sellsam", "tinyhealthpotion") == potions_at
+      and body and body.get("total_received") == 5 * offers["tinyhealthpotion"])
+
+gold_before = purse("sellsam")
+status("a cell that no longer holds that item", sell(SELLER, potions_at, "jadesword"), 409)
+status("more than the cell holds", sell(SELLER, potions_at, "tinyhealthpotion", 8), 409)
+stale = sell(SELLER, potions_at, "tinyhealthpotion", 8).get_json() or {}
+check("  which hands back the bag, so the game can catch up",
+      isinstance((stale.get("resync") or {}).get("inventory"), list))
+for label, quantity in (("none", 0), ("a negative", -1), ("a fraction", 2.5), ("true", True), ("words", "lots")):
+    status("selling %s" % label, sell(SELLER, potions_at, "tinyhealthpotion", quantity), 400)
+give("sellsam", "goldcoin", 3)
+status("a pile of coins is cashed, not sold", sell(SELLER, cell_of("sellsam", "goldcoin"), "goldcoin"), 400)
+status("a shop that does not exist", sell(SELLER, potions_at, "tinyhealthpotion", 1, "nosuchshop"), 400)
+status("no token", client.post("/api/shop/sell", json={"slot": 0, "shop_id": "generalstore",
+                                                       "position": potions_at, "item_id": "tinyhealthpotion"}), 401)
+status("a slot with no character", client.post("/api/shop/sell", headers=SELLER, json={
+    "slot": 3, "shop_id": "generalstore", "position": 0, "item_id": "tinyhealthpotion"}), 404)
+check("none of the refusals paid anything or took anything",
+      purse("sellsam") == gold_before and holding("sellsam", "tinyhealthpotion") == 7)
+
+seed_gold("sellsam", 1000)
+gold_before = purse("sellsam")
+bought = status("buying a tiny potion", client.post("/api/shop/buy", headers=SELLER, json={
+    "slot": 0, "shop_id": "generalstore", "item_id": "tinyhealthpotion", "quantity": 1}), 200)
+status("and selling one straight back",
+       sell(SELLER, cell_of("sellsam", "tinyhealthpotion"), "tinyhealthpotion", 1), 200)
+check("  costs gold: buying to sell is never a profit", purse("sellsam") < gold_before,
+      purse("sellsam") - gold_before)
+
+give("sellsam", "doubleaxe", 1)
+body = status("a mythic sells too", sell(SELLER, cell_of("sellsam", "doubleaxe"), "doubleaxe"), 200)
+check("  for the same share of its value", body and body.get("total_received")
+      == _math.floor(int(gd.ITEMS["doubleaxe"]["value"]) * rate))
+balanced("every sale")
+
 
 print("\n%d passed, %d failed" % (passed, failed))
 if failures:

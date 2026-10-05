@@ -392,6 +392,9 @@ updating the maxima it implies.
 - **Item ids are not whitelisted.** Validating them against a list would mean
   every new item in the game needs a matching server deploy. Unknown ids are
   bounded by `QUANTITY_CEILING` instead; known ones by their own `max_stack`.
+  The one exception is an id with a quality roll in it (`~`): a staff grant
+  of one that is not a real roll is refused, because every other route would
+  read it as nothing.
 - **Every query scopes on `g.user["id"]` in the SQL itself**, rather than
   fetching and then checking ownership. "Not yours" and "does not exist" return
   the same 404, so there is nothing to learn by asking. (That last clause is the
@@ -1039,9 +1042,83 @@ so a stock change is a re-export, a copy and a restart, with no code change.
   `required_level`.
 - **The pace is measured, not assumed.** `test_pacing.py`, "THE STORE SELLS
   IRON TO AMETHYST", rolls kills through the real `roll_kill_rewards()` with a
-  seeded generator swapped in for `_rng`, and holds each next set at 2 to 6
-  hours of the previous band's gold (about 3 to 4 today). It also holds the
+  seeded generator swapped in for `_rng`, and holds each next set at 5 to 9
+  hours of the previous band's gold (about 6 to 8 today). It also holds the
   shelf against the catalogue: every tier 1-4 piece on it, nothing of tier 5.
+- **The 5 Oct price pass** (the owner: a few lucky kills or a good fishing
+  trip made the old prices trivial): every weapon, armour piece, amulet and
+  rod doubled, every potion quadrupled, worms, fish, gold and pets left alone.
+  Sets were 2 to 6 hours. Potions were a quarter of what a cooked fish of the
+  same tier costs per point healed; now they match, within a fifth, at every
+  tier, and `test_pacing.py` holds that too. Gold drops do not read item
+  values (`GOLD_TIER_RATIO` in the game), so a price change is a pure sink
+  change. It also moves the trade tax, which is 5% of `value`.
+- **The shop buys** (5 Oct). `POST /api/shop/sell` takes one carried cell
+  and the item the game saw in it (ONE CELL AT A TIME), prices it with
+  `gamedata.shop_sell_price()` - `value` times the shop's `sell_multiplier`
+  (0.05), rounded down, never at or above what the same shop charges - and
+  MINTS the gold through `gold_delta()` under `shop_sell`. Money, pets and
+  quest items are refused (`SELLABLE_TYPES`). `GET /api/shop/<id>` lists
+  `sell_prices` from the same function. The rate is measured, not guessed:
+  `test_pacing.py` holds an hour's drops sold at a tenth to the whole of the
+  hour's coin, and the next set four to nine hours away even selling
+  everything. **Selling turns an item grant into gold**: `/api/staff/grant` is
+  mod and up, so a mod could give themselves potions and sell them. Until the
+  grant is owner-only (or a test-server switch, see "Decided, not built"), a
+  mod rank is trust with gold as well as with players.
+- **Tests read prices from the catalogue.** `test_economy.py` and
+  `test_equipment.py` had a potion's 50 typed in, and the price pass turned
+  seven checks red that were about the ledger and the tooltip, not the price.
+
+## Quality rolls: the roll is in the id
+
+The owner, 5 Oct: "random stats on all items because it gives loot a better
+value if a rare max roll". A dropped piece of gear rolls every stat it has
+above zero - damage, armour, max health, max mana, the damage bonus - each on
+its own, `QUALITY_LOW` to `QUALITY_HIGH` (85-115) percent of the catalogue
+number, from a triangle peaked at 100. One drop in `QUALITY_PERFECT_ODDS` (100)
+is Perfect, every stat at `QUALITY_PERFECT` (120). The shop sells the
+catalogue piece, 100%. QUALITY ROLLS in gamedata.py; the numbers and the
+letters come from the game through gamedata.json.
+
+- **The roll is part of the item id**: `jadechest~a104h96`. That is the whole
+  design, and the reason is everything that did not change: carry, bank, loot
+  bag entries, the equipment map, trade rows and staff whole writes all hold
+  an id, and every route that moves one checks "the item the game saw in that
+  cell" - so a rolled piece moves by the paths that exist, and those checks
+  cover the roll. No migration: a piece from before is a plain id, 100%.
+- **`gamedata.item_row(id)` is the one way to ask what an id is.** A rolled id
+  is not a key of `ITEMS`, and `ITEMS.get("ironsword~d107")` is None - an item
+  nobody has heard of: `_stack_limit()` gave it 9,999, a trade offer said "No
+  such item", `equip_slot_for()` gave it no slot. Every lookup by id in
+  gamedata.py and app.py goes through `item_row()` / `has_item()` now, which
+  hand back the base row with the rolled stats scaled, `base_id`, `rolls` and
+  `perfect`, and "Perfect " on a Perfect name. Iterating `ITEMS` (the shelf,
+  the loot pool) is still right. **`test_quality.py` Q-7 scans app.py and
+  gamedata.py for an `ITEMS` lookup by id** and fails on a new one.
+- **`split_variant()` is strict**: every stat the piece has, once, in
+  `QUALITY_FIELDS` order, 85-115 each or 120 all. One roll has one spelling,
+  or two spellings of it would be two items to every cell check.
+- **`scale_stat()` is integer arithmetic, halves up** - `ItemRegistry` does
+  the same sum in GDScript, and `gear_bonuses()` derives max health from it.
+  Both suites hold one table of pairs.
+- **A roll changes what a piece does, not its price.** `value` is the
+  catalogue's, so `shop_sell_price()` pays a roll its base piece's price
+  (capped by what the shelf charges for the base - the shelf never holds a
+  roll) and the trade tax is 5% of the same number.
+- **Where a roll is made**: `build_bag_contents()` for every gear slot and
+  `roll_kill_rewards()` for the mythic (`roll_quality()`, which reads `_rng`
+  when called, so a test's seeded generator reaches it).
+  `/api/staff/grant` takes `"quality": "store" | "roll" | "perfect"`, and
+  refuses an id that looks like a roll and is not one (an unknown plain id is
+  still stored as typed - ids are not whitelisted).
+- **The broadcast names the piece, not the id**: `mythic_find_text()` reads
+  `item_row()`, so a Perfect find says "found the Perfect Meteorite".
+- **`CURRENT_CLIENT_BUILD` is 3**: a build-2 game reads a rolled id as its
+  error item. Raise the minimum to 3 once the new game is out.
+
+`test_quality.py`. test_loot, test_rewards and test_equipment read dropped
+ids through `item_row()` / `base_id()` for the same reason the app does.
 
 ## Gear bonuses: a character's maximum includes what it wears
 
@@ -1196,6 +1273,7 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
   gathering     fishing and cooking - the item-minting endpoints
   loot          bags, rolls, and taking things out of them
   equipment     what a worn item is worth, and what the tooltip says
+  quality       dropped gear's rolled stats, carried whole by every path
   chat/chatrooms  the feed, the channels, moderation and picture revocation
   broadcast     the server's voice, and the poll that doubles as a heartbeat
   maintenance   the kill switch and its countdown

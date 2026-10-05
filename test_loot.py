@@ -132,6 +132,16 @@ section("A KILL ACTUALLY PAYS OUT")
 # practical purpose.
 
 SAMPLE = 200_000
+# SEEDED, because the band below is only three standard deviations wide at
+# 1 in 1296 (154 expected, a spread of about 12), and there are dozens of
+# enemies: on SystemRandom roughly one run in twenty-five failed somewhere for
+# no reason at all - seen 5 Oct as "193 wins in 200000 kills, expected ~154"
+# on a change that never touched pets. A fixed generator still proves the roll
+# fires at the advertised rate through the real roll_pet(); it just gives the
+# same answer every run. test_pacing.py swaps _rng the same way.
+import random as _seeded
+_real_rng = gamedata._rng
+gamedata._rng = _seeded.Random(2026)
 for eid in sorted(REWARDING):
     enemy = REWARDING[eid]
     pet = str(enemy.get("pet_drop_id", "") or "")
@@ -146,6 +156,8 @@ for eid in sorted(REWARDING):
     check("%s pays out its pet at about 1/%d" % (eid, odds),
           expected * 0.75 <= wins <= expected * 1.25,
           "%d wins in %d kills, expected ~%.0f" % (wins, SAMPLE, expected))
+
+gamedata._rng = _real_rng
 
 # And the pet that comes out is the one advertised. pick_pet_id() can return
 # the RARE pet instead, so this asserts membership rather than equality.
@@ -543,13 +555,13 @@ _bags = 0
 for _eid, _e in _bosses:
     for _ in range(3000):
         _contents = [c for c in gamedata.build_bag_contents(_e)
-                     if ITEMS[c["item_id"]]["type_name"] != "CURRENCY"]
+                     if gamedata.item_row(c["item_id"])["type_name"] != "CURRENCY"]
         _bags += 1
         _boss_items += len(_contents)
         if _contents:
-            _gear_slot_kinds.add(ITEMS[_contents[0]["item_id"]]["type_name"])
-        _potions += sum(1 for c in _contents[1:] if ITEMS[c["item_id"]]["type_name"] == "CONSUMABLE")
-        _iron += sum(1 for c in _contents if int(ITEMS[c["item_id"]]["tier"]) == 1)
+            _gear_slot_kinds.add(gamedata.item_row(_contents[0]["item_id"])["type_name"])
+        _potions += sum(1 for c in _contents[1:] if gamedata.item_row(c["item_id"])["type_name"] == "CONSUMABLE")
+        _iron += sum(1 for c in _contents if int(gamedata.item_row(c["item_id"])["tier"]) == 1)
 check("the guaranteed slot is always a weapon or armour",
       _gear_slot_kinds <= gamedata.LOOT_GEAR_TYPES and bool(_gear_slot_kinds), _gear_slot_kinds)
 check("a boss bag holds about 1.5 items (was 3.6)",
@@ -575,7 +587,7 @@ try:
         ENEMIES[_eid]["pet_odds"] = 1
         for _ in range(500):
             _c = gamedata.roll_kill_rewards(_eid)["contents"]
-            _kinds = [ITEMS[x["item_id"]]["type_name"] for x in _c]
+            _kinds = [gamedata.item_row(x["item_id"])["type_name"] for x in _c]
             if not _kinds or _kinds[0] != "PET":
                 _first_bad += 1
             _ranks = [0 if k == "PET" else (2 if k == "CURRENCY" else 1) for k in _kinds]
@@ -709,8 +721,9 @@ try:
         ENEMIES[_eid]["mythic_odds"] = 1
         for _ in range(40):
             _r = gamedata.roll_kill_rewards(_eid, "warrior")
-            _ids = [c["item_id"] for c in _r["contents"]]
-            if _r["mythic"] != "doubleaxe":
+            # base_id(): a mythic rolls like any other dropped piece.
+            _ids = [gamedata.base_id(c["item_id"]) for c in _r["contents"]]
+            if gamedata.base_id(_r["mythic"]) != "doubleaxe":
                 _flagged += 1
             if "doubleaxe" not in _ids:
                 _missing += 1

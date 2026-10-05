@@ -32,6 +32,7 @@ import json
 import math
 import os
 import random
+import re
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GAMEDATA_PATH = os.environ.get("ELUSION_GAMEDATA", os.path.join(HERE, "gamedata.json"))
@@ -110,6 +111,192 @@ def _load():
 CONSTANTS, ITEMS, ENEMIES, CLASSES, SHOPS = _load()
 
 
+# =============================================================================
+# QUALITY ROLLS
+# =============================================================================
+# A DROPPED PIECE OF GEAR ROLLS EACH OF ITS STATS. The owner, 5 Oct: "random
+# stats on all items because it gives loot a better value if a rare max roll".
+# Every stat a piece has - damage, armour, max health, max mana, the damage
+# bonus - rolls on its own, from QUALITY_LOW to QUALITY_HIGH percent of the
+# catalogue number, most often near 100. One piece in QUALITY_PERFECT_ODDS is
+# Perfect instead: every stat at QUALITY_PERFECT. What the store sells is
+# always exactly the catalogue, 100% on everything.
+#
+# THE ROLL TRAVELS IN THE ITEM ID: "jadechest~a104h96" is a jade cuirass with
+# armour at 104% and health at 96%. That is the whole design, and the reason
+# is everything that did not have to change. A carry cell, a bank cell, a loot
+# bag entry, the equipment map, a trade row and a staff whole-bag write all
+# hold an item id and nothing else, and every route that moves one takes "the
+# item the game saw in that cell" - so a rolled piece moves, is equipped,
+# banked, traded and sold by the paths that already exist, and the cell check
+# that guards each of them checks the roll as well. A column beside the id
+# would have had to be carried by every one of those, and the one that forgot
+# would turn a Perfect piece back into a plain one without an error.
+#
+# WHAT HAD TO CHANGE IS EVERY QUESTION ABOUT WHAT AN ID IS, and they all go
+# through item_row() now. "ironsword~d107" is not a key of ITEMS, so a bare
+# ITEMS.get() reads a rolled piece as an item nobody has heard of: unlimited
+# stacking, "No such item" on a trade, no slot to wear it in. ITEMS itself is
+# still only the catalogue - iterate it for the shelf or the loot pool, never
+# index it with an id that came out of a row or a request. test_quality.py
+# scans app.py for that.
+#
+# THE LETTERS AND THE RANGE ARE THE GAME'S (GameConstants.QUALITY_*, through
+# gamedata.json), like every other balance number here; the fallbacks below are
+# what the game holds today, for a gamedata.json exported before them.
+#
+# A ROLL CHANGES WHAT A PIECE DOES, NOT WHAT IT COSTS. value stays the
+# catalogue's, so the shop pays the same for a 90% sword as a 110% one and the
+# trade tax is 5% of the same number. A Perfect piece is worth more to players,
+# and players set that price in a trade.
+QUALITY_FIELDS = tuple(
+    (str(pair[0]), str(pair[1]))
+    for pair in (CONSTANTS.get("quality_fields") or (
+        ("d", "damage"), ("a", "armor_value"), ("h", "bonus_max_hp"),
+        ("m", "bonus_max_mana"), ("p", "bonus_damage_percent"),
+    ))
+)
+QUALITY_LOW = int(CONSTANTS.get("quality_low", 85))
+QUALITY_HIGH = int(CONSTANTS.get("quality_high", 115))
+QUALITY_PERFECT = int(CONSTANTS.get("quality_perfect", 120))
+QUALITY_PERFECT_ODDS = int(CONSTANTS.get("quality_perfect_odds", 100))
+VARIANT_MARK = "~"
+
+_FIELD_FOR_LETTER = {letter: field for letter, field in QUALITY_FIELDS}
+_VARIANT_PART = re.compile(r"([a-z])(\d{2,3})")
+_VARIANT_SUFFIX = re.compile(r"^(?:[a-z]\d{2,3})+$")
+
+
+def rolled_fields(definition):
+    """[(letter, field)] for every stat this catalogue row has above zero, in
+    QUALITY_FIELDS order. A potion, a rod or a coin has none and never rolls."""
+    out = []
+    for letter, field in QUALITY_FIELDS:
+        try:
+            if int(definition.get(field, 0) or 0) > 0:
+                out.append((letter, field))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def split_variant(item_id):
+    """
+    (base_id, {field: percent}) for a rolled id, (item_id, {}) for a plain one,
+    and (None, None) for anything that only looks like a roll.
+
+    STRICT, BECAUSE THE ID IS THE IDENTITY. Two spellings of one roll would be
+    two different items to every cell check, so there is exactly one: every
+    stat the base piece has, each once, in QUALITY_FIELDS order, and either all
+    at QUALITY_PERFECT or each inside QUALITY_LOW..QUALITY_HIGH. A stat the
+    piece does not have, a missing one, a 300% or a "d07" is not a roll.
+    """
+    item_id = str(item_id)
+    if VARIANT_MARK not in item_id:
+        return item_id, {}
+    base, _, suffix = item_id.partition(VARIANT_MARK)
+    definition = ITEMS.get(base)
+    if definition is None or not _VARIANT_SUFFIX.match(suffix):
+        return None, None
+    parts = _VARIANT_PART.findall(suffix)
+    expected = rolled_fields(definition)
+    if [letter for letter, _ in parts] != [letter for letter, _ in expected]:
+        return None, None
+    rolls = {}
+    for letter, digits in parts:
+        if digits.startswith("0"):
+            return None, None
+        rolls[_FIELD_FOR_LETTER[letter]] = int(digits)
+    values = set(rolls.values())
+    if values != {QUALITY_PERFECT} and not all(QUALITY_LOW <= v <= QUALITY_HIGH for v in values):
+        return None, None
+    return base, rolls
+
+
+def scale_stat(number, percent):
+    """A catalogue number at this percent, to the nearest whole point, halves
+    up. INTEGER ARITHMETIC ON PURPOSE: ItemRegistry does the same sum in
+    GDScript, and the server derives max health from it, so a float rounding
+    differently on one side would put the two a point apart forever."""
+    number = int(number)
+    if number <= 0:
+        return number
+    return (number * int(percent) + 50) // 100
+
+
+def item_row(item_id):
+    """
+    THE ONE WAY TO ASK WHAT AN ID IS. The catalogue row for a plain id; for a
+    rolled one, a copy of its base row with each rolled stat scaled, plus
+    "base_id", "rolls" and "perfect", and "Perfect " in front of a Perfect
+    piece's name. None for an unknown id or a malformed roll.
+    """
+    item_id = str(item_id)
+    if VARIANT_MARK not in item_id:
+        return ITEMS.get(item_id)
+    base, rolls = split_variant(item_id)
+    if base is None:
+        return None
+    row = dict(ITEMS[base])
+    for field, percent in rolls.items():
+        row[field] = scale_stat(row.get(field, 0) or 0, percent)
+    perfect = set(rolls.values()) == {QUALITY_PERFECT}
+    row["item_id"] = item_id
+    row["base_id"] = base
+    row["rolls"] = dict(rolls)
+    row["perfect"] = perfect
+    if perfect:
+        row["display_name"] = "Perfect " + str(row.get("display_name") or base)
+    return row
+
+
+def perfect_id(item_id):
+    """The Perfect roll of a catalogue piece - every stat at QUALITY_PERFECT -
+    or item_id unchanged for anything with nothing to roll."""
+    definition = ITEMS.get(str(item_id))
+    fields = rolled_fields(definition) if definition is not None else []
+    if not fields:
+        return item_id
+    return item_id + VARIANT_MARK + "".join(
+        "%s%d" % (letter, QUALITY_PERFECT) for letter, _ in fields)
+
+
+def base_id(item_id):
+    """The catalogue id under a roll: "ironsword" for "ironsword~d107"."""
+    return str(item_id).partition(VARIANT_MARK)[0]
+
+
+def is_perfect(item_id):
+    row = item_row(item_id)
+    return bool(row and row.get("perfect"))
+
+
+def roll_quality(item_id):
+    """
+    A dropped piece's roll: item_id with a roll on every stat it has, or
+    item_id unchanged for anything with nothing to roll (potions, rods, coins,
+    pets). Each stat is its own triangle from QUALITY_LOW to QUALITY_HIGH,
+    peaked at 100, so most pieces sit near the catalogue and the top of the
+    range is rare; one in QUALITY_PERFECT_ODDS is Perfect, every stat at
+    QUALITY_PERFECT. Reads _rng when called, so a test's seeded generator
+    reaches it.
+    """
+    definition = ITEMS.get(str(item_id))
+    if definition is None:
+        return item_id
+    fields = rolled_fields(definition)
+    if not fields:
+        return item_id
+    if QUALITY_PERFECT_ODDS > 0 and _rng.randrange(QUALITY_PERFECT_ODDS) == 0:
+        return perfect_id(item_id)
+    parts = []
+    for letter, _ in fields:
+        percent = int(round(_rng.triangular(QUALITY_LOW, QUALITY_HIGH, 100)))
+        parts.append("%s%d" % (letter, min(QUALITY_HIGH, max(QUALITY_LOW, percent))))
+    return item_id + VARIANT_MARK + "".join(parts)
+
+
+
 def shop_price(shop_id, item_id):
     """
     What this vendor charges for one of these, or None when it does not stock
@@ -131,12 +318,53 @@ def shop_price(shop_id, item_id):
         return None
     if item_id not in shop.get("stock", []):
         return None
-    definition = ITEMS.get(item_id)
+    definition = item_row(item_id)
     if definition is None:
         return None
 
     multiplier = float(shop.get("price_multiplier", 1.0))
     return max(1, int(math.ceil(int(definition.get("value", 0)) * multiplier)))
+
+
+# WHAT A VENDOR WILL BUY. Gear, potions and food, fish and the fishing kit:
+# the things that drop, get caught or get bought. Not money (a pile is cashed,
+# not sold), not pets (a second copy already turns into lusions), and not
+# quest items, which cannot leave the bag at all.
+SELLABLE_TYPES = ("WEAPON", "ARMOR", "CONSUMABLE", "FISH", "MATERIAL")
+
+
+def shop_sell_price(shop_id, item_id):
+    """
+    What this vendor pays for one of these, or None when it will not buy it.
+
+    ItemData.value times the shop's sell_multiplier, ROUNDED DOWN - the house's
+    side again, as shop_price() rounds up - and None when that comes to zero:
+    an item worth nothing to the shop is one it does not take, rather than a
+    sale for 0 gold that reads as a bug.
+
+    NEVER AT OR ABOVE WHAT THE SAME SHOP CHARGES. A vendor that pays what it
+    asks is a loop: buy, sell, repeat, and the gold comes from nowhere. The
+    multiplier the game exports is far below the markup today (0.05 against
+    1.0), so this cap only ever bites on a mistake - which is when it matters.
+    """
+    shop = SHOPS.get(shop_id)
+    if shop is None:
+        return None
+    definition = item_row(item_id)
+    if definition is None:
+        return None
+    if str(definition.get("type_name", "")) not in SELLABLE_TYPES:
+        return None
+
+    multiplier = float(shop.get("sell_multiplier", 0.0) or 0.0)
+    price = int(math.floor(int(definition.get("value", 0)) * multiplier))
+    # A ROLLED PIECE IS PRICED AS ITS BASE, and capped by what the shop
+    # charges for the base: the shelf never holds a roll, so asking about
+    # "ironsword~d107" there would find nothing and skip the cap.
+    charged = shop_price(shop_id, base_id(item_id))
+    if charged is not None:
+        price = min(price, charged - 1)
+    return price if price > 0 else None
 
 
 def stack_value(item_id, quantity):
@@ -148,7 +376,7 @@ def stack_value(item_id, quantity):
     purpose: a second valuation ladder for tax would let players find the gap
     between the two and trade across it.
     """
-    definition = ITEMS.get(item_id)
+    definition = item_row(item_id)
     if definition is None:
         return None
     return int(definition.get("value", 0)) * int(quantity)
@@ -258,7 +486,8 @@ def gear_bonuses(equipment):
     for slot_name, item_id in equipment.items():
         if not isinstance(item_id, str) or not item_id:
             continue
-        item = ITEMS.get(item_id)
+        # item_row(), so a rolled amulet adds its rolled health.
+        item = item_row(item_id)
         if item is None or equip_slot_for(item_id) != str(slot_name).strip().lower():
             continue
         for field in GEAR_BONUS_FIELDS:
@@ -305,13 +534,14 @@ def max_stats_for(class_id, level, equipment=None):
 
 
 def has_item(item_id):
-    """Mirrors ItemRegistry.has_item()."""
-    return item_id in ITEMS
+    """Mirrors ItemRegistry.has_item(). A well-formed roll of a known piece is
+    an item; a malformed one is not."""
+    return item_row(item_id) is not None
 
 
 def item_value(item_id):
     """What one of these is worth in gold. 0 for anything unpriced."""
-    record = ITEMS.get(item_id) or {}
+    record = item_row(item_id) or {}
     try:
         return max(0, int(record.get("value", 0) or 0))
     except (TypeError, ValueError):
@@ -499,7 +729,7 @@ def restore_for(item_id):
     pool. exportgamedata.gd writes the name beside the integer for exactly this
     reason; see RESTORE_TARGET_NAMES there.
     """
-    item = ITEMS.get(item_id)
+    item = item_row(item_id)
     if item is None:
         return "", 0
     target = str(item.get("restore_target_name", ""))
@@ -603,7 +833,7 @@ def equip_slot_for(item_id):
     "" for anything that is not equipment, for an item the catalogue does not
     know, and for a gamedata.json exported before equip_slot_name existed.
     Callers that need to tell those apart check EQUIP_EXPORTED first."""
-    item = ITEMS.get(item_id)
+    item = item_row(item_id)
     if item is None:
         return ""
     name = str(item.get("equip_slot_name", "NONE")).strip().upper()
@@ -618,7 +848,7 @@ def equip_classes_for(item_id):
     AN EMPTY LIST MEANS ANYONE - rings and amulets are shared by everybody - so
     a caller has to test for emptiness before it tests for membership, or it
     will lock every class out of the jewellery."""
-    item = ITEMS.get(item_id)
+    item = item_row(item_id)
     if item is None:
         return []
     raw = item.get("required_classes", [])
@@ -632,7 +862,7 @@ def gear_bonus_for(item_id):
     else. The two arrive together because combat will want both from one
     lookup, and because the exporter already refuses to write a weapon whose
     damage is zero."""
-    item = ITEMS.get(item_id)
+    item = item_row(item_id)
     if item is None:
         return 0, 0
     return int(item.get("damage", 0)), int(item.get("armor_value", 0))
@@ -675,7 +905,7 @@ def equip_check(item_id, slot_name, class_id, character_level):
     caller checks EQUIP_EXPORTED and skips this entirely rather than refusing
     every honest save on an un-re-exported server.
     """
-    item = ITEMS.get(item_id)
+    item = item_row(item_id)
     if item is None:
         return {"ok": False, "reason": "unknown"}
 
@@ -777,7 +1007,7 @@ def consume_check(item_id, character_level, skill_levels, known_skills=None):
     gate holds; not in the set at all means nobody can answer and it passes.
     Found by a smoke test, not by review.
     """
-    item = ITEMS.get(item_id)
+    item = item_row(item_id)
     if item is None:
         return {"ok": False, "reason": "unknown"}
 
@@ -1021,8 +1251,7 @@ def mythic_pool(class_id=""):
     )
     own = [
         item_id for item_id in every
-        if not ITEMS[item_id].get("required_classes")
-        or class_id in ITEMS[item_id].get("required_classes")
+        if not equip_classes_for(item_id) or class_id in equip_classes_for(item_id)
     ]
     return own or every
 
@@ -1102,7 +1331,8 @@ def build_bag_contents(enemy):
         if _rng.random() <= slot_fill_chance:
             picked = pick_loot_item(roll_loot_tier(enemy), slot_kind)
             if picked:
-                contents.append({"item_id": picked, "quantity": 1})
+                # A dropped piece rolls its stats; a potion has none to roll.
+                contents.append({"item_id": roll_quality(picked), "quantity": 1})
 
     # A boss's potion rides beside its gear piece rather than competing with it
     # for the one slot.
@@ -1233,7 +1463,7 @@ def roll_cook(item_id, cooking_level):
     would be no cost to cooking above your level and the burn chance would be
     decoration - a slower road to the same place rather than a reason to wait.
     """
-    item = ITEMS.get(item_id)
+    item = item_row(item_id)
     if item is None:
         return {"ok": False, "reason": "unknown"}
 
@@ -1269,7 +1499,7 @@ def rarest_first(contents):
     were cut away without a word. Coins last means a cut costs copper.
     """
     def rank(entry):
-        item = ITEMS.get(entry.get("item_id", ""), {})
+        item = item_row(entry.get("item_id", "")) or {}
         kind = item.get("type_name", "")
         # A mythic is cut by nothing, like the pet.
         if kind == "PET" or (kind in LOOT_GEAR_TYPES and int(item.get("tier", 0)) >= mythic_tier()):
@@ -1306,7 +1536,11 @@ def roll_kill_rewards(enemy_id, class_id=""):
 
     pet_won = roll_pet(enemy)
     bag_drops = _rng.random() <= float(enemy.get("bag_drop_chance", 0.0))
+    # A mythic rolls like any other dropped piece. The answer's "mythic" is
+    # the rolled id, the one in the bag.
     mythic = roll_mythic(enemy, class_id)
+    if mythic:
+        mythic = roll_quality(mythic)
 
     contents = []
     if bag_drops or pet_won or mythic:
