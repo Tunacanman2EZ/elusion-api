@@ -10811,8 +10811,8 @@ def staff_grant():
             quantity: {type: integer, example: 1}
             quality:
               type: string
-              enum: [store, roll, perfect]
-              description: "store (the default) is the catalogue piece at 100%; roll rolls it like a drop; perfect gives the Perfect roll"
+              enum: [plain, roll, perfect]
+              description: "plain (the default) is the catalogue piece at 100%; roll rolls it like a drop or a purchase; perfect gives the Perfect roll. store is read as plain."
     responses:
       200:
         description: The backpack as stored, after the grant
@@ -10869,15 +10869,20 @@ def staff_grant():
     if quantity <= 0:
         return bad_request("quantity must be a positive integer")
 
-    # WHAT THE PIECE ROLLS. "store" is what the shelf sells, the catalogue at
-    # 100%; "roll" is what a kill would have dropped; "perfect" is the 1 in
-    # QUALITY_PERFECT_ODDS, so the owner can see one without granting a
-    # hundred. Only a plain id is rolled: an id that already names a roll is
-    # granted as named. Anything with no stats to roll is granted as it is.
-    quality = str(payload.get("quality", "store") or "store").strip().lower()
-    if quality not in ("store", "roll", "perfect"):
-        return bad_request("quality must be store, roll or perfect")
-    if quality != "store" and gamedata.VARIANT_MARK not in item_id:
+    # WHAT THE PIECE ROLLS. "plain" is the catalogue at 100%, the only way to
+    # have one now that the shop rolls what it sells; "roll" is what a kill or
+    # a purchase would hand over; "perfect" is the 1 in QUALITY_PERFECT_ODDS,
+    # so the owner can see one without granting a hundred. "store" is read as
+    # "plain": it was the name for the 100% piece while the shop sold one, and
+    # the build-3 game that is out sends it. Only a plain id is rolled: an id
+    # that already names a roll is granted as named. Anything with no stats to
+    # roll is granted as it is.
+    quality = str(payload.get("quality", "plain") or "plain").strip().lower()
+    if quality == "store":
+        quality = "plain"
+    if quality not in ("plain", "roll", "perfect"):
+        return bad_request("quality must be plain, roll or perfect")
+    if quality != "plain" and gamedata.VARIANT_MARK not in item_id:
         item_id = gamedata.roll_quality(item_id) if quality == "roll" else gamedata.perfect_id(item_id)
 
     # The same ceiling an ordinary write gets. Staff is not a reason to be
@@ -14152,7 +14157,10 @@ def shop_buy():
                 quantity: {type: integer, example: 1}
       responses:
         200:
-          description: Bought. Returns the new gold balance and backpack.
+          description: >
+            Bought. Returns the new gold balance and backpack. item_id is the
+            piece that arrived - for gear, rolled on the spot ("jadesword~d104p96");
+            stock_id is the shelf's id it was bought as.
         400:
           description: Bad slot, unknown shop, item not stocked, or not enough gold
         404:
@@ -14236,7 +14244,16 @@ def shop_buy():
     # THE ITEM FIRST, because this is the half that can still fail. It writes
     # nothing unless the whole quantity fits, so a refusal here leaves the
     # backpack exactly as it was and the gold untouched.
-    written = _add_to_backpack(user_id, slot, item_id, quantity)
+    # GEAR IS ROLLED AT THE TILL. The owner, 5 Oct: "item stats say ? and are
+    # revealed upon buying in shop only". The shelf lists the catalogue piece
+    # and its price; what is handed over rolls exactly as a drop does
+    # (gamedata.roll_quality: 85-115% a stat, one in QUALITY_PERFECT_ODDS
+    # Perfect). Same price whatever it rolls, so an average purchase is the
+    # catalogue piece, as it was. A potion, a worm or a rod has nothing to roll
+    # and comes as it is. Gear stacks to one, so quantity is 1 here.
+    bought = gamedata.roll_quality(item_id)
+
+    written = _add_to_backpack(user_id, slot, bought, quantity)
     if written is None:
         db.rollback()
         return {
@@ -14250,7 +14267,7 @@ def shop_buy():
     # holds it afterwards, which is what makes it a sink.
     remaining = gold_delta(
         db, user_id, slot, -total, "shop_buy",
-        "%s x%d @%d from %s" % (item_id, quantity, unit_price, shop_id),
+        "%s x%d @%d from %s" % (bought, quantity, unit_price, shop_id),
     )
 
     db.commit()
@@ -14258,7 +14275,8 @@ def shop_buy():
     return {
         "slot": slot,
         "shop_id": shop_id,
-        "item_id": item_id,
+        "item_id": bought,
+        "stock_id": item_id,
         "quantity": quantity,
         "unit_price": unit_price,
         "total_paid": total,

@@ -359,13 +359,16 @@ body = r.get_json() or {}
 check("a level 1 character may buy a jade sword, at %s" % "{:,}".format(sword),
       r.status_code == 200 and body.get("total_paid") == sword == gamedata.ITEMS["jadesword"]["value"],
       (r.status_code, body))
-r = client.post("/api/character/equip", headers=H, json={"slot": 0, "item_id": "jadesword"})
+# THE SWORD THAT ARRIVED: the shop rolls gear at the till, so the piece in
+# the bag is "jadesword~..." and is worn by that id.
+bought_sword = str(body.get("item_id", "jadesword"))
+r = client.post("/api/character/equip", headers=H, json={"slot": 0, "item_id": bought_sword})
 check("but may not wear it yet", r.status_code in (400, 403) and "level" in str(r.get_json()).lower(),
       (r.status_code, r.get_json()))
 conn = sqlite3.connect(DB_PATH)
 conn.execute("UPDATE saves SET level = 5 WHERE user_id = ? AND slot = 0", (uid,))
 conn.commit(); conn.close()
-r = client.post("/api/character/equip", headers=H, json={"slot": 0, "item_id": "jadesword"})
+r = client.post("/api/character/equip", headers=H, json={"slot": 0, "item_id": bought_sword})
 check("at level 5 the same sword goes on", r.status_code == 200, (r.status_code, r.get_json()))
 r = client.post("/api/shop/buy", headers=H, json={"slot": 0, "shop_id": "generalstore", "item_id": "embersword"})
 check("and no amount of gold buys an ember sword", r.status_code == 400, r.status_code)

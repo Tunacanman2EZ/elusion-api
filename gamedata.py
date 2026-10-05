@@ -119,8 +119,10 @@ CONSTANTS, ITEMS, ENEMIES, CLASSES, SHOPS = _load()
 # Every stat a piece has - damage, armour, max health, max mana, the damage
 # bonus - rolls on its own, from QUALITY_LOW to QUALITY_HIGH percent of the
 # catalogue number, most often near 100. One piece in QUALITY_PERFECT_ODDS is
-# Perfect instead: every stat at QUALITY_PERFECT. What the store sells is
-# always exactly the catalogue, 100% on everything.
+# Perfect instead: every stat at QUALITY_PERFECT. A piece bought from the shop
+# rolls the same way, at the till (the owner, 5 Oct: "item stats say ? and are
+# revealed upon buying in shop only") - the shelf lists the catalogue piece and
+# its price, and shop_buy hands over a roll of it.
 #
 # THE ROLL TRAVELS IN THE ITEM ID: "jadechest~a104h96" is a jade cuirass with
 # armour at 104% and health at 96%. That is the whole design, and the reason
@@ -273,7 +275,7 @@ def is_perfect(item_id):
 
 def roll_quality(item_id):
     """
-    A dropped piece's roll: item_id with a roll on every stat it has, or
+    A dropped or bought piece's roll: item_id with a roll on every stat it has, or
     item_id unchanged for anything with nothing to roll (potions, rods, coins,
     pets). Each stat is its own triangle from QUALITY_LOW to QUALITY_HIGH,
     peaked at 100, so most pieces sit near the catalogue and the top of the

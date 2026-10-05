@@ -1077,8 +1077,8 @@ value if a rare max roll". A dropped piece of gear rolls every stat it has
 above zero - damage, armour, max health, max mana, the damage bonus - each on
 its own, `QUALITY_LOW` to `QUALITY_HIGH` (85-115) percent of the catalogue
 number, from a triangle peaked at 100. One drop in `QUALITY_PERFECT_ODDS` (100)
-is Perfect, every stat at `QUALITY_PERFECT` (120). The shop sells the
-catalogue piece, 100%. QUALITY ROLLS in gamedata.py; the numbers and the
+is Perfect, every stat at `QUALITY_PERFECT` (120). Gear bought from the shop
+rolls the same way, at the till. QUALITY ROLLS in gamedata.py; the numbers and the
 letters come from the game through gamedata.json.
 
 - **The roll is part of the item id**: `jadechest~a104h96`. That is the whole
@@ -1106,10 +1106,19 @@ letters come from the game through gamedata.json.
   catalogue's, so `shop_sell_price()` pays a roll its base piece's price
   (capped by what the shelf charges for the base - the shelf never holds a
   roll) and the trade tax is 5% of the same number.
-- **Where a roll is made**: `build_bag_contents()` for every gear slot and
-  `roll_kill_rewards()` for the mythic (`roll_quality()`, which reads `_rng`
-  when called, so a test's seeded generator reaches it).
-  `/api/staff/grant` takes `"quality": "store" | "roll" | "perfect"`, and
+- **Where a roll is made**: `build_bag_contents()` for every gear slot,
+  `roll_kill_rewards()` for the mythic, and `/api/shop/buy` for every piece it
+  sells (`roll_quality()`, which reads `_rng` when called, so a test's seeded
+  generator reaches it).
+- **The shop rolls at the till.** The owner, 5 Oct: "item stats say ? and
+  are revealed upon buying in shop only". The shelf lists the catalogue id
+  and its price (a roll cannot be bought by name: `shop_price()` has none),
+  and the purchase hands over `roll_quality()` of it at that price, whatever
+  it rolls - so an average purchase is the catalogue piece, as it was, and a
+  Perfect is a hundred purchases on average. The answer's `item_id` is the
+  roll, `stock_id` the shelf's id, and the ledger line names the roll.
+  `/api/staff/grant` takes `"quality": "plain" | "roll" | "perfect"` ("store",
+  which the first build-3 game sends, is read as plain), and
   refuses an id that looks like a roll and is not one (an unknown plain id is
   still stored as typed - ids are not whitelisted).
 - **The broadcast names the piece, not the id**: `mythic_find_text()` reads

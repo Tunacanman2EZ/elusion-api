@@ -1,12 +1,13 @@
 """
-Quality rolls on dropped gear. Run: python3 test_quality.py
+Quality rolls on dropped and bought gear. Run: python3 test_quality.py
 
 WHAT A ROLL IS. The owner, 5 Oct: random stats on every item, "because it
 gives loot a better value if a rare max roll". A dropped piece of gear rolls
 every stat it has - damage, armour, max health, max mana, the damage bonus -
 each on its own, QUALITY_LOW to QUALITY_HIGH percent of the catalogue number,
 most often near 100; one drop in QUALITY_PERFECT_ODDS is Perfect, every stat at
-QUALITY_PERFECT. What the store sells is the catalogue, 100% on everything.
+QUALITY_PERFECT. A piece bought from the shop rolls the same way, at the till:
+"item stats say ? and are revealed upon buying in shop only".
 
 WHERE IT LIVES. In the item id: "jadechest~a104h96". Every cell, bag entry,
 trade row and the equipment map already hold an id, and every route that moves
@@ -322,7 +323,10 @@ rolled_grant = (res.get_json() or {}).get("granted_item_id", "")
 check("  a rolled one, like a drop", res.status_code == 200 and Q.base_id(rolled_grant) == "jadeamulet"
       and Q.VARIANT_MARK in rolled_grant and Q.has_item(rolled_grant), rolled_grant)
 res = post(OWNER, "/api/staff/grant", {"slot": 0, "item_id": "jadeamulet"})
-check("  and, by default, the piece the store sells",
+check("  and, by default, the plain catalogue piece at 100%",
+      res.status_code == 200 and (res.get_json() or {}).get("granted_item_id") == "jadeamulet")
+res = post(OWNER, "/api/staff/grant", {"slot": 0, "item_id": "jadeamulet", "quality": "store"})
+check("  \"store\", the name the build-3 game sends, is read as plain",
       res.status_code == 200 and (res.get_json() or {}).get("granted_item_id") == "jadeamulet")
 res = post(OWNER, "/api/staff/grant", {"slot": 0, "item_id": "tinyhealthpotion", "quantity": 3, "quality": "roll"})
 check("a potion asked to roll is granted as a potion",
@@ -336,14 +340,42 @@ check("two of one rolled sword is refused: a rolled piece stacks to one",
 check("a player cannot grant at all", post(ALICE, "/api/staff/grant",
       {"slot": 0, "item_id": "ironsword", "quality": "perfect"}).status_code == 404)
 
-# A STORE PURCHASE IS 100%.
-seed_gold("qalice", 50000)
+# A PURCHASE ROLLS AT THE TILL. The shelf lists the catalogue piece; what is
+# handed over is rolled the way a drop is, at the shelf's price.
+seed_gold("qalice", 500000)
+seed_carry("qalice", {})
+gold_before = int(save_row("qalice")["gold"])
 res = post(ALICE, "/api/shop/buy", {"slot": 0, "shop_id": "generalstore", "item_id": "jadeamulet"})
-check("the store sells the catalogue piece, unrolled",
-      res.status_code == 200 and holds("qalice", "jadeamulet") == 1
-      and not any(Q.base_id(i) == "jadeamulet" and i != "jadeamulet" for i, _ in carry_cells("qalice").values()),
-      [res.status_code, carry_cells("qalice")])
-check("and will not sell a roll by name", post(ALICE, "/api/shop/buy",
+body = res.get_json() or {}
+got = str(body.get("item_id", ""))
+check("a piece of gear bought from the shop arrives rolled",
+      res.status_code == 200 and Q.base_id(got) == "jadeamulet" and Q.VARIANT_MARK in got and Q.has_item(got),
+      [res.status_code, got])
+check("  the answer names the roll that arrived, and the shelf id it was bought as",
+      body.get("stock_id") == "jadeamulet" and holds("qalice", got) == 1, body.get("stock_id"))
+check("  at the shelf's price, whatever it rolled",
+      body.get("total_paid") == Q.shop_price("generalstore", "jadeamulet")
+      and int(save_row("qalice")["gold"]) == gold_before - Q.shop_price("generalstore", "jadeamulet"),
+      body.get("total_paid"))
+ledger = sql("SELECT detail FROM gold_ledger WHERE user_id = ? AND reason = 'shop_buy' ORDER BY rowid DESC LIMIT 1",
+             (uid("qalice"),))
+check("  and the ledger records which roll was paid for",
+      bool(ledger) and ledger[0]["detail"].startswith(got + " x1"), ledger[0]["detail"] if ledger else None)
+seed_carry("qalice", {})
+rolls = []
+for _ in range(25):
+    seed_carry("qalice", {})   # the bag holds twenty; emptied so every buy lands
+    r = post(ALICE, "/api/shop/buy", {"slot": 0, "shop_id": "generalstore", "item_id": "ironsword"})
+    rolls.append(str((r.get_json() or {}).get("item_id", "")))
+check("every purchase rolls on its own (25 iron swords, %d different rolls)" % len(set(rolls)),
+      all(Q.base_id(i) == "ironsword" and Q.has_item(i) and Q.VARIANT_MARK in i for i in rolls)
+      and len(set(rolls)) >= 5, rolls[:5])
+seed_carry("qalice", {})
+res = post(ALICE, "/api/shop/buy", {"slot": 0, "shop_id": "generalstore", "item_id": "tinyhealthpotion", "quantity": 3})
+check("a potion has nothing to roll and comes as it is",
+      res.status_code == 200 and (res.get_json() or {}).get("item_id") == "tinyhealthpotion"
+      and holds("qalice", "tinyhealthpotion") == 3, res.get_json())
+check("and the shop will not sell a roll by name", post(ALICE, "/api/shop/buy",
       {"slot": 0, "shop_id": "generalstore", "item_id": "jadeamulet~a120h120m120p120"}).status_code in (400, 404))
 
 # A DRAG. Two pieces of one roll do not merge: a rolled piece stacks to one.
@@ -392,7 +424,7 @@ for item_id in (perfect_amulet, low_amulet, "jadeamulet"):
           int(after["max_hp"]) - bare["max_hp"] == want["bonus_max_hp"]
           and int(after["max_mana"]) - bare["max_mana"] == want["bonus_max_mana"],
           (int(after["max_hp"]) - bare["max_hp"], int(after["max_mana"]) - bare["max_mana"]))
-check("a Perfect Jade Amulet is +12 health where the store's is +10",
+check("a Perfect Jade Amulet is +12 health where the catalogue's is +10",
       Q.item_row(perfect_amulet)["bonus_max_hp"] == 12 and Q.ITEMS["jadeamulet"]["bonus_max_hp"] == 10)
 res = post(ALICE, "/api/character/unequip", {"slot": 0, "equip_slot": "amulet"})
 check("taking it off brings the maximum back to bare",
