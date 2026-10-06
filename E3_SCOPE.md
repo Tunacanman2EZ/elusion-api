@@ -210,6 +210,16 @@ arrives with E-9 and the world boss attached.
 
 ## If the answer is B, here is the shape
 
+**Built, 6 October 2026.** The owner chose B, with "allow trade to finish" for
+the in-flight case: off refuses only a new offer, and an open trade may be
+changed, accepted or cancelled until it finishes or expires. Added on top, from
+outside advice the owner brought: a fresh mythic or Perfect find waits 48 hours
+before it can be traded, which targets exactly what a cheated kill is for and
+leaves everyday trading alone. Account-age and volume caps were left for a
+public launch, to be sized from real trade logs rather than guessed. See
+api/CLAUDE.md, "Trade gates", and `test_tradegates.py`. The shape below is
+what was planned.
+
 Kept short deliberately — the pattern already exists twice and the detail
 belongs in the commit, not here.
 

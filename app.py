@@ -1491,6 +1491,25 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_presence_tickets_expiry
             ON presence_tickets(expires_at);
 
+        -- A FRESH FIND THAT CANNOT BE TRADED YET. One row per mythic or Perfect
+        -- piece as it enters an account - taken from a loot bag or bought from
+        -- the shop - lasting TRADE_HOLD_SECONDS. The server does not watch the
+        -- fight (E-3), so a cheated kill can mint a mythic; the hold keeps it
+        -- in the account that found it long enough for killwatch.py and staff
+        -- to see it first. Counted per account and item id, not per cell:
+        -- the item may move between characters through the bank.
+        CREATE TABLE IF NOT EXISTS trade_holds (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            item_id     TEXT    NOT NULL,
+            created_at  INTEGER NOT NULL,
+            held_until  INTEGER NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_trade_holds_user
+            ON trade_holds(user_id, item_id, held_until);
+
         -- A DELETED CHARACTER, KEPT FOR A WHILE. POST /api/character/delete
         -- removes the character's rows; this keeps a copy of what it was - the
         -- save row, its bag and its skills, as JSON - so "I did not delete
@@ -3770,6 +3789,21 @@ MAINTENANCE_KEY = "maintenance"
 # than growing one in a hurry next to the thing that needed it.
 PVP_KEY = "pvp"
 
+# TRADE. Fourth row, the same shape: the owner can stop players trading with
+# each other in one request. E-3 is open - a kill is asserted, not watched - so
+# a cheated drop is real loot, and trading is the one way loot or gold moves
+# from one account to another. Off, a cheat stays in the account that made it.
+# E3_SCOPE.md, option B.
+#
+# OFF STOPS NEW TRADES, NOT OPEN ONES. The owner, 6 Oct: "allow trade to
+# finish". A trade already open may still be changed, accepted or cancelled,
+# and it dies on its own after TRADE_EXPIRY_SECONDS of nobody touching it; only
+# POST /api/trade/offer is refused. Nothing is half-done by the switch.
+#
+# NO ROW READS ON, because trading was on before the switch existed; a row that
+# cannot be read reads OFF, because a corrupt row must not open the border.
+TRADE_KEY = "trade"
+
 # THE CLIENT BUILD GATE. Third row in server_settings, same shape as the two
 # above, and here for a reason neither of them has: this one cannot be added
 # later without leaving a permanent hole.
@@ -3871,6 +3905,18 @@ def pvp_enabled():
     raw = get_server_setting(PVP_KEY)
     if not raw:
         return False
+    try:
+        stored = json.loads(raw)
+    except (ValueError, TypeError):
+        return False
+    return bool(isinstance(stored, dict) and stored.get("on"))
+
+
+def trades_enabled():
+    """True unless the owner has switched trading off. See TRADE_KEY."""
+    raw = get_server_setting(TRADE_KEY)
+    if raw is None:
+        return True
     try:
         stored = json.loads(raw)
     except (ValueError, TypeError):
@@ -11409,7 +11455,7 @@ STAFF_ACTION_KINDS = (
     "ban", "unban", "kick", "warn", "note", "role",
     "grant", "level", "skill", "teleport", "chat_delete", "mute", "unmute", "report",
     "guild_rename", "guild_disband",
-    "maintenance", "minbuild", "pvp",
+    "maintenance", "minbuild", "pvp", "trade",
 )
 
 # NAMED SETS OF KINDS the log can be asked for by one name (?action=moderation).
@@ -12227,6 +12273,9 @@ def server_status():
         # the world, not about an account, and the login screen is exactly where
         # somebody wants to know before they walk in.
         "pvp": pvp_enabled(),
+        # Whether players may open a trade. The trade window asks before it
+        # offers anything, and a player on the login screen can know too.
+        "trade": trades_enabled(),
         # THE BUILD GATE, ON THE ONE ROUTE IT DOES NOT GATE. An outdated client
         # is refused everywhere else, so this is where it finds out what it
         # needs - and a client that is merely BEHIND, with the gate still
@@ -12527,6 +12576,65 @@ def set_pvp():
         # sets it says so too.
         "damage_implemented": False,
     }, 200
+
+
+@app.post("/api/server/trade")
+@require_auth
+@require_owner
+def set_trade():
+    """
+    Let players open trades, or stop them (owner only)
+    ---
+    tags:
+      - Status
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: switch
+        schema:
+          type: object
+          required: [on]
+          properties:
+            on: {type: boolean, description: "false stops new trades; open ones may finish"}
+    responses:
+      200:
+        description: The switch, as it now stands, and how many trades are still open
+      400:
+        description: No 'on' field
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: Not the owner
+    """
+    # OWNER, like maintenance and PvP: a rule about the whole world. See
+    # TRADE_KEY for what off does and does not do.
+    payload = request.get_json(silent=True) or {}
+    if "on" not in payload or not isinstance(payload.get("on"), bool):
+        return bad_request('send {"on": true} or {"on": false}')
+
+    wanted = payload["on"]
+    db = get_db()
+    set_server_setting(TRADE_KEY, json.dumps({"on": wanted}), g.user["username"])
+
+    # ANNOUNCED, so a player whose offer is refused already knows why. The
+    # trade window says so too; this reaches the people who are not in it.
+    post_broadcast(
+        "Trading is open again." if wanted
+        else "Trading is paused for now. A trade already open can still finish.",
+        "system", g.user["username"])
+    log_staff_action(g.user, "trade", "server", None, "on" if wanted else "off")
+    db.commit()
+
+    # HOW MANY ARE STILL OPEN, so the owner knows what "may finish" covers.
+    cutoff = int(time.time()) - TRADE_EXPIRY_SECONDS
+    still_open = db.execute(
+        "SELECT COUNT(*) FROM trades WHERE state = 'open' AND updated_at >= ?", (cutoff,)
+    ).fetchone()[0]
+    return {"trade": wanted, "open_trades": int(still_open)}, 200
 
 @app.post("/api/server/broadcast")
 @require_auth
@@ -14406,6 +14514,10 @@ def shop_buy():
             "message": "Your backpack is full (%d slots)." % INVENTORY_CAPACITY,
         }, 409
 
+    # A PERFECT FROM THE SHOP IS HELD FROM TRADE like one from a bag: gold
+    # from cheated kills buys it as well as anything.
+    place_trade_hold(db, user_id, bought, quantity)
+
     # THE BURN. Negative delta, through gold_delta() so it lands in the ledger
     # in the same transaction as the balance - see gold_ledger in init_db().
     # This is gold leaving the world, not moving to a vendor's pocket: nothing
@@ -14672,6 +14784,76 @@ TRADE_EXPIRY_SECONDS = 600
 # after a week. Pruned when a new trade is opened, like loot bags on a kill:
 # the thing making rows is the thing that clears them, and there is no sweeper.
 TRADE_CANCELLED_KEPT_SECONDS = 7 * 24 * 60 * 60
+
+# HOW LONG A FRESH MYTHIC OR PERFECT WAITS BEFORE IT CAN BE TRADED. See
+# trade_holds in init_db(). Long enough for killwatch.py's daily look and a
+# person to read it; short enough that an honest find is tradeable the day
+# after tomorrow. The owner chose the two days, 6 Oct.
+TRADE_HOLD_SECONDS = 48 * 60 * 60
+
+
+def trade_held_kind(item_id):
+    """True for the pieces a fresh find holds: mythic tier, or a Perfect roll.
+    Those are where a cheated kill's value concentrates."""
+    row = gamedata.item_row(item_id)
+    if not row:
+        return False
+    return int(row.get("tier", 0)) >= gamedata.mythic_tier() or bool(row.get("perfect"))
+
+
+def place_trade_hold(db, user_id, item_id, quantity=1, now=None):
+    """A fresh find of a held kind: one hold per piece, from now. Prunes this
+    account's own finished holds as it goes (no sweeper, and only its own rows,
+    so no route reaches past the caller)."""
+    if not trade_held_kind(item_id):
+        return
+    now = int(time.time()) if now is None else int(now)
+    db.execute("DELETE FROM trade_holds WHERE user_id = ? AND held_until <= ?", (user_id, now))
+    for _ in range(max(1, int(quantity))):
+        db.execute(
+            "INSERT INTO trade_holds (user_id, item_id, created_at, held_until)"
+            " VALUES (?, ?, ?, ?)",
+            (user_id, item_id, now, now + TRADE_HOLD_SECONDS),
+        )
+
+
+def trade_hold_refusal(db, user_id, items, now=None):
+    """None when every piece in `items` ({item_id: quantity}) may be traded by
+    this account, else the sentence that says which may not and when it may.
+
+    WHAT IS FREE IS WHAT IS OWNED LESS WHAT IS HELD, across every character's
+    bag and the bank, because a held piece can be carried to another character
+    through the bank and must not get out by the side door. Two pieces with the
+    same id are the same piece, so it does not matter which of them is the new
+    one - only how many are."""
+    now = int(time.time()) if now is None else int(now)
+    for item_id, quantity in items.items():
+        if not trade_held_kind(item_id):
+            continue
+        holds = db.execute(
+            "SELECT COUNT(*) AS n, MIN(held_until) AS first FROM trade_holds"
+            " WHERE user_id = ? AND item_id = ? AND held_until > ?",
+            (user_id, item_id, now),
+        ).fetchone()
+        held = int(holds["n"] or 0)
+        if held == 0:
+            continue
+        owned = int(db.execute(
+            "SELECT COALESCE(SUM(quantity), 0) FROM carry_items WHERE user_id = ? AND item_id = ?",
+            (user_id, item_id)).fetchone()[0]) + int(db.execute(
+            "SELECT COALESCE(SUM(quantity), 0) FROM bank_items WHERE user_id = ? AND item_id = ?",
+            (user_id, item_id)).fetchone()[0])
+        if int(quantity) > owned - held:
+            row = gamedata.item_row(item_id) or {}
+            wait = max(0, int(holds["first"]) - now)
+            hours = (wait + 3599) // 3600
+            return ("%s was found less than %d hours ago and can be traded in %s. "
+                    "Mythic and Perfect finds wait %d hours before they can change hands."
+                    % (row.get("display_name", item_id), TRADE_HOLD_SECONDS // 3600,
+                       ("%d hour%s" % (hours, "" if hours == 1 else "s")) if hours > 0 else "a moment",
+                       TRADE_HOLD_SECONDS // 3600))
+    return None
+
 
 # How many finished trades GET /api/trade/history returns. Enough to answer
 # "what did I just do" and "did that trade yesterday go through"; a full
@@ -15169,6 +15351,14 @@ def _execute_trade(db, trade):
         return _trade_refuse(db, trade_id, *bad_request(
             "The kingdom's cut is %d and %d; one of you cannot cover it." % (a_tax, b_tax)))
 
+    # 3b. HOLDS. A fresh mythic or Perfect may have arrived since the offer
+    # was made, and the offer's own check is stale by now like the purses.
+    for party, offered in ((a_user, a_items), (b_user, b_items)):
+        waiting = trade_hold_refusal(db, party,
+                                     {entry["item_id"]: entry["quantity"] for entry in offered})
+        if waiting is not None:
+            return _trade_refuse(db, trade_id, *bad_request(waiting))
+
     # 4. TAKE. Both bags emptied of what was promised before anything is added.
     #
     # THE BAG BEFORE THE KEYS. An offer is a quantity, not a cell, so the
@@ -15270,6 +15460,14 @@ def trade_offer():
     """
     payload = request.get_json(silent=True) or {}
     user_id = g.user["id"]
+
+    # THE SWITCH, FIRST. 503 and not 403, the reading maintenance_refusal()
+    # makes: nothing is wrong with who is asking; the door is shut for now.
+    # Only a NEW trade is refused - see TRADE_KEY.
+    if not trades_enabled():
+        return {"error": "Service Unavailable",
+                "message": "Trading is switched off for now. A trade already open can still finish.",
+                "trade": False}, 503
 
     slot = parse_slot(payload.get("slot"))
     if slot is None:
@@ -15489,6 +15687,12 @@ def trade_update():
     for item_id, quantity in merged.items():
         if held.get(item_id, 0) < quantity:
             return bad_request("You only have %d x %s." % (held.get(item_id, 0), item_id))
+
+    # A FRESH MYTHIC OR PERFECT WAITS (TRADE_HOLD_SECONDS). Checked here so the
+    # window can say so at once, and again at execution with everything else.
+    waiting = trade_hold_refusal(db, user_id, merged)
+    if waiting is not None:
+        return bad_request(waiting)
 
     # THE SAME OFFER AGAIN IS NOT A CHANGE. Every write below withdraws both
     # acceptances and moves the revision, which is right for a real change and
@@ -20000,6 +20204,9 @@ def take_loot():
 
         result["credited"] = "inventory"
         result["carry_positions"] = written
+        # A MYTHIC OR A PERFECT IS HELD FROM TRADE for TRADE_HOLD_SECONDS from
+        # the moment it lands - see trade_holds in init_db().
+        place_trade_hold(db, user_id, granted_id, granted_qty)
 
     result["granted_item_id"] = granted_id
     result["granted_quantity"] = granted_qty

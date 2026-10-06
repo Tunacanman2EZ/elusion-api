@@ -710,6 +710,11 @@ This caps the *speed* of the fraud, not its existence, and it is the one that
 matters most with strangers connected. Not closed, but now **watched**:
 `killwatch.py` (above) turns an invisible claim into a flagged, bannable account,
 and alarms outright if the rate limit or spawn ceiling ever stops running.
+And now **contained**: the owner's trade switch ("Trading" in the GM panel's Testing tab, or
+`POST /api/server/trade`) stops new trades in one request, and a fresh mythic
+or Perfect find cannot be traded for 48 hours, so what a cheat mints stays in
+the account that minted it while it is looked at. Switch trading off the moment
+`killwatch.py` alarms, and decide before a public link whether it starts off.
 
 **E-2 — closed: all six skills are server-owned.** Fishing, cooking and attack
 ride their own server events; defense, agility and magic report activity to

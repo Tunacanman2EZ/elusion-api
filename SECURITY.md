@@ -255,7 +255,9 @@ No comforting lies. These are known, named and open.
   server rolls its own rewards, refuses reward-less enemies, rate-limits with a
   token bucket and caps kills at what the world's respawners can physically
   produce — that is a rate and content bound, not a proof. Closing it needs
-  server-side encounter state.
+  server-side encounter state. Until then what a cheat mints is kept from
+  spreading: the owner can switch trading off in one request, and a fresh
+  mythic or Perfect find cannot be traded for 48 hours (`test_tradegates.py`).
 - **hp, mana and stamina are clamped, not verified** (E-9). Every rise is
   reconciled against what regeneration plus authorised potions could produce and
   trimmed past a 3× margin. A bound, not a proof.

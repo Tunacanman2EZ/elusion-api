@@ -970,6 +970,35 @@ gate it on membership, and a line carries its guild in `target_id`. The one
 sentence for "no guild", reading or writing, is `GUILD_CHAT_NO_GUILD`. The
 client refused the tab locally until it was reported; see the game's CLAUDE.md.
 
+## Trade gates: the owner's switch and the 48-hour hold
+
+E3_SCOPE.md, option B, built 6 Oct. The kill is still the game's word (E-3),
+so a cheated kill mints real loot; a trade is the only road from one account
+to another, so the gates are on it. `test_tradegates.py`.
+
+- **The switch** is `TRADE_KEY` in `server_settings`, beside maintenance and
+  PvP: `POST /api/server/trade` (owner, 404 to everyone else, `{"on": bool}`),
+  announced, logged as `trade`, and on `/api/status` as `"trade"`. No row
+  reads ON (trading came first); an unreadable row reads OFF.
+- **Off refuses only `POST /api/trade/offer`**, with 503 - the door is shut,
+  nothing is wrong with the caller, the reading `maintenance_refusal()` made.
+  The owner, 6 Oct: "allow trade to finish". An open trade may still be
+  changed, accepted, executed or cancelled, and dies after
+  `TRADE_EXPIRY_SECONDS` untouched, so off is never a half-done trade. The
+  answer says how many are still open.
+- **The hold**: a mythic-tier piece or a Perfect roll (`trade_held_kind()`)
+  taken from a loot bag or bought from the shop gets a `trade_holds` row per
+  piece for `TRADE_HOLD_SECONDS` (48 h) - `place_trade_hold()`, called by
+  `/api/loot/take` and `/api/shop/buy`. Not by staff grants or trades. A held
+  piece is refused by `/api/trade/update` and again at execution
+  (`trade_hold_refusal()`, the same sentence both times, saying when).
+- **Counted per account and id, not per cell**: free = owned in every
+  character's bag and the bank, less live holds. A piece walked to an alt
+  through the bank is still held; an older copy of the same id may go. Two
+  pieces with one id are one piece.
+- **Placing a hold prunes the account's own finished ones**, never anybody
+  else's - so `test_ownership.py` needs no allowlist entry for it.
+
 ## Loot: the tier first, then the item
 
 `gamedata.roll_loot_tier()` picks which tier a filled bag slot lands on from
@@ -1330,6 +1359,8 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
   quality       dropped gear's rolled stats, carried whole by every path
   presence      the presence socket: tickets, areas, what the game may say,
                 limits, and a login ended anywhere ending the connection
+  tradegates    the owner's trade switch, and the hold on fresh mythic and
+                Perfect finds
   chat/chatrooms  the feed, the channels, moderation and picture revocation
   broadcast     the server's voice, and the poll that doubles as a heartbeat
   maintenance   the kill switch and its countdown
