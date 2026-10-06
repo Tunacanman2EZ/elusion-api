@@ -410,7 +410,11 @@ updating the maxima it implies.
   to name another account. So is `POST /api/staff/level` (day 2, so the owner
   can test level 22 gear): it sets the caller's own character, does what a
   level-up does to XP, maxima and pools, records the refill as a level-up
-  grant, and logs a `level` line; `test_ownership.py` O-7 holds it.
+  grant, and logs a `level` line; `test_ownership.py` O-7 holds it. And
+  `POST /api/staff/skill` (6 Oct, "full control of my stats ... so i can do
+  more testing"): one skill or `"all"` (`STAFF_SKILL_ORDER`, held to
+  `VALID_SKILLS`) set to a level 1-`MAX_SKILL_LEVEL` with no XP into it, on the
+  caller's own character, with a `skill` line in the log; O-8 holds it.
 - **`GET /api/chat/image/<image_id>` is served only to someone who could see
   it** (`_may_see_image`): a line the caller could read shows it, by
   `_can_read_chat_row`; or the caller uploaded those bytes

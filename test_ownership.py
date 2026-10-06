@@ -923,6 +923,90 @@ check("the powers list shows it under the owner, so it surprises nobody",
       "/api/staff/level" in owner_routes, owner_routes)
 
 
+
+# =============================================================================
+section("O-8  THE OWNER'S SKILL TOOL SETS THE OWNER'S OWN SKILLS")
+# =============================================================================
+# The owner, 6 Oct: "full control of my stats in admin panel so i can do more
+# testing". /api/staff/skill is the level tool's shape: owner only, the
+# caller's own character, a username in the payload ignored.
+def skill_rows(name, slot=0):
+    db = raw_db()
+    rows = db.execute("SELECT skill_id, level, xp FROM skills WHERE user_id = ? AND slot = ?",
+                      (uid(name), slot)).fetchall()
+    db.close()
+    return {r["skill_id"]: (int(r["level"]), int(r["xp"])) for r in rows}
+
+
+check("the tool's list of skills is the server's list of skills",
+      set(app_module.STAFF_SKILL_ORDER) == app_module.VALID_SKILLS
+      and len(app_module.STAFF_SKILL_ORDER) == len(app_module.VALID_SKILLS),
+      app_module.STAFF_SKILL_ORDER)
+
+res = client.post("/api/staff/skill", headers=alice, json={"slot": 0, "skill": "attack", "level": 50})
+check("a player is told the skill tool does not exist", res.status_code == 404, res.status_code)
+res = client.post("/api/staff/skill", headers=mod, json={"slot": 0, "skill": "attack", "level": 50})
+check("so is a mod - it is the owner's", res.status_code == 404, res.status_code)
+
+alice_before = skill_rows("alice")
+res = client.post("/api/staff/skill", headers=owner,
+                  json={"username": "alice", "slot": 0, "skill": "attack", "level": 50})
+body = res.get_json() or {}
+mine = skill_rows("boss")
+db = raw_db()
+logged = db.execute("SELECT detail FROM staff_actions WHERE action = 'skill' AND actor_id = ?"
+                    " ORDER BY id DESC LIMIT 1", (uid("boss"),)).fetchone()
+db.close()
+check("the owner sets his own attack to 50", res.status_code == 200
+      and mine.get("attack") == (50, 0), [body, mine.get("attack")])
+check("  and is told the level, no XP into it, the next step and what it was",
+      body.get("skills", {}).get("attack") == {
+          "level": 50, "xp": 0, "was": 1,
+          "xp_next": _gd.xp_needed_for_skill_level("attack", 50)}, body)
+check("  only attack - nothing else of his moved",
+      all(k == "attack" or v[0] == 1 for k, v in mine.items()), mine)
+check("  a line in the staff log", logged is not None
+      and logged["detail"] == "slot 0: attack 1 -> 50", dict(logged) if logged else None)
+check("alice, who was named in the payload, is untouched",
+      skill_rows("alice") == alice_before, skill_rows("alice"))
+
+res = client.post("/api/staff/skill", headers=owner, json={"slot": 0, "skill": "all", "level": 99})
+body = res.get_json() or {}
+mine = skill_rows("boss")
+check("\"all\" sets every skill at once",
+      res.status_code == 200 and all(mine.get(k) == (99, 0) for k in app_module.STAFF_SKILL_ORDER)
+      and set(body.get("skills", {}).keys()) == set(app_module.STAFF_SKILL_ORDER), [body, mine])
+check("  each answering with what it was", body.get("skills", {}).get("attack", {}).get("was") == 50
+      and body.get("skills", {}).get("cooking", {}).get("was") == 1, body)
+
+db = raw_db()
+db.execute("UPDATE skills SET xp = 777 WHERE user_id = ? AND slot = 0 AND skill_id = 'magic'",
+           (uid("boss"),))
+db.commit()
+db.close()
+res = client.post("/api/staff/skill", headers=owner, json={"slot": 0, "skill": "Magic", "level": 3})
+check("it sets a skill down as well, reads the name in any case, and clears the XP it had",
+      res.status_code == 200 and skill_rows("boss").get("magic") == (3, 0), skill_rows("boss"))
+
+for label, body_in in [("level 0", {"slot": 0, "skill": "attack", "level": 0}),
+                       ("level 100", {"slot": 0, "skill": "attack", "level": 100}),
+                       ("a level that is not a number", {"slot": 0, "skill": "attack", "level": "high"}),
+                       ("true as a level", {"slot": 0, "skill": "attack", "level": True}),
+                       ("no level at all", {"slot": 0, "skill": "attack"}),
+                       ("a skill that does not exist", {"slot": 0, "skill": "strength", "level": 10}),
+                       ("no skill at all", {"slot": 0, "level": 10}),
+                       ("a slot that is not one", {"slot": 9, "skill": "attack", "level": 10})]:
+    res = client.post("/api/staff/skill", headers=owner, json=body_in)
+    check("%s is refused" % label, res.status_code == 400, res.status_code)
+res = client.post("/api/staff/skill", headers=owner, json={"slot": 2, "skill": "attack", "level": 10})
+check("an empty slot is a 404", res.status_code == 404, res.status_code)
+check("  and a refusal writes nothing", "attack" not in skill_rows("boss", slot=2), skill_rows("boss", slot=2))
+
+powers = client.get("/api/staff/powers", headers=owner).get_json() or {}
+owner_routes = [r.get("path") for rank in powers.get("ladder", [])
+                if rank.get("rank") == "owner" for r in rank.get("routes", [])]
+check("the powers list shows it under the owner", "/api/staff/skill" in owner_routes, owner_routes)
+
 print("\n" + "=" * 70)
 print("  %d passed, %d failed" % (passed, failed))
 if failures:

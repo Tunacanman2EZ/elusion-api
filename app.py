@@ -10806,6 +10806,127 @@ def staff_level():
     }, 200
 
 
+# The skills the owner's skill tool sets, in the order the game lists them.
+# test_ownership.py holds it to VALID_SKILLS, so a seventh skill cannot be
+# added to the game and quietly left out of "all".
+STAFF_SKILL_ORDER = ("attack", "defense", "agility", "magic", "fishing", "cooking")
+
+
+@app.post("/api/staff/skill")
+@require_auth
+@require_owner
+def staff_skill():
+    """
+    Set your own character's skill levels, for testing (owner only)
+    ---
+    tags:
+      - Staff
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        schema:
+          type: object
+          required: [slot, skill, level]
+          properties:
+            slot:  {type: integer, example: 0}
+            skill: {type: string, example: "attack", description: "One skill, or \"all\""}
+            level: {type: integer, example: 50}
+    responses:
+      200:
+        description: Each skill set, with its new level, XP and next threshold
+      400:
+        description: Bad slot, skill or level
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: Not the owner, or no character in that slot
+    """
+    # WHY THIS EXISTS. The owner, 6 Oct: "i want full control of my stats in
+    # admin panel so i can do more testing". Skills train on hours of play -
+    # attack at the kill, the rest through /api/skill/train at a capped rate -
+    # so gear and recipes that need a skill level could not be tested without
+    # those hours. The level tool above is the precedent.
+    #
+    # OWNER ONLY, SELF ONLY, like the gold grant and the level tool: a slot, a
+    # skill and a level, applied to THE CALLER's character; a username in the
+    # payload is ignored.
+    #
+    # A SET, NOT A GRANT. The skill lands on the level asked for with no XP
+    # into it, up or down, the way the level tool sets a level. MAX_SKILL_LEVEL
+    # is the ceiling every server grant already observes. Logged as "skill", in
+    # the same transaction.
+    payload = request.get_json(silent=True) or {}
+    user_id = g.user["id"]
+
+    slot = parse_slot(payload.get("slot"))
+    if slot is None:
+        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+
+    skill = str(payload.get("skill", "")).strip().lower()
+    if skill == "all":
+        chosen = list(STAFF_SKILL_ORDER)
+    elif skill in VALID_SKILLS:
+        chosen = [skill]
+    else:
+        return bad_request("skill must be one of %s, or all"
+                           % ", ".join(STAFF_SKILL_ORDER))
+
+    raw = payload.get("level")
+    if isinstance(raw, bool):
+        return bad_request("level must be a whole number")
+    try:
+        level = int(raw)
+    except (TypeError, ValueError):
+        return bad_request("level must be a whole number")
+    if level < 1 or level > MAX_SKILL_LEVEL:
+        return bad_request("level must be 1-%d" % MAX_SKILL_LEVEL)
+
+    db = get_db()
+    if db.execute("SELECT 1 FROM saves WHERE user_id = ? AND slot = ?",
+                  (user_id, slot)).fetchone() is None:
+        return {"error": "Not Found",
+                "message": "No character in slot %d." % slot}, 404
+
+    before = {
+        row["skill_id"]: int(row["level"])
+        for row in db.execute("SELECT skill_id, level FROM skills"
+                              " WHERE user_id = ? AND slot = ?", (user_id, slot))
+    }
+    answer = {}
+    changes = []
+    for skill_id in chosen:
+        was = before.get(skill_id, 1)
+        db.execute(
+            """
+            INSERT INTO skills (user_id, slot, skill_id, level, xp)
+                 VALUES (?, ?, ?, ?, 0)
+            ON CONFLICT(user_id, slot, skill_id)
+              DO UPDATE SET level = excluded.level, xp = 0
+            """,
+            (user_id, slot, skill_id, level),
+        )
+        answer[skill_id] = {
+            "level": level,
+            "xp": 0,
+            "xp_next": int(gamedata.xp_needed_for_skill_level(skill_id, level)),
+            "was": was,
+        }
+        changes.append("%s %d -> %d" % (skill_id, was, level))
+
+    log_staff_action(
+        g.user, "skill", g.user["username"], g.user["id"],
+        "slot %d: %s" % (slot, ", ".join(changes)),
+    )
+    db.commit()
+
+    return {"slot": slot, "level": level, "skills": answer}, 200
+
+
 @app.post("/api/staff/grant")
 @require_auth
 @require_role("mod")
@@ -11231,7 +11352,7 @@ def staff_powers():
             "Exempt from the maintenance switch: never locked out or disconnected by it.",
             "The only rank the GM panel opens for: its Account, Testing and Server tabs.",
             "Testing tab: gold, any item by id or from the item catalogue, and"
-            " the level of their own character.",
+            " the level and skill levels of their own character.",
         ],
     }
 
@@ -11286,7 +11407,7 @@ STAFF_LIST_SHOWS = ("all", "online", "banned", "staff")
 # log_staff_action() call in this file and fails on a name missing from here.
 STAFF_ACTION_KINDS = (
     "ban", "unban", "kick", "warn", "note", "role",
-    "grant", "level", "teleport", "chat_delete", "mute", "unmute", "report",
+    "grant", "level", "skill", "teleport", "chat_delete", "mute", "unmute", "report",
     "guild_rename", "guild_disband",
     "maintenance", "minbuild", "pvp",
 )
@@ -11295,7 +11416,7 @@ STAFF_ACTION_KINDS = (
 #
 # "moderation" IS WHAT THE LOG AND A PLAYER'S RECORD OPEN ON: what staff did
 # about players and what players said. Left out are the server switches
-# (maintenance, minbuild, pvp) and the testing tools (grant, level, teleport) - the
+# (maintenance, minbuild, pvp) and the testing tools (grant, level, skill, teleport) - the
 # owner granting himself twelve swords while testing a shop is not something
 # a mod looking for "has anybody warned this player" should scroll past.
 # "Everything" is still one choice away; nothing is hidden from anybody who
