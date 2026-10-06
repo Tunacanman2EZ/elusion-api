@@ -29,29 +29,58 @@ a password change, a login from another computer - all of them delete sessions,
 so all of them reach here within seconds without app.py having to know this
 file exists.
 
-WHAT IT RELAYS, AND WHAT IT DOES NOT. Position, the body's animation (walking,
-idle, attacking, facing), the tank's aura and the pet a player has out. Not
-damage, not enemies: each game still fights its own enemies, so a player swinging
-at something you cannot see is swinging at their own monster. This is presence,
-not combat (see E3_SCOPE.md and "Decided, not built: PvP and the world boss").
+WHAT IT RELAYS. Position, the body's animation (walking, idle, attacking,
+facing), the tank's aura and the pet a player has out - and, since 0.7.0, the
+MONSTERS, so everyone in an area fights the same ones.
+
+SHARED MONSTERS: ONE GAME RUNS THEM, AND THIS ONLY PASSES THE NOTES. The server
+does not simulate a monster; it has no map, no collision and no AI, and growing
+those here is E3_SCOPE.md's option C, "a season". Instead each area has a
+LEADER - the game that has been in it longest - whose game runs the area's
+monsters exactly as a lone player's always has, and says what they are doing
+("w", world). Everyone else in the area draws those monsters where the leader
+says and sends their hits to the leader ("h"); the leader's game applies them.
+When a monster dies, every game that hit it reports its own kill to the API, so
+each helper gets their own XP and their own loot bag (the owner's words: "shared
+monsters separate loot bags"). The leader leaving hands the area to the next
+game in line, which takes the monsters over where they stand.
+
+This file decides only WHO LEADS and WHO HEARS WHAT: a world message from
+anybody but the area's leader is dropped, hits go to the leader and nowhere
+else, and a game joining the area makes the leader send it everything ("need").
+What a world message says is the games' business - see monstersync.gd.
+
+ONLY GAMES THAT SAY THEY CAN. A game that speaks the shared-monster wire says so
+in its hello ("v": 2). One that does not (a build from before 0.7.0) is never
+made leader and never sent monsters: it fights its own, as before, while still
+seeing everybody walk about.
 
 THE WIRE (JSON text frames):
 
   game -> here
-    {"t": "hello", "ticket": "..."}                      first, within HELLO_SECONDS
+    {"t": "hello", "ticket": "...", "v": 2}              first, within HELLO_SECONDS; "v" 2
+                                                         = speaks shared monsters
     {"t": "s", "a": "field", "x": 1471.0, "y": 1090.5,
      "m": "walkdown", "fx": ["ring"], "pet": "petsniper"}   where I am, when it changes
     {"t": "renew", "ticket": "..."}                      a fresh ticket, every minute
     {"t": "sync"}                                        tell me again who is here (the
                                                          game rebuilt its world: same area,
                                                          new scene, every body gone)
+    {"t": "w", "d": {...}, "to": 12}                     LEADER ONLY: the area's monsters, to
+                                                         everyone in it, or one game ("to")
+    {"t": "h", "p": [[monster, damage, element], ...]}   a follower's hits, for the leader
 
   here -> game
-    {"t": "welcome", "id": 12}                           you are in
+    {"t": "welcome", "id": 12, "v": 2}                   you are in; this server shares monsters
     {"t": "join", "p": [{id, name, cls, lvl, role, hue, guild, x, y, m, fx, pet}]}
                                                          people now in your area
     {"t": "moves", "p": [[id, x, y, m, fx, pet], ...]}   who moved this tick (yourself included; skip it)
     {"t": "leave", "ids": [12, 40]}                      gone from your area
+    {"t": "lead", "a": "field", "id": 12, "n": 2}        who runs this area's monsters, and how
+                                                         many others share them (-1: nobody)
+    {"t": "need", "id": 40}                              (to the leader) send 40 everything
+    {"t": "w", "d": {...}}                               the leader's monsters, passed on as sent
+    {"t": "h", "from": 40, "p": [[m, dmg, el], ...]}     (to the leader) 40's hits
     {"t": "bye", "why": "..."}                           and then the socket closes
 
 test_presence.py holds every rule here.
@@ -85,13 +114,32 @@ TICK_SECONDS = 0.1
 SWEEP_SECONDS = 5.0
 # A socket that has not said hello by then is not a game.
 HELLO_SECONDS = 5.0
-# One state message is under 200 bytes; nothing a game sends is near this.
+# One state message is under 200 bytes; nothing a game sends is near this -
+# except a leader's world message, which may describe every monster in Big
+# Field (128 of them) to a game that just walked in.
 MAX_MESSAGE_BYTES = 2048
+MAX_WORLD_BYTES = 65536
+# What the socket itself accepts: the larger of the two. Anything over
+# MAX_MESSAGE_BYTES that is not a world message is closed with 1009 by hand.
+MAX_SOCKET_BYTES = MAX_WORLD_BYTES
 # Messages a connection may send: a bucket of BURST, refilled RATE a second.
-# The game sends ten a second while moving; double that is a bug or a script.
-RATE_PER_SECOND = 20.0
-BURST = 40.0
+# A game sends ten states a second while moving, and a leader ten world
+# messages or a follower ten batches of hits beside them; half again on top of
+# that is a bug or a script.
+RATE_PER_SECOND = 30.0
+BURST = 60.0
 MAX_CONNECTIONS = 1000
+
+# The shared-monster wire. A game says which it speaks in its hello.
+SHARED_VERSION = 2
+# A follower's hits arrive batched, about ten batches a second. A tank's aura
+# touching every monster around it four times a second is the most a game
+# sends; this is several times that.
+MAX_HITS_PER_MESSAGE = 64
+# No single hit in the game comes near this; a number over it is not a hit.
+MAX_HIT = 100000
+MAX_MONSTER_ID = 2 ** 31 - 1
+MAX_ELEMENT = 64
 
 # What a body may claim to be doing: the player scenes' own animation names.
 ANIM_PATTERN = re.compile(r"^(idle|walk|attack|death|hitflash)(up|down|left|right)$")
@@ -177,6 +225,14 @@ class Player:
         self.dropped = False
         self.tokens = BURST
         self.stamp = time.monotonic()
+        # The shared-monster wire this game speaks (0: none), and when it
+        # walked into its current area - the leader is the earliest.
+        self.version = 0
+        self.joined_at = 0.0
+
+    @property
+    def shares(self):
+        return self.version >= SHARED_VERSION
 
     def allow(self):
         """Token bucket: False once the game sends faster than it ever would."""
@@ -200,6 +256,9 @@ class Player:
             "hue": ident.get("hue"),
             "guild": str(ident.get("guild", "")),
             "x": self.x, "y": self.y, "m": self.anim, "fx": list(self.fx), "pet": self.pet,
+            # Whether this game shares monsters: one that does not cannot be
+            # hit by them, so a leader's monsters do not chase it.
+            "v": self.version,
         }
 
     def move(self):
@@ -239,10 +298,33 @@ def clean_state(msg, allowed_pets):
     return out
 
 
+def clean_hits(msg):
+    """A follower's hits, checked: [[monster id, damage, element], ...], or
+    None when it is not that. Whole numbers only, each in range - a hit is
+    passed to another player's game, and that game should never have to ask
+    whether "damage" is a number."""
+    batch = msg.get("p")
+    if not isinstance(batch, list) or not batch or len(batch) > MAX_HITS_PER_MESSAGE:
+        return None
+    out = []
+    for hit in batch:
+        if not isinstance(hit, list) or len(hit) != 3:
+            return None
+        if any(isinstance(v, bool) or not isinstance(v, int) for v in hit):
+            return None
+        monster, damage, element = hit
+        if not (0 <= monster <= MAX_MONSTER_ID and 1 <= damage <= MAX_HIT
+                and 0 <= element <= MAX_ELEMENT):
+            return None
+        out.append([monster, damage, element])
+    return out
+
+
 class PresenceServer:
     def __init__(self, sweep_seconds=None, tick_seconds=None):
         self.players = {}     # user_id -> Player
         self.rooms = {}       # area -> set of Player
+        self.leaders = {}     # area -> Player running its monsters
         self.sweep_seconds = SWEEP_SECONDS if sweep_seconds is None else sweep_seconds
         self.tick_seconds = TICK_SECONDS if tick_seconds is None else tick_seconds
         self._tasks = []
@@ -266,22 +348,100 @@ class PresenceServer:
     def _leave_room(self, player):
         if not player.area:
             return
-        room = self.rooms.get(player.area)
+        area = player.area
+        room = self.rooms.get(area)
         if room is not None:
             room.discard(player)
             if not room:
-                del self.rooms[player.area]
-        self._room_broadcast(player.area, {"t": "leave", "ids": [player.user_id]})
+                del self.rooms[area]
+        self._room_broadcast(area, {"t": "leave", "ids": [player.user_id]})
         player.area = ""
+        if self.leaders.get(area) is player:
+            # THE NEXT IN LINE TAKES THE MONSTERS OVER, where they stand: its
+            # game has been drawing them all along, so it already knows where
+            # every one is and how hurt. The earliest arrival, so the order is
+            # one anybody could predict.
+            del self.leaders[area]
+            heirs = [p for p in self.rooms.get(area, ()) if p.shares]
+            if heirs:
+                self.leaders[area] = min(heirs, key=lambda p: (p.joined_at, p.user_id))
+        if player.shares:
+            self._announce_lead(area)
 
     async def _enter_room(self, player, area):
         room = self.rooms.setdefault(area, set())
         others = [p.entry() for p in room if p is not player]
         room.add(player)
         player.area = area
+        player.joined_at = time.monotonic()
         if others:
             await self._send(player, {"t": "join", "p": others})
         self._room_broadcast(area, {"t": "join", "p": [player.entry()]}, skip=player)
+        if not player.shares:
+            return
+        leader = self.leaders.get(area)
+        if leader is None or leader.area != area:
+            self.leaders[area] = player
+        self._announce_lead(area)
+        self._ask_for_world(area, player)
+
+    # ---- shared monsters ------------------------------------------------------
+
+    def _announce_lead(self, area):
+        """Everyone in the area who shares monsters hears who runs them now,
+        and how many others share them (the leader sends nothing to nobody)."""
+        if not area:
+            return
+        sharers = [p for p in self.rooms.get(area, ()) if p.shares]
+        if not sharers:
+            return
+        leader = self.leaders.get(area)
+        message = {"t": "lead", "a": area, "id": leader.user_id if leader is not None else -1,
+                   "n": len(sharers) - 1 if leader is not None else 0}
+        broadcast([p.ws for p in sharers], json.dumps(message, separators=(",", ":")))
+
+    def _ask_for_world(self, area, player):
+        """The leader sends `player` everything: the monsters as they stand."""
+        leader = self.leaders.get(area)
+        if leader is None or leader is player or not player.shares:
+            return
+        broadcast([leader.ws], json.dumps({"t": "need", "id": player.user_id}, separators=(",", ":")))
+
+    def relay_world(self, player, raw, msg):
+        """A world message from the area's leader, passed on exactly as sent -
+        to one game ("to") or to everyone else in the area who shares monsters.
+        From anyone else, nothing: a game that was leader a moment ago and has
+        not heard yet does not get to move monsters on screens it no longer
+        runs."""
+        area = player.area
+        if not area or self.leaders.get(area) is not player:
+            return False
+        if not isinstance(msg.get("d"), dict):
+            return False
+        to = msg.get("to")
+        room = self.rooms.get(area, ())
+        if to is not None:
+            if isinstance(to, bool) or not isinstance(to, int):
+                return False
+            targets = [p.ws for p in room if p.user_id == to and p.shares and p is not player]
+        else:
+            targets = [p.ws for p in room if p.shares and p is not player]
+        if targets:
+            broadcast(targets, raw)
+        return True
+
+    def relay_hits(self, player, msg):
+        """A follower's hits, to the game running the monsters and no other."""
+        area = player.area
+        leader = self.leaders.get(area) if area else None
+        if leader is None or leader is player or not player.shares:
+            return False
+        hits = clean_hits(msg)
+        if hits is None:
+            return False
+        broadcast([leader.ws], json.dumps({"t": "h", "from": player.user_id, "p": hits},
+                                          separators=(",", ":")))
+        return True
 
     async def apply_state(self, player, msg):
         state = clean_state(msg, player.identity.get("pets") or [])
@@ -377,8 +537,11 @@ class PresenceServer:
         if old is not None:
             await self.drop(old, "replaced")
         player = Player(ws, user_id, _hash(msg.get("ticket")), identity, expires)
+        version = msg.get("v", 0)
+        player.version = version if isinstance(version, int) and not isinstance(version, bool) \
+            and 0 <= version <= 1000 else 0
         self.players[user_id] = player
-        await self._send(player, {"t": "welcome", "id": user_id})
+        await self._send(player, {"t": "welcome", "id": user_id, "v": SHARED_VERSION})
 
         try:
             async for raw in ws:
@@ -394,6 +557,12 @@ class PresenceServer:
                 if not isinstance(message, dict):
                     continue
                 kind = message.get("t")
+                # ONLY A WORLD MESSAGE MAY BE BIG. The socket takes up to
+                # MAX_SOCKET_BYTES so a leader can describe Big Field to a game
+                # that walked in; anything else that size is not a game.
+                if kind != "w" and len(raw) > MAX_MESSAGE_BYTES:
+                    await self.drop(player, "too big", 1009)
+                    continue
                 if kind == "s":
                     await self.apply_state(player, message)
                 elif kind == "renew":
@@ -401,6 +570,15 @@ class PresenceServer:
                 elif kind == "sync" and player.area:
                     others = [p.entry() for p in self.rooms.get(player.area, ()) if p is not player]
                     await self._send(player, {"t": "join", "p": others})
+                    # The game rebuilt its world: tell it again who leads, and
+                    # have the leader send it the monsters again.
+                    if player.shares:
+                        self._announce_lead(player.area)
+                        self._ask_for_world(player.area, player)
+                elif kind == "w":
+                    self.relay_world(player, raw, message)
+                elif kind == "h":
+                    self.relay_hits(player, message)
         except ConnectionClosed:
             pass
         finally:
@@ -449,7 +627,7 @@ class PresenceServer:
 async def main():
     server = PresenceServer()
     server.start_clocks()
-    async with serve(server.handler, HOST, PORT, max_size=MAX_MESSAGE_BYTES,
+    async with serve(server.handler, HOST, PORT, max_size=MAX_SOCKET_BYTES,
                      ping_interval=20, ping_timeout=20) as ws_server:
         print("[PRESENCE] listening on ws://%s:%d%s (database %s)" % (HOST, PORT, PATH, DB_PATH), flush=True)
         await ws_server.serve_forever()

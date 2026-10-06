@@ -186,6 +186,7 @@ for open_item, why in [
     ("E-3", "the kill event is asserted, not proven"),
     ("new computer", "defeats ban evasion"),
     ("patched client", "can ignore a 401 and keep drawing the world"),
+    ("area's leader", "a modified game leading an area runs everyone's monsters"),
 ]:
     check("the limits still name %s (%s)" % (open_item, why),
           open_item in doc,

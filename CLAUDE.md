@@ -1196,12 +1196,60 @@ every rule.
   `/ws/presence`, `wss://` for an https page - one address for the page, the
   API and the socket, which the browser build needs; run locally, the
   presence port on the host the game used.
-- **Limits**: one connection per account (a second replaces the first), 20
-  messages a second with a burst of 40, 2 KB a message, 1000 connections,
-  hello within 5 seconds. Moves are relayed ten times a second per area.
-- **Presence, not combat.** No damage, no enemies: each game still fights its
-  own monsters, so a player swinging at something you cannot see is swinging
-  at theirs. PvP and shared enemies stay in "Decided, not built".
+- **Limits**: one connection per account (a second replaces the first), 30
+  messages a second with a burst of 60, 2 KB a message (64 KB for a leader's
+  world message; anything else that big is closed with 1009, "too big"), 1000
+  connections, hello within 5 seconds. Moves are relayed ten times a second
+  per area.
+- **And, since 0.7.0, the monsters** - next section. PvP stays in "Decided,
+  not built".
+
+## Shared monsters: one game runs them, presence.py passes the notes
+
+The owner, 6 Oct: "shared monsters separate loot bags". Everyone in an area
+fights the same monsters. The server does not simulate them - it has no map,
+no collision and no AI, and growing those here is E3_SCOPE.md's option C, "a
+season". Instead one GAME runs each area's monsters and presence.py decides
+only who that is and who hears what. The game side is the game repo's
+`src/world/monstersync.gd` and CLAUDE.md, "Shared monsters".
+
+- **Only games that say so share.** A hello with `"v": 2` (`SHARED_VERSION`);
+  the welcome says the server shares too. A game without it (a build from
+  before 0.7.0) is never made leader, never sent monsters, and carries `"v": 0`
+  in its join entry so a leader's monsters do not chase it - it fights its own,
+  as before.
+- **The leader** of an area is the sharing game that walked in earliest
+  (`Player.joined_at`). `self.leaders[area]`. Everyone sharing the area hears
+  `{"t": "lead", "a", "id", "n"}` when it changes or when someone comes or goes
+  (`n` = how many others share, so a leader alone sends nothing). When the
+  leader leaves - another area, a closed socket, a drop - the next in line is
+  named at once.
+- **`w`, world, is the leader's alone.** `relay_world()` passes it on exactly as
+  sent (the raw text, never re-encoded), to everyone else sharing the area or
+  to one game (`"to"`); from anybody else it is dropped, so a game that was
+  leader a moment ago cannot move monsters on screens it no longer runs. What
+  it says is the games' business.
+- **`h`, hits, go to the leader and nowhere else**, with who sent them, after
+  `clean_hits()`: `[[monster, damage, element]]`, whole numbers (not bools),
+  damage 1-`MAX_HIT`, at most `MAX_HITS_PER_MESSAGE`.
+- **`need`.** A sharing game entering an area, or saying `sync` (its world was
+  rebuilt), makes the server ask the leader to send it everything.
+- **Kills are unchanged.** Each game whose player hit a monster reports the
+  kill through `/api/combat/kill` itself, and is paid from the server's own
+  roll - which is what "separate loot bags" means. The E-3 ceilings are per
+  account, so two players sharing a kill each stay inside their own.
+- **The honest limit.** The leader is trusted with the monsters the way every
+  game is already trusted with its own kills (E-3): a cheating leader can move,
+  heal or kill the monsters on everyone's screen, or set the game's own
+  monsters on somebody, and nothing more than a cheating game could always do
+  to its own. It cannot touch anyone's health, bag or gold - those stay on each
+  game and on this server - and each follower builds every attack from its own
+  copy of the monster and caps the few numbers a `w` carries
+  (`monstersync.gd`, `safe_spike()` and `safe_pillar_damage()`), so it cannot
+  make one hit harder either. This server never reads a `w`, so none of that
+  is checked here.
+
+`test_presence.py` P-7.
 
 ## Gear bonuses: a character's maximum includes what it wears
 
@@ -1360,7 +1408,8 @@ envfile.py      reads a .env beside the code; first thing app.py and wsgi.py do
 wsgi.py         what gunicorn serves: a preflight of the settings, then app
 gamedata.py     loot rolls, XP curve, stat curves - the game's rules
 gamedata.json   exported from the Godot project, NOT hand-edited
-presence.py     the presence socket, a second process: who stands where
+presence.py     the presence socket, a second process: who stands where,
+                and whose game runs each area's monsters
 test_*.py       discovered and run by run_tests.ps1, which prints how many.
                 No counts here on purpose - see above. What each one is FOR:
   api           the broad one; read its header before adding to it
@@ -1389,7 +1438,8 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
   equipment     what a worn item is worth, and what the tooltip says
   quality       dropped gear's rolled stats, carried whole by every path
   presence      the presence socket: tickets, areas, what the game may say,
-                limits, and a login ended anywhere ending the connection
+                limits, a login ended anywhere ending the connection, and
+                who leads each area's monsters (P-7)
   tradegates    the owner's trade switch, and the hold on fresh mythic and
                 Perfect finds
   chat/chatrooms  the feed, the channels, moderation and picture revocation

@@ -301,6 +301,15 @@ No comforting lies. These are known, named and open.
   ticket tied to their login - and nothing over the socket deals damage or
   moves an item. Messages are size- and rate-limited, and an ended login ends
   the connection within seconds.
+- **The monsters in a shared area are whatever the area's leader says.** Since
+  0.7.0 one game - the area's leader, the sharing game that walked in first -
+  runs the monsters for everyone there, and `presence.py` passes its messages
+  on without reading them. A modified game that becomes leader can move, heal
+  or kill those monsters on everybody's screen, or set the game's own monsters
+  on somebody. It cannot reach anyone's health, bag, gold or kills: every game
+  still builds each attack from its own copy of the monster, caps the few
+  numbers the leader sends, and reports its own kills under the same E-3
+  ceilings as before.
 
 Anything not on this list that later turns out to be true belongs on it.
 

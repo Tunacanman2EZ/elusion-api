@@ -142,6 +142,13 @@ per-player authoritative encounter state: this player, these enemies, this hp.
 That is a materially smaller thing than an MMO combat server, and it is worth
 knowing before pricing it.
 
+**Since then (0.7.0, 6 October):** players do see each other (`presence.py`),
+and each area's monsters are run by one game for everyone in it - the area's
+leader. So C would now mean one server-owned simulation per area, not per
+player, which is more than the paragraph above prices. The shape is already
+built, though: the game's `monstersync.gd` sends snapshots and events out and
+takes hits in, and C is the server taking the leader's seat.
+
 **What it still needs, in order:**
 
 1. **Server-owned player position.** `saves` holds no coordinates at all — not

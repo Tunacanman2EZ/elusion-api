@@ -140,12 +140,24 @@ def byes(messages):
     return [m.get("why") for m in messages if m.get("t") == "bye"]
 
 
-async def enter(port, headers, area=None, **kw):
+def of(messages, kind):
+    return [m for m in messages if m.get("t") == kind]
+
+
+def last_lead(messages):
+    leads = of(messages, "lead")
+    return leads[-1] if leads else None
+
+
+async def enter(port, headers, area=None, v=None, **kw):
     """A connected game: hello with a fresh ticket, welcome read, optionally
-    standing somewhere."""
+    standing somewhere. v=2 is a game that shares monsters."""
     raw, _ = ticket(headers)
-    ws = await connect("ws://127.0.0.1:%d/ws/presence" % port)
-    await ws.send(json.dumps({"t": "hello", "ticket": raw}))
+    ws = await connect("ws://127.0.0.1:%d/ws/presence" % port, max_size=presence.MAX_SOCKET_BYTES)
+    hello = {"t": "hello", "ticket": raw}
+    if v is not None:
+        hello["v"] = v
+    await ws.send(json.dumps(hello))
     welcome = json.loads(await asyncio.wait_for(ws.recv(), 2))
     if area:
         await ws.send(state(area, **kw))
@@ -195,7 +207,8 @@ async def run(port, server):
     check("so is a game that starts talking before hello", got and got[-1]["t"] == "_closed", got)
 
     a, welcome = await enter(port, ALICE)
-    check("a real ticket is welcomed, by account id", welcome == {"t": "welcome", "id": uid("presa")}, welcome)
+    check("a real ticket is welcomed, by account id",
+          welcome == {"t": "welcome", "id": uid("presa"), "v": presence.SHARED_VERSION}, welcome)
     await a.close()
 
     # =========================================================================
@@ -371,6 +384,133 @@ async def run(port, server):
     await collect(b)
     check("somebody else's ticket is not a renewal", server.players[uid("presb")].identity["name"] == "presb")
 
+
+    # =========================================================================
+    section("P-7 SHARED MONSTERS: ONE GAME RUNS THEM, THE SERVER PASSES THE NOTES")
+    # =========================================================================
+    # 0.7.0. Everyone in an area fights the same monsters: the game that has
+    # been there longest (the leader) runs them and says what they do; the
+    # others draw them and send their hits to the leader. This file only
+    # decides who leads and who hears what.
+    DAVE = account("presd", "healer")
+    ERIN = account("prese", "mage")
+    FRAN = account("presf")
+    GUS = account("presg")
+
+    d, welcome = await enter(port, DAVE, v=2)
+    check("the server says it shares monsters", welcome.get("v") == presence.SHARED_VERSION, welcome)
+    await d.send(state("crypt", x=10.0, y=10.0))
+    got_d = await collect(d)
+    lead = last_lead(got_d)
+    check("the first game into an area leads it, alone",
+          lead == {"t": "lead", "a": "crypt", "id": uid("presd"), "n": 0}, got_d)
+
+    e, _ = await enter(port, ERIN, "crypt", v=2)
+    got_d = await collect(d)
+    got_e = await collect(e)
+    check("the second one in is told who leads", last_lead(got_e) == {
+        "t": "lead", "a": "crypt", "id": uid("presd"), "n": 1}, got_e)
+    check("  and so is the leader, with one game sharing",
+          (last_lead(got_d) or {}).get("n") == 1, got_d)
+    check("  and the leader is asked to send it everything",
+          of(got_d, "need") == [{"t": "need", "id": uid("prese")}], got_d)
+    check("  but the newcomer is not asked to send anything", not of(got_e, "need"), got_e)
+
+    world = {"t": "w", "d": {"snap": [[1, 50.0, 60.0, "walkleft", 90]], "ev": []}}
+    await d.send(json.dumps(world))
+    got_e = await collect(e)
+    check("the leader's world reaches the other game exactly as sent", of(got_e, "w") == [world], got_e)
+    check("  and not back to the leader", not of(await collect(d), "w"))
+
+    await e.send(json.dumps({"t": "w", "d": {"snap": [[1, 0.0, 0.0, "idledown", 1]]}}))
+    check("a world message from a game that is not the leader goes nowhere",
+          not of(await collect(d), "w"))
+
+    f, _ = await enter(port, FRAN, "crypt", v=2)
+    await collect(d)
+    await collect(e)
+    await collect(f)
+    await d.send(json.dumps({"t": "w", "to": uid("presf"), "d": {"full": True}}))
+    check("a world message for one game reaches that game", of(await collect(f), "w"), None)
+    check("  and only that game", not of(await collect(e), "w"))
+    await d.send(json.dumps({"t": "w", "to": uid("presa"), "d": {"full": True}}))
+    check("  one for a game in another area reaches nobody",
+          not of(await collect(e), "w") and not of(await collect(f), "w"))
+    await d.send(json.dumps({"t": "w", "d": ["not", "a", "dict"]}))
+    check("a world message that is not an object is not passed on", not of(await collect(e), "w"))
+
+    await e.send(json.dumps({"t": "h", "p": [[1, 30, 0], [4, 12, 3]]}))
+    got_d = await collect(d)
+    check("a follower's hits reach the leader, with who sent them",
+          of(got_d, "h") == [{"t": "h", "from": uid("prese"), "p": [[1, 30, 0], [4, 12, 3]]}], got_d)
+    check("  and nobody else", not of(await collect(f), "h"))
+    await d.send(json.dumps({"t": "h", "p": [[1, 30, 0]]}))
+    check("the leader's own 'hits' go nowhere - its game applies them itself",
+          not of(await collect(e), "h") and not of(await collect(f), "h"))
+    for bad in ([[1, "30", 0]], [[1, 30]], [[-1, 30, 0]], [[1, 0, 0]], [[1, presence.MAX_HIT + 1, 0]],
+                [[1, True, 0]], [[1, 30, 0]] * (presence.MAX_HITS_PER_MESSAGE + 1), [], "hits",
+                [[1, 30.5, 0]]):
+        await e.send(json.dumps({"t": "h", "p": bad}))
+    check("hits that are not whole numbers in range are not passed on",
+          not of(await collect(d), "h"))
+
+    g, _ = await enter(port, GUS, "crypt")
+    got_g = await collect(g)
+    got_d = await collect(d)
+    check("a game from before shared monsters is never told who leads",
+          not of(got_g, "lead") and not of(got_g, "need"), got_g)
+    check("  nor is the leader asked to send it anything", not of(got_d, "need"), got_d)
+    check("  and everyone can see it does not share them",
+          joined(got_d).get(uid("presg"), {}).get("v") == 0, got_d)
+    await d.send(json.dumps(world))
+    check("  so it hears no monsters", not of(await collect(g), "w"))
+    await g.close()
+    await collect(d)
+    await collect(e)
+    await collect(f)
+
+    await f.send(json.dumps({"t": "sync"}))
+    got_d = await collect(d)
+    got_f = await collect(f)
+    check("a game that rebuilt its world is told again who leads",
+          (last_lead(got_f) or {}).get("id") == uid("presd"), got_f)
+    check("  and the leader is asked to send it everything again",
+          of(got_d, "need") == [{"t": "need", "id": uid("presf")}], got_d)
+
+    await d.close()
+    got_e = await collect(e)
+    got_f = await collect(f)
+    check("when the leader goes, the game that came in next takes over",
+          last_lead(got_e) == {"t": "lead", "a": "crypt", "id": uid("prese"), "n": 1}, got_e)
+    check("  and everyone left is told", (last_lead(got_f) or {}).get("id") == uid("prese"), got_f)
+    check("  and the server agrees", server.leaders.get("crypt") is server.players.get(uid("prese")))
+    await e.send(json.dumps(world))
+    check("the new leader's world reaches the others", of(await collect(f), "w") == [world])
+
+    await e.send(state("dungeon", x=1.0, y=1.0))
+    got_e = await collect(e)
+    got_f = await collect(f)
+    check("a leader walking into another area hands this one on",
+          (last_lead(got_f) or {}).get("id") == uid("presf"), got_f)
+    check("  and leads the empty one it walked into",
+          (last_lead(got_e) or {}) == {"t": "lead", "a": "dungeon", "id": uid("prese"), "n": 0}, got_e)
+    await e.send(json.dumps(world))
+    check("  whose monsters nobody in the old area hears", not of(await collect(f), "w"))
+
+    big = {"t": "w", "d": {"spawn": [{"id": n, "s": "res://scene/enemy/" + "x" * 60 + ".tscn"}
+                                     for n in range(120)]}}
+    await f.send(json.dumps(big))
+    got_f = await collect(f, 0.3)
+    check("a leader's world message far bigger than a state is not refused",
+          not byes(got_f) and not of(got_f, "_closed"), got_f[-2:])
+    await f.send(json.dumps({"t": "h", "p": [[1, 1, 0]], "pad": "x" * 4000}))
+    got_f = await collect(f, 0.5)
+    check("  but anything else that big still closes the socket",
+          got_f and got_f[-1]["t"] == "_closed" and f.close_code == 1009, (got_f[-2:], f.close_code))
+    await e.close()
+    await asyncio.sleep(0.1)
+    check("an empty area has no leader", not server.leaders, server.leaders)
+
     # =========================================================================
     section("P-6 LEAVING")
     # =========================================================================
@@ -388,7 +528,7 @@ async def main():
     presence.HELLO_SECONDS = 0.5
     server = presence.PresenceServer(sweep_seconds=0.3, tick_seconds=0.05)
     server.start_clocks()
-    async with serve(server.handler, "127.0.0.1", 0, max_size=presence.MAX_MESSAGE_BYTES) as ws_server:
+    async with serve(server.handler, "127.0.0.1", 0, max_size=presence.MAX_SOCKET_BYTES) as ws_server:
         port = list(ws_server.sockets)[0].getsockname()[1]
         try:
             await run(port, server)
