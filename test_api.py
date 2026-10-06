@@ -2185,15 +2185,28 @@ status("and its heartbeat is refused - this 401 is how the game notices",
 
 section("STAFF GRANTS")
 
-# The grant needs a character to put things in. Give the mod one.
+# OWNER ONLY SINCE 6 OCT 2026. It was mod and up, and a mod could give
+# themselves a Perfect mythic and trade it on. Every rank below the owner is
+# refused with the same 404 a player gets, so a refusal does not confirm the
+# route exists.
 status("a mod makes a character", client.put("/api/save", headers=MOD_H,
        json={"slot": 0, "class_id": "warrior", "name": "Modling"}), 200)
+status("a dev makes one too", client.put("/api/save", headers=DEV_H,
+       json={"slot": 0, "class_id": "mage", "name": "Devling"}), 200)
 
 status("a player cannot grant themselves anything",
        client.post("/api/staff/grant", headers=PLAYER_H,
                    json={"slot": 0, "item_id": "ironsword", "quantity": 1}), 404)
+status("NOR CAN A MOD, any more",
+       client.post("/api/staff/grant", headers=MOD_H,
+                   json={"slot": 0, "item_id": "ironsword", "quantity": 1}), 404)
+status("nor a dev",
+       client.post("/api/staff/grant", headers=DEV_H,
+                   json={"slot": 0, "item_id": "petsniper", "quantity": 1}), 404)
+_mod_bag = client.get("/api/character?slot=0", headers=MOD_H).get_json()["inventory"]
+check("and the mod's bag got nothing", not any(_mod_bag), _mod_bag)
 
-body = status("a mod can", client.post("/api/staff/grant", headers=MOD_H,
+body = status("the owner can", client.post("/api/staff/grant", headers=OWNER_H,
               json={"slot": 0, "item_id": "ironsword", "quantity": 1}), 200)
 check("the item landed in the backpack",
       any(cell and cell["item_id"] == "ironsword" for cell in body["inventory"]),
@@ -2203,7 +2216,7 @@ check("and the response says what was granted",
 
 # A PET, which is the whole point. Pets are the rarest loot in the game and the
 # thing a player is supposed to earn.
-body = status("a mod can grant a pet", client.post("/api/staff/grant", headers=MOD_H,
+body = status("the owner can grant a pet", client.post("/api/staff/grant", headers=OWNER_H,
               json={"slot": 0, "item_id": "petsniper", "quantity": 1}), 200)
 check("the pet is in the bag",
       any(cell and cell["item_id"] == "petsniper" for cell in body["inventory"]),
@@ -2213,37 +2226,45 @@ status("a player cannot grant themselves a pet either",
        client.post("/api/staff/grant", headers=PLAYER_H,
                    json={"slot": 0, "item_id": "petsniper", "quantity": 1}), 404)
 
-# THE SAME CEILING AS AN ORDINARY WRITE. Staff is not a reason to be allowed to
-# create a corrupt row - a cell holding a billion potions is a bug wearing a
-# privilege.
-status("not past the stack ceiling", client.post("/api/staff/grant", headers=MOD_H,
+# THE SAME CEILING AS AN ORDINARY WRITE. Being the owner is not a reason to be
+# allowed to create a corrupt row - a cell holding a billion potions is a bug
+# wearing a privilege.
+status("not past the stack ceiling", client.post("/api/staff/grant", headers=OWNER_H,
        json={"slot": 0, "item_id": "tinyhealthpotion", "quantity": 10 ** 9}), 400)
-status("nor a negative quantity", client.post("/api/staff/grant", headers=MOD_H,
+status("nor a negative quantity", client.post("/api/staff/grant", headers=OWNER_H,
        json={"slot": 0, "item_id": "ironsword", "quantity": -1}), 400)
-status("nor zero", client.post("/api/staff/grant", headers=MOD_H,
+status("nor zero", client.post("/api/staff/grant", headers=OWNER_H,
        json={"slot": 0, "item_id": "ironsword", "quantity": 0}), 400)
-status("nor a boolean dressed as a number", client.post("/api/staff/grant", headers=MOD_H,
+status("nor a boolean dressed as a number", client.post("/api/staff/grant", headers=OWNER_H,
        json={"slot": 0, "item_id": "ironsword", "quantity": True}), 400)
-status("nor an empty item id", client.post("/api/staff/grant", headers=MOD_H,
+status("nor an empty item id", client.post("/api/staff/grant", headers=OWNER_H,
        json={"slot": 0, "item_id": "", "quantity": 1}), 400)
-status("nor into a slot with no character", client.post("/api/staff/grant", headers=MOD_H,
-       json={"slot": 3, "item_id": "ironsword", "quantity": 1}), 404)
+# A slot THIS owner has no character in, found rather than assumed: earlier
+# sections gave checker characters in several slots.
+_c = _owner_sq.connect(DB_PATH)
+_taken = {r[0] for r in _c.execute(
+    "SELECT slot FROM saves WHERE user_id = (SELECT id FROM users WHERE username = 'checker')")}
+_c.close()
+_empty_slot = next(n for n in range(app_module.MAX_SLOT + 1) if n not in _taken)
+status("nor into a slot with no character", client.post("/api/staff/grant", headers=OWNER_H,
+       json={"slot": _empty_slot, "item_id": "ironsword", "quantity": 1}), 404)
 
 # EVERY GRANT IS IN THE AUDIT LOG, in the same transaction as the grant itself.
 # An item that appears with no line about it is the thing this endpoint exists
-# to prevent.
+# to prevent. The refused mod and dev left none.
 _grants = _owner_sq.connect(DB_PATH).execute(
     "SELECT actor_name, target_name, detail FROM staff_actions WHERE action = 'grant'"
 ).fetchall()
-check("both grants were logged", len(_grants) == 2, _grants)
+check("both grants were logged, and nothing for the refused mod and dev",
+      len(_grants) == 2, _grants)
 check("the log names the granter and what they took",
-      all(a == "themod" and t == "themod" for a, t, _ in _grants), _grants)
+      all(a == "checker" and t == "checker" for a, t, _ in _grants), _grants)
 check("including the pet", any("petsniper" in d for _, _, d in _grants), _grants)
 
 # A REFUSED GRANT LEAVES NO LINE. A log that records attempts as if they were
-# grants is worse than no log - it would read as the mod having taken things
+# grants is worse than no log - it would read as the owner having taken things
 # they never got.
-status("a refused grant", client.post("/api/staff/grant", headers=MOD_H,
+status("a refused grant", client.post("/api/staff/grant", headers=OWNER_H,
        json={"slot": 0, "item_id": "ironsword", "quantity": -5}), 400)
 _after = _owner_sq.connect(DB_PATH).execute(
     "SELECT COUNT(*) FROM staff_actions WHERE action = 'grant'").fetchone()[0]

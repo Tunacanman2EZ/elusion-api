@@ -783,9 +783,21 @@ check("the mod's notes carry this server's answer",
       app_module._staff_login_note() in notes.get("mod", []), notes.get("mod"))
 
 all_notes = " ".join(n for rank in notes.values() for n in rank)
-check("the debug keys are said to need a debug build",
-      any("debug item keys" in n and "debug build" in n for n in notes.get("mod", [])),
-      notes.get("mod"))
+check("the debug keys are said to need a debug build - and to be the owner's",
+      any("debug item keys" in n and "debug build" in n for n in notes.get("owner", [])),
+      notes.get("owner"))
+check("  no lower rank is told it has them",
+      not any("debug item keys" in n for rank in ("mod", "dev") for n in notes.get(rank, [])),
+      [notes.get("mod"), notes.get("dev")])
+# OWNER ONLY SINCE 6 OCT 2026: the grant moved from mod to owner, and the
+# routes are read from the decorators, so the list follows by itself.
+_where = {name: [r.get("path") for r in rank.get("routes", [])] for name, rank in ladder.items()}
+check("the item grant is on the owner's list",
+      "/api/staff/grant" in _where.get("owner", []), _where.get("owner"))
+check("  and on nobody else's",
+      not any("/api/staff/grant" in _where.get(name, []) for name in ("player", "mod", "dev")))
+check("  and a mod is told plainly that creating items is not theirs",
+      any("Cannot create items" in n for n in notes.get("mod", [])), notes.get("mod"))
 check("the owner's tools are where they are now: the GM panel's Testing tab",
       any("GM panel" in n for n in notes.get("owner", []))
       and any(n.startswith("Testing tab") and "item catalogue" in n and "level" in n

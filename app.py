@@ -9422,8 +9422,12 @@ def write_bank():
     # POST /api/bank/items, and rearranging is POST /api/bank/move; a whole
     # bank from the client was only ever trimmed to the record (E-1), never
     # derived from it. Ignored rather than refused, with the bank the server
-    # holds in the answer; staff still write it whole, for tooling.
-    if not role_at_least(g.user, "mod"):
+    # holds in the answer; the owner still writes it whole, for tooling.
+    #
+    # THE OWNER, NOT "MOD AND UP". A whole write can hold any item, so it is an
+    # item grant by another name, and the grant itself is owner-only now - see
+    # staff_grant(). A mod's bank is ignored exactly like a player's.
+    if not is_owner(g.user["username"]):
         body = account_payload(user_id)
         body["ignored"] = ["bank_inventory"]
         return body, 200
@@ -10975,10 +10979,10 @@ def staff_skill():
 
 @app.post("/api/staff/grant")
 @require_auth
-@require_role("mod")
+@require_owner
 def staff_grant():
     """
-    Give yourself an item (staff only)
+    Give yourself an item (owner only)
     ---
     tags:
       - Staff
@@ -11010,7 +11014,7 @@ def staff_grant():
       400:
         description: Bad slot, item id or quantity
       404:
-        description: That slot is empty, or you are not staff
+        description: That slot is empty, or you are not the owner
       409:
         description: Backpack full
       401:
@@ -11024,9 +11028,18 @@ def staff_grant():
     # "owner" got the keys back, and could have skipped them entirely and just
     # written the item into the array it was going to send anyway.
     #
-    # Now the client asks and the SERVER decides. require_role above is the real
+    # Now the client asks and the SERVER decides. require_owner above is the real
     # gate; _staff_debug_allowed() in player.gd is only there to stop an honest
     # player pressing a key that would be refused.
+    #
+    # OWNER ONLY, NOT MOD AND UP (6 Oct 2026). It was require_role("mod"), and a
+    # mod could give themselves anything - a Perfect mythic, a stack of potions
+    # to sell - and trade it on. A rank is trust with PLAYERS; nothing about
+    # judging a chat report needs the power to create items, and "Item spawning
+    # is gated on the SERVER, not on a rank" in CLAUDE.md said where this was
+    # going. The two whole-write doors that leaned on this one being open (the
+    # bag in write_inventory() and the bank in write_bank()) closed with it, so
+    # the owner is now the only account that can make an item from nothing.
     #
     # SELF ONLY. There is no target parameter and there should not be one until
     # there is a reason: granting to someone else is a different action with
@@ -11366,13 +11379,11 @@ def staff_powers():
             "Cannot be ignored in chat - a player's ignore refuses staff, so"
             " what a mod says always arrives.",
             _staff_login_note(),
-            "May write a whole bag or bank at once (players move one cell at a"
-            " time), and is not held to the skill-level ceiling.",
-            # CLIENT-SIDE, like god mode below. player.gd checks
-            # OS.is_debug_build() as well as the rank, and the browser game is a
-            # release export, so on play.elusionrpg.com these keys do nothing.
-            "The debug item keys, in a debug build of the game only - never in"
-            " a release export such as the browser game.",
+            # WHAT A MOD NO LONGER HAS, said where the owner handing out the
+            # rank will read it. Until 6 Oct 2026 a mod could give themselves
+            # any item and write a whole bag or bank; both are the owner's now.
+            "Cannot create items: giving yourself an item, and writing a whole"
+            " bag or bank at once, are the owner's alone.",
         ],
         "dev": [
             "Ban permanently, and for any number of days.",
@@ -11399,6 +11410,10 @@ def staff_powers():
             "The only rank the GM panel opens for: its Account, Testing and Server tabs.",
             "Testing tab: gold, any item by id or from the item catalogue, and"
             " the level and skill levels of their own character.",
+            "The only account that can create items: the Testing tab, the debug"
+            " item keys, and writing a whole bag or bank at once (everyone else"
+            " moves one cell at a time). The keys work in a debug build of the"
+            " game only - never in a release export such as the browser game.",
         ],
     }
 
@@ -18196,11 +18211,14 @@ def write_inventory():
     # turn that into an error on screen. It gets the bag the server holds, and
     # `ignored` says why its own did not stick.
     #
-    # STAFF STILL WRITE IT WHOLE, for tooling and tests. A mod or above can
-    # already put anything in a bag with POST /api/staff/grant, so this closes
-    # no door by staying open to them - the same reasoning the ledger used for
-    # exempting them.
-    if not role_at_least(g.user, "mod"):
+    # THE OWNER STILL WRITES IT WHOLE, for tooling and tests. It used to be
+    # any staff rank, on the reasoning that a mod could already put anything
+    # in a bag with POST /api/staff/grant, so leaving this open closed no door.
+    # That held only while the grant was mod and up. The grant is owner-only
+    # now (6 Oct 2026), so this is too: otherwise a mod denied the grant would
+    # write the same Perfect mythic in here instead. A mod's bag is ignored
+    # exactly like a player's.
+    if not is_owner(g.user["username"]):
         return {"slot": slot, "inventory": inventory_payload(user_id, slot),
                 "ignored": ["inventory"]}, 200
 
@@ -18515,9 +18533,10 @@ def write_skills():
 
         parsed.append((user_id, slot, name, level, xp))
 
-    # SKILL CEILING. A non-staff claim over the cap is clamped rather than
-    # rejected, so a single over-cap skill never discards the whole (otherwise
-    # honest) sync. Staff are exempt for the same reason as the backpack.
+    # SKILL CEILING. A claim over the cap is clamped rather than rejected, so a
+    # single over-cap skill never discards the whole (otherwise honest) sync.
+    # The owner is exempt, as with the backpack - and since 6 Oct 2026 only the
+    # owner, matching write_inventory(); a mod is clamped like a player.
     #
     # ITS OPENING LINE USED TO SAY "skills have no server-side grant path yet",
     # AND THAT HAS NOT BEEN TRUE SINCE E-2 CLOSED. All six are granted
@@ -18536,7 +18555,7 @@ def write_skills():
     #
     # The ceiling that IS load-bearing today is in _grant_skill_xp(), which caps
     # every server grant. That one is on the path everything actually takes.
-    if not role_at_least(g.user, "mod"):
+    if not is_owner(g.user["username"]):
         capped, hits = [], []
         for (uid, s, name, level, xp) in parsed:
             if level > MAX_SKILL_LEVEL or xp > MAX_SKILL_XP:

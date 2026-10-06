@@ -113,8 +113,11 @@ to nothing; reorders, drops and server-granted items pass untouched.
 This was only safe to switch on because every real source of an item — loot,
 bank withdrawal, staff grant — already writes `carry_items` server-side first.
 That was verified before flipping it, not assumed: there is no live client-side
-item source. Staff are exempt, because a mod can already self-grant through
-`POST /api/staff/grant` and clamping them would close no door.
+item source. Staff were exempt, because a mod could already self-grant through
+`POST /api/staff/grant` and clamping them would close no door. *Since 6 Oct
+2026 only the owner is:* the grant became owner-only, and the whole-bag and
+whole-bank writes followed it, so no rank below the owner can make an item
+(api/CLAUDE.md, "The owner is the only item source").
 
 The sequence mattered. `_report_unexplained_gains()` ran in **shadow mode**
 first — comparing the claim to the record and *logging* the difference while

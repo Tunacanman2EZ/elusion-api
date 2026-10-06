@@ -171,15 +171,40 @@ check("rearranging by a whole write moves nothing - a drag is POST .../move",
       _cells[:3])
 
 
-print("\n=== E-1  STAFF STILL WRITE A BAG WHOLE (a mod+ can already self-grant) ===\n")
+print("\n=== E-1  THE OWNER STILL WRITES A BAG WHOLE; A MOD DOES NOT ===\n")
 
 owner = register("boss")            # matches ELUSION_OWNER
 make_char(owner)
-# Same correction as above - a legal quantity, so the staff bypass is what is
+# Same correction as above - a legal quantity, so the owner's bypass is what is
 # being measured rather than the stack ceiling.
 put_inventory(owner, [{"item_id": "embersword", "quantity": 1}])
 check("the owner may set an arbitrary backpack", carried(owner) == {"embersword": 1},
       carried(owner))
+
+# A MOD, SINCE 6 OCT 2026, IS A PLAYER HERE. The whole write was open to every
+# staff rank on the grounds that a mod could self-grant anyway; the grant is
+# owner-only now, and a whole write that holds any item is the same power.
+def promote(username, role):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE users SET role = ? WHERE username = ?", (role, username))
+    conn.commit()
+    conn.close()
+
+register("moddy")
+promote("moddy", "mod")
+moddy = {"Authorization": "Bearer " + client.post("/api/auth/login",
+         json={"username": "moddy", "password": "password123"}).get_json()["token"]}
+make_char(moddy)
+r = put_inventory(moddy, [{"item_id": "embersword", "quantity": 1}])
+check("a mod's fabricated backpack is accepted as a request", r.status_code == 200, r.status_code)
+check("but nothing in it is written - a mod no longer writes a bag whole",
+      carried(moddy) == {}, carried(moddy))
+check("and the answer says it was ignored, as it says to a player",
+      (r.get_json() or {}).get("ignored") == ["inventory"], r.get_json())
+r = client.post("/api/staff/grant", headers=moddy,
+                json={"slot": 0, "item_id": "embersword", "quantity": 1})
+check("and the grant the old reasoning leaned on is closed to them too",
+      r.status_code == 404 and carried(moddy) == {}, (r.status_code, carried(moddy)))
 
 
 
@@ -263,6 +288,12 @@ check("the same item claimed twice is not two of it",
 put_bank(owner, [{"item_id": "embersword", "quantity": 1}])
 check("the owner may still set an arbitrary bank",
       banked(owner) == {"embersword": 1}, banked(owner))
+
+r = put_bank(moddy, [{"item_id": "embersword", "quantity": 1}])
+check("a mod's fabricated bank is ignored like a player's",
+      r.status_code == 200 and banked(moddy) == {}
+      and (r.get_json() or {}).get("ignored") == ["bank_inventory"],
+      (r.status_code, banked(moddy), (r.get_json() or {}).get("ignored")))
 
 print("\n=== E-2  ALL SKILLS ARE SERVER-OWNED; CLIENT CLAIMS ARE DROPPED ===\n")
 

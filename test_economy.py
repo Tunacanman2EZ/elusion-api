@@ -558,10 +558,9 @@ def give(username, item_id, quantity):
     """
     Put an item in a backpack, written straight into carry_items.
 
-    NOT THROUGH /api/staff/grant, which is @require_role("mod") - making a
-    trader staff to arm them would test trade between two moderators, and the
-    staff exemption in _reconcile_inventory() means that is not the same player
-    the code has to be right for.
+    NOT THROUGH /api/staff/grant, which is owner-only - making a trader the
+    owner to arm them would test trade with the one account the server treats
+    differently, and that is not the player the code has to be right for.
 
     DIRECT IS HONEST HERE IN A WAY IT IS NOT FOR GOLD. carry_items IS the
     server's record of what somebody owns, so writing it is indistinguishable

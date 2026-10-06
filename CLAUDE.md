@@ -1095,10 +1095,11 @@ so a stock change is a re-export, a copy and a restart, with no code change.
   `sell_prices` from the same function. The rate is measured, not guessed:
   `test_pacing.py` holds an hour's drops sold at a tenth to the whole of the
   hour's coin, and the next set four to nine hours away even selling
-  everything. **Selling turns an item grant into gold**: `/api/staff/grant` is
-  mod and up, so a mod could give themselves potions and sell them. Until the
-  grant is owner-only (or a test-server switch, see "Decided, not built"), a
-  mod rank is trust with gold as well as with players.
+  everything. **Selling turns an item grant into gold**, which is one reason
+  `/api/staff/grant` is owner-only (since 6 Oct 2026; it was mod and up, and a
+  mod could give themselves potions and sell them, or a Perfect mythic and
+  trade it on). The whole-bag and whole-bank writes went with it - see "The
+  owner is the only item source" below.
 - **Tests read prices from the catalogue.** `test_economy.py` and
   `test_equipment.py` had a potion's 50 typed in, and the price pass turned
   seven checks red that were about the ledger and the tooltip, not the price.
@@ -1291,6 +1292,31 @@ ones, still counts - `test_throttle.py`, "A SIGNUP IS NOT A SPRAY".
 - ...)" off the end; the message gives way now, with an ellipsis.
 `test_maintenance.py`.
 
+## The owner is the only item source
+
+Every item in the game comes from the server rolling it (a kill, a catch, a
+cook, a shop sale) - except what the owner makes for testing. Since 6 Oct 2026
+that is the ONLY exception; before, any staff rank had three ways to make an
+item from nothing, and each was justified by the others:
+
+- `POST /api/staff/grant` was `require_role("mod")`. Now `require_owner`, with
+  the same 404 to everybody else, so a refusal does not confirm the route.
+- `PUT /api/character/inventory` wrote a mod's whole bag, "because a mod can
+  already self-grant". Now only the owner's (`write_inventory()`); a mod's is
+  ignored with `"ignored": ["inventory"]`, exactly as a player's is.
+- `PUT /api/account/bank` the same (`write_bank()`).
+
+The skill-ceiling exemption in the skills route moved to the owner too, for
+symmetry; that route writes nothing, so it changed no behaviour.
+
+The game follows: `Api.DEBUG_KEYS_MIN_ROLE` is `"owner"`, so F1-F7 and the
+Ctrl-letter keys stay quiet for a mod rather than firing requests that 404.
+`/api/staff/powers` says it in words on both sides - the mod's notes say they
+cannot create items, the owner's that they are the only one who can - and the
+route itself moves to the owner's list on its own, because that list is read
+from the decorators. `test_api.py` (STAFF GRANTS), `test_security.py` (E-1)
+and `test_moderation.py` (M-10).
+
 ## Decided, not built: staff commands
 
 **Put the required rank on the command definition, not in the handler.** A
@@ -1309,6 +1335,11 @@ the command can create value from nothing or remove a person. `/who`,
 economy, not the person. `/give` should not exist on the production build even
 for the owner - an environment flag for a test server, the same trick as
 `ELUSION_OWNER`. A rank you hold is a rank you can use at 2am.
+
+*Half of this is built (6 Oct 2026):* no rank below the owner can create an
+item - see "The owner is the only item source". The environment flag that
+would take it from the owner on production is not; the owner tests on the live
+server, and chose to keep the tool there.
 
 **Staff-created danger a player did not choose cannot take anything.** This is
 the fairness rule, and it is specific to this game: `gameover.gd` clears carry
