@@ -1357,8 +1357,9 @@ item from nothing, and each was justified by the others:
 The skill-ceiling exemption in the skills route moved to the owner too, for
 symmetry; that route writes nothing, so it changed no behaviour.
 
-The game follows: `Api.DEBUG_KEYS_MIN_ROLE` is `"owner"`, so F1-F7 and the
-Ctrl-letter keys stay quiet for a mod rather than firing requests that 404.
+The game follows: since 0.7.1 it has no debug keys at all (they were the
+owner's from 0.6.1), so the GM panel's Give item and item catalogue are the
+only things that ask for a grant.
 `/api/staff/powers` says it in words on both sides - the mod's notes say they
 cannot create items, the owner's that they are the only one who can - and the
 route itself moves to the owner's list on its own, because that list is read

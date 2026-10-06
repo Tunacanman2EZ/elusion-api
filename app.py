@@ -10655,10 +10655,11 @@ def staff_gold():
     """
     # WHY THIS EXISTS AT ALL, stated plainly: a server nobody can put gold on
     # is a server whose shops, trades, bank, revive cost and guild founding
-    # cannot be tested by the person who wrote them. The debug keys did this
-    # job, but they are gated on OS.is_debug_build() and so disappear the
-    # moment the game is exported - which is exactly when it most needs
-    # exercising.
+    # cannot be tested by the person who wrote them. The game's debug keys did
+    # this job, but they were gated on OS.is_debug_build() and so disappeared
+    # the moment the game was exported - which is exactly when it most needs
+    # exercising. (Since game 0.7.1 there are no keys at all; the GM panel does
+    # their work.)
     #
     # OWNER ONLY, NOT MOD. Granting an item is a test fixture; minting the
     # currency is the economy itself, and the Kingdom Tax board is built on
@@ -11029,8 +11030,8 @@ def staff_grant():
     # written the item into the array it was going to send anyway.
     #
     # Now the client asks and the SERVER decides. require_owner above is the real
-    # gate; _staff_debug_allowed() in player.gd is only there to stop an honest
-    # player pressing a key that would be refused.
+    # gate. Since game 0.7.1 the keys are gone altogether, and the GM panel's
+    # Give item and item catalogue are what call this.
     #
     # OWNER ONLY, NOT MOD AND UP (6 Oct 2026). It was require_role("mod"), and a
     # mod could give themselves anything - a Perfect mythic, a stack of potions
@@ -11388,21 +11389,6 @@ def staff_powers():
         "dev": [
             "Ban permanently, and for any number of days.",
             "Mute for up to %s." % _days_words(MUTE_MAX_MINUTES),
-            # CLIENT-SIDE, AND SAID SO. Everything else on this list is something
-            # the SERVER enforces; god mode is a switch in the game client, and a
-            # rank the client checks is only ever worth what an honest build is
-            # worth. It is here because an owner handing out `dev` deserves to
-            # know it comes with the ability to stop dying - the whole point of
-            # this route is that a rank never surprises the person granting it.
-            #
-            # It grants nothing: the client returns before the damage AND before
-            # the defense XP it would otherwise report to /api/skill/train, so an
-            # invincible character earns exactly what a stationary one does. And
-            # hp is client-written anyway (E-9), so a modified client could
-            # always refuse to die - this changes what an HONEST build can do.
-            "In-game god mode (client-side): takes no damage, and earns no"
-            " defense XP while it is on. A key in a debug build; the owner also"
-            " has a switch in the GM panel.",
         ],
         "owner": [
             "Cannot be granted or revoked - it comes from ELUSION_OWNER in the server's environment.",
@@ -11410,10 +11396,23 @@ def staff_powers():
             "The only rank the GM panel opens for: its Account, Testing and Server tabs.",
             "Testing tab: gold, any item by id or from the item catalogue, and"
             " the level and skill levels of their own character.",
-            "The only account that can create items: the Testing tab, the debug"
-            " item keys, and writing a whole bag or bank at once (everyone else"
-            " moves one cell at a time). The keys work in a debug build of the"
-            " game only - never in a release export such as the browser game.",
+            # CLIENT-SIDE, AND SAID SO. Everything else on this list is something
+            # the SERVER enforces; god mode is a switch in the game client, and a
+            # rank the client checks is only ever worth what an honest build is
+            # worth. It was a dev's too, through a key, until game 0.7.1 removed
+            # the debug keys; the GM panel's switch is the only way in now.
+            #
+            # It grants nothing: the client returns before the damage AND before
+            # the defense XP it would otherwise report to /api/skill/train, so an
+            # invincible character earns exactly what a stationary one does. And
+            # hp is client-written anyway (E-9), so a modified client could
+            # always refuse to die - this changes what an HONEST build can do.
+            "Also on the Testing tab (client-side): god mode, which takes no"
+            " damage and earns no defense XP while it is on, and the game's"
+            " performance readout.",
+            "The only account that can create items: the Testing tab, and"
+            " writing a whole bag or bank at once (everyone else moves one cell"
+            " at a time). The game has no debug keys.",
         ],
     }
 
