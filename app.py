@@ -1467,6 +1467,30 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_trusted_devices_user
             ON trusted_devices(user_id, created_at);
 
+        -- A TICKET TO THE PRESENCE SERVER (presence.py), which shows players to
+        -- each other over a WebSocket. The game asks for one with its login
+        -- (POST /api/presence/ticket) and hands it to the socket, so the socket
+        -- never sees a login and every rule about who may sign in stays here.
+        -- token_hash, not the ticket. `identity` is who the player is on other
+        -- people's screens - name, rank, colour, guild, class, level and the
+        -- pets they hold - written by this server from its own rows, as JSON.
+        -- session_hash is the login that asked: presence.py drops a connection
+        -- whose login is gone (logout, ban, kick, a login elsewhere) by joining
+        -- on sessions, so none of those routes has to know the socket exists.
+        CREATE TABLE IF NOT EXISTS presence_tickets (
+            token_hash   TEXT    PRIMARY KEY,
+            session_hash TEXT    NOT NULL,
+            user_id      INTEGER NOT NULL,
+            slot         INTEGER NOT NULL,
+            identity     TEXT    NOT NULL,
+            issued_at    INTEGER NOT NULL,
+            expires_at   INTEGER NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_presence_tickets_expiry
+            ON presence_tickets(expires_at);
+
         -- A DELETED CHARACTER, KEPT FOR A WHILE. POST /api/character/delete
         -- removes the character's rows; this keeps a copy of what it was - the
         -- save row, its bag and its skills, as JSON - so "I did not delete
@@ -15802,6 +15826,138 @@ def players_online():
         "players": players,
         # SO THE MENU CAN SAY SO. One list, one answer about the world's rules.
         "pvp": pvp_enabled(),
+    }, 200
+
+
+# =============================================================================
+# PRESENCE: SEEING EACH OTHER
+# =============================================================================
+# Players are drawn in each other's worlds by presence.py, a WebSocket process
+# beside this one (it says why it is a process of its own). This route is its
+# front door: a game with a login asks here for a ticket, then hands the ticket
+# to the socket. So bans, a session ended elsewhere and a stale token are
+# decided here, by require_auth, exactly as for every other route - and the
+# socket only has to find a ticket row and its login.
+#
+# THE IDENTITY IS OURS. What other players see over somebody's head - name,
+# crown or badge, colour, guild tag, class and level - and which pets they may
+# be seen with are read from this server's rows, never taken from the game.
+# The game only tells the socket where it is standing and how it is moving.
+PRESENCE_TICKET_SECONDS = 120
+PRESENCE_PORT = int(os.environ.get("ELUSION_PRESENCE_PORT", "5001") or 5001)
+PRESENCE_URL = os.environ.get("ELUSION_PRESENCE_URL", "").strip()
+PRESENCE_PATH = "/ws/presence"
+
+
+def _presence_url():
+    """
+    Where the game should open its socket.
+
+    ELUSION_PRESENCE_URL when it is set. Otherwise, BEHIND THE PROXY (Caddy,
+    ELUSION_TRUSTED_PROXIES above 0) it is this same host under /ws/presence,
+    wss:// when the page came over https - one address for the game, the API and
+    the socket, as the browser needs. Run locally, it is the presence process's
+    own port on the host the game reached the API by.
+    """
+    if PRESENCE_URL:
+        return PRESENCE_URL
+    if TRUSTED_PROXY_HOPS > 0:
+        # request.scheme is already the proxy's (ProxyFix, x_proto, above),
+        # and Caddy passes the page's Host through unchanged.
+        return "%s://%s%s" % ("wss" if request.scheme == "https" else "ws", request.host, PRESENCE_PATH)
+    host = request.host or "127.0.0.1"
+    if host.startswith("["):
+        host = host[:host.index("]") + 1]
+    else:
+        host = host.split(":")[0]
+    return "ws://%s:%d%s" % (host, PRESENCE_PORT, PRESENCE_PATH)
+
+
+@app.post("/api/presence/ticket")
+@require_auth
+def presence_ticket():
+    """
+    A ticket to be seen by other players
+    ---
+    tags:
+      - Players
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [slot]
+          properties:
+            slot: {type: integer, example: 0}
+    responses:
+      200:
+        description: "{ticket, expires_in, socket_url}: hand the ticket to the socket at socket_url"
+      400:
+        description: Bad slot
+      404:
+        description: No character in that slot
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+    user_id = g.user["id"]
+    slot = parse_slot(payload.get("slot"))
+    if slot is None:
+        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+
+    db = get_db()
+    save = db.execute(
+        "SELECT name, class_id, level FROM saves WHERE user_id = ? AND slot = ?",
+        (user_id, slot),
+    ).fetchone()
+    if save is None:
+        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
+
+    # THE PETS THIS CHARACTER MAY BE SEEN WITH: the ones the account holds,
+    # in this character's bag or the shared bank - the rule /api/save uses for
+    # active_pet_id (_owns_item). The socket draws a claimed pet only when it is
+    # on this list, so a modified game cannot parade one it never won.
+    held = db.execute(
+        "SELECT item_id FROM carry_items WHERE user_id = ? AND slot = ?"
+        " UNION SELECT item_id FROM bank_items WHERE user_id = ?",
+        (user_id, slot, user_id),
+    ).fetchall()
+    pets = sorted({r["item_id"] for r in held
+                   if (gamedata.item_row(r["item_id"]) or {}).get("type_name") == "PET"})
+
+    identity = {
+        "name": g.user["username"],
+        "character": save["name"] or "",
+        "cls": save["class_id"] or "",
+        "lvl": int(save["level"] or 1),
+        "role": role_for(g.user),
+        "hue": g.user["name_hue"],
+        "guild": _own_guild(db, user_id)["guild_tag"],
+        "pets": pets,
+    }
+
+    now = int(time.time())
+    raw = secrets.token_urlsafe(32)
+    # Pruned as they are issued, like chat: a ticket lives two minutes, so the
+    # table is never more than two minutes of renewals deep.
+    db.execute("DELETE FROM presence_tickets WHERE expires_at <= ?", (now,))
+    db.execute(
+        "INSERT INTO presence_tickets (token_hash, session_hash, user_id, slot, identity,"
+        " issued_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (_token_hash(raw), _token_hash(bearer_token()), user_id, slot,
+         json.dumps(identity, separators=(",", ":")), now, now + PRESENCE_TICKET_SECONDS),
+    )
+    db.commit()
+    return {
+        "ticket": raw,
+        "expires_in": PRESENCE_TICKET_SECONDS,
+        "socket_url": _presence_url(),
     }, 200
 
 

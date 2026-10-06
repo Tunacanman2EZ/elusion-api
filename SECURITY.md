@@ -291,6 +291,15 @@ No comforting lies. These are known, named and open.
   keep a copy: deleting the line takes it off screens and off the server
   (invariant 15), not off somebody's disk.
 
+- **Where somebody stands is whatever their game says.** The presence socket
+  (`presence.py`) relays positions as games send them, so a modified game can
+  stand inside a wall or hop across the area on other people's screens. It
+  cannot appear as somebody else, or show a rank, colour, guild or pet it does
+  not hold - who a player is comes from the server's own rows, through a
+  ticket tied to their login - and nothing over the socket deals damage or
+  moves an item. Messages are size- and rate-limited, and an ended login ends
+  the connection within seconds.
+
 Anything not on this list that later turns out to be true belongs on it.
 
 ---

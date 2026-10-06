@@ -1129,6 +1129,46 @@ letters come from the game through gamedata.json.
 `test_quality.py`. test_loot, test_rewards and test_equipment read dropped
 ids through `item_row()` / `base_id()` for the same reason the app does.
 
+## Seeing each other: presence.py, a second process
+
+The owner, 5 Oct: "i want to make other players see each other" - over a live
+connection, showing the body walking and idling the right way round, the name
+over the head, their attacks and their pet following. `presence.py` is a small
+asyncio WebSocket server on 127.0.0.1:5001, path `/ws/presence`, run as its own
+service beside gunicorn. Its header holds the wire; `test_presence.py` holds
+every rule.
+
+- **Why not a route.** gunicorn runs two workers that share no memory and
+  eight threads between them; a socket held open for a session would hold a
+  thread. One asyncio process keeps every connection in one place, in memory.
+  A position is worth something for a tenth of a second, so none of it is
+  written to the database.
+- **It never sees a login.** `POST /api/presence/ticket` (behind
+  `require_auth`, `{"slot"}`) writes a ticket to `presence_tickets` - stored
+  hashed, tied to the session that asked, two minutes long - and answers
+  `{ticket, expires_in, socket_url}`. The socket takes the ticket. Every rule
+  about who may sign in stays here in app.py: a ban, a logout, a login
+  elsewhere or a password change deletes the session, and presence.py drops
+  the connection within `SWEEP_SECONDS` without app.py knowing it exists.
+- **Who somebody is comes from the ticket**, written from this file's own
+  rows: name, class, level, rank (`role_for`), name hue, guild tag and the
+  pets the character holds (carry for that slot, plus the bank). The game says
+  only where it is (area, x, y), which animation its body plays, which aura is
+  lit and which pet is out - and a pet it does not hold is dropped. The game
+  renews the ticket every minute, which is how a level-up or a new guild
+  reaches other screens.
+- **`socket_url`**: `ELUSION_PRESENCE_URL` when set; behind the proxy
+  (`ELUSION_TRUSTED_PROXIES` above 0) the same host the request came to, under
+  `/ws/presence`, `wss://` for an https page - one address for the page, the
+  API and the socket, which the browser build needs; run locally, the
+  presence port on the host the game used.
+- **Limits**: one connection per account (a second replaces the first), 20
+  messages a second with a burst of 40, 2 KB a message, 1000 connections,
+  hello within 5 seconds. Moves are relayed ten times a second per area.
+- **Presence, not combat.** No damage, no enemies: each game still fights its
+  own monsters, so a player swinging at something you cannot see is swinging
+  at theirs. PvP and shared enemies stay in "Decided, not built".
+
 ## Gear bonuses: a character's maximum includes what it wears
 
 Amulets add max health (`bonus_max_hp`), max mana (`bonus_max_mana`) or a
@@ -1256,6 +1296,7 @@ envfile.py      reads a .env beside the code; first thing app.py and wsgi.py do
 wsgi.py         what gunicorn serves: a preflight of the settings, then app
 gamedata.py     loot rolls, XP curve, stat curves - the game's rules
 gamedata.json   exported from the Godot project, NOT hand-edited
+presence.py     the presence socket, a second process: who stands where
 test_*.py       discovered and run by run_tests.ps1, which prints how many.
                 No counts here on purpose - see above. What each one is FOR:
   api           the broad one; read its header before adding to it
@@ -1283,6 +1324,8 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
   loot          bags, rolls, and taking things out of them
   equipment     what a worn item is worth, and what the tooltip says
   quality       dropped gear's rolled stats, carried whole by every path
+  presence      the presence socket: tickets, areas, what the game may say,
+                limits, and a login ended anywhere ending the connection
   chat/chatrooms  the feed, the channels, moderation and picture revocation
   broadcast     the server's voice, and the poll that doubles as a heartbeat
   maintenance   the kill switch and its countdown

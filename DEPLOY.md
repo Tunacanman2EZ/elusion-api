@@ -22,6 +22,9 @@ gunicorn --preload -w 4 -b 127.0.0.1:5000 wsgi:application
 
 # Windows
 waitress-serve --listen=127.0.0.1:5000 wsgi:application
+
+# Both - players seeing each other, a second process beside the API
+python presence.py              # 127.0.0.1:5001, path /ws/presence
 ```
 
 …behind a reverse proxy that terminates TLS, with these set:
@@ -84,6 +87,7 @@ One small droplet holds the API, the proxy and the browser build.
 | Firewall | ufw allows OpenSSH, 80 and 443, nothing else. SSH takes keys only (`PasswordAuthentication no`) |
 | Proxy and TLS | Caddy, from Caddy's own apt repository. It fetches and renews the certificates itself |
 | Service | systemd unit `elusion-api`, run as the system user `elusion` |
+| Presence | systemd unit `elusion-presence`: `presence.py` on 127.0.0.1:5001, same user, folder and settings |
 | Code | `/opt/elusion/api`, a git clone of this repository, owned by `elusion` |
 | Python | `/opt/elusion/venv`: `requirements.txt` plus gunicorn |
 | Settings | `/etc/elusion/elusion.env`, owned by root, `chmod 600` |
@@ -131,11 +135,17 @@ boot log line to look for is `[DEPLOY] preflight passed (trusted proxy hops: 1)`
 ```caddy
 api.elusionrpg.com {
     encode zstd gzip
+    handle /ws/* {
+        reverse_proxy 127.0.0.1:5001
+    }
     reverse_proxy 127.0.0.1:5000
 }
 
 play.elusionrpg.com {
     encode zstd gzip
+    handle /ws/* {
+        reverse_proxy 127.0.0.1:5001
+    }
     handle /api/* {
         reverse_proxy 127.0.0.1:5000
     }
@@ -162,6 +172,52 @@ It runs the copy of `backup_db.py` in the clone, so a `git pull` updates it.
 These backups are on the same disk as the database; **Backups**, below, covers
 getting copies off the machine.
 
+### Seeing each other: the presence server
+
+`presence.py` shows players to each other (api/CLAUDE.md, "Seeing each
+other"). It is its own service because it holds a socket open per player,
+which a gunicorn thread should not. Set up once, 6 October 2026:
+
+```
+sudo -u elusion /opt/elusion/venv/bin/pip install -r /opt/elusion/api/requirements.txt
+sudo nano /etc/systemd/system/elusion-presence.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now elusion-presence
+sudo journalctl -u elusion-presence -n 20 --no-pager
+```
+
+The unit:
+
+```ini
+[Unit]
+Description=Elusion presence (players seeing each other)
+After=network.target
+
+[Service]
+User=elusion
+WorkingDirectory=/opt/elusion/api
+EnvironmentFile=/etc/elusion/elusion.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/elusion/venv/bin/python presence.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The log line to look for is `[PRESENCE] listening on ws://127.0.0.1:5001/ws/presence
+(database /var/lib/elusion/elusion.db)` - the same database the API uses, read
+from the same settings file. Then the `handle /ws/*` lines in both Caddy blocks
+above, `caddy validate` and `reload`. Caddy passes the WebSocket upgrade
+through `reverse_proxy` with no further settings; `encode` leaves it alone
+(checked against Caddy 2.10.2 with the blocks exactly as above).
+
+**Nothing else changes.** The game asks the API for a ticket and the API's
+answer says where the socket is: `wss://` the same host the game reached the
+API on, so the browser build and the desktop game both find it with no new
+setting. No presence server running is not an error anywhere - the game plays
+as before and nobody else is drawn.
+
 ### Updating the server
 
 After pushing to GitHub, from an SSH session on the droplet:
@@ -170,9 +226,13 @@ After pushing to GitHub, from an SSH session on the droplet:
 cd /opt/elusion/api
 sudo -u elusion git pull
 sudo systemctl restart elusion-api
+sudo systemctl restart elusion-presence
 sudo journalctl -u elusion-api -n 30 --no-pager
 curl -s https://api.elusionrpg.com/api/status
 ```
+
+- **Restarting the presence server** drops every connection; the games
+  reconnect by themselves within a few seconds and draw everybody again.
 
 - **`sudo -u elusion`** because the clone is that user's. git refuses to work in
   a folder another user owns ("dubious ownership"), and a pull as root would
@@ -381,6 +441,11 @@ play.elusionrpg.com {
 		reverse_proxy 127.0.0.1:5000
 	}
 
+	# The presence socket, on the same address for the same reason.
+	handle /ws/* {
+		reverse_proxy 127.0.0.1:5001
+	}
+
 	# The export: index.html and the files beside it, nowhere near elusion.db.
 	# Compressed as it goes by encode, above. Not "precompressed": Caddy 2.10.2
 	# answered a plain request for a precompressed file with 206 Partial Content.
@@ -426,6 +491,18 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_read_timeout 30s;
         client_max_body_size 12M;
+    }
+
+    # THE PRESENCE SOCKET. Unlike Caddy, nginx passes a WebSocket upgrade only
+    # when told to: HTTP/1.1 and the two headers. The server pings every 20
+    # seconds, well inside the read timeout.
+    location /ws/ {
+        proxy_pass http://127.0.0.1:5001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host       $host;
+        proxy_read_timeout 120s;
     }
 
     # 46 MB as exported, 16 MB compressed. gzip_static sends the .gz beside a

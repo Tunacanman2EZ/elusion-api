@@ -665,6 +665,9 @@ SWEEPS_ALLOWED = [
     ("chat_deletions", "deleted_at <", "retention: past CHAT_DELETION_WINDOW_SECONDS"),
     ("chat_messages", "id NOT IN", "the per-channel ring buffer trim"),
     ("sessions", "expires_at <", "expired sessions"),
+    # the presence socket's tickets: two minutes long, pruned whenever one is
+    # issued. Every row it deletes is dead to everybody already.
+    ("presence_tickets", "expires_at <=", "expired presence tickets"),
     ("ended_sessions", "ended_at <", "retention: why a session ended, kept a day"),
     # a boot-time migration: every save's display copy of xp_to_next re-derived
     # from the curve after 100 x 1.15 became 1,250 x 1.27. It sets a pure
