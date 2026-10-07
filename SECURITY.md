@@ -34,7 +34,7 @@ Role definitions, the ladder and how the owner is named: [`CLAUDE.md` → Ranks]
 | **Logged-in player** | Move, chat, save, and *request* loot, trades, purchases, revives, cooking, fishing — each as a claim the server re-derives | Their own level, XP, stat maxima, loot rolls, gold totals, lusion totals, any of the six skills, or any row that is not theirs |
 | **Mod** | Kick, ban up to 30 days, mute up to a day, take a chat line down, read and close chat reports, read the staff user list, the moderation log and linked accounts, write staff-only notes and warnings | Banning at or above their own rank, banning permanently, granting a rank at or above their own, touching the economy — including creating any item, which since 6 Oct 2026 no rank below the owner can do (`test_security.py` E-1, `test_api.py` STAFF GRANTS) |
 | **Dev** | Everything a mod can, plus permanent bans, longer mutes, teleporting a player, reading economy supply | Granting dev or owner, moving the whole server, minting gold, the metrics endpoint |
-| **Owner** | Everything, incl. broadcast, maintenance, metrics, moving everyone, and test fixtures on their own characters only (gold, level, skill levels, any item) — the only account that can create an item | Being stored anywhere. `ELUSION_OWNER` is an environment variable, so no request writes it and no database backup carries it |
+| **Owner** | Everything, incl. broadcast, maintenance, metrics, moving everyone, test fixtures on their own characters (gold, level, skill levels, any item), giving any player an item, and putting a player's character back to a snapshot — the only account that can create an item or undo a character | Being stored anywhere. `ELUSION_OWNER` is an environment variable, so no request writes it and no database backup carries it |
 | **The server** | Owns level, XP, derived maxima, loot rolls and loot bag contents, and every backpack and bank cell; sole author of the gold and lusion ledgers | Knowing whether the client is honest, or whether the IP it sees is the player's. Both are assumed false |
 
 One cell is deliberately weaker than it looks, and it is covered under
@@ -244,6 +244,18 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     hash that no route returns.
     → Held by: `test_security.py` — "a banned computer cannot register from a brand-new address", "the sibling on the family computer still logs in", "one banned account cannot stop a library computer making accounts", "the server keeps the SHA-256 of the id, not the id"
     → and in the game: `src/tools/testrunner.gd` — `_test_install_id_is_kept_and_sent()`
+29. **Only the owner can put a character back, or put an item in somebody
+    else's bag, and both are written down about the player.** The server keeps
+    each character's last 20 snapshots - level, XP, purse, gear, pet, bag and
+    skills, never the account's bank or lusions. A rollback restores one, moves
+    the gold through the ledger so the supply still balances, takes a snapshot
+    first so it can itself be undone, refuses a character in an open trade, and
+    ends the player's sessions so their game reloads. A gift goes into the
+    character they are playing, after a snapshot. Each is a line in the
+    moderation log about the player. Everybody else gets the same bare 404 as a
+    route that does not exist.
+    → Held by: `test_rollback.py` — "nobody below the owner reads, restores or gives - the same bare 404 as no route at all", "the supply balances after a rollback", "the bank is the account's and untouched", "the snapshot taken before a rollback is returned", "a character in an open trade is a 409", "every rollback of carol is a line about carol, and no refusal is", "the gift is a 'give' line about lena, by the owner"
+    → and in the game: `src/tools/testrunner.gd` — `_test_give_and_save_history()`
 
 ---
 
@@ -310,6 +322,14 @@ No comforting lies. These are known, named and open.
   still builds each attack from its own copy of the monster, caps the few
   numbers the leader sends, and reports its own kills under the same E-3
   ceilings as before.
+
+- **A rollback can make a second copy of an item.** It puts back what the
+  character held when the snapshot was taken; an item traded, banked or sold
+  since then is still wherever it went, too. That is why only the owner can do
+  it, why each one is a line on the player's record, and why the Save history
+  window says so under the buttons. The gold cannot be copied this way - it moves
+  through the ledger like any other mint or burn - but, like every burn, gold a
+  rollback takes away is counted on the Kingdom board as given.
 
 Anything not on this list that later turns out to be true belongs on it.
 

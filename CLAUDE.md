@@ -772,8 +772,10 @@ routes after `chat_delete`); `test_chatsafety.py` holds all three.
 - **The log opens on moderation.** `STAFF_ACTION_GROUPS["moderation"]` is
   what staff did about players (bans, kicks, mutes, warnings, notes, ranks,
   reports, deletions, guild renames): `?action=moderation` leaves out the
-  server switches and the testing tools (grant, teleport). The answer carries
-  `groups` for the client's dropdown. A player's record asks for it too.
+  server switches and the testing tools (grant, teleport) - but not a gift
+  to a player or a rollback (`give`, `rollback`), which are done to them. The
+  answer carries `groups` for the client's dropdown. A player's record asks for
+  it too.
 - **A mute is three columns on users** (`chat_muted_until`, reason, by), read
   by `chat_mute_state()`, refused in `chat_send` before the flood bucket so a
   muted player's attempts cost nothing. A mod's longest is a day
@@ -1359,12 +1361,74 @@ symmetry; that route writes nothing, so it changed no behaviour.
 
 The game follows: since 0.7.1 it has no debug keys at all (they were the
 owner's from 0.6.1), so the GM panel's Give item and item catalogue are the
-only things that ask for a grant.
+only things that ask for a grant - for the owner, or since 0.7.5 for a named
+player (next section).
 `/api/staff/powers` says it in words on both sides - the mod's notes say they
 cannot create items, the owner's that they are the only one who can - and the
 route itself moves to the owner's list on its own, because that list is read
 from the decorators. `test_api.py` (STAFF GRANTS), `test_security.py` (E-1)
 and `test_moderation.py` (M-10).
+
+## Save history, rollback, and giving a player an item
+
+The owner, 6 Oct: "roll back and give player item might be useful". SAVE
+SNAPSHOTS AND ROLLBACK in app.py, `test_rollback.py`. All of it is
+`require_owner`, a bare 404 to everyone else.
+
+- **`save_snapshots`** holds a character as JSON: level, xp, xp_to_next, the
+  purse, `equipment`, `active_pet_id`, every carried cell (bag and hotbar) and
+  every skill (`_character_state()`). Not the bank or lusions (the account's,
+  shared by four characters), not the area or the map, not hp/mana/stamina. A
+  new table, so `CREATE TABLE IF NOT EXISTS` is its whole migration.
+- **`take_snapshot(db, user_id, slot, reason)`** - no commit, the caller's
+  transaction. `save`: from `write_save()`, at most every
+  `SNAPSHOT_EVERY_SECONDS` (600), and that is checked first with one indexed
+  read, so a save inside the window costs nothing more. `before-give` and
+  `before-rollback`: every time. **Never when nothing changed** - the newest
+  row's `fingerprint` (sha1 of the JSON) matches, and its id is returned
+  instead - so a character standing in town does not push the history out.
+  The newest `SNAPSHOTS_KEPT` (20) per character, pruned on write. A
+  character's go with it on `POST /api/character/delete`: a snapshot names a
+  slot, and the next character in that slot is somebody else.
+- **`GET /api/staff/snapshots?username=&slot=`** lists them (never the JSON),
+  with every character on the account and the chosen one as it is now. No
+  slot is the character they are playing (`_playing_slot()`). Not logged: it
+  is a read.
+- **`POST /api/staff/rollback {username, snapshot_id}`** - the id must be a
+  snapshot OF that account, so a stale window cannot roll the wrong player
+  back. 409 for a character in an open trade (the delete route's rule) or a
+  slot that holds another class now. It snapshots first and answers the id
+  (`undo_snapshot`), replaces `carry_items` and `skills` for the slot, moves the
+  purse by the difference through `gold_delta()` under `staff_rollback`, puts
+  back level, xp, gear and the pet - the pet only if still held
+  (`_owns_item()`, after the bag is restored) - re-derives the maxima, brings
+  the pools DOWN to them (never up: a rollback is not a heal), clears
+  `resync_trade`, and **deletes every session of the account**, like a kick.
+  The game sees the 401 on its next poll and reloads everything at sign-in;
+  nothing short of that replaces the game's copy of level, gold and gear. The
+  owner rolling back their own character is signed out the same way.
+- **`POST /api/staff/grant` takes `username`** (staff_grant, TO SOMEBODY ELSE).
+  Your own name, any case, is your own grant as before (and needs `slot`).
+  Another name goes to `_give_to_player()`: the character they are PLAYING,
+  never a slot from the request; a `before-give` snapshot; the item; the flag;
+  a `give` line about them; 409 naming them when the bag is full, with the
+  snapshot rolled back too. Offline is fine - their last save's character -
+  and the answer's `online` says which.
+- **The gift rides the trade's resync flag.** `saves.resync_trade` holds
+  `GIFT_MARK` ("gift:") and a JSON list of `{by, item_id, quantity}`, the newest
+  `GIFTS_KEPT` (5). `_take_resync()` hands the bag over exactly as for a trade,
+  with `gifts` instead of `trade`, on whichever poll gets there first; the game
+  says "boss gave you 2 × Large Health Potion." A game from before reads
+  `trade: null` and says its old "Your backpack was updated by the server".
+  **A waiting trade result is never overwritten** by a gift: the bag delivered
+  is read at delivery, so it holds the gift anyway.
+- **`give` and `rollback` are in the "moderation" group** of the log, unlike
+  `grant`: they are done to a player, and "has this player been rolled back
+  before" is what a mod reading their record asks.
+- **The honest limit** (SECURITY.md): a rollback can return an item the
+  character has since traded away, which then exists twice. The owner's call,
+  logged on the player's record. And every burn counts as given on the Kingdom
+  board, a rollback's included.
 
 ## Decided, not built: staff commands
 
@@ -1431,6 +1495,8 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
                 no recovery-email demand with no mail
   chatsafety    ignore, report and mute
   chardelete    deleting a character, and only the character
+  rollback      the save history: snapshots, the owner's rollback, and
+                giving a player an item
   concurrency   requests that arrive together: the write lock
   attackxp      attack XP banked at the kill, with the class specialty
   pacing        the level curve, the element bands, and the store's saving pace

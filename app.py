@@ -1535,6 +1535,39 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_character_deletions_user
             ON character_deletions(user_id, deleted_at);
 
+        -- A CHARACTER AS IT WAS, a few times over, so the owner can put it
+        -- back. See SAVE SNAPSHOTS AND ROLLBACK. One row is everything about a
+        -- character that a mistake, a bug or a dupe can change: level, xp,
+        -- purse, what is worn, the pet, every carried cell and every skill, as
+        -- JSON in `snapshot`. level, gold and items are copies of what is in
+        -- it, so the list can be drawn without parsing every row.
+        --
+        -- NOT the bank and not lusions: those are the account's, shared by all
+        -- four characters, and putting one character back must not reach into
+        -- the other three.
+        --
+        -- `fingerprint` is the snapshot's sha1, so a character that has not
+        -- changed takes no new row - an afternoon standing in town does not
+        -- push the useful history out. The newest SNAPSHOTS_KEPT per character,
+        -- pruned on write. A new table, so CREATE TABLE IF NOT EXISTS is the
+        -- whole migration.
+        CREATE TABLE IF NOT EXISTS save_snapshots (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            slot        INTEGER NOT NULL,
+            taken_at    INTEGER NOT NULL,
+            reason      TEXT    NOT NULL,
+            level       INTEGER NOT NULL,
+            gold        INTEGER NOT NULL,
+            items       INTEGER NOT NULL,
+            fingerprint TEXT    NOT NULL,
+            snapshot    TEXT    NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_save_snapshots_character
+            ON save_snapshots(user_id, slot, taken_at);
+
         -- EVERY GOLD THAT ENTERS OR LEAVES THE ECONOMY, one row each.
         --
         -- WHAT THIS BUYS. Two numbers that must agree:
@@ -7972,6 +8005,12 @@ def write_save():
             )
         db.commit()
 
+    # THE SAVE HISTORY. At most one snapshot every SNAPSHOT_EVERY_SECONDS, and
+    # none when nothing has changed - see SAVE SNAPSHOTS AND ROLLBACK. Not for
+    # a character created by this very request: there is nothing to go back to.
+    if not is_new and take_snapshot(db, g.user["id"], slot, "save") is not None:
+        db.commit()
+
     # active_pet_id is echoed back only when the caller actually set it, so a
     # client can tell "you stored this" apart from "we left yours alone".
     result = {"slot": slot, "updated_at": now}
@@ -10983,7 +11022,7 @@ def staff_skill():
 @require_owner
 def staff_grant():
     """
-    Give yourself an item (owner only)
+    Give an item to yourself or to a player (owner only)
     ---
     tags:
       - Staff
@@ -11000,9 +11039,10 @@ def staff_grant():
         required: true
         schema:
           type: object
-          required: [slot, item_id]
+          required: [item_id]
           properties:
-            slot: {type: integer, example: 0}
+            slot: {type: integer, example: 0, description: "Your own character's slot. Needed unless username names somebody else."}
+            username: {type: string, example: someplayer, description: "Give it to this account instead, into the character it is playing. Your own name, or none, is yourself."}
             item_id: {type: string, example: "petsniper"}
             quantity: {type: integer, example: 1}
             quality:
@@ -11011,13 +11051,13 @@ def staff_grant():
               description: "plain (the default) is the catalogue piece at 100%; roll rolls it like a drop or a purchase; perfect gives the Perfect roll. store is read as plain."
     responses:
       200:
-        description: The backpack as stored, after the grant
+        description: "Your own: the backpack as stored, after the grant. Somebody else's: who, which character, what arrived and where."
       400:
         description: Bad slot, item id or quantity
       404:
-        description: That slot is empty, or you are not the owner
+        description: That slot is empty, no such account or it has no character, or you are not the owner
       409:
-        description: Backpack full
+        description: The backpack it was going into is full
       401:
         description: Missing, invalid or expired token
     """
@@ -11042,17 +11082,44 @@ def staff_grant():
     # bag in write_inventory() and the bank in write_bank()) closed with it, so
     # the owner is now the only account that can make an item from nothing.
     #
-    # SELF ONLY. There is no target parameter and there should not be one until
-    # there is a reason: granting to someone else is a different action with
-    # different consequences, and can_act_on() exists for when that day comes.
+    # TO SOMEBODY ELSE, SINCE 6 OCT 2026 (the owner: "give player item might be
+    # useful"). It said "SELF ONLY ... there should not be one until there is a
+    # reason": granting to someone else is a different action with different
+    # consequences. The reason came, and the consequences are what is below:
+    #
+    # - THE CHARACTER THEY ARE PLAYING (PLAYING_SLOT_SQL, the trade offer's
+    #   rule), never a slot the owner names - the panel knows a name, not
+    #   which of four characters is at the keyboard. Offline, their last save.
+    # - THEIR GAME IS TOLD. The bag is flagged (_mark_gift(), the trade flag's
+    #   column) and the broadcast poll hands the game the bag the server holds
+    #   and who gave what - the way a trade that finished without them watching
+    #   reaches them. Offline, they load the bag at login and read the line.
+    # - A SNAPSHOT FIRST ("before-give"), so the gift can be taken back with
+    #   the save history like any other change.
+    # - ITS OWN LINE IN THE LOG, "give", about THEM - on their record, where a
+    #   mod looking at them will see it, not filed under the owner's testing.
+    #
+    # Still owner only, and still no can_act_on(): the owner outranks everyone,
+    # and nobody else reaches this line.
     payload = request.get_json(silent=True) or {}
     user_id = g.user["id"]
 
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-    if not _slot_exists(user_id, slot):
-        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
+    target = None
+    wanted = str(payload.get("username", "") or "").strip()
+    if wanted and wanted.casefold() != str(g.user["username"]).casefold():
+        target = _user_by_name(wanted)
+        if target is None:
+            return {"error": "Not Found", "message": "No such account."}, 404
+        slot = _playing_slot(get_db(), int(target["id"]))
+        if slot is None:
+            return {"error": "Not Found",
+                    "message": "%s has no character to give it to." % target["username"]}, 404
+    else:
+        slot = parse_slot(payload.get("slot"))
+        if slot is None:
+            return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+        if not _slot_exists(user_id, slot):
+            return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
 
     item_id = str(payload.get("item_id", "")).strip()
     if not item_id or len(item_id) > 64:
@@ -11100,6 +11167,9 @@ def staff_grant():
         )
 
     db = get_db()
+    if target is not None:
+        return _give_to_player(db, target, slot, item_id, quantity)
+
     written = _add_to_backpack(user_id, slot, item_id, quantity)
     if written is None:
         return {
@@ -11123,6 +11193,497 @@ def staff_grant():
         "granted_quantity": quantity,
         "carry_positions": written,
         "inventory": inventory_payload(user_id, slot),
+    }, 200
+
+
+def _give_to_player(db, target, slot, item_id, quantity):
+    """
+    The half of POST /api/staff/grant that puts an item in somebody else's bag:
+    `target` is their users row, `slot` the character they are playing. A
+    snapshot first, then the item, the flag their game reads, and the log line,
+    in one transaction. See TO SOMEBODY ELSE in staff_grant().
+    """
+    receiver = int(target["id"])
+    take_snapshot(db, receiver, slot, "before-give")
+    written = _add_to_backpack(receiver, slot, item_id, quantity)
+    if written is None:
+        db.rollback()
+        return {
+            "error": "Conflict",
+            "message": "%s's backpack is full (%d slots)." % (target["username"], INVENTORY_CAPACITY),
+        }, 409
+
+    _mark_gift(db, receiver, slot, g.user["username"], item_id, quantity)
+    character = db.execute("SELECT name, class_id FROM saves WHERE user_id = ? AND slot = ?",
+                           (receiver, slot)).fetchone()
+    name = (character["name"] or character["class_id"]) if character is not None else "?"
+    log_staff_action(
+        g.user, "give", target["username"], receiver,
+        "%d x %s into %s (slot %d)" % (quantity, item_id, name, slot),
+    )
+    db.commit()
+
+    now = int(time.time())
+    online = db.execute(
+        "SELECT 1 FROM sessions WHERE user_id = ? AND last_seen_at > ? AND expires_at > ? LIMIT 1",
+        (receiver, now - ONLINE_WINDOW_SECONDS, now),
+    ).fetchone() is not None
+    return {
+        "username": target["username"],
+        "slot": slot,
+        "character": name,
+        "granted_item_id": item_id,
+        "granted_quantity": quantity,
+        "carry_positions": written,
+        # So the panel can say WHEN they will see it: within a poll, or at
+        # their next login.
+        "online": online,
+    }, 200
+
+
+# A GIFT RIDES THE TRADE FLAG. saves.resync_trade is "this character's game is
+# holding an old bag; hand it the new one" - set by a trade, read and cleared by
+# _take_resync() on whichever of three polls reaches the game first. A staff
+# gift needs exactly that, plus a line saying what arrived, so the column holds
+# GIFT_MARK and a short JSON list instead of a trade id. A trade id is a hex
+# token and never starts with the mark.
+#
+# A TRADE'S RESULT WINS. If one is still waiting to be shown, the gift leaves the
+# flag alone: the bag the poll hands over is read at delivery, so it holds the
+# gift anyway, and the trade's line is the one a player needs to read. A trade
+# that finishes after a gift overwrites the gift's line the same way.
+GIFT_MARK = "gift:"
+GIFTS_KEPT = 5
+
+
+def _gifts_in(marker):
+    """The gifts a resync_trade value carries; [] for a trade id or nothing."""
+    if not marker or not str(marker).startswith(GIFT_MARK):
+        return []
+    try:
+        value = json.loads(str(marker)[len(GIFT_MARK):])
+    except ValueError:
+        return []
+    if not isinstance(value, list):
+        return []
+    return [entry for entry in value if isinstance(entry, dict)]
+
+
+def _mark_gift(db, user_id, slot, by, item_id, quantity):
+    """Flag this character's bag as changed by a gift. NO COMMIT - the grant's."""
+    row = db.execute("SELECT resync_trade FROM saves WHERE user_id = ? AND slot = ?",
+                     (user_id, slot)).fetchone()
+    if row is None:
+        return
+    held = row["resync_trade"]
+    if held is not None and not str(held).startswith(GIFT_MARK):
+        return
+    gifts = _gifts_in(held)
+    gifts.append({"by": str(by), "item_id": str(item_id), "quantity": int(quantity)})
+    db.execute("UPDATE saves SET resync_trade = ? WHERE user_id = ? AND slot = ?",
+               (GIFT_MARK + json.dumps(gifts[-GIFTS_KEPT:]), user_id, slot))
+
+
+# =============================================================================
+# SAVE SNAPSHOTS AND ROLLBACK
+# =============================================================================
+#
+# The owner, 6 Oct: "roll back ... might be useful" - a player who lost a
+# stack to a bug, a dupe to undo, a gift given to the wrong name. The server
+# keeps each character as it was, a few times over, and one owner-only route
+# puts one back.
+#
+# WHAT A SNAPSHOT HOLDS: everything about one character a mistake can change -
+# level, xp, the purse, what is worn, the pet that is out, every carried cell
+# (bag and hotbar) and every skill. NOT the bank or lusions: they are the
+# account's, shared by all four characters, and putting one character back must
+# not reach into the other three. NOT the area or the explored map: where
+# somebody stands and what they have seen are not what a rollback is for. NOT
+# hp, mana or stamina: a rollback keeps today's pools (brought down to the old
+# maxima if those are lower), so it never doubles as a free heal.
+#
+# WHEN ONE IS TAKEN:
+#   save             on PUT /api/save, at most every SNAPSHOT_EVERY_SECONDS
+#   before-give      before the owner puts an item in somebody's bag
+#   before-rollback  before a rollback - so a rollback can itself be undone
+# and never when nothing has changed since the newest one (`fingerprint`), so an
+# afternoon standing in town does not push the useful history out. The newest
+# SNAPSHOTS_KEPT per character are kept, pruned on write, and a character's go
+# with it when it is deleted (character_deletions keeps its own copy).
+#
+# OWNER ONLY, and the reason is the honest limit: a rollback can only put back
+# what this character holds. An item it has since traded, banked, sold or
+# dropped is somewhere else now and stays there - so a snapshot from before a
+# trade gives the item back AND leaves it with the other player. That is a
+# duplicate the owner made on purpose, a judgement about one player's history,
+# and the same kind of power as creating an item. SECURITY.md says so.
+#
+# THE GOLD GOES THROUGH THE LEDGER (`staff_rollback`), up or down, so the
+# supply invariant holds - and, like every burn, gold a rollback takes away is
+# counted on the Kingdom board as given.
+#
+# THEIR GAME RELOADS. Every session of the account is ended, as a kick ends
+# them: the game sees the 401 on its next poll, goes to the login screen, and
+# signing in loads the character from here. The game holds its own copy of
+# level, gold and gear, and nothing short of a reload replaces all of it. The
+# owner rolling back their own character is signed out the same way.
+SNAPSHOT_EVERY_SECONDS = 600
+SNAPSHOTS_KEPT = 20
+SNAPSHOT_REASONS = ("save", "before-give", "before-rollback")
+ROLLBACK_REASON = "staff_rollback"
+
+
+def _character_state(db, user_id, slot):
+    """What a snapshot keeps of one character, or None when there is none."""
+    row = db.execute(
+        "SELECT class_id, name, level, xp, xp_to_next, gold, active_pet_id, equipment"
+        " FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone()
+    if row is None:
+        return None
+    carry = [[int(r["position"]), r["item_id"], int(r["quantity"])] for r in db.execute(
+        "SELECT position, item_id, quantity FROM carry_items"
+        " WHERE user_id = ? AND slot = ? ORDER BY position", (user_id, slot))]
+    skills = [[r["skill_id"], int(r["level"]), int(r["xp"])] for r in db.execute(
+        "SELECT skill_id, level, xp FROM skills"
+        " WHERE user_id = ? AND slot = ? ORDER BY skill_id", (user_id, slot))]
+    return {
+        "class_id": row["class_id"],
+        "name": row["name"],
+        "level": int(row["level"] or 1),
+        "xp": int(row["xp"] or 0),
+        "xp_to_next": int(row["xp_to_next"] or 0),
+        "gold": int(row["gold"] or 0),
+        "active_pet_id": row["active_pet_id"] or "",
+        "equipment": _stored_json(row["equipment"], {}),
+        "carry": carry,
+        "skills": skills,
+    }
+
+
+def _state_fingerprint(state):
+    return hashlib.sha1(
+        json.dumps(state, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def take_snapshot(db, user_id, slot, reason):
+    """
+    Keep this character as it is now.
+
+    Returns the id of the snapshot that holds the character as it is - a new
+    one, or the newest one when nothing has changed since it was taken - or
+    None when there is no character, or (`save` only) the newest is younger
+    than SNAPSHOT_EVERY_SECONDS.
+
+    NO COMMIT. It joins the caller's transaction, so a rollback and the
+    snapshot taken before it land together or not at all.
+    """
+    now = int(time.time())
+    newest = db.execute(
+        "SELECT id, taken_at, fingerprint FROM save_snapshots"
+        " WHERE user_id = ? AND slot = ? ORDER BY taken_at DESC, id DESC LIMIT 1",
+        (user_id, slot)).fetchone()
+    # THE CHEAP QUESTION FIRST. Every save asks, so a save inside the window
+    # costs one indexed read and nothing else.
+    if reason == "save" and newest is not None \
+            and now - int(newest["taken_at"]) < SNAPSHOT_EVERY_SECONDS:
+        return None
+    state = _character_state(db, user_id, slot)
+    if state is None:
+        return None
+    fingerprint = _state_fingerprint(state)
+    if newest is not None and newest["fingerprint"] == fingerprint:
+        return int(newest["id"])
+    cursor = db.execute(
+        "INSERT INTO save_snapshots"
+        " (user_id, slot, taken_at, reason, level, gold, items, fingerprint, snapshot)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (user_id, slot, now, reason, state["level"], state["gold"], len(state["carry"]),
+         fingerprint, json.dumps(state, separators=(",", ":"))),
+    )
+    db.execute(
+        "DELETE FROM save_snapshots WHERE user_id = ? AND slot = ? AND id NOT IN ("
+        " SELECT id FROM save_snapshots WHERE user_id = ? AND slot = ?"
+        " ORDER BY taken_at DESC, id DESC LIMIT ?)",
+        (user_id, slot, user_id, slot, SNAPSHOTS_KEPT),
+    )
+    return int(cursor.lastrowid)
+
+
+def _snapshot_row(row):
+    """One snapshot as the save history lists it - never the JSON itself."""
+    return {
+        "id": int(row["id"]),
+        "taken_at": int(row["taken_at"]),
+        "reason": row["reason"],
+        "level": int(row["level"]),
+        "gold": int(row["gold"]),
+        "items": int(row["items"]),
+    }
+
+
+def _rollback_target(username):
+    """The account named, or (None, 404). The owner may name anyone, themselves
+    included; a name that is not an account is the same 404 as any refusal."""
+    username = str(username or "").strip()
+    if not username:
+        return None, bad_request("username is required")
+    target = _user_by_name(username)
+    if target is None:
+        return None, ({"error": "Not Found", "message": "No such account."}, 404)
+    return target, None
+
+
+@app.get("/api/staff/snapshots")
+@require_auth
+@require_owner
+def staff_snapshots():
+    """
+    Read a player's save history (owner only)
+    ---
+    tags:
+      - Staff
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: query
+        name: username
+        type: string
+        required: true
+      - in: query
+        name: slot
+        type: integer
+        description: "Which character. Left out, the one they are playing."
+    responses:
+      200:
+        description: Their characters, the chosen one as it is now, and its snapshots newest first
+      400:
+        description: No username, or a bad slot
+      404:
+        description: No such account, no character there, or you are not the owner
+      401:
+        description: Missing, invalid or expired token
+    """
+    # A READ, SO NOT LOGGED. Looking is not an action on the player; the
+    # rollback it may lead to is, and that is logged with what it changed.
+    target, refusal = _rollback_target(request.args.get("username"))
+    if refusal is not None:
+        return refusal
+    db = get_db()
+    user_id = int(target["id"])
+
+    characters = [
+        {"slot": int(r["slot"]), "name": r["name"], "class_id": r["class_id"],
+         "level": int(r["level"] or 1)}
+        for r in db.execute("SELECT slot, name, class_id, level FROM saves"
+                            " WHERE user_id = ? ORDER BY slot", (user_id,))
+    ]
+    if not characters:
+        return {"error": "Not Found",
+                "message": "%s has no characters." % target["username"]}, 404
+
+    raw_slot = request.args.get("slot")
+    if raw_slot is None or str(raw_slot).strip() == "":
+        slot = _playing_slot(db, user_id)
+    else:
+        slot = parse_slot(raw_slot)
+        if slot is None:
+            return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+    now = _character_state(db, user_id, slot) if slot is not None else None
+    if now is None:
+        return {"error": "Not Found", "message": "No character in slot %s." % raw_slot}, 404
+
+    snapshots = [_snapshot_row(r) for r in db.execute(
+        "SELECT id, taken_at, reason, level, gold, items FROM save_snapshots"
+        " WHERE user_id = ? AND slot = ? ORDER BY taken_at DESC, id DESC",
+        (user_id, slot))]
+    return {
+        "username": target["username"],
+        "slot": slot,
+        "playing": _playing_slot(db, user_id),
+        "characters": characters,
+        "now": {"name": now["name"], "class_id": now["class_id"], "level": now["level"],
+                "gold": now["gold"], "items": len(now["carry"])},
+        "snapshots": snapshots,
+        "kept": SNAPSHOTS_KEPT,
+        "every_seconds": SNAPSHOT_EVERY_SECONDS,
+    }, 200
+
+
+@app.post("/api/staff/rollback")
+@require_auth
+@require_owner
+def staff_rollback():
+    """
+    Put a player's character back to a snapshot (owner only)
+    ---
+    tags:
+      - Staff
+    consumes:
+      - application/json
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [username, snapshot_id]
+          properties:
+            username:    {type: string, example: someplayer}
+            snapshot_id: {type: integer, example: 42, description: "From GET /api/staff/snapshots"}
+    responses:
+      200:
+        description: "Restored: what it was and is now, the snapshot that undoes it, and how many sessions ended"
+      400:
+        description: No username, or a snapshot_id that is not a whole number
+      404:
+        description: No such account, no such snapshot of theirs, the character is gone, or you are not the owner
+      409:
+        description: The character is in an open trade, or its slot now holds another class
+      401:
+        description: Missing, invalid or expired token
+    """
+    payload = request.get_json(silent=True) or {}
+    target, refusal = _rollback_target(payload.get("username"))
+    if refusal is not None:
+        return refusal
+    raw_id = payload.get("snapshot_id")
+    if isinstance(raw_id, bool):
+        return bad_request("snapshot_id must be a whole number")
+    try:
+        snapshot_id = int(raw_id)
+    except (TypeError, ValueError):
+        return bad_request("snapshot_id must be a whole number")
+    if isinstance(raw_id, float) and raw_id != snapshot_id:
+        return bad_request("snapshot_id must be a whole number")
+
+    db = get_db()
+    user_id = int(target["id"])
+    # BY ID AND ACCOUNT TOGETHER: the name in the request and the snapshot have
+    # to agree, so a stale panel holding somebody else's id cannot roll the
+    # wrong player back.
+    snap = db.execute(
+        "SELECT * FROM save_snapshots WHERE id = ? AND user_id = ?",
+        (snapshot_id, user_id)).fetchone()
+    if snap is None:
+        return {"error": "Not Found", "message": "No such snapshot of %s." % target["username"]}, 404
+    slot = int(snap["slot"])
+    state = _stored_json(snap["snapshot"], {})
+    row = db.execute("SELECT * FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone()
+    if row is None:
+        return {"error": "Not Found", "message": "That character no longer exists."}, 404
+    # A SLOT IS A CLASS (one per class), so this only fails if the character
+    # was deleted and made again since - and the delete takes the snapshots
+    # with it. Checked anyway: a warrior's bag and skills on a mage is not a
+    # state anything in this file expects.
+    if state.get("class_id") != row["class_id"]:
+        return {"error": "Conflict",
+                "message": "That snapshot is of a %s; the slot holds a %s now." % (
+                    state.get("class_id", "?"), row["class_id"])}, 409
+    # NOT IN THE MIDDLE OF A TRADE - the delete route's rule, for its reason:
+    # an open trade names items in this bag, and a rollback changes the bag
+    # under it. It ends on its own at TRADE_EXPIRY_SECONDS.
+    trade = _trade_find_open(db, user_id)
+    if trade is not None and (
+            (trade["a_user"] == user_id and trade["a_slot"] == slot)
+            or (trade["b_user"] == user_id and trade["b_slot"] == slot)):
+        return {"error": "Conflict",
+                "message": "%s is in a trade. Try again when it has finished or timed out." % (
+                    target["username"])}, 409
+
+    # ---- everything above this line is validation; everything below commits --
+
+    was = _character_state(db, user_id, slot)
+    undo = take_snapshot(db, user_id, slot, "before-rollback")
+    now = int(time.time())
+
+    db.execute("DELETE FROM carry_items WHERE user_id = ? AND slot = ?", (user_id, slot))
+    carry = [(user_id, slot, int(c[0]), str(c[1]), int(c[2]))
+             for c in state.get("carry", [])
+             if isinstance(c, list) and len(c) == 3 and 0 <= int(c[0]) < CARRY_CAPACITY]
+    if carry:
+        db.executemany("INSERT INTO carry_items (user_id, slot, position, item_id, quantity)"
+                       " VALUES (?, ?, ?, ?, ?)", carry)
+    db.execute("DELETE FROM skills WHERE user_id = ? AND slot = ?", (user_id, slot))
+    skills = [(user_id, slot, str(s[0]), max(1, int(s[1])), max(0, int(s[2])))
+              for s in state.get("skills", []) if isinstance(s, list) and len(s) == 3]
+    if skills:
+        db.executemany("INSERT INTO skills (user_id, slot, skill_id, level, xp)"
+                       " VALUES (?, ?, ?, ?, ?)", skills)
+
+    # THE PURSE THROUGH THE LEDGER, by the difference, never written outright.
+    gold_now = int(row["gold"] or 0)
+    gold_then = max(0, int(state.get("gold", 0)))
+    if gold_then != gold_now:
+        gold_delta(db, user_id, slot, gold_then - gold_now, ROLLBACK_REASON,
+                   "rollback to snapshot #%d by %s" % (snapshot_id, g.user["username"]))
+
+    # THE PET ONLY IF IT IS STILL HELD - the save route's rule. It may have
+    # been in this bag then and in nobody's now.
+    pet = str(state.get("active_pet_id", "") or "")
+    if pet and not _owns_item(user_id, slot, pet):
+        pet = ""
+    equipment = state.get("equipment", {}) if isinstance(state.get("equipment"), dict) else {}
+    level = max(1, int(state.get("level", 1)))
+    db.execute(
+        "UPDATE saves SET level = ?, xp = ?, xp_to_next = ?, equipment = ?, active_pet_id = ?,"
+        " resync_trade = NULL, updated_at = ? WHERE user_id = ? AND slot = ?",
+        (level, max(0, int(state.get("xp", 0))),
+         int(gamedata.xp_needed_for_level(level)),
+         json.dumps(equipment), pet, now, user_id, slot),
+    )
+    # THE MAXIMA FOLLOW THE OLD LEVEL AND GEAR; THE POOLS ONLY COME DOWN.
+    stored = db.execute("SELECT class_id, level, equipment FROM saves WHERE user_id = ? AND slot = ?",
+                        (user_id, slot)).fetchone()
+    derived = _derived_stats(stored)
+    if derived is not None:
+        db.execute(
+            "UPDATE saves SET max_hp = ?, max_mana = ?, max_stamina = ?,"
+            " hp = MIN(hp, ?), mana = MIN(mana, ?), stamina = MIN(stamina, ?), pools_at = ?"
+            " WHERE user_id = ? AND slot = ?",
+            (derived["max_hp"], derived["max_mana"], derived["max_stamina"],
+             derived["max_hp"], derived["max_mana"], derived["max_stamina"], now,
+             user_id, slot),
+        )
+
+    # THEIR GAME RELOADS - see the section header. Counted first, like a kick,
+    # because "were they playing" is the useful number.
+    ended = int(db.execute(
+        "SELECT COUNT(*) AS n FROM sessions WHERE user_id = ? AND expires_at > ?",
+        (user_id, now)).fetchone()["n"] or 0)
+    db.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+
+    after = _character_state(db, user_id, slot)
+    log_staff_action(
+        g.user, "rollback", target["username"], user_id,
+        "%s (slot %d) to snapshot #%d of %s UTC: level %d -> %d, gold %d -> %d, %d -> %d"
+        " carried; undo is #%s; %d session(s) ended" % (
+            row["name"], slot, snapshot_id,
+            time.strftime("%Y-%m-%d %H:%M", time.gmtime(int(snap["taken_at"]))),
+            was["level"], after["level"], was["gold"], after["gold"],
+            len(was["carry"]), len(after["carry"]),
+            undo if undo is not None else "-", ended),
+    )
+    db.commit()
+
+    return {
+        "username": target["username"],
+        "slot": slot,
+        "character": row["name"],
+        "restored": snapshot_id,
+        "taken_at": int(snap["taken_at"]),
+        "undo_snapshot": undo,
+        "was": {"level": was["level"], "gold": was["gold"], "items": len(was["carry"])},
+        "now": {"level": after["level"], "gold": after["gold"], "items": len(after["carry"])},
+        "pet_cleared": bool(state.get("active_pet_id")) and pet == "",
+        "sessions_ended": ended,
     }, 200
 
 
@@ -11383,8 +11944,8 @@ def staff_powers():
             # WHAT A MOD NO LONGER HAS, said where the owner handing out the
             # rank will read it. Until 6 Oct 2026 a mod could give themselves
             # any item and write a whole bag or bank; both are the owner's now.
-            "Cannot create items: giving yourself an item, and writing a whole"
-            " bag or bank at once, are the owner's alone.",
+            "Cannot create items: giving an item to anyone, yourself included,"
+            " and writing a whole bag or bank at once, are the owner's alone.",
         ],
         "dev": [
             "Ban permanently, and for any number of days.",
@@ -11413,6 +11974,12 @@ def staff_powers():
             "The only account that can create items: the Testing tab, and"
             " writing a whole bag or bank at once (everyone else moves one cell"
             " at a time). The game has no debug keys.",
+            "Account tab: Give item puts anything from the item catalogue into"
+            " the bag of the character a player is playing, and Save history"
+            " puts a player's character back to one of its last %d snapshots"
+            " (one every %d minutes at most, while it changes). A rollback signs"
+            " them out so their game reloads it, and can return an item they"
+            " have since traded away." % (SNAPSHOTS_KEPT, SNAPSHOT_EVERY_SECONDS // 60),
         ],
     }
 
@@ -11470,6 +12037,7 @@ STAFF_ACTION_KINDS = (
     "grant", "level", "skill", "teleport", "chat_delete", "mute", "unmute", "report",
     "guild_rename", "guild_disband",
     "maintenance", "minbuild", "pvp", "trade",
+    "give", "rollback",
 )
 
 # NAMED SETS OF KINDS the log can be asked for by one name (?action=moderation).
@@ -11482,8 +12050,12 @@ STAFF_ACTION_KINDS = (
 # "Everything" is still one choice away; nothing is hidden from anybody who
 # could read it before.
 STAFF_ACTION_GROUPS = {
+    # "give" and "rollback" ARE IN IT, unlike "grant": they are done to a
+    # player's character, not to the owner's own, and "has this player been
+    # rolled back before" is exactly what a mod reading their record asks.
     "moderation": ("ban", "unban", "kick", "warn", "note", "role", "chat_delete",
-                   "mute", "unmute", "report", "guild_rename", "guild_disband"),
+                   "mute", "unmute", "report", "guild_rename", "guild_disband",
+                   "give", "rollback"),
 }
 
 # WRITTEN FOR THE PEOPLE WHO CAN ACT ON THE ACCOUNT, NOT FOR THE ACCOUNT.
@@ -15017,12 +15589,21 @@ def _take_resync(db, user_id, slot=None):
     db.execute("UPDATE saves SET resync_trade = NULL WHERE user_id = ? AND slot = ?",
                (user_id, slot))
     db.commit()
-    return {
+    resync = {
         "slot": slot,
         "gold": int(row["gold"]),
         "inventory": inventory_payload(user_id, slot),
-        "trade": _trade_record(db, row["resync_trade"], user_id),
+        "trade": None,
     }
+    # OR WHAT THE OWNER GAVE, which rides the same flag (see GIFT_MARK): the
+    # bag the same way, and `gifts` - who gave what - for the game's line. A
+    # game from before gifts reads trade = None and says "Your backpack was
+    # updated by the server", which is still true.
+    if str(row["resync_trade"]).startswith(GIFT_MARK):
+        resync["gifts"] = _gifts_in(row["resync_trade"])
+    else:
+        resync["trade"] = _trade_record(db, row["resync_trade"], user_id)
+    return resync
 
 
 def _trade_record(db, trade_id, user_id):
@@ -19654,7 +20235,10 @@ def character_delete():
         gold_delta(db, user_id, slot, -gold, CHARACTER_DELETE_REASON,
                    "carried gold of a deleted %s in slot %d" % (row["class_id"], slot))
 
-    for table in ("carry_items", "skills", "consume_grants"):
+    # AND ITS SAVE HISTORY: a snapshot names a slot, not a character, and the
+    # next character made in this slot is somebody else. The copy above is
+    # what is kept of this one.
+    for table in ("carry_items", "skills", "consume_grants", "save_snapshots"):
         db.execute("DELETE FROM %s WHERE user_id = ? AND slot = ?" % table, (user_id, slot))
     # The items in its loot bags go with the bags: loot_bag_items cascades.
     db.execute("DELETE FROM loot_bags WHERE user_id = ? AND slot = ?", (user_id, slot))
