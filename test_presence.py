@@ -35,6 +35,7 @@ _spec.loader.exec_module(app_module)
 client = app_module.app.test_client()
 
 import presence  # noqa: E402  (after ELUSION_DB is set: it reads it on import)
+import combatbook  # noqa: E402
 from websockets.asyncio.client import connect  # noqa: E402
 from websockets.asyncio.server import serve  # noqa: E402
 from websockets.exceptions import ConnectionClosed  # noqa: E402
@@ -208,7 +209,8 @@ async def run(port, server):
 
     a, welcome = await enter(port, ALICE)
     check("a real ticket is welcomed, by account id",
-          welcome == {"t": "welcome", "id": uid("presa"), "v": presence.SHARED_VERSION}, welcome)
+          welcome == {"t": "welcome", "id": uid("presa"), "v": presence.SHARED_VERSION,
+                      "books": presence.BOOKS}, welcome)
     await a.close()
 
     # =========================================================================
@@ -512,6 +514,192 @@ async def run(port, server):
     check("an empty area has no leader", not server.leaders, server.leaders)
 
     # =========================================================================
+    section("P-8 THE BOOKS: THE SERVER COUNTS EVERY MONSTER'S HEALTH, AND CHANGES NOTHING")
+    # =========================================================================
+    # 0.10.0, E3_SCOPE.md option C step 1. Every leader's world and every
+    # follower's hit is also read into combatbook.py's books; what they find
+    # is written to combat_kills and combat_flags. The relay is untouched.
+    check("the books are on with this catalogue", presence.BOOKS)
+    HAL = account("presh")
+    IVY = account("presi", "mage")
+    raw, _ = ticket(HAL)
+    ident = json.loads(sql("SELECT identity FROM presence_tickets WHERE token_hash = ?",
+                           (presence._hash(raw),))[0]["identity"])
+    check("a ticket carries what the books hold a character to: its gear and fighting skills",
+          ident.get("gear") == [] and isinstance(ident.get("skills"), dict), ident)
+    sql("INSERT INTO carry_items (user_id, slot, position, item_id, quantity) VALUES (?, 0, 0, 'ironsword', 1)",
+        (uid("presh"),))
+    sql("INSERT OR REPLACE INTO skills (user_id, slot, skill_id, level, xp) VALUES (?, 0, 'attack', 7, 0)",
+        (uid("presh"),))
+    raw, _ = ticket(HAL)
+    ident = json.loads(sql("SELECT identity FROM presence_tickets WHERE token_hash = ?",
+                           (presence._hash(raw),))[0]["identity"])
+    check("  gear carried counts as well as gear worn, and the skills are the character's",
+          ident.get("gear") == ["ironsword"] and ident["skills"].get("attack") == 7, ident)
+
+    spots = [s for s in presence.gamedata.AREAS["bigfield"]["spawns"] if s["e"] == "firesprite"][:3]
+    fire = presence.gamedata.ENEMIES["firesprite"]
+
+    def rec(i, spot, hp=None):
+        return {"id": i, "o": spot["o"], "s": "res://scene/enemy/firesprite.tscn", "pp": "ysortworld",
+                "x": spot["x"], "y": spot["y"], "a": "idledown", "hp": hp or fire["max_hp"],
+                "mh": fire["max_hp"], "p": {"ed": fire["resource"], "eo": -1, "lr": 250.0, "g": False}}
+
+    h, welcome = await enter(port, HAL, "bigfield", v=presence.BOOKS_VERSION, x=spots[0]["x"] + 20, y=spots[0]["y"])
+    check("the welcome says this server keeps books", welcome.get("books") is True, welcome)
+    await collect(h)
+    full = {"t": "w", "d": {"full": True, "reset": True, "part": 0, "parts": 1, "wave": -1,
+                            "spawn": [rec(1, spots[0]), rec(2, spots[1])]}}
+    await h.send(json.dumps(full))
+    await asyncio.sleep(0.1)
+    book = server.books.get("bigfield")
+    check("a leader alone still has its world read into the books",
+          book is not None and set(book.monsters) == {1, 2}, book and book.monsters)
+
+    i, _ = await enter(port, IVY, "bigfield", v=presence.BOOKS_VERSION, x=spots[0]["x"] - 20, y=spots[0]["y"])
+    got_h = await collect(h)
+    seen = joined(got_h).get(uid("presi"), {})
+    check("what the books hold a player to is never shown to anyone", seen and "gear" not in seen
+          and "skills" not in seen, seen)
+    await collect(i)
+    ivy_bounds = server.players[uid("presi")].fighter.bounds
+    hal_bounds = server.players[uid("presh")].fighter.bounds
+    check("  each player's bounds come from their own ticket",
+          hal_bounds["max_hit"] > ivy_bounds["max_hit"] > 0, (hal_bounds, ivy_bounds))
+    half = fire["max_hp"] // 2
+    left_hp = fire["max_hp"] - half
+    sent = 0
+    while sent < half:
+        n = min(ivy_bounds["max_hit"], half - sent)
+        await i.send(json.dumps({"t": "h", "p": [[1, n, 0]]}))
+        sent += n
+        await asyncio.sleep(n / ivy_bounds["dps"])
+    got_h = await collect(h, 0.2)
+    check("a follower's hits still reach the leader, exactly as before",
+          sum(p[1] for m in of(got_h, "h") for p in m["p"]) == half, of(got_h, "h")[-1:])
+    own = []
+    while sum(own) < left_hp:
+        own.append(min(hal_bounds["max_hit"], left_hp - sum(own)))
+    world = {"t": "w", "d": {"hits": [[1, n, 0] for n in own],
+                             "ev": [{"k": "die", "id": 1, "x": spots[0]["x"], "y": spots[0]["y"]}]}}
+    await h.send(json.dumps(world))
+    got_i = await collect(i)
+    check("a world carrying the leader's own hits reaches the others exactly as sent",
+          of(got_i, "w") == [world], got_i)
+    await h.send(json.dumps({"t": "w", "d": {"ev": [{"k": "die", "id": 2, "x": 0, "y": 0}]}}))
+    await asyncio.sleep(combatbook.HOLD_SECONDS + server.flush_seconds + 0.4)
+    rows = sql("SELECT * FROM combat_kills WHERE area = 'bigfield' ORDER BY id")
+    first = {r["user_id"]: r for r in rows if r["origin"] == spots[0]["o"]}
+    check("a monster both players killed is AGREED, one row each with their own damage",
+          set(first) == {uid("presh"), uid("presi")}
+          and all(r["verdict"] == "agreed" for r in first.values())
+          and first[uid("presi")]["damage"] == half and first[uid("presh")]["damage"] == left_hp
+          and first[uid("presi")]["slot"] == 0 and first[uid("presh")]["leader_id"] == uid("presh"),
+          [dict(r) for r in rows])
+    second = [r for r in rows if r["origin"] == spots[1]["o"]]
+    check("one the leader says died with nobody hitting it is SHORT, on the leader",
+          len(second) == 1 and second[0]["verdict"] == "short" and second[0]["user_id"] == uid("presh")
+          and second[0]["hp_left"] == fire["max_hp"], [dict(r) for r in second])
+
+    await h.send(json.dumps({"t": "w", "d": {"ev": [{"k": "spawn", "r": rec(3, spots[2])}]}}))
+    await asyncio.sleep(0.1)
+    await i.send(json.dumps({"t": "h", "p": [[3, ivy_bounds["max_hit"] * 5, 0]]}))
+    await asyncio.sleep(combatbook.PENDING_SECONDS + server.flush_seconds + 0.4)
+    flags = sql("SELECT * FROM combat_flags WHERE user_id = ?", (uid("presi"),))
+    check("a hit bigger than the character could land is written down, with the numbers",
+          [f["kind"] for f in flags] == ["hit_too_big"] and str(ivy_bounds["max_hit"] * 5) in flags[0]["detail"],
+          [dict(f) for f in flags])
+    await collect(h)
+    await collect(i)
+
+    await h.send(json.dumps({"t": "w", "d": {"snap": [[999, 1.0, 1.0, "idledown", 5]]}}))
+    got_h = await collect(h)
+    check("a leader that talks of a monster the books never saw is asked for everything, for game 0",
+          {"t": "need", "id": 0} in of(got_h, "need"), got_h)
+    await collect(i)
+    await h.send(json.dumps({"t": "w", "to": 0, "d": {"full": True, "reset": False, "part": 0, "parts": 1,
+                                                       "spawn": [dict(rec(999, spots[1]), hp=40)]}}))
+    await asyncio.sleep(0.1)
+    check("  and its answer, to nobody, is read by the books alone",
+          999 in book.monsters and book.monsters[999].hp == 40 and not of(await collect(i), "w"),
+          (sorted(book.monsters), book.monsters.get(999) and book.monsters[999].hp))
+
+    await i.close()
+    await asyncio.sleep(0.1)
+    i, _ = await enter(port, IVY, "bigfield", v=2, x=spots[0]["x"] - 20, y=spots[0]["y"])
+    await asyncio.sleep(0.1)
+    await collect(h)
+    await h.close()
+    got_i = await collect(i)
+    check("a game from before the books still leads an area it is alone in",
+          (last_lead(got_i) or {}).get("id") == uid("presi"), got_i)
+    await i.send(json.dumps({"t": "w", "d": {"full": True, "reset": True, "part": 0, "parts": 1,
+                                             "spawn": [rec(1, spots[0])]}}))
+    await i.send(json.dumps({"t": "w", "d": {"ev": [{"k": "die", "id": 1, "x": 0, "y": 0}]}}))
+    await asyncio.sleep(combatbook.HOLD_SECONDS + server.flush_seconds + 0.4)
+    check("  but nothing it kills is judged - it never sends its own hits - so no row, not a false SHORT",
+          len(sql("SELECT * FROM combat_kills WHERE area = 'bigfield'")) == len(rows) + 0,
+          [dict(r) for r in sql("SELECT * FROM combat_kills WHERE area = 'bigfield'")])
+    await i.close()
+    await asyncio.sleep(0.1)
+    h, _ = await enter(port, HAL, "bigfield", v=presence.BOOKS_VERSION, x=spots[0]["x"] + 20, y=spots[0]["y"])
+    i, _ = await enter(port, IVY, "bigfield", v=presence.BOOKS_VERSION, x=spots[0]["x"] - 20, y=spots[0]["y"])
+    await collect(h)
+    await collect(i)
+    book = server.books.get("bigfield")
+
+    odd = {"t": "w", "d": {"ev": "x", "snap": 5, "full": True, "spawn": [1, None], "hits": "lots"}}
+    await h.send(json.dumps(odd))
+    check("a world the books cannot read is still passed on exactly as sent",
+          of(await collect(i), "w") == [odd])
+    errors = server._book_errors
+    book.world = lambda *args: 1 / 0
+    await h.send(json.dumps(odd))
+    await i.send(json.dumps({"t": "h", "p": [[1, 5, 0]]}))
+    got_i = await collect(i)
+    got_h = await collect(h)
+    del book.world
+    check("  and a book that breaks outright breaks nothing else: the world and the hits still go through",
+          of(got_i, "w") == [odd] and of(got_h, "h") and server._book_errors == errors + 1,
+          (got_i, got_h, server._book_errors))
+
+    presence.BOOKS = False
+    try:
+        j, welcome = await enter(port, login("presa"), v=2)
+        check("ELUSION_BOOKS=off: the welcome says so", welcome.get("books") is False, welcome)
+        check("  and the player has nothing to be judged by", server.players[uid("presa")].fighter is None)
+        await j.close()
+    finally:
+        presence.BOOKS = True
+    ALICE = login("presa")
+    a, _ = await enter(port, ALICE, "field", x=100.0, y=200.0)
+    await collect(b)
+
+    bare = os.path.join(tempfile.gettempdir(), "elusion_presence_bare.db")
+    if os.path.exists(bare):
+        os.remove(bare)
+    sqlite3.connect(bare).close()
+    keep = presence.DB_PATH
+    presence.DB_PATH = bare
+    try:
+        presence.write_books([dict(rows[0])], [(1, "field", "too_fast", 1, "x", 1, 1)], prune_before=0)
+        quiet = True
+    except Exception as exc:  # noqa: BLE001
+        quiet = repr(exc)
+    finally:
+        presence.DB_PATH = keep
+    check("a database from before the books' tables is not an error", quiet is True, quiet)
+    await h.send(json.dumps({"t": "w", "d": {"ev": [{"k": "spawn", "r": rec(5, spots[2])}]}}))
+    await asyncio.sleep(0.1)
+    await h.close()
+    await i.close()
+    await asyncio.sleep(0.1)
+    check("an emptied area's books keep its living monsters a while, for a link coming back",
+          book.monsters and book.empty_since is not None, book.monsters)
+    await asyncio.sleep(combatbook.EMPTY_KEEP + 0.2)
+    check("  then forget them: the next game in loads the scene afresh", not book.monsters, book.monsters)
+
+    # =========================================================================
     section("P-6 LEAVING")
     # =========================================================================
     await a.close()
@@ -526,7 +714,11 @@ async def run(port, server):
 
 async def main():
     presence.HELLO_SECONDS = 0.5
+    combatbook.HOLD_SECONDS = 0.2
+    combatbook.PENDING_SECONDS = 0.3
+    combatbook.EMPTY_KEEP = 0.5
     server = presence.PresenceServer(sweep_seconds=0.3, tick_seconds=0.05)
+    server.flush_seconds = 0.2
     server.start_clocks()
     async with serve(server.handler, "127.0.0.1", 0, max_size=presence.MAX_SOCKET_BYTES) as ws_server:
         port = list(ws_server.sockets)[0].getsockname()[1]

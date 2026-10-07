@@ -218,6 +218,19 @@ API on, so the browser build and the desktop game both find it with no new
 setting. No presence server running is not an error anywhere - the game plays
 as before and nobody else is drawn.
 
+**The books on the monsters (0.10.0).** The same process also keeps the
+server's own count of every monster's health and writes what it finds into
+`combat_kills` and `combat_flags` - two tables `app.py` creates, so restart
+`elusion-api` before `elusion-presence` the first time (the presence log says
+so once if it starts first, and writes nothing until it can). Its second boot
+line says whether they are on: `[PRESENCE] books on the monsters: on, 6 areas
+mapped`. They need the `areas` and `combat` blocks of a gamedata.json exported
+by 0.10.0's exporter; with an older one the line says `off` and nothing else
+changes. To switch them off without a deploy, add `ELUSION_BOOKS=off` to the
+settings file and restart `elusion-presence`. **Nothing a player sees depends
+on them** - a kill is paid as before - so off is always safe. Read what they
+found with `killwatch.py` (below), tier WATCHED.
+
 ### Updating the server
 
 After pushing to GitHub, from an SSH session on the droplet:
@@ -675,6 +688,15 @@ a defence was not running) and **SUSPICIOUS** (legal but far outside honest play
 — a sustained rate, a boss farmed fast, the ceiling blind spot, an under-levelled
 boss). The first is an alarm; the second is a review list. It bans nothing.
 
+Since 0.10.0 there is a third pile, **WATCHED**: paid kills the presence
+server's own count of the fight does not back up (SHORT, NOT DUE, or a kill the
+books never saw), and checks a player tripped (a hit too big or too fast, a
+walk too quick), each with its numbers - and a `books:` line in the header
+counting every verdict. It ranks below every review and never alarms: the first
+week is for learning whether honest play ever lands there. A kill from a game
+older than 0.10.0, or one whose presence link was down, is "never seen" by
+design; a teleporter is a `jumped`.
+
 ```
 python3 killwatch.py --db /path/to/elusion.db          # full review dossier
 python3 killwatch.py --db /path/to/elusion.db --quiet   # cron: speak only on an alarm
@@ -694,8 +716,9 @@ scream about. So it splits into two schedules, an alarm and a digest:
 ```
 
 `--window` and `--respawn` must match the server's spawn-ceiling constants; the
-defaults already do. This is the standing watch over **E-3** (below) until the
-day combat is server-observed.
+defaults already do. This is the standing watch over **E-3** (below): combat is
+server-observed since 0.10.0, and the weekly digest's WATCHED pile is what
+decides when the server starts refusing kills its count does not back up.
 
 ---
 

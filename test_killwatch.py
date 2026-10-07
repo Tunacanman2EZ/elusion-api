@@ -189,6 +189,86 @@ check("two boss instances killed together -> no finding", 8 not in d,
       "got %s" % signals(d, 8))
 
 # --------------------------------------------------------------------------- #
+# 9. THE BOOKS (0.10.0). Paid kills matched to presence.py's own judgement of
+#    every death (combat_kills) and its tripped checks (combat_flags): WATCHED,
+#    with the numbers, never an alarm.
+def books_tables(con):
+    con.execute(
+        "CREATE TABLE combat_kills (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, area TEXT,"
+        " enemy_id TEXT, origin TEXT DEFAULT '', leader_id INTEGER DEFAULT 0, user_id INTEGER,"
+        " slot INTEGER DEFAULT -1, verdict TEXT, damage INTEGER DEFAULT 0, refused INTEGER DEFAULT 0,"
+        " hp_left INTEGER DEFAULT 0, max_hp INTEGER DEFAULT 0, seconds REAL DEFAULT 0)")
+    con.execute(
+        "CREATE TABLE combat_flags (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,"
+        " area TEXT DEFAULT '', kind TEXT, count INTEGER DEFAULT 1, detail TEXT DEFAULT '',"
+        " first_at INTEGER, last_at INTEGER)")
+
+
+def judged(con, uid, enemy, at, verdict="agreed", damage=100):
+    con.execute("INSERT INTO combat_kills (at, area, enemy_id, user_id, verdict, damage)"
+                " VALUES (?, 'field', ?, ?, ?, ?)", (at, enemy, uid, verdict, damage))
+
+
+print("-" * 68)
+con = fresh(); books_tables(con)
+for uid, name in ((20, "booked"), (21, "unseen"), (22, "shortly"), (23, "before"), (24, "flagged"),
+                  (25, "twice")):
+    add_user(con, uid, name)
+judged(con, 99, "bushmage", 1000000)          # the books' first row: they began here
+kill(con, 23, "bushmage", 999000)             # a kill from before the books
+for i in range(10):
+    at = 1000100 + i * 60
+    kill(con, 20, "bushmage", at)
+    judged(con, 20, "bushmage", at - 2)
+for i in range(3):
+    kill(con, 21, "bushmage", 1000100 + i * 60)
+kill(con, 22, "bushmage", 1000500)
+judged(con, 22, "bushmage", 1000499, verdict="short", damage=0)
+kill(con, 25, "firesprite", 1000600)
+kill(con, 25, "firesprite", 1000601)
+judged(con, 25, "firesprite", 1000600)
+con.execute("INSERT INTO combat_flags (user_id, kind, count, detail, first_at, last_at)"
+            " VALUES (24, 'too_fast', 5, 'old', 1000000, 1000010)")
+con.execute("INSERT INTO combat_flags (user_id, kind, count, detail, first_at, last_at)"
+            " VALUES (24, 'too_fast', 7, 'newest', 1000020, 1000030)")
+d = killwatch.analyze(con)
+check("books: kills the books agreed with are nothing to see", 20 not in d, "got %s" % signals(d, 20))
+check("books: paid kills the books never saw are WATCHED, with the numbers",
+      tiers(d, 21) == {"WATCHED"} and "3 the books never saw" in d[21]["findings"][0][2], d.get(21))
+check("books: a kill the books judged short is WATCHED",
+      tiers(d, 22) == {"WATCHED"} and "1 short" in d[22]["findings"][0][2], d.get(22))
+check("books: a kill from before the books began is not judged", 23 not in d, d.get(23))
+check("books: one row backs one kill, not two",
+      "1 agreed" in str(d.get(25)) and "1 the books never saw" in str(d.get(25)), d.get(25))
+check("books: a tripped check is WATCHED, counted, with the newest detail",
+      tiers(d, 24) == {"WATCHED"} and "too_fast x12 (latest: newest)" in d[24]["findings"][0][2], d.get(24))
+check("books: WATCHED ranks below every review",
+      [u for u, _ in killwatch._rank({**d, 99: {"username": "x", "findings": [("SUSPICIOUS", "s", "x")]}})][0]
+      == 99)
+check("books: the summary line counts every verdict",
+      killwatch.books_summary(con).startswith("books: 13 kill rows since")
+      and "12 agreed, 1 short, 0 not due" in killwatch.books_summary(con), killwatch.books_summary(con))
+plain = fresh()
+check("books: a database from before them is no error", killwatch.books_matches(plain) == {}
+      and killwatch.books_flags(plain) == {} and killwatch.books_summary(plain) is None)
+
+fd, path = tempfile.mkstemp(suffix=".db"); os.close(fd)
+disk = sqlite3.connect(path)
+for statement in con.iterdump():
+    if statement.startswith(("CREATE TABLE", "INSERT")):
+        disk.execute(statement)
+disk.commit(); disk.close()
+r = subprocess.run([sys.executable, os.path.join(HERE, "killwatch.py"), "--db", path],
+                   capture_output=True, text=True)
+rq = subprocess.run([sys.executable, os.path.join(HERE, "killwatch.py"), "--db", path, "--quiet"],
+                    capture_output=True, text=True)
+os.remove(path)
+check("books: CLI shows WATCHED and the books' line, and exits 0 - never an alarm",
+      r.returncode == 0 and "WATCHED" in r.stdout and "books: 13 kill rows" in r.stdout, r.stdout[-400:])
+check("books: --quiet stays silent on WATCHED alone", rq.returncode == 0 and rq.stdout.strip() == "",
+      rq.stdout[:200])
+
+# --------------------------------------------------------------------------- #
 # EXIT-CODE CONTRACT (the cron promise), run end-to-end through the CLI.
 print("-" * 68)
 

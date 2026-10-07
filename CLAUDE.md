@@ -1248,10 +1248,79 @@ only who that is and who hears what. The game side is the game repo's
   game and on this server - and each follower builds every attack from its own
   copy of the monster and caps the few numbers a `w` carries
   (`monstersync.gd`, `safe_spike()` and `safe_pillar_damage()`), so it cannot
-  make one hit harder either. This server never reads a `w`, so none of that
-  is checked here.
+  make one hit harder either. Since 0.10.0 this server reads every `w` into its
+  books (next section) - and still passes it on exactly as sent.
 
 `test_presence.py` P-7.
+
+## The books on every monster: the server watches (0.10.0)
+
+E3_SCOPE.md, option C, STEP 1. The owner: "Moving combat onto the server ...
+The first step only watches: the server checks every hit against what that
+character could really do, but changes nothing in play." `combatbook.py` is the
+logic, pure and clocked by its caller; `presence.py` feeds it and writes what it
+finds. `test_combatbook.py` holds the books, `test_presence.py` P-8 the wiring.
+
+- **What it reads.** Every world message from an area's leader (`book.world()`,
+  including the leader's OWN hits, which a 0.10.0 game puts inside it as
+  `"hits"`) and every follower's hit on its way to the leader
+  (`book.hit()`). A book exists only for an area in `gamedata.AREAS`.
+- **Its own count.** A monster that spawns or a scene that loads starts at the
+  catalogue's `max_hp` - never the leader's word - and every hit takes from it.
+  Only a monster the books joined part-way (a non-reset full: the server
+  restarted, a link came back) starts from the leader's health. A new leader's
+  first word is taken where it is lower, never higher; so is a returning
+  leader's reset of monsters the books still hold (`EMPTY_KEEP`).
+- **The bounds are the game's arithmetic** (`gamedata.combat_bounds()`, COMBAT
+  BOUNDS): the biggest single hit, the damage a second into ONE monster and the
+  walking speed, from the ticket's `gear` (worn and carried, filtered by
+  `equip_check()`), `skills` (attack, magic, agility) and `pets`, and the
+  exported `combat` block. Each class's formula is written out above the code;
+  the game's suite (`_test_combat_bounds_match_the_game`) holds the exported
+  numbers to the game's own. Every bound gets `SLACK` (1.5) while watching.
+- **Hits**: one over the biggest is booked at the cap and waits
+  `PENDING_SECONDS` for a fresh ticket (the game renews right after an equip)
+  before it is `hit_too_big`. Past a per-monster token bucket of the rate
+  (`BURST_SECONDS` of it) the rest is refused by the books and `too_fast`. One
+  from further than `REACH` is `too_far` - and still booked: a pet's arrow
+  flies ten seconds, and how far honest hits land is what the week measures.
+- **Spawns**: `unknown_monster`, `not_on_map`, `wrong_monster`, two at one
+  spot or a runtime monster nothing explains (`unaccounted_spawn`),
+  `back_too_soon` (inside the area's respawn), `max_hp_differs`. A large slime's
+  split is its `die` (poisonslime.gd emits `died` as it begins) and releases
+  `split_count` smalls only at half health or less (`split_early` otherwise); a
+  large authored in the scene may make one twin. A RESET within `RESET_GRACE` of
+  the leader's game loading a scene (its first state in the area, or `sync`) is
+  that scene loading and is not judged against the respawn clock - walking out
+  and back in has always brought every monster back.
+- **Deaths** wait `HOLD_SECONDS` for hits in the air, then: AGREED (the count
+  is at most `AGREED_LEFT` of the maximum), SHORT, or NOT DUE (a flagged spawn).
+  One `combat_kills` row per player who hit it, with their damage, what was
+  refused and their character's slot; a death nobody hit is one row on the
+  leader. A monster that grants nothing (a large slime) is no row. An area
+  led by a game from before 0.10.0 (hello `"v"` under `BOOKS_VERSION`) is not
+  judged at all - its player's hits never arrive - rather than called SHORT.
+- **Walking**: `too_quick` over the last `SPEED_WINDOW` seconds of states (long
+  enough that a few the network delivered together are not a burst), and
+  `jumped` for one step the length of a teleport.
+- **Written by presence.py, every `FLUSH_SECONDS`**, on a connection of its own
+  (`write_books()`, in a thread) into the only two tables that process writes;
+  flags counted per player, area and kind per write; both pruned after
+  `BOOKS_KEPT_SECONDS` (14 days). A database without the tables drops the rows
+  and says so once. `ELUSION_BOOKS=off` turns all of it off; the welcome says
+  `"books"` either way, and a game only sends its world alone, or its own hits,
+  to a server whose welcome says true.
+- **THE BOOKS NEVER BREAK THE RELAY.** `_book_safely()` catches anything a
+  book cannot read and the message goes on exactly as it would have.
+- **Asking for everything.** A world about a monster the books never saw makes
+  the server send the leader `{"t": "need", "id": 0}` (at most every 3 s); the
+  leader's answer, addressed to game 0, reaches nobody and is read by the books.
+- **killwatch.py reads the rows**: every paid kill since the books began is
+  matched to a row for the same account and monster within 30 s - AGREED,
+  SHORT, NOT DUE or never seen - and a tripped check is listed with its count.
+  Tier WATCHED: below every review, never an alarm. **Nothing pays or refuses
+  on the books yet**; step 2 makes a kill need an AGREED row, decided from what
+  the first week of WATCHED says.
 
 ## Gear bonuses: a character's maximum includes what it wears
 
@@ -1430,6 +1499,32 @@ SNAPSHOTS AND ROLLBACK in app.py, `test_rollback.py`. All of it is
   logged on the player's record. And every burn counts as given on the Kingdom
   board, a rollback's included.
 
+## The kill record
+
+The owner, 7 Oct: "lets make a button in game that records all players kills
+with icons of the enemies". THE KILL RECORD in app.py, `test_killrecord.py`.
+
+- **`kill_tally`**: one row per character per monster - kills, first and
+  last - counted by `_record_kill()` in the paid kill's own transaction, so a
+  refused kill (unknown monster, one that grants nothing, the rate limit or
+  the ceiling) counts nowhere. Kept for good; `kill_reports` is the log and is
+  pruned after `KILL_LOG_RETENTION_SECONDS`.
+- **It has a birthday**, the trap in "A counter added by migration starts at
+  zero" above. `_migrate_seed_kill_tally()` runs once - `kill_tally_since` in
+  `server_settings` is both the date and the proof it ran - and counts what
+  `kill_reports` still holds, skipping a slot's rows from before its newest
+  `character_deletions` row (a deleted character's kills are not the next
+  one's). Both routes send `since`, and the game says "counted since".
+- **`GET /api/kills?slot=`**: the character's rows, most first, with a total
+  and how many kinds. **`GET /api/kills/everyone`**: per monster, every
+  account's kills added up, how many players, the top account (its slots
+  summed; a tie goes to the earlier `first_at`) and the caller's own total -
+  one window-function query over the table. Usernames, as the Kingdom board
+  shows them.
+- **`KILL_TALLY_SINCE_KEY` is defined above `init_db()`**, not with the
+  routes: the seed runs at import ("init_db() runs at import time").
+- Deleting a character deletes its record with its other rows.
+
 ## Decided, not built: staff commands
 
 **Put the required rank on the command definition, not in the handler.** A
@@ -1474,7 +1569,9 @@ wsgi.py         what gunicorn serves: a preflight of the settings, then app
 gamedata.py     loot rolls, XP curve, stat curves - the game's rules
 gamedata.json   exported from the Godot project, NOT hand-edited
 presence.py     the presence socket, a second process: who stands where,
-                and whose game runs each area's monsters
+                whose game runs each area's monsters, and the books on them
+combatbook.py   the books: the server's own count of every monster's health,
+                every hit held to what its character could do (0.10.0)
 test_*.py       discovered and run by run_tests.ps1, which prints how many.
                 No counts here on purpose - see above. What each one is FOR:
   api           the broad one; read its header before adding to it
@@ -1497,6 +1594,8 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
   chardelete    deleting a character, and only the character
   rollback      the save history: snapshots, the owner's rollback, and
                 giving a player an item
+  killrecord    every paid kill counted per character and monster, kept for
+                good, and the two routes the Kills window reads
   concurrency   requests that arrive together: the write lock
   attackxp      attack XP banked at the kill, with the class specialty
   pacing        the level curve, the element bands, and the store's saving pace
@@ -1506,7 +1605,9 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
   quality       dropped gear's rolled stats, carried whole by every path
   presence      the presence socket: tickets, areas, what the game may say,
                 limits, a login ended anywhere ending the connection, and
-                who leads each area's monsters (P-7)
+                who leads each area's monsters (P-7), the books' wiring (P-8)
+  combatbook    the books themselves: the bounds, every hit, spawn and death
+                judged, and that nothing a leader sends breaks them
   tradegates    the owner's trade switch, and the hold on fresh mythic and
                 Perfect finds
   chat/chatrooms  the feed, the channels, moderation and picture revocation
@@ -1599,8 +1700,9 @@ TIME). The ledger functions went with it.
 - The kill EVENT is asserted rather than verified. The server rolls the rewards
   and rate-limits the reports, so this caps the speed of the fraud, not its
   existence. It is now at least RECORDED - `kill_reports` logs every claim the
-  server paid out, in the same transaction, and refused kills leave no row. That
-  is groundwork, not a fix: verification needs the client to register spawns.
+  server paid out, in the same transaction, and refused kills leave no row -
+  and since 0.10.0 WATCHED: the books judge every death and killwatch.py
+  matches every paid kill to them. Still paid on the game's word until step 2.
   The deepest open finding; see SECURITY_NOTES.md (E-3).
 - `app.run()` is Flask's development server even with debug off. Right for local
   play, wrong for anything public; a real deployment needs a WSGI server, TLS,

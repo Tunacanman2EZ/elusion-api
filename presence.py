@@ -67,23 +67,39 @@ THE WIRE (JSON text frames):
                                                          game rebuilt its world: same area,
                                                          new scene, every body gone)
     {"t": "w", "d": {...}, "to": 12}                     LEADER ONLY: the area's monsters, to
-                                                         everyone in it, or one game ("to")
+                                                         everyone in it, or one game ("to");
+                                                         since 0.10.0 "d" may carry "hits", the
+                                                         leader's own, for the books
     {"t": "h", "p": [[monster, damage, element], ...]}   a follower's hits, for the leader
 
   here -> game
-    {"t": "welcome", "id": 12, "v": 2}                   you are in; this server shares monsters
+    {"t": "welcome", "id": 12, "v": 2, "books": true}    you are in; this server shares monsters,
+                                                         and keeps books on them (0.10.0): send
+                                                         the world even alone, own hits inside it
     {"t": "join", "p": [{id, name, cls, lvl, role, hue, guild, x, y, m, fx, pet}]}
                                                          people now in your area
     {"t": "moves", "p": [[id, x, y, m, fx, pet], ...]}   who moved this tick (yourself included; skip it)
     {"t": "leave", "ids": [12, 40]}                      gone from your area
     {"t": "lead", "a": "field", "id": 12, "n": 2}        who runs this area's monsters, and how
                                                          many others share them (-1: nobody)
-    {"t": "need", "id": 40}                              (to the leader) send 40 everything
+    {"t": "need", "id": 40}                              (to the leader) send 40 everything;
+                                                         id 0 is the server's books
     {"t": "w", "d": {...}}                               the leader's monsters, passed on as sent
     {"t": "h", "from": 40, "p": [[m, dmg, el], ...]}     (to the leader) 40's hits
     {"t": "bye", "why": "..."}                           and then the socket closes
 
-test_presence.py holds every rule here.
+THE BOOKS (0.10.0). Every world message from a leader and every hit from a
+follower is also read into combatbook.py's books on the area's monsters - the
+server's own count of each one's health, every hit held to what that character
+could do, every spawn held to the area's map, every death judged - and what
+they find is written to combat_kills and combat_flags every FLUSH_SECONDS, on a
+connection that writes nothing else. NOTHING IN PLAY CHANGES: the relay is
+exactly what it was, a book that cannot read a message passes it on anyway,
+and kills are still paid by the API as before. E3_SCOPE.md, option C, step 1;
+killwatch.py reads the rows. ELUSION_BOOKS=off turns them off.
+
+test_presence.py holds every rule here, P-8 the books; test_combatbook.py the
+books themselves.
 """
 import envfile
 envfile.load()
@@ -99,6 +115,15 @@ import time
 
 from websockets.asyncio.server import broadcast, serve
 from websockets.exceptions import ConnectionClosed
+
+# THE BOOKS ARE OPTIONAL. gamedata.py raises at import without a gamedata.json,
+# and the socket must still show players to each other without one.
+try:
+    import combatbook
+    import gamedata
+except Exception as exc:  # noqa: BLE001
+    combatbook = gamedata = None
+    print("[PRESENCE] no books on the monsters: %s" % exc, flush=True)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("ELUSION_DB", os.path.join(HERE, "elusion.db"))
@@ -132,6 +157,9 @@ MAX_CONNECTIONS = 1000
 
 # The shared-monster wire. A game says which it speaks in its hello.
 SHARED_VERSION = 2
+# A game that sends its own player's hits inside its world (0.10.0). An area
+# led by an older one cannot be judged by the books.
+BOOKS_VERSION = 3
 # A follower's hits arrive batched, about ten batches a second. A tank's aura
 # touching every monster around it four times a second is the most a game
 # sends; this is several times that.
@@ -140,6 +168,14 @@ MAX_HITS_PER_MESSAGE = 64
 MAX_HIT = 100000
 MAX_MONSTER_ID = 2 ** 31 - 1
 MAX_ELEMENT = 64
+
+# THE BOOKS (combatbook.py): on when the catalogue has the areas' maps and the
+# classes' combat numbers, and nobody switched them off.
+BOOKS = (combatbook is not None and bool(gamedata.AREAS) and gamedata.COMBAT_EXPORTED
+         and os.environ.get("ELUSION_BOOKS", "on").strip().lower() not in ("off", "0", "no", "false"))
+# How often what the books found is written down, and how long it is kept.
+FLUSH_SECONDS = 2.0
+BOOKS_KEPT_SECONDS = 14 * 86400
 
 # What a body may claim to be doing: the player scenes' own animation names.
 ANIM_PATTERN = re.compile(r"^(idle|walk|attack|death|hitflash)(up|down|left|right)$")
@@ -161,8 +197,8 @@ def _connect():
 
 
 def lookup_ticket(raw, now=None):
-    """(user_id, identity dict, expires_at) for a ticket that is in date and
-    whose login still exists, else None. The API wrote it; this only reads."""
+    """(user_id, identity dict, expires_at, slot) for a ticket that is in date
+    and whose login still exists, else None. The API wrote it; this only reads."""
     raw = str(raw or "")
     if not raw or len(raw) > 128:
         return None
@@ -170,7 +206,7 @@ def lookup_ticket(raw, now=None):
     conn = _connect()
     try:
         row = conn.execute(
-            "SELECT p.user_id, p.identity, p.expires_at FROM presence_tickets p"
+            "SELECT p.user_id, p.identity, p.expires_at, p.slot FROM presence_tickets p"
             " JOIN sessions s ON s.token_hash = p.session_hash"
             " WHERE p.token_hash = ? AND p.expires_at > ? AND s.expires_at > ?",
             (_hash(raw), now, now),
@@ -183,7 +219,48 @@ def lookup_ticket(raw, now=None):
         identity = json.loads(row["identity"])
     except (TypeError, ValueError):
         return None
-    return int(row["user_id"]), identity, int(row["expires_at"])
+    if not isinstance(identity, dict):
+        return None
+    return int(row["user_id"]), identity, int(row["expires_at"]), int(row["slot"])
+
+
+# The two tables the books write, and the only ones this process ever writes:
+# app.py creates them (its schema block), and a database from before them is
+# not an error - the rows are dropped and the boot log says so once.
+_BOOK_TABLES_MISSING = []
+
+
+def write_books(kills, flags, prune_before=None):
+    """Write what the books found: kills as combat_kills rows, flags as
+    combat_flags rows ((user_id, area, kind, count, detail, first_at, last_at)),
+    and drop rows older than prune_before. Runs in a thread."""
+    if not kills and not flags and prune_before is None:
+        return
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    try:
+        if kills:
+            conn.executemany(
+                "INSERT INTO combat_kills (at, area, enemy_id, origin, leader_id, user_id, slot,"
+                " verdict, damage, refused, hp_left, max_hp, seconds)"
+                " VALUES (:at, :area, :enemy_id, :origin, :leader_id, :user_id, :slot,"
+                " :verdict, :damage, :refused, :hp_left, :max_hp, :seconds)", kills)
+        if flags:
+            conn.executemany(
+                "INSERT INTO combat_flags (user_id, area, kind, count, detail, first_at, last_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)", flags)
+        if prune_before is not None:
+            conn.execute("DELETE FROM combat_kills WHERE at < ?", (int(prune_before),))
+            conn.execute("DELETE FROM combat_flags WHERE last_at < ?", (int(prune_before),))
+        conn.commit()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
+        if not _BOOK_TABLES_MISSING:
+            _BOOK_TABLES_MISSING.append(str(exc))
+            print("[PRESENCE] the books cannot be written (%s): this database is from "
+                  "before them - start app.py once to add the tables" % exc, flush=True)
+    finally:
+        conn.close()
 
 
 def still_valid(ticket_hashes, now=None):
@@ -209,12 +286,17 @@ def still_valid(ticket_hashes, now=None):
 class Player:
     """One connected game."""
 
-    def __init__(self, ws, user_id, ticket_hash, identity, expires_at):
+    def __init__(self, ws, user_id, ticket_hash, identity, expires_at, slot=-1):
         self.ws = ws
         self.user_id = user_id
         self.ticket_hash = ticket_hash
         self.identity = identity
         self.expires_at = expires_at
+        # What the books know of this player: which character, how hard it can
+        # hit and how fast it walks (the ticket), where it stands (its states).
+        self.fighter = combatbook.Fighter(user_id, slot) if BOOKS else None
+        if self.fighter is not None:
+            self.fighter.set_bounds(gamedata.combat_bounds(identity), time.time())
         self.area = ""
         self.x = 0.0
         self.y = 0.0
@@ -327,8 +409,15 @@ class PresenceServer:
         self.leaders = {}     # area -> Player running its monsters
         self.sweep_seconds = SWEEP_SECONDS if sweep_seconds is None else sweep_seconds
         self.tick_seconds = TICK_SECONDS if tick_seconds is None else tick_seconds
+        self.flush_seconds = FLUSH_SECONDS
         self._tasks = []
         self._closing = set()
+        # THE BOOKS: one per area that has a map, kept while the process runs.
+        self.books = {}       # area -> combatbook.AreaBook
+        self._kills = []      # combat_kills rows not yet written
+        self._flags = {}      # (user_id, area, kind) -> [count, detail, first_at, last_at]
+        self._pruned_at = 0.0
+        self._book_errors = 0
 
     # ---- sending -------------------------------------------------------------
 
@@ -356,6 +445,9 @@ class PresenceServer:
                 del self.rooms[area]
         self._room_broadcast(area, {"t": "leave", "ids": [player.user_id]})
         player.area = ""
+        if area not in self.rooms and area in self.books:
+            # NOBODY LEFT: the next game in loads the scene afresh.
+            self.books[area].emptied(time.time())
         if self.leaders.get(area) is player:
             # THE NEXT IN LINE TAKES THE MONSTERS OVER, where they stand: its
             # game has been drawing them all along, so it already knows where
@@ -407,6 +499,49 @@ class PresenceServer:
             return
         broadcast([leader.ws], json.dumps({"t": "need", "id": player.user_id}, separators=(",", ":")))
 
+    # ---- the books (combatbook.py) --------------------------------------------
+
+    def _book(self, area):
+        """The books on this area's monsters, or None: books off, or an area
+        the catalogue has no map of."""
+        if not BOOKS or not area or area not in gamedata.AREAS:
+            return None
+        book = self.books.get(area)
+        if book is None:
+            book = self.books[area] = combatbook.AreaBook(area, gamedata.AREAS[area])
+        return book
+
+    def _book_safely(self, what, *args):
+        """THE BOOKS NEVER BREAK THE RELAY. Whatever a book cannot read, the
+        message is still passed on exactly as it would have been."""
+        try:
+            what(*args)
+        except Exception as exc:  # noqa: BLE001
+            self._book_errors += 1
+            if self._book_errors <= 5 or self._book_errors % 1000 == 0:
+                print("[PRESENCE] the books could not read a message (%d so far): %r"
+                      % (self._book_errors, exc), flush=True)
+
+    def _book_world(self, player, data):
+        book = self._book(player.area)
+        if book is None or player.fighter is None:
+            return
+        now = time.time()
+        book.world(player.fighter, data, now)
+        if book.needs_full(now):
+            # The leader talked about monsters these books never saw (they
+            # began after it did): it sends everything to "game 0", which is
+            # nobody's - only the books read it.
+            broadcast([player.ws], json.dumps({"t": "need", "id": 0}, separators=(",", ":")))
+
+    def _book_hits(self, player, hits):
+        book = self._book(player.area)
+        if book is None or player.fighter is None:
+            return
+        now = time.time()
+        for monster, damage, _element in hits:
+            book.hit(player.fighter, monster, damage, now)
+
     def relay_world(self, player, raw, msg):
         """A world message from the area's leader, passed on exactly as sent -
         to one game ("to") or to everyone else in the area who shares monsters.
@@ -418,6 +553,7 @@ class PresenceServer:
             return False
         if not isinstance(msg.get("d"), dict):
             return False
+        self._book_safely(self._book_world, player, msg["d"])
         to = msg.get("to")
         room = self.rooms.get(area, ())
         if to is not None:
@@ -439,6 +575,7 @@ class PresenceServer:
         hits = clean_hits(msg)
         if hits is None:
             return False
+        self._book_safely(self._book_hits, player, hits)
         broadcast([leader.ws], json.dumps({"t": "h", "from": player.user_id, "p": hits},
                                           separators=(",", ":")))
         return True
@@ -449,6 +586,9 @@ class PresenceServer:
             return False
         moved_area = state["area"] != player.area
         player.x, player.y = state["x"], state["y"]
+        if player.fighter is not None:
+            self._book_safely(player.fighter.moved, state["area"], state["x"], state["y"],
+                              time.time(), moved_area)
         player.anim, player.fx, player.pet = state["anim"], state["fx"], state["pet"]
         if moved_area:
             self._leave_room(player)
@@ -492,8 +632,12 @@ class PresenceServer:
         found = await asyncio.to_thread(lookup_ticket, msg.get("ticket"))
         if found is None or found[0] != player.user_id:
             return False
-        _uid, identity, expires = found
+        _uid, identity, expires, slot = found
         changed = identity != player.identity
+        if player.fighter is not None and changed:
+            # A new weapon, a skill level, a pet: the books' bounds follow.
+            player.fighter.slot = slot
+            self._book_safely(player.fighter.set_bounds, gamedata.combat_bounds(identity), time.time())
         player.ticket_hash = _hash(msg.get("ticket"))
         player.identity = identity
         player.expires_at = expires
@@ -530,18 +674,20 @@ class PresenceServer:
             await ws.close(1008, "ticket")
             return
 
-        user_id, identity, expires = found
+        user_id, identity, expires, slot = found
         # ONE GAME PER ACCOUNT, as at login: a second connection replaces the
         # first rather than drawing the same player twice.
         old = self.players.get(user_id)
         if old is not None:
             await self.drop(old, "replaced")
-        player = Player(ws, user_id, _hash(msg.get("ticket")), identity, expires)
+        player = Player(ws, user_id, _hash(msg.get("ticket")), identity, expires, slot)
         version = msg.get("v", 0)
         player.version = version if isinstance(version, int) and not isinstance(version, bool) \
             and 0 <= version <= 1000 else 0
+        if player.fighter is not None:
+            player.fighter.reports_hits = player.version >= BOOKS_VERSION
         self.players[user_id] = player
-        await self._send(player, {"t": "welcome", "id": user_id, "v": SHARED_VERSION})
+        await self._send(player, {"t": "welcome", "id": user_id, "v": SHARED_VERSION, "books": BOOKS})
 
         try:
             async for raw in ws:
@@ -572,6 +718,8 @@ class PresenceServer:
                     await self._send(player, {"t": "join", "p": others})
                     # The game rebuilt its world: tell it again who leads, and
                     # have the leader send it the monsters again.
+                    if player.fighter is not None:
+                        player.fighter.reloaded(time.time())
                     if player.shares:
                         self._announce_lead(player.area)
                         self._ask_for_world(player.area, player)
@@ -599,6 +747,60 @@ class PresenceServer:
             for p in movers:
                 p.dirty = False
             self._room_broadcast(area, {"t": "moves", "p": [p.move() for p in movers]})
+        if BOOKS:
+            self._book_safely(self.tick_books, time.time())
+
+    def tick_books(self, now):
+        """Judge the deaths that have waited, and gather what every book and
+        every player's fighter found for the next write."""
+        for book in self.books.values():
+            book.tick(now)
+            kills, flags = book.take()
+            self._kills.extend(kills)
+            self._gather(flags)
+        for player in self.players.values():
+            if player.fighter is not None:
+                player.fighter.tick(now)
+                self._gather(player.fighter.take_flags())
+
+    def _gather(self, flags):
+        # ONE ROW PER PLAYER, AREA AND KIND PER WRITE, with a count: a cheat
+        # trips the same check hundreds of times a minute.
+        for user_id, area, kind, detail, at in flags:
+            key = (int(user_id), str(area), str(kind))
+            entry = self._flags.get(key)
+            if entry is None:
+                self._flags[key] = [1, str(detail)[:200], at, at]
+            else:
+                entry[0] += 1
+                entry[1] = str(detail)[:200]
+                entry[3] = at
+
+    def take_books(self):
+        """(kills, flag rows) gathered since the last call, for write_books()."""
+        kills, self._kills = self._kills, []
+        flags = [(k[0], k[1], k[2], e[0], e[1], int(e[2]), int(e[3])) for k, e in self._flags.items()]
+        self._flags = {}
+        return kills, flags
+
+    async def flush_loop(self):
+        while True:
+            await asyncio.sleep(self.flush_seconds)
+            await self.flush_books()
+
+    async def flush_books(self):
+        kills, flags = self.take_books()
+        now = time.time()
+        prune = None
+        if now - self._pruned_at >= 3600.0:
+            self._pruned_at = now
+            prune = now - BOOKS_KEPT_SECONDS
+        if not kills and not flags and prune is None:
+            return
+        try:
+            await asyncio.to_thread(write_books, kills, flags, prune)
+        except Exception as exc:  # noqa: BLE001
+            print("[PRESENCE] could not write the books: %r" % exc, flush=True)
 
     async def sweep_loop(self):
         while True:
@@ -617,6 +819,8 @@ class PresenceServer:
 
     def start_clocks(self):
         self._tasks = [asyncio.create_task(self.tick_loop()), asyncio.create_task(self.sweep_loop())]
+        if BOOKS:
+            self._tasks.append(asyncio.create_task(self.flush_loop()))
 
     def stop_clocks(self):
         for task in self._tasks:
@@ -630,6 +834,8 @@ async def main():
     async with serve(server.handler, HOST, PORT, max_size=MAX_SOCKET_BYTES,
                      ping_interval=20, ping_timeout=20) as ws_server:
         print("[PRESENCE] listening on ws://%s:%d%s (database %s)" % (HOST, PORT, PATH, DB_PATH), flush=True)
+        print("[PRESENCE] books on the monsters: %s" % (
+            "on, %d areas mapped" % len(gamedata.AREAS) if BOOKS else "off"), flush=True)
         await ws_server.serve_forever()
 
 

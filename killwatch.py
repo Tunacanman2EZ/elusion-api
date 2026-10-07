@@ -56,6 +56,18 @@ players get clamped (the interim skill bound under E-2 was that mistake). You
 read the dossier and decide. Under --quiet these stay silent; run it without
 --quiet - interactively, or as a weekly digest - to see the review list.
 
+THE BOOKS (0.10.0), A THIRD KIND: WATCHED. presence.py now keeps the
+server's own count of every monster's health and judges every death
+(combatbook.py, combat_kills), and writes down every hit that did not fit what
+the character could do (combat_flags). Each paid kill since the books began is
+matched to the books' row for that account and monster: AGREED, SHORT, NOT DUE,
+or never seen. An account with kills the books do not back up, or with a
+tripped check, is listed as WATCHED with the numbers - below every review and
+never an alarm, because the books' first week is for finding out whether honest
+play trips them at all. A game from before 0.10.0, or one whose link to the
+presence server is down, is never seen by the books; expect "never saw" rows
+from those until everyone has updated.
+
 READ-ONLY BY CONSTRUCTION. Opens the database mode=ro, the same discipline as
 canary.py: a watcher must never be able to become the thing it is watching.
 
@@ -150,8 +162,15 @@ LOWLEVEL_BOSS_MEDIAN_FRACTION = 0.5
 LOWLEVEL_BOSS_ABSOLUTE_FLOOR = 10
 MIN_BOSS_KILLERS_FOR_MEDIAN = 5
 
+# THE BOOKS (0.10.0). presence.py now keeps its own count of every monster's
+# health and judges every death (combatbook.py, combat_kills), so a paid kill
+# can be checked against what the server saw: a kill report matches a books
+# row for the same account and monster within this many seconds of it.
+BOOKS_MATCH_SECONDS = 30
 
-# -- a finding is (tier, signal, detail); tier is "IMPOSSIBLE" or "SUSPICIOUS" --
+
+# -- a finding is (tier, signal, detail); tier is "IMPOSSIBLE", "SUSPICIOUS" or
+#    "WATCHED" (the books, below) --
 
 def _ceiling_for(placed, window, respawn):
     """The live spawn ceiling for a window: placed x (W/respawn + 1). Mirrors
@@ -310,6 +329,26 @@ def analyze(con, window=KILL_WINDOW_SECONDS, respawn=KILL_RESPAWN_FLOOR_SECONDS)
                          "first killed '%s' at level %d; its killers reach it at a "
                          "median of level %d." % (enemy_id, low, median))
 
+    # W1 - THE BOOKS. Every account whose paid kills the server's own count
+    # does not back up, or who tripped one of the books' checks. A third tier,
+    # WATCHED: the first week of the books is for learning whether honest play
+    # ever trips them, so this RANKS NOTHING ABOVE A REVIEW and never alarms -
+    # it shows the numbers. Step 2 (a kill needs an agreed row) is decided
+    # from what this says.
+    for user_id, tally in books_matches(con).items():
+        unproven = tally["short"] + tally["not_due"] + tally["unmatched"]
+        if unproven:
+            note(user_id, "WATCHED", "kills the books do not back up",
+                 "%d paid kill(s) since the books began: %d agreed, %d short (died with "
+                 "health the server still counted), %d not due (should not have been "
+                 "there), %d the books never saw."
+                 % (tally["reported"], tally["agreed"], tally["short"], tally["not_due"],
+                    tally["unmatched"]))
+    for user_id, kinds in books_flags(con).items():
+        note(user_id, "WATCHED", "tripped the books' checks",
+             "; ".join("%s x%d (latest: %s)" % (kind, count, detail)
+                       for kind, (count, detail) in sorted(kinds.items())))
+
     # S3 - farming the ceiling-exempt enemy almost exclusively. One pass tallies
     # exempt kills per user; which enemies are exempt does not change within a
     # run, so it is decided once per enemy, not once per (user, enemy).
@@ -343,14 +382,88 @@ def analyze(con, window=KILL_WINDOW_SECONDS, respawn=KILL_RESPAWN_FLOOR_SECONDS)
     return dossier
 
 
+def _has_table(con, name):
+    return con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                       (name,)).fetchone() is not None
+
+
+def books_matches(con):
+    """
+    {user_id: {"reported", "agreed", "short", "not_due", "unmatched"}}: every
+    kill report since the books' first row, matched to a combat_kills row for
+    the same account and monster within BOOKS_MATCH_SECONDS. A row backs one
+    report only; one with damage is preferred, since that is the account
+    having hit it. {} on a database from before the books.
+    """
+    if not _has_table(con, "combat_kills"):
+        return {}
+    first = con.execute("SELECT MIN(at) FROM combat_kills").fetchone()[0]
+    if first is None:
+        return {}
+    rows = {}
+    for row_id, user_id, enemy_id, at, verdict, damage in con.execute(
+            "SELECT id, user_id, enemy_id, at, verdict, damage FROM combat_kills"
+            " WHERE at >= ? ORDER BY at", (first - BOOKS_MATCH_SECONDS,)):
+        rows.setdefault((user_id, enemy_id), []).append([at, verdict, damage, False])
+    out = {}
+    for user_id, enemy_id, at in con.execute(
+            "SELECT user_id, enemy_id, at FROM kill_reports WHERE at >= ? ORDER BY at", (first,)):
+        tally = out.setdefault(user_id, {"reported": 0, "agreed": 0, "short": 0, "not_due": 0,
+                                         "unmatched": 0})
+        tally["reported"] += 1
+        best = None
+        for candidate in rows.get((user_id, enemy_id), ()):
+            if candidate[3] or abs(candidate[0] - at) > BOOKS_MATCH_SECONDS:
+                continue
+            if best is None or (candidate[2] > 0 and best[2] <= 0) or \
+                    ((candidate[2] > 0) == (best[2] > 0) and abs(candidate[0] - at) < abs(best[0] - at)):
+                best = candidate
+        if best is None:
+            tally["unmatched"] += 1
+            continue
+        best[3] = True
+        tally[best[1] if best[1] in ("agreed", "short", "not_due") else "short"] += 1
+    return out
+
+
+def books_flags(con):
+    """{user_id: {kind: (count, latest detail)}} from combat_flags."""
+    if not _has_table(con, "combat_flags"):
+        return {}
+    out = {}
+    for user_id, kind, count, detail, _last in con.execute(
+            "SELECT user_id, kind, SUM(count), "
+            " (SELECT f2.detail FROM combat_flags f2 WHERE f2.user_id = f.user_id AND f2.kind = f.kind"
+            "  ORDER BY f2.last_at DESC, f2.id DESC LIMIT 1), MAX(last_at)"
+            " FROM combat_flags f GROUP BY user_id, kind"):
+        out.setdefault(user_id, {})[kind] = (int(count), detail)
+    return out
+
+
+def books_summary(con):
+    """One line on what the books judged, or None before they began."""
+    if not _has_table(con, "combat_kills"):
+        return None
+    counts = dict(con.execute("SELECT verdict, COUNT(*) FROM combat_kills GROUP BY verdict").fetchall())
+    if not counts:
+        return None
+    first = con.execute("SELECT MIN(at) FROM combat_kills").fetchone()[0]
+    import time as _time
+    return "books: %d kill rows since %s - %d agreed, %d short, %d not due" % (
+        sum(counts.values()), _time.strftime("%d %b %Y", _time.gmtime(first)),
+        counts.get("agreed", 0), counts.get("short", 0), counts.get("not_due", 0))
+
+
 def _rank(dossier):
-    """Worst first: any IMPOSSIBLE outranks all SUSPICIOUS; then more findings
-    before fewer. So the account a defence broke on is always at the top."""
+    """Worst first: any IMPOSSIBLE outranks all SUSPICIOUS, and SUSPICIOUS all
+    WATCHED; then more findings before fewer. So the account a defence broke on
+    is always at the top."""
     def key(item):
         _uid, d = item
         hard = sum(1 for t, _s, _x in d["findings"] if t == "IMPOSSIBLE")
         soft = sum(1 for t, _s, _x in d["findings"] if t == "SUSPICIOUS")
-        return (-hard, -soft)
+        watched = sum(1 for t, _s, _x in d["findings"] if t == "WATCHED")
+        return (-hard, -soft, -watched)
     return sorted(dossier.items(), key=key)
 
 
@@ -375,6 +488,7 @@ def main():
     con = sqlite3.connect("file:%s?mode=ro" % args.db, uri=True)
     try:
         dossier = analyze(con, window=args.window, respawn=args.respawn)
+        books_line = books_summary(con)
     except sqlite3.Error as exc:
         print("[KILLWATCH] FAIL: could not read the database: %s" % exc, file=sys.stderr)
         sys.exit(2)
@@ -397,6 +511,8 @@ def main():
     if not _GAMEDATA_OK:
         print("  !! gamedata did not load (%s)" % _GAMEDATA_ERR)
         print("  !! IMPOSSIBLE checks are DARK; only behavioural review ran.")
+    if books_line:
+        print("  %s" % books_line)
     print("=" * 68)
 
     if not dossier:

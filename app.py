@@ -1218,6 +1218,74 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
 
+        -- THE KILL RECORD (7 Oct, the owner: "a button in game that records
+        -- all players kills with icons of the enemies"). One row per character
+        -- per kind of monster, counted at every paid kill in combat_kill's own
+        -- transaction and KEPT FOR GOOD - kill_reports above is pruned after
+        -- two weeks, so it can say how fast, never how many. A TALLY, so it has
+        -- a birthday: kill_tally_since in server_settings, written when it was
+        -- first filled from what kill_reports still held. See THE KILL RECORD.
+        CREATE TABLE IF NOT EXISTS kill_tally (
+            user_id    INTEGER NOT NULL,
+            slot       INTEGER NOT NULL,
+            enemy_id   TEXT    NOT NULL,
+            kills      INTEGER NOT NULL DEFAULT 0,
+            first_at   INTEGER NOT NULL,
+            last_at    INTEGER NOT NULL,
+            PRIMARY KEY (user_id, slot, enemy_id),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        -- "everyone's kills of each monster" reads the whole table grouped by
+        -- enemy; this is that grouping's index.
+        CREATE INDEX IF NOT EXISTS idx_kill_tally_enemy ON kill_tally(enemy_id, user_id);
+
+        -- THE BOOKS ON EVERY MONSTER (0.10.0; E3_SCOPE.md option C, step 1).
+        -- presence.py keeps its own count of every monster's health from what
+        -- the area's leader says and every hit any game sends (combatbook.py),
+        -- and writes down what it saw here - and into nothing else: these two
+        -- tables are the only ones that process writes. NOTHING READS THEM TO
+        -- DECIDE ANYTHING YET: a kill is paid as it always was. killwatch.py
+        -- matches kill_reports against combat_kills ("THE BOOKS"), and step 2
+        -- makes a kill need an agreed row. Kept two weeks, like kill_reports;
+        -- presence.py prunes them.
+        --
+        -- One row per player who hit a monster that died: AGREED (the books'
+        -- count reached zero too), SHORT (the leader said it died with health
+        -- the books still counted) or NOT DUE (it should not have been there).
+        CREATE TABLE IF NOT EXISTS combat_kills (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            at         INTEGER NOT NULL,
+            area       TEXT    NOT NULL,
+            enemy_id   TEXT    NOT NULL,
+            origin     TEXT    NOT NULL DEFAULT '',
+            leader_id  INTEGER NOT NULL DEFAULT 0,
+            user_id    INTEGER NOT NULL,
+            slot       INTEGER NOT NULL DEFAULT -1,
+            verdict    TEXT    NOT NULL,
+            damage     INTEGER NOT NULL DEFAULT 0,
+            refused    INTEGER NOT NULL DEFAULT 0,
+            hp_left    INTEGER NOT NULL DEFAULT 0,
+            max_hp     INTEGER NOT NULL DEFAULT 0,
+            seconds    REAL    NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_combat_kills_user ON combat_kills(user_id, at);
+        CREATE INDEX IF NOT EXISTS idx_combat_kills_at ON combat_kills(at);
+        -- What did not fit, counted per player, area and kind per write: a
+        -- hit too big, too fast or too far, a walk too quick, a monster the
+        -- map does not explain (combatbook.FLAG_KINDS).
+        CREATE TABLE IF NOT EXISTS combat_flags (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER NOT NULL,
+            area       TEXT    NOT NULL DEFAULT '',
+            kind       TEXT    NOT NULL,
+            count      INTEGER NOT NULL DEFAULT 1,
+            detail     TEXT    NOT NULL DEFAULT '',
+            first_at   INTEGER NOT NULL,
+            last_at    INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_combat_flags_user ON combat_flags(user_id, last_at);
+        CREATE INDEX IF NOT EXISTS idx_combat_flags_at ON combat_flags(last_at);
+
         -- "what has this account been killing, and how fast" - one query.
         CREATE INDEX IF NOT EXISTS idx_kill_reports_user ON kill_reports(user_id, at);
         -- "who is reporting this enemy most" - the other one.
@@ -2367,9 +2435,51 @@ def init_db():
     _migrate_seed_gold_ledger(db)
     _migrate_seed_lusion_ledger(db)
     _migrate_xp_to_next_from_curve(db)
+    _migrate_seed_kill_tally(db)
 
     db.commit()
     db.close()
+
+
+# Defined up here, not with the routes: init_db() runs at import, before
+# anything further down the file exists (CLAUDE.md, "init_db() runs at import
+# time"), and the seed below reads it.
+KILL_TALLY_SINCE_KEY = "kill_tally_since"
+
+
+def _migrate_seed_kill_tally(db):
+    """
+    THE KILL RECORD'S OPENING COUNT, once: every paid kill kill_reports still
+    holds (the last KILL_LOG_RETENTION_SECONDS of them), counted into
+    kill_tally, and the date counting began written to server_settings as
+    kill_tally_since - which is also what says this has run. A counter can only
+    describe the future (CLAUDE.md, "A counter added by migration starts at
+    zero"); this one starts with the two weeks the log remembers and says so.
+
+    A DELETED CHARACTER'S KILLS ARE NOT THE NEXT ONE'S. kill_reports keeps a
+    slot's rows when its character is deleted, so only rows after the slot's
+    newest deletion are counted.
+    """
+    done = db.execute("SELECT value FROM server_settings WHERE key = ?",
+                      (KILL_TALLY_SINCE_KEY,)).fetchone()
+    if done is not None:
+        return
+    now = int(time.time())
+    db.execute(
+        "INSERT OR IGNORE INTO kill_tally (user_id, slot, enemy_id, kills, first_at, last_at)"
+        " SELECT k.user_id, k.slot, k.enemy_id, COUNT(*), MIN(k.at), MAX(k.at)"
+        "   FROM kill_reports k"
+        "  WHERE k.at > COALESCE((SELECT MAX(d.deleted_at) FROM character_deletions d"
+        "                          WHERE d.user_id = k.user_id AND d.slot = k.slot), 0)"
+        "  GROUP BY k.user_id, k.slot, k.enemy_id"
+    )
+    first = db.execute("SELECT MIN(first_at) FROM kill_tally").fetchone()
+    since = int(first[0]) if first is not None and first[0] is not None else now
+    db.execute(
+        "INSERT INTO server_settings (key, value, updated_by, updated_at) VALUES (?, ?, ?, ?)",
+        (KILL_TALLY_SINCE_KEY, str(since), "migration", now),
+    )
+    app.logger.info("[KILLS] kill record seeded from kill_reports; counting since %d", since)
 
 
 def _migrate_xp_to_next_from_curve(db):
@@ -16833,7 +16943,7 @@ def presence_ticket():
 
     db = get_db()
     save = db.execute(
-        "SELECT name, class_id, level FROM saves WHERE user_id = ? AND slot = ?",
+        "SELECT name, class_id, level, equipment FROM saves WHERE user_id = ? AND slot = ?",
         (user_id, slot),
     ).fetchone()
     if save is None:
@@ -16851,6 +16961,24 @@ def presence_ticket():
     pets = sorted({r["item_id"] for r in held
                    if (gamedata.item_row(r["item_id"]) or {}).get("type_name") == "PET"})
 
+    # WHAT THE BOOKS HOLD THIS CHARACTER TO (presence.py, combatbook.py): the
+    # gear it wears and carries and its three fighting skills, from which
+    # gamedata.combat_bounds() works out the biggest hit it can land, its
+    # damage a second and how fast it walks. Carried as well as worn, so a
+    # sword swapped in mid-fight was always within its bounds. Never shown to
+    # another player - presence.py's join entry names what it shares.
+    try:
+        worn = json.loads(save["equipment"] or "{}")
+    except (TypeError, ValueError):
+        worn = {}
+    gear = {str(v) for v in (worn.values() if isinstance(worn, dict) else []) if isinstance(v, str) and v}
+    gear |= {r["item_id"] for r in db.execute(
+        "SELECT DISTINCT item_id FROM carry_items WHERE user_id = ? AND slot = ?", (user_id, slot))
+        if gamedata.equip_slot_for(r["item_id"])}
+    skills = {r["skill_id"]: int(r["level"]) for r in db.execute(
+        "SELECT skill_id, level FROM skills WHERE user_id = ? AND slot = ?"
+        " AND skill_id IN ('attack', 'magic', 'agility')", (user_id, slot))}
+
     identity = {
         "name": g.user["username"],
         "character": save["name"] or "",
@@ -16860,6 +16988,8 @@ def presence_ticket():
         "hue": g.user["name_hue"],
         "guild": _own_guild(db, user_id)["guild_tag"],
         "pets": pets,
+        "gear": sorted(gear),
+        "skills": skills,
     }
 
     now = int(time.time())
@@ -20238,7 +20368,8 @@ def character_delete():
     # AND ITS SAVE HISTORY: a snapshot names a slot, not a character, and the
     # next character made in this slot is somebody else. The copy above is
     # what is kept of this one.
-    for table in ("carry_items", "skills", "consume_grants", "save_snapshots"):
+    # And its kill record: the next character in this slot starts its own.
+    for table in ("carry_items", "skills", "consume_grants", "save_snapshots", "kill_tally"):
         db.execute("DELETE FROM %s WHERE user_id = ? AND slot = ?" % table, (user_id, slot))
     # The items in its loot bags go with the bags: loot_bag_items cascades.
     db.execute("DELETE FROM loot_bags WHERE user_id = ? AND slot = ?", (user_id, slot))
@@ -20501,7 +20632,8 @@ KILL_LOG_RETENTION_SECONDS = 60 * 60 * 24 * 14
 
 
 def _record_kill(db, user_id, slot, enemy_id, rewards, level_at, now):
-    """Write one row for this claimed kill, and prune the old ones.
+    """Write one row for this claimed kill, and prune the old ones - and count
+    it on the kill record, which is never pruned.
 
     NO COMMIT - this shares combat_kill's transaction on purpose, so a kill is
     never banked without its record, and a record never exists for a kill that
@@ -20515,6 +20647,130 @@ def _record_kill(db, user_id, slot, enemy_id, rewards, level_at, now):
     )
     db.execute("DELETE FROM kill_reports WHERE at < ?",
                (now - KILL_LOG_RETENTION_SECONDS,))
+    db.execute(
+        "INSERT INTO kill_tally (user_id, slot, enemy_id, kills, first_at, last_at)"
+        " VALUES (?, ?, ?, 1, ?, ?)"
+        " ON CONFLICT(user_id, slot, enemy_id) DO UPDATE SET"
+        "   kills = kills + 1, last_at = excluded.last_at",
+        (user_id, slot, str(enemy_id)[:64], now, now),
+    )
+
+
+# =============================================================================
+# THE KILL RECORD
+# =============================================================================
+#
+# The owner, 7 Oct: "lets make a button in game that records all players kills
+# with icons of the enemies". The game's Kills window reads these two routes:
+# this character's kills of each kind of monster, and everybody's. The counts
+# are kill_tally's - paid kills only, so a monster that grants nothing (a large
+# slime, which splits instead of dying) is never on it - and both answers carry
+# `since`, the day counting began, so a board that starts at zero says why.
+#
+# READS ONLY. Nothing here changes a count; _record_kill() is the only writer,
+# and a deleted character's rows go with it (character_delete).
+
+def _kill_tally_since():
+    raw = get_server_setting(KILL_TALLY_SINCE_KEY, None)
+    try:
+        return int(raw) if raw is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+@app.get("/api/kills")
+@require_auth
+def kills_mine():
+    """
+    Your character's kill record: how many of each monster, first and last
+    ---
+    tags:
+      - Combat
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: query
+        name: slot
+        type: integer
+        required: true
+        description: Which character
+    responses:
+      200:
+        description: "{slot, since, total, kinds, kills: [{enemy_id, kills, first_at, last_at}]} most killed first"
+      400:
+        description: Bad slot
+      401:
+        description: Missing, invalid or expired token
+    """
+    slot = parse_slot(request.args.get("slot"))
+    if slot is None:
+        return {"error": "Bad Request", "message": "slot must be 0-%d" % MAX_SLOT}, 400
+    rows = get_db().execute(
+        "SELECT enemy_id, kills, first_at, last_at FROM kill_tally"
+        " WHERE user_id = ? AND slot = ? AND kills > 0"
+        " ORDER BY kills DESC, enemy_id",
+        (g.user["id"], slot),
+    ).fetchall()
+    kills = [{"enemy_id": r["enemy_id"], "kills": int(r["kills"]),
+              "first_at": int(r["first_at"]), "last_at": int(r["last_at"])} for r in rows]
+    return {"slot": slot, "since": _kill_tally_since(),
+            "total": sum(k["kills"] for k in kills), "kinds": len(kills),
+            "kills": kills}, 200
+
+
+@app.get("/api/kills/everyone")
+@require_auth
+def kills_everyone():
+    """
+    Everybody's kill record: each monster's total, how many players, and who has killed the most
+    ---
+    tags:
+      - Combat
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+    responses:
+      200:
+        description: "{since, total, players, kills: [{enemy_id, kills, players, top, top_kills, yours}]} most killed first"
+      401:
+        description: Missing, invalid or expired token
+    """
+    db = get_db()
+    me = g.user["id"]
+    # PER ACCOUNT, not per character: "who has killed the most" is a player,
+    # and four characters of one account are one person. Ties go to whoever
+    # started first (first_at), so the name on a monster does not flicker
+    # between two players level on kills.
+    rows = db.execute(
+        "WITH per AS ("
+        "  SELECT enemy_id, user_id, SUM(kills) AS k, MIN(first_at) AS f"
+        "    FROM kill_tally WHERE kills > 0 GROUP BY enemy_id, user_id),"
+        " ranked AS ("
+        "  SELECT enemy_id, user_id, k,"
+        "         ROW_NUMBER() OVER (PARTITION BY enemy_id ORDER BY k DESC, f ASC, user_id) AS n,"
+        "         SUM(k) OVER (PARTITION BY enemy_id) AS total,"
+        "         COUNT(*) OVER (PARTITION BY enemy_id) AS players"
+        "    FROM per)"
+        " SELECT r.enemy_id, r.total, r.players, r.k AS top_kills, u.username AS top,"
+        "        COALESCE((SELECT k FROM per WHERE per.enemy_id = r.enemy_id AND per.user_id = ?), 0) AS yours"
+        "   FROM ranked r JOIN users u ON u.id = r.user_id"
+        "  WHERE r.n = 1"
+        "  ORDER BY r.total DESC, r.enemy_id",
+        (me,),
+    ).fetchall()
+    kills = [{"enemy_id": r["enemy_id"], "kills": int(r["total"]), "players": int(r["players"]),
+              "top": r["top"], "top_kills": int(r["top_kills"]), "yours": int(r["yours"])}
+             for r in rows]
+    players = db.execute(
+        "SELECT COUNT(DISTINCT user_id) FROM kill_tally WHERE kills > 0").fetchone()[0]
+    return {"since": _kill_tally_since(), "total": sum(k["kills"] for k in kills),
+            "players": int(players or 0), "kills": kills}, 200
 
 
 def _grant_skill_xp(user_id, slot, skill_id, gained):

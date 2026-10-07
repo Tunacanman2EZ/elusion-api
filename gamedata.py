@@ -102,13 +102,19 @@ def _load():
     # a project with no vendors is legitimate. Silent rather than warned for
     # that reason - unlike classes, nothing degrades to trusting the client
     # when there are no shops; /api/shop/buy simply has nothing to sell.
-    return raw.get("constants", {}), items, enemies, classes, shops
+    #
+    # Areas and combat (0.10.0) feed presence.py's books on every monster and
+    # nothing else. A catalogue from before them is not an error: the books
+    # say they cannot judge, and every route here works as it did.
+    areas = raw.get("areas") if isinstance(raw.get("areas"), dict) else {}
+    combat = raw.get("combat") if isinstance(raw.get("combat"), dict) else {}
+    return raw.get("constants", {}), items, enemies, classes, shops, areas, combat
 
 
 # Loaded once at import. Failing here takes the whole server down on start,
 # which is correct: a server that cannot roll loot should not accept kills and
 # quietly grant nothing.
-CONSTANTS, ITEMS, ENEMIES, CLASSES, SHOPS = _load()
+CONSTANTS, ITEMS, ENEMIES, CLASSES, SHOPS, AREAS, COMBAT = _load()
 
 
 # =============================================================================
@@ -926,6 +932,193 @@ def equip_check(item_id, slot_name, class_id, character_level):
         return {"ok": False, "reason": "level", "needs": needs_level}
 
     return {"ok": True}
+
+
+# =============================================================================
+# COMBAT BOUNDS
+# =============================================================================
+# THE MOST ONE CHARACTER CAN DO TO ONE MONSTER: its biggest single hit, how
+# much damage a second it can put into one target, and how fast it can walk.
+# presence.py's books on every monster (combatbook.py) hold every hit a game
+# reports to these, with room to spare (combatbook.SLACK), and write down what
+# does not fit. E3_SCOPE.md, option C, step 1: the server watches, and nothing
+# in play changes.
+#
+# FROM WHAT THE CHARACTER HOLDS, NOT ONLY WHAT IT WEARS. The ticket the socket
+# reads (app.py, presence_ticket) names every piece worn and every piece of
+# gear in the character's bag. A character that swaps to a better sword in the
+# middle of a fight could always hit that hard - it was carrying the sword - so
+# the weapon is the best one held and each slot's damage bonus the best held
+# for that slot. An honest character never hits above this, whatever it puts on.
+#
+# THE ARITHMETIC IS THE GAME'S, from the four class scripts:
+#   unit    (class base + the weapon's top roll) x skills x worn damage percent;
+#           roundi((own_base + weapon_damage_roll()) * get_damage_multiplier())
+#   speed   1 + 1% a level of agility, never more than 2
+#           (PlayerStats.attack_speed_multiplier); cooldowns divide by it.
+#   warrior a swing and its slash wave (wave_ratio of a swing) reach one target
+#           once a swing, and a swing lasts its animation (swing_seconds), not
+#           the 1.0 s lock - the lock is released when the clip ends. With the
+#           Double Axe: a full swing as it passes out and back, and a swing a
+#           second (the attack period) while it spins.
+#   mage    one circle a cast; the Meteorite casts twice one time in ten, so
+#           two a cast is the most.
+#   healer  one shot a cooldown.
+#   tank    the aura ticks every cooldown; with Dynamite, a stick is a second
+#           of ticks (dynamite_cooldown / cooldown), and two one time in ten.
+#   pet     half the character's multiplier on its own damage (pet_share),
+#           half the agility bonus on its cooldown (pet_speed_share); the boss
+#           pet's puddles tick for puddle_damage.
+# A catalogue from before the combat block has no bounds (None), and the books
+# then judge no hit at all rather than guess.
+
+COMBAT_EXPORTED = bool(COMBAT.get("classes"))
+# What a missing skill is read as: the most it could be. A ticket from an API
+# that does not send skills must not make honest hits look too big.
+BOUNDS_UNKNOWN_SKILL = 99
+# The boss pet's puddles: two can lie under a target at once (a cast every two
+# seconds, half of them leave one, a puddle lasts three) and each ticks twice a
+# second. Six ticks a second is that with room.
+PUDDLE_TICKS_PER_SECOND = 6
+
+
+def _skill_for_bounds(skills, name):
+    if not isinstance(skills, dict):
+        return BOUNDS_UNKNOWN_SKILL
+    try:
+        return min(BOUNDS_UNKNOWN_SKILL, max(1, int(skills.get(name, 1) or 1)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def weapon_top_roll(item):
+    """The most one hit of this weapon adds - PlayerStats.weapon_damage_range()'s
+    high end: damage x (1 + spread), spread at most 0.9, rounded up."""
+    try:
+        damage = int(item.get("damage", 0) or 0)
+        spread = float(item.get("damage_spread", 0.0) or 0.0)
+    except (TypeError, ValueError, AttributeError):
+        return 0
+    if damage <= 0:
+        return 0
+    band = min(max(spread, 0.0), 0.9)
+    low = max(1, math.floor(damage * (1.0 - band)))
+    return max(low, math.ceil(damage * (1.0 + band)))
+
+
+def best_loadout(gear, class_id, level):
+    """(the best weapon's top roll, the best damage percent each slot could
+    wear added up, the special attacks a held weapon brings) over the pieces a
+    character holds AND MAY WEAR - equip_check(), the equip routes' own rule,
+    so a healer carrying a Double Axe is not bounded by it. gear None means
+    nobody said: the whole catalogue."""
+    if not isinstance(gear, (list, tuple)):
+        gear = None
+    pieces = list(ITEMS.keys()) if gear is None else [g for g in gear if isinstance(g, str) and g]
+    attacks = COMBAT.get("weapon_attacks") if isinstance(COMBAT.get("weapon_attacks"), dict) else {}
+    top = 0
+    by_slot = {}
+    specials = set()
+    for item_id in pieces:
+        item = item_row(item_id)
+        slot = equip_slot_for(item_id)
+        if item is None or not slot:
+            continue
+        if not equip_check(item_id, slot, class_id, level).get("ok"):
+            continue
+        if slot == "weapon":
+            top = max(top, weapon_top_roll(item))
+            special = attacks.get(base_id(item_id))
+            if special:
+                specials.add(str(special))
+        try:
+            bonus = max(0, int(item.get("bonus_damage_percent", 0) or 0))
+        except (TypeError, ValueError):
+            bonus = 0
+        by_slot[slot] = max(by_slot.get(slot, 0), bonus)
+    return top, sum(by_slot.values()), specials
+
+
+def combat_bounds(identity):
+    """
+    {"max_hit", "dps", "speed"} for the character a presence ticket describes:
+    the biggest single hit it can land, the most damage a second it can put
+    into ONE monster (character and pet together), and the fastest it can
+    walk. None when this catalogue has no combat block.
+
+    identity is the ticket's: "cls", "gear" (worn and carried equipment ids),
+    "skills" ({attack, magic, agility}) and "pets" (the pets it may have out).
+    A missing "gear" reads as the whole catalogue and missing "skills" as the
+    highest level - an older API's ticket can only make the bounds looser.
+    """
+    if not COMBAT_EXPORTED or not isinstance(identity, dict):
+        return None
+    classes = COMBAT.get("classes") or {}
+    cls = str(identity.get("cls", "") or "")
+    if cls not in classes:
+        # A class this catalogue does not know: the loosest of the four.
+        options = [combat_bounds(dict(identity, cls=name)) for name in classes]
+        options = [o for o in options if o]
+        if not options:
+            return None
+        return {key: max(o[key] for o in options) for key in ("max_hit", "dps", "speed")}
+    row = classes[cls]
+
+    skills = identity.get("skills")
+    attack = _skill_for_bounds(skills, "attack")
+    magic = _skill_for_bounds(skills, "magic")
+    agility = _skill_for_bounds(skills, "agility")
+    step = float(COMBAT.get("skill_step", 0.01))
+    try:
+        level = max(1, int(identity.get("lvl", 1) or 1))
+    except (TypeError, ValueError):
+        level = 1
+    if "gear" not in identity:
+        level = 10 ** 6
+    top, percent, specials = best_loadout(identity.get("gear") if "gear" in identity else None, cls, level)
+    mult = (1.0 + (attack - 1) * step + (magic - 1) * step) * (1.0 + percent / 100.0)
+    haste = min(max(1.0 + (agility - 1) * float(COMBAT.get("agility_step", 0.01)), 1.0),
+                float(COMBAT.get("agility_cap", 2.0)))
+
+    unit = (int(row.get("base", 0)) + top) * mult
+    cooldown = max(float(row.get("cooldown", 1.0) or 1.0), 0.01)
+    if cls == "warrior":
+        swing = max(float(row.get("swing_seconds", 0.0) or 0.0), 0.05) or cooldown
+        max_hit = unit
+        dps = unit * haste * (1.0 + float(row.get("wave_ratio", 0.0))) / swing
+        if "SPINNING_AXE" in specials:
+            dps = max(dps, unit * haste * (1.0 / cooldown + 2.0 / swing))
+    elif cls == "mage":
+        casts = 2.0 if "METEOR" in specials else 1.0
+        max_hit = unit
+        dps = unit * haste * casts / cooldown
+    elif cls == "tank":
+        max_hit = unit
+        dps = unit * haste / cooldown
+        if "DYNAMITE" in specials:
+            fuse = max(float(row.get("dynamite_cooldown", 1.0) or 1.0), 0.01)
+            sticks = fuse / cooldown
+            max_hit = unit * sticks
+            dps += unit * sticks * haste * 2.0 / fuse
+    else:
+        max_hit = unit
+        dps = unit * haste / cooldown
+
+    pets = COMBAT.get("pets") or {}
+    claimed = identity.get("pets") if isinstance(identity.get("pets"), (list, tuple)) else []
+    held = [p for p in claimed if isinstance(p, str) and p in pets]
+    if held:
+        share = float(COMBAT.get("pet_share", 0.5))
+        pet_haste = 1.0 + (haste - 1.0) * float(COMBAT.get("pet_speed_share", 0.5))
+        pet_hit = max(int(int(pets[p].get("damage", 0)) * mult * share) for p in held)
+        pet_dps = max(int(int(pets[p].get("damage", 0)) * mult * share) * pet_haste
+                      / max(float(pets[p].get("cooldown", 2.0) or 2.0), 0.01) for p in held)
+        max_hit = max(max_hit, pet_hit)
+        dps += pet_dps + float(COMBAT.get("puddle_damage", 0)) * PUDDLE_TICKS_PER_SECOND
+
+    walk = (int(row.get("speed", 0) or 0) + (agility - 1) * int(COMBAT.get("agility_speed", 10))) \
+        * float(COMBAT.get("sprint", 2.0) or 2.0)
+    return {"max_hit": int(math.ceil(max_hit)), "dps": round(dps, 2), "speed": round(float(walk), 1)}
 
 
 # HOW FAST A CHARACTER RECOVERS ON ITS OWN.

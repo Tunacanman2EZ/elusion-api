@@ -174,6 +174,38 @@ it, not against.
 **Risk:** it touches the thing players feel most. A worse-feeling game that is
 harder to cheat is not obviously a better game at this stage.
 
+### C, step 1 — built 7 October 2026 (0.10.0): the server watches
+
+The owner chose to start C, in three steps, the first only watching. Steps 1
+and 2 of the list above turned out to be already half-paid for: every
+position (presence states) and every monster's spawn, position and death (the
+leader's world) already passed through `presence.py`. So step 1 reads them.
+
+- **The books** (`combatbook.py`, api CLAUDE.md "The books on every monster"):
+  the server's own count of every monster's health, every hit held to what
+  that character could deal (`gamedata.combat_bounds()`), every spawn held to
+  the area's map (`gamedata.AREAS`, exported with the spawn points and respawn
+  times), every death judged AGREED / SHORT / NOT DUE into `combat_kills`, and
+  everything that did not fit counted in `combat_flags`.
+- **The game's part** (0.10.0): a leader sends its world even alone, with its
+  own player's hits inside it, and renews its ticket after an equip.
+- **Nothing in play changes.** The relay is untouched; kills are paid as
+  before. `killwatch.py` matches every paid kill to the books (tier WATCHED).
+
+**What the first week should answer**, reading `killwatch.py` without
+`--quiet`: does honest play ever leave a SHORT, a `hit_too_big`, a `too_fast`
+or a `too_quick`? Expected noise, already explained: kills by a game older
+than 0.10.0 or with its presence link down are "never seen"; teleporters and
+the GM's Go to are `jumped`; a pet's long arrow can be `too_far`.
+
+**Step 2 - enforce.** A kill is paid only with an AGREED row for that
+account, character and monster (the receipt), checked by `/api/combat/kill`;
+a game not connected to presence earns no kill rewards and says so. The bounds
+lose their slack where the week showed honest play never needs it.
+
+**Step 3 - the rest of the list above:** the player's hp on the server (E-9),
+then server-side monster AI, which is what the world boss needs.
+
 ---
 
 ## What I would do

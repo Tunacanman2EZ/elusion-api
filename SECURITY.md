@@ -256,6 +256,21 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     route that does not exist.
     → Held by: `test_rollback.py` — "nobody below the owner reads, restores or gives - the same bare 404 as no route at all", "the supply balances after a rollback", "the bank is the account's and untouched", "the snapshot taken before a rollback is returned", "a character in an open trade is a 409", "every rollback of carol is a line about carol, and no refusal is", "the gift is a 'give' line about lena, by the owner"
     → and in the game: `src/tools/testrunner.gd` — `_test_give_and_save_history()`
+30. **The server keeps its own count of every monster's health, and writes down
+    what does not fit** (0.10.0, E3_SCOPE.md option C, step 1). `presence.py`
+    reads every leader's world and every player's hit - the leader's own
+    included - into `combatbook.py`'s books: each monster's health counted down
+    from the catalogue's maximum, each hit held to the biggest hit and the damage
+    a second that character could deal with what it holds and its skills, each
+    spawn held to the area's map and its respawn time, each death judged AGREED,
+    SHORT or NOT DUE, one row per player who hit it (`combat_kills`), and every
+    hit, walk or spawn that did not fit counted in `combat_flags`.
+    `killwatch.py` matches every paid kill to the books. **Nothing in play
+    changes yet**: the relay is untouched and a kill is paid as before - this is
+    the week that measures whether honest play ever trips a check.
+    → Held by: `test_combatbook.py` — "then it is judged: agreed", "a monster the leader kills with no hits is SHORT, on the leader, with all its health left", "a hit bigger than the character could land is booked at the most it could", "hits faster than the character's rate are refused past the burst it may land", "one back before the area's respawn", "three thousand malformed world messages raise nothing"
+    → and: `test_presence.py` P-8, `test_killwatch.py` "books:"
+    → and in the game: `src/tools/testrunner.gd` — `_test_shared_monsters_keep_the_books()`, `_test_combat_bounds_match_the_game()`
 
 ---
 
@@ -266,10 +281,14 @@ No comforting lies. These are known, named and open.
 - **Kill events are asserted, not proven** (E-3, the deepest one still open). The
   server rolls its own rewards, refuses reward-less enemies, rate-limits with a
   token bucket and caps kills at what the world's respawners can physically
-  produce — that is a rate and content bound, not a proof. Closing it needs
-  server-side encounter state. Until then what a cheat mints is kept from
-  spreading: the owner can switch trading off in one request, and a fresh
-  mythic or Perfect find cannot be traded for 48 hours (`test_tradegates.py`).
+  produce — that is a rate and content bound, not a proof. Since 0.10.0 the
+  server **watches** the fight (invariant 30) and writes down every kill its
+  own count does not back up, but it still **pays** on the game's word: refusing
+  waits for a week of evidence that honest play never trips the books (step 2).
+  Until then what a cheat mints is kept from spreading: the owner can switch
+  trading off in one request, and a fresh mythic or Perfect find cannot be
+  traded for 48 hours (`test_tradegates.py`). A game from before 0.10.0, or one
+  whose presence link is down, is not seen by the books at all.
 - **hp, mana and stamina are clamped, not verified** (E-9). Every rise is
   reconciled against what regeneration plus authorised potions could produce and
   trimmed past a 3× margin. A bound, not a proof.
@@ -307,7 +326,10 @@ No comforting lies. These are known, named and open.
 
 - **Where somebody stands is whatever their game says.** The presence socket
   (`presence.py`) relays positions as games send them, so a modified game can
-  stand inside a wall or hop across the area on other people's screens. It
+  stand inside a wall or hop across the area on other people's screens. Since
+  0.10.0 the books write down a walk faster than the character can and a step
+  the length of a teleport, and a hit from beyond any screen, but refuse none
+  of them. It
   cannot appear as somebody else, or show a rank, colour, guild or pet it does
   not hold - who a player is comes from the server's own rows, through a
   ticket tied to their login - and nothing over the socket deals damage or
@@ -316,12 +338,15 @@ No comforting lies. These are known, named and open.
 - **The monsters in a shared area are whatever the area's leader says.** Since
   0.7.0 one game - the area's leader, the sharing game that walked in first -
   runs the monsters for everyone there, and `presence.py` passes its messages
-  on without reading them. A modified game that becomes leader can move, heal
-  or kill those monsters on everybody's screen, or set the game's own monsters
-  on somebody. It cannot reach anyone's health, bag, gold or kills: every game
+  on exactly as sent. A modified game that becomes leader can move, heal or
+  kill those monsters on everybody's screen, or set the game's own monsters on
+  somebody. It cannot reach anyone's health, bag, gold or kills: every game
   still builds each attack from its own copy of the monster, caps the few
   numbers the leader sends, and reports its own kills under the same E-3
-  ceilings as before.
+  ceilings as before. Since 0.10.0 the server also reads what the leader says
+  into its books (invariant 30), so a monster killed without the hits to kill
+  it, or one the map does not hold, is written down against that leader - but
+  the books do not check where a leader says a monster stands.
 
 - **A rollback can make a second copy of an item.** It puts back what the
   character held when the snapshot was taken; an item traded, banked or sold
