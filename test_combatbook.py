@@ -181,6 +181,27 @@ check("  but not one the character may not wear yet (its level)",
 other = gamedata.combat_bounds({"cls": "mage", "lvl": 30, "gear": ["embersword"], "skills": {}, "pets": []})
 check("  nor another class's", other["max_hit"] == cls_rows["mage"]["base"], other)
 
+# THE DOUBLE AXE LEFT SPINNING (0.11.9): it climbs to axe_spin_max_rate swings
+# a second, and a pass out or back is a swing - the bound holds the top rate,
+# or a warrior who leaves the axe in a pack is "too fast" for being good at it.
+spin = float(w.get("axe_spin_max_rate", 0))
+ba = gamedata.combat_bounds({"cls": "warrior", "lvl": 30, "gear": ["doubleaxe"], "skills": {}, "pets": []})
+check("the catalogue says how fast the Double Axe spins at the most",
+      spin > 1.0, w)
+check("  and a warrior with it is bounded at that rate, plus a pass",
+      abs(ba["dps"] - hit_of(w["base"], "doubleaxe") * (1 / w["cooldown"] + (1 + spin) / w["swing_seconds"])) < 0.05,
+      [ba, spin])
+_older_row = dict(w)
+_older_row.pop("axe_spin_max_rate", None)
+_saved_row = cls_rows["warrior"]
+cls_rows["warrior"] = _older_row
+try:
+    bo = gamedata.combat_bounds({"cls": "warrior", "lvl": 30, "gear": ["doubleaxe"], "skills": {}, "pets": []})
+finally:
+    cls_rows["warrior"] = _saved_row
+check("  a catalogue from before says nothing, and spins at 1x - the old bound",
+      abs(bo["dps"] - hit_of(w["base"], "doubleaxe") * (1 / w["cooldown"] + 2 / w["swing_seconds"])) < 0.05, bo)
+
 m = cls_rows["mage"]
 b1 = gamedata.combat_bounds({"cls": "mage", "lvl": 30, "gear": ["emberstaff"], "skills": {}, "pets": []})
 b2 = gamedata.combat_bounds({"cls": "mage", "lvl": 30, "gear": ["meteorite"], "skills": {}, "pets": []})

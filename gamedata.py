@@ -1064,7 +1064,8 @@ def equip_check(item_id, slot_name, class_id, character_level):
 #           once a swing, and a swing lasts its animation (swing_seconds), not
 #           the 1.0 s lock - the lock is released when the clip ends. With the
 #           Double Axe: a full swing as it passes out and back, and a swing a
-#           second (the attack period) while it spins.
+#           second (the attack period) while it spins, climbing to
+#           axe_spin_max_rate swings a second when it is left (0.11.9).
 #   mage    one circle a cast; the Meteorite casts twice one time in ten, so
 #           two a cast is the most.
 #   healer  one shot a cooldown.
@@ -1191,7 +1192,12 @@ def combat_bounds(identity):
         max_hit = unit
         dps = unit * haste * (1.0 + float(row.get("wave_ratio", 0.0))) / swing
         if "SPINNING_AXE" in specials:
-            dps = max(dps, unit * haste * (1.0 / cooldown + 2.0 / swing))
+            # A pass out or back is a swing (1 / cooldown at most), and the
+            # spinning axe cuts a swing a second times its rate, which climbs
+            # to axe_spin_max_rate when it is left (spinningaxe.gd, SPIN UP,
+            # 0.11.9). A catalogue from before says nothing and spun at 1x.
+            spin = max(float(row.get("axe_spin_max_rate", 1.0) or 1.0), 1.0)
+            dps = max(dps, unit * haste * (1.0 / cooldown + (1.0 + spin) / swing))
     elif cls == "mage":
         casts = 2.0 if "METEOR" in specials else 1.0
         max_hit = unit

@@ -1057,7 +1057,10 @@ rarity but it should be super rewarding getting 1".
   `test_loot.py` holds the order, the rates and the roll; `test_equipment.py`
   holds the kill, the bag, the take and the notice, plus the class and level
   gates. The weapons' damage follows the ladder with the Double Axe as the
-  tier's sword.
+  tier's sword - since game 0.11.9 a sword of 140, 1.4 times ember's 100 (the
+  owner: "pretty weak for a super rare drop"), and 15% damage on each, so a
+  mythic is clearly past a Perfect ember piece. `test_equipment.py` still
+  holds the Meteorite (53) and Dynamite (23) to the axe's share.
 - **The kill is still the client's word** (SECURITY_NOTES E-3). The ceiling
   bounds how many kills a modified client can claim, so it bounds its mythic
   rolls too, but it does not stop them.
@@ -1304,7 +1307,9 @@ finds. `test_combatbook.py` holds the books, `test_presence.py` P-8 the wiring.
   BOUNDS): the biggest single hit, the damage a second into ONE monster and the
   walking speed, from the ticket's `gear` (worn and carried, filtered by
   `equip_check()`), `skills` (attack, magic, agility) and `pets`, and the
-  exported `combat` block. Each class's formula is written out above the code;
+  exported `combat` block (the warrior's row carries `axe_spin_max_rate`
+  since 0.11.9: the Double Axe left spinning climbs to that many swings a
+  second, and the bound allows for it). Each class's formula is written out above the code;
   the game's suite (`_test_combat_bounds_match_the_game`) holds the exported
   numbers to the game's own. Every bound gets `SLACK` (1.5) while watching.
 - **Hits**: one over the biggest is booked at the cap and waits
