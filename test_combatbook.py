@@ -219,10 +219,12 @@ check("a tank's aura ticks once a cooldown",
       b1["max_hit"] == math.ceil(hit_of(t["base"], "embermaul"))
       and abs(b1["dps"] - hit_of(t["base"], "embermaul") / t["cooldown"]) < 0.05, b1)
 chain = 1 + t.get("dynamite_chain_bonus", 0)
-check("  and a stick of Dynamite is a second of ticks, two at once, harder when a blast set it off (0.12.0)",
-      chain > 1
+check("  and a stick of Dynamite is a second of ticks, two at once, harder when a blast set it off (0.12.0),"
+      " with its scorch smouldering on top (0.13.0)",
+      chain > 1 and t.get("dynamite_field_share", 0) > 0
       and b2["max_hit"] == math.ceil(hit_of(t["base"], "dynamite") * sticks * chain)
-      and abs(b2["dps"] - hit_of(t["base"], "dynamite") * (1 / t["cooldown"] + 2 * sticks * chain / t["dynamite_cooldown"])) < 0.05,
+      and abs(b2["dps"] - hit_of(t["base"], "dynamite") * (1 / t["cooldown"] + 2 * sticks * chain / t["dynamite_cooldown"]
+                                                           + sticks * t["dynamite_field_share"] / t["dynamite_field_every"])) < 0.05,
       [b2, t])
 h = cls_rows["healer"]
 b1 = gamedata.combat_bounds({"cls": "healer", "lvl": 30, "gear": ["emberscepter"], "skills": {}, "pets": []})

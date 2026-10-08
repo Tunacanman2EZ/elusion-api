@@ -1073,7 +1073,8 @@ def equip_check(item_id, slot_name, class_id, character_level):
 #   tank    the aura ticks every cooldown; with Dynamite, a stick is a second
 #           of ticks (dynamite_cooldown / cooldown), and two one time in ten,
 #           and a stick set off by another's blast hits dynamite_chain_bonus
-#           harder (0.12.0).
+#           harder (0.12.0), and its scorch smoulders for dynamite_field_share
+#           of a stick every dynamite_field_every seconds on top (0.13.0).
 #   pet     half the character's multiplier on its own damage (pet_share),
 #           half the agility bonus on its cooldown (pet_speed_share); the boss
 #           pet's puddles tick for puddle_damage.
@@ -1224,6 +1225,11 @@ def combat_bounds(identity):
             chain = 1.0 + max(float(row.get("dynamite_chain_bonus", 0.0) or 0.0), 0.0)
             max_hit = unit * sticks * chain
             dps += unit * sticks * haste * 2.0 / fuse * chain
+            # Each blast's scorch smoulders, biting dynamite_field_share of a
+            # stick every dynamite_field_every seconds, one per monster at a
+            # time (0.13.0). Its own clock, so not hastened.
+            every = max(float(row.get("dynamite_field_every", 1.0) or 1.0), 0.01)
+            dps += unit * sticks * max(float(row.get("dynamite_field_share", 0.0) or 0.0), 0.0) / every
     else:
         max_hit = unit
         dps = unit * haste / cooldown
