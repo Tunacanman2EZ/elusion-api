@@ -3990,7 +3990,12 @@ CLIENT_BUILD_HEADER = "X-Elusion-Build"
 # ROLLS in gamedata.py). A build-2 game has never seen one: its ItemRegistry
 # answers the error item for a rolled piece, so it cannot show, wear or sell
 # one. Set the minimum to 3 once the new game is out.
-CURRENT_CLIENT_BUILD = 3
+#
+# 4: armour carries an element resistance at the end of its roll
+# ("jadechest~a104h96r605", ELEMENT RESISTANCE in gamedata.py). A build-3 game
+# reads that whole id as a malformed roll - the error item - exactly as build 2
+# read a quality roll. Set the minimum to 4 once 0.11.0 is out.
+CURRENT_CLIENT_BUILD = 4
 
 MAINTENANCE_DEFAULT_MESSAGE = "Update in progress - please come back later."
 
@@ -10389,7 +10394,7 @@ def mythic_find_text(username, item_id, enemy_id):
     """
     "Tunacan found the Meteorite on a Dark Sprite!" The enemy is named because
     a mythic off a light slime is a story worth telling. A boss is a name
-    ("The Crowned", "Fire The Crowned") and takes no article.
+    ("The Crowned Beholder", "Fire The Crowned Beholder") and takes no article.
     """
     item = gamedata.item_row(item_id) or {}
     enemy = gamedata.ENEMIES.get(enemy_id, {})
@@ -11254,7 +11259,8 @@ def staff_grant():
     # WHAT THE PIECE ROLLS. "plain" is the catalogue at 100%, the only way to
     # have one now that the shop rolls what it sells; "roll" is what a kill or
     # a purchase would hand over; "perfect" is the 1 in QUALITY_PERFECT_ODDS,
-    # so the owner can see one without granting a hundred. "store" is read as
+    # so the owner can see one without granting a hundred - armour with its
+    # resistance at the top of its range, as a Perfect drop. "store" is read as
     # "plain": it was the name for the 100% piece while the shop sold one, and
     # the build-3 game that is out sends it. Only a plain id is rolled: an id
     # that already names a roll is granted as named. Anything with no stats to
@@ -11265,7 +11271,8 @@ def staff_grant():
     if quality not in ("plain", "roll", "perfect"):
         return bad_request("quality must be plain, roll or perfect")
     if quality != "plain" and gamedata.VARIANT_MARK not in item_id:
-        item_id = gamedata.roll_quality(item_id) if quality == "roll" else gamedata.perfect_id(item_id)
+        item_id = (gamedata.roll_quality(item_id) if quality == "roll"
+                   else gamedata.perfect_id(item_id, resist=True))
 
     # The same ceiling an ordinary write gets. Staff is not a reason to be
     # allowed to create a cell holding a billion potions - that is a corrupt

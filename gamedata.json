@@ -1592,6 +1592,43 @@
 		"regen_idle_threshold": 1.0,
 		"regen_minimum_per_second": 1.0,
 		"regen_percent_per_second": 0.0167,
+		"resist_cap": 50,
+		"resist_elements": [
+			1,
+			2,
+			3,
+			4,
+			5,
+			6,
+			7
+		],
+		"resist_letter": "r",
+		"resist_ranges": [
+			[
+				0,
+				0
+			],
+			[
+				2,
+				5
+			],
+			[
+				3,
+				7
+			],
+			[
+				4,
+				9
+			],
+			[
+				5,
+				11
+			],
+			[
+				6,
+				13
+			]
+		],
 		"revive_cost": 20,
 		"revive_gold_minimum": 100,
 		"revive_gold_rate": 0.8,
@@ -1612,7 +1649,7 @@
 			"attack_xp_reward": 239,
 			"bag_drop_chance": 1.0,
 			"bonus_potion_chance": 0.5,
-			"display_name": "The Crowned",
+			"display_name": "The Crowned Beholder",
 			"element": 1,
 			"enemy_id": "boss",
 			"grants_rewards": true,
@@ -1918,7 +1955,7 @@
 			"attack_xp_reward": 128,
 			"bag_drop_chance": 1.0,
 			"bonus_potion_chance": 0.5,
-			"display_name": "Earth The Crowned",
+			"display_name": "Earth The Crowned Beholder",
 			"element": 5,
 			"enemy_id": "earthboss",
 			"grants_rewards": true,
@@ -2157,7 +2194,7 @@
 			"attack_xp_reward": 159,
 			"bag_drop_chance": 1.0,
 			"bonus_potion_chance": 0.5,
-			"display_name": "Fire The Crowned",
+			"display_name": "Fire The Crowned Beholder",
 			"element": 6,
 			"enemy_id": "fireboss",
 			"grants_rewards": true,
@@ -2259,7 +2296,7 @@
 			"attack_xp_reward": 107,
 			"bag_drop_chance": 1.0,
 			"bonus_potion_chance": 0.5,
-			"display_name": "Ice The Crowned",
+			"display_name": "Ice The Crowned Beholder",
 			"element": 3,
 			"enemy_id": "iceboss",
 			"grants_rewards": true,
@@ -2497,7 +2534,7 @@
 			"attack_xp_reward": 79,
 			"bag_drop_chance": 1.0,
 			"bonus_potion_chance": 0.5,
-			"display_name": "Light The Crowned",
+			"display_name": "Light The Crowned Beholder",
 			"element": 2,
 			"enemy_id": "lightboss",
 			"grants_rewards": true,
@@ -2803,7 +2840,7 @@
 			"attack_xp_reward": 97,
 			"bag_drop_chance": 1.0,
 			"bonus_potion_chance": 0.5,
-			"display_name": "Water The Crowned",
+			"display_name": "Water The Crowned Beholder",
 			"element": 7,
 			"enemy_id": "waterboss",
 			"grants_rewards": true,
@@ -3041,7 +3078,7 @@
 			"attack_xp_reward": 86,
 			"bag_drop_chance": 1.0,
 			"bonus_potion_chance": 0.5,
-			"display_name": "Wind The Crowned",
+			"display_name": "Wind The Crowned Beholder",
 			"element": 4,
 			"enemy_id": "windboss",
 			"grants_rewards": true,
@@ -3276,7 +3313,7 @@
 			"xp_reward": 84
 		}
 	],
-	"generated_at": 1791347982,
+	"generated_at": 1791421911,
 	"items": [
 		{
 			"armor_value": 6,
