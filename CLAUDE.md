@@ -1159,11 +1159,40 @@ letters come from the game through gamedata.json.
   still stored as typed - ids are not whitelisted).
 - **The broadcast names the piece, not the id**: `mythic_find_text()` reads
   `item_row()`, so a Perfect find says "found the Perfect Meteorite".
-- **`CURRENT_CLIENT_BUILD` is 3**: a build-2 game reads a rolled id as its
-  error item. Raise the minimum to 3 once the new game is out.
+- **`CURRENT_CLIENT_BUILD` is 4**: a build-2 game reads a rolled id as its
+  error item, and a build-3 game a resisting one (below). Raise the minimum to
+  4 once 0.11.0 is out.
+- **One spelling means ASCII and the very end.** `_VARIANT_PART` and
+  `_VARIANT_SUFFIX` said `\d` and `$` until 7 Oct: Python's `\d` is every
+  Unicode digit and `$` matches before a final newline, so
+  `"ironsword~d\u0661\u0660\u0667"` and `"ironsword~d107\n"` were the 107 roll
+  too - three ids for one piece, two of them the error item in the game. It
+  is `[0-9]` and `fullmatch` now; the MALFORMED list holds both.
 
-`test_quality.py`. test_loot, test_rewards and test_equipment read dropped
-ids through `item_row()` / `base_id()` for the same reason the app does.
+**Armour resists an element** (0.11.0, ELEMENT RESISTANCE in gamedata.py). The
+owner, 7 Oct: "add resistance to armor with a ? random roll also in the shop".
+Every piece of ARMOR worn in a slot (helm to amulet; never a weapon) rolls one
+of `RESIST_ELEMENTS` (the game's `Element.Type` 1-7, the seven lands) and a
+percent from its tier's row of `RESIST_RANGES`, evenly - the top of it on a
+Perfect - as the LAST part of the roll: `jadechest~a104h96r605` is fire, 5%.
+
+- **`_parse_variant()` is the parser** (base, rolls, resist); `split_variant()`
+  wraps it and stays a pair, `item_row()` adds `resist_element` and
+  `resist_percent` (0 and 0 for none). A resistance on a weapon, outside the
+  range, not two digits of percent, not last, twice, or below the top on a
+  Perfect is a malformed roll; one missing is a piece from before and fine.
+- **`roll_quality()` appends it** (`_resist_part()`), so a drop, the till and
+  the owner's `"roll"` grant all carry one. `perfect_id()` alone stays one
+  answer per piece, for tests; `perfect_id(id, resist=True)` is what a Perfect
+  drop and the owner's `"perfect"` grant hand over.
+- **Nothing else here reads it.** What it does - matching pieces added up to
+  `RESIST_CAP`, taken off a hit of that element - is the game's
+  `Player.damage_taken()`, on damage this server never sees. It changes no
+  price, maximum, bound or trade rule.
+
+`test_quality.py`, Q-8 for the resistance. test_loot, test_rewards and
+test_equipment read dropped ids through `item_row()` / `base_id()` for the
+same reason the app does.
 
 ## Seeing each other: presence.py, a second process
 
@@ -1602,7 +1631,8 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
   gathering     fishing and cooking - the item-minting endpoints
   loot          bags, rolls, and taking things out of them
   equipment     what a worn item is worth, and what the tooltip says
-  quality       dropped gear's rolled stats, carried whole by every path
+  quality       dropped gear's rolled stats and armour's resistance,
+                carried whole by every path
   presence      the presence socket: tickets, areas, what the game may say,
                 limits, a login ended anywhere ending the connection, and
                 who leads each area's monsters (P-7), the books' wiring (P-8)

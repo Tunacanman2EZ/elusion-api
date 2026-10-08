@@ -171,8 +171,40 @@ QUALITY_PERFECT_ODDS = int(CONSTANTS.get("quality_perfect_odds", 100))
 VARIANT_MARK = "~"
 
 _FIELD_FOR_LETTER = {letter: field for letter, field in QUALITY_FIELDS}
-_VARIANT_PART = re.compile(r"([a-z])(\d{2,3})")
-_VARIANT_SUFFIX = re.compile(r"^(?:[a-z]\d{2,3})+$")
+# [0-9], NOT \d, AND fullmatch, NOT $. Python's \d is every Unicode digit and
+# its $ matches before a final newline, so "ironsword~d\u0661\u0660\u0667" and
+# "ironsword~d107\n" were both read as the 107 roll - three spellings of one
+# piece, where the game (ItemRegistry, [0-9] and an anchored pattern) reads
+# the other two as nothing. Found adding resistances, 7 Oct.
+_VARIANT_PART = re.compile(r"([a-z])([0-9]{2,3})")
+_VARIANT_SUFFIX = re.compile(r"(?:[a-z][0-9]{2,3})+")
+
+# ELEMENT RESISTANCE (0.11.0). The owner, 7 Oct: "add resistance to armor with
+# a ? random roll also in the shop", "i want elements to do something". Every
+# piece of ARMOUR - anything worn that is not a weapon - rolls one of the seven
+# lands' elements and a percent from its tier's row, wherever its stats roll
+# (a drop, the till, the owner's "roll" and "perfect" grants), and the roll is
+# the LAST part of the id: "jadechest~a104h96r605" resists fire (the game's
+# Element.Type 6) by 5%. The letter, one digit of element, two of percent. A
+# Perfect piece resists at the top of its range. A piece from before
+# resistances has none and is still read.
+#
+# THE SERVER ONLY CARRIES IT. What a resistance does - matching pieces added
+# up to RESIST_CAP, taken off a hit of that element - happens in the game's
+# Player.take_damage(), on damage the server never sees. It changes nothing a
+# player can be paid for, so nothing here reads it but the parser and the roll.
+#
+# NEVER ON A WEAPON. The owner, 7 Oct: "the main goal should be to keep players
+# damage consistent with attack level and gear". The numbers are the game's
+# (GameConstants.RESIST_*, through gamedata.json); the fallbacks are what it
+# holds today.
+RESIST_LETTER = str(CONSTANTS.get("resist_letter") or "r")
+RESIST_ELEMENTS = tuple(int(e) for e in (CONSTANTS.get("resist_elements") or (1, 2, 3, 4, 5, 6, 7)))
+RESIST_RANGES = tuple(
+    (int(row[0]), int(row[1]))
+    for row in (CONSTANTS.get("resist_ranges") or ((0, 0), (2, 5), (3, 7), (4, 9), (5, 11), (6, 13)))
+)
+RESIST_CAP = int(CONSTANTS.get("resist_cap", 50))
 
 
 def rolled_fields(definition):
@@ -188,36 +220,88 @@ def rolled_fields(definition):
     return out
 
 
-def split_variant(item_id):
+def resist_range(definition):
+    """(low, high), the percent a piece of this catalogue row may resist, or
+    (0, 0) for one that never resists: anything but armour that is worn, or a
+    tier with no range. Past the table, its last row - the game's
+    GameConstants.resist_range() and ItemData.resists_when_rolled()."""
+    if not isinstance(definition, dict) or str(definition.get("type_name")) != "ARMOR":
+        return (0, 0)
+    try:
+        slot = int(definition.get("equip_slot") or 0)
+        tier = int(definition.get("tier") or 0)
+    except (TypeError, ValueError):
+        return (0, 0)
+    if slot == 0 or tier < 1 or not RESIST_RANGES:
+        return (0, 0)
+    low, high = RESIST_RANGES[min(tier, len(RESIST_RANGES) - 1)]
+    return (low, high) if high > 0 else (0, 0)
+
+
+def _read_resist(definition, digits):
+    """(element, percent) from a resistance's three digits, or None when they
+    are not one this piece could have rolled."""
+    low, high = resist_range(definition)
+    if high <= 0 or len(digits) != 3:
+        return None
+    element, percent = int(digits[0]), int(digits[1:])
+    if element not in RESIST_ELEMENTS or not low <= percent <= high:
+        return None
+    return (element, percent)
+
+
+def _parse_variant(item_id):
     """
-    (base_id, {field: percent}) for a rolled id, (item_id, {}) for a plain one,
-    and (None, None) for anything that only looks like a roll.
+    (base_id, {field: percent}, (element, percent) or None) for a rolled id,
+    (item_id, {}, None) for a plain one, and (None, None, None) for anything
+    that only looks like a roll.
 
     STRICT, BECAUSE THE ID IS THE IDENTITY. Two spellings of one roll would be
     two different items to every cell check, so there is exactly one: every
     stat the base piece has, each once, in QUALITY_FIELDS order, and either all
-    at QUALITY_PERFECT or each inside QUALITY_LOW..QUALITY_HIGH. A stat the
-    piece does not have, a missing one, a 300% or a "d07" is not a roll.
+    at QUALITY_PERFECT or each inside QUALITY_LOW..QUALITY_HIGH; then at most
+    one resistance, on armour only, inside its tier's range - at the top of it
+    on a Perfect piece. A stat the piece does not have, a missing one, a 300%,
+    a "d07", a resistance on a sword or a 2% one spelled "r62" is not a roll.
+    ItemRegistry.split_roll() is the game's copy of these rules.
     """
     item_id = str(item_id)
     if VARIANT_MARK not in item_id:
-        return item_id, {}
+        return item_id, {}, None
     base, _, suffix = item_id.partition(VARIANT_MARK)
     definition = ITEMS.get(base)
-    if definition is None or not _VARIANT_SUFFIX.match(suffix):
-        return None, None
+    if definition is None or not _VARIANT_SUFFIX.fullmatch(suffix):
+        return None, None, None
     parts = _VARIANT_PART.findall(suffix)
+    resist = None
+    if parts and parts[-1][0] == RESIST_LETTER:
+        resist = _read_resist(definition, parts[-1][1])
+        if resist is None:
+            return None, None, None
+        parts = parts[:-1]
     expected = rolled_fields(definition)
-    if [letter for letter, _ in parts] != [letter for letter, _ in expected]:
-        return None, None
+    if not parts or [letter for letter, _ in parts] != [letter for letter, _ in expected]:
+        return None, None, None
     rolls = {}
     for letter, digits in parts:
         if digits.startswith("0"):
-            return None, None
+            return None, None, None
         rolls[_FIELD_FOR_LETTER[letter]] = int(digits)
     values = set(rolls.values())
     if values != {QUALITY_PERFECT} and not all(QUALITY_LOW <= v <= QUALITY_HIGH for v in values):
-        return None, None
+        return None, None, None
+    if values == {QUALITY_PERFECT} and resist is not None and resist[1] != resist_range(definition)[1]:
+        return None, None, None
+    return base, rolls, resist
+
+
+def split_variant(item_id):
+    """
+    (base_id, {field: percent}) for a rolled id, (item_id, {}) for a plain one,
+    and (None, None) for anything that only looks like a roll - _parse_variant()
+    without the resistance, which item_row() reads.
+    """
+    base, rolls, _resist = _parse_variant(item_id)
     return base, rolls
 
 
@@ -236,13 +320,14 @@ def item_row(item_id):
     """
     THE ONE WAY TO ASK WHAT AN ID IS. The catalogue row for a plain id; for a
     rolled one, a copy of its base row with each rolled stat scaled, plus
-    "base_id", "rolls" and "perfect", and "Perfect " in front of a Perfect
-    piece's name. None for an unknown id or a malformed roll.
+    "base_id", "rolls", "perfect", "resist_element" and "resist_percent" (0 and
+    0 for none), and "Perfect " in front of a Perfect piece's name. None for an
+    unknown id or a malformed roll.
     """
     item_id = str(item_id)
     if VARIANT_MARK not in item_id:
         return ITEMS.get(item_id)
-    base, rolls = split_variant(item_id)
+    base, rolls, resist = _parse_variant(item_id)
     if base is None:
         return None
     row = dict(ITEMS[base])
@@ -253,20 +338,38 @@ def item_row(item_id):
     row["base_id"] = base
     row["rolls"] = dict(rolls)
     row["perfect"] = perfect
+    row["resist_element"] = resist[0] if resist else 0
+    row["resist_percent"] = resist[1] if resist else 0
     if perfect:
         row["display_name"] = "Perfect " + str(row.get("display_name") or base)
     return row
 
 
-def perfect_id(item_id):
+def perfect_id(item_id, resist=False):
     """The Perfect roll of a catalogue piece - every stat at QUALITY_PERFECT -
-    or item_id unchanged for anything with nothing to roll."""
+    or item_id unchanged for anything with nothing to roll. resist=True gives
+    armour its resistance too, a random element at the top of its range - what
+    a Perfect drop is; without it the answer is the same every time, which is
+    what a test comparing ids wants."""
     definition = ITEMS.get(str(item_id))
     fields = rolled_fields(definition) if definition is not None else []
     if not fields:
         return item_id
     return item_id + VARIANT_MARK + "".join(
-        "%s%d" % (letter, QUALITY_PERFECT) for letter, _ in fields)
+        "%s%d" % (letter, QUALITY_PERFECT) for letter, _ in fields) \
+        + (_resist_part(definition, top=True) if resist else "")
+
+
+def _resist_part(definition, top=False):
+    """The resistance a piece of armour rolls, "r605", or "" for anything that
+    never resists: an element from RESIST_ELEMENTS, evenly, and a percent
+    evenly across its tier's range - or the top of it (top=True, a Perfect)."""
+    low, high = resist_range(definition)
+    if high <= 0 or not RESIST_ELEMENTS:
+        return ""
+    element = RESIST_ELEMENTS[_rng.randrange(len(RESIST_ELEMENTS))]
+    percent = high if top else _rng.randint(low, high)
+    return "%s%d%02d" % (RESIST_LETTER, element, percent)
 
 
 def base_id(item_id):
@@ -286,8 +389,9 @@ def roll_quality(item_id):
     pets). Each stat is its own triangle from QUALITY_LOW to QUALITY_HIGH,
     peaked at 100, so most pieces sit near the catalogue and the top of the
     range is rare; one in QUALITY_PERFECT_ODDS is Perfect, every stat at
-    QUALITY_PERFECT. Reads _rng when called, so a test's seeded generator
-    reaches it.
+    QUALITY_PERFECT. Armour also rolls its resistance (_resist_part(), the
+    top of the range on a Perfect). Reads _rng when called, so a test's seeded
+    generator reaches it.
     """
     definition = ITEMS.get(str(item_id))
     if definition is None:
@@ -296,12 +400,12 @@ def roll_quality(item_id):
     if not fields:
         return item_id
     if QUALITY_PERFECT_ODDS > 0 and _rng.randrange(QUALITY_PERFECT_ODDS) == 0:
-        return perfect_id(item_id)
+        return perfect_id(item_id, resist=True)
     parts = []
     for letter, _ in fields:
         percent = int(round(_rng.triangular(QUALITY_LOW, QUALITY_HIGH, 100)))
         parts.append("%s%d" % (letter, min(QUALITY_HIGH, max(QUALITY_LOW, percent))))
-    return item_id + VARIANT_MARK + "".join(parts)
+    return item_id + VARIANT_MARK + "".join(parts) + _resist_part(definition)
 
 
 

@@ -16,6 +16,11 @@ that exist, and those checks guard the roll too. What had to change is every
 question about what an id IS, and those go through gamedata.item_row(). This
 suite holds both halves: the roll, and that each path carries it whole.
 
+AND ARMOUR RESISTS AN ELEMENT (0.11.0, Q-8). The owner, 7 Oct: "add resistance
+to armor with a ? random roll also in the shop". Every piece of armour rolls one
+of the seven lands' elements and a percent from its tier's range, the last part
+of the id: "jadechest~a104h96r605" resists fire by 5%. Never a weapon.
+
 Runs against a throwaway database in the temp folder, never elusion.db.
 """
 import collections, importlib.util, os, random, re, sqlite3, sys, tempfile
@@ -201,6 +206,9 @@ MALFORMED = [
     "jadeamulet~a120h120m120p115",          # a Perfect is every stat or none
     "nosuchthing~d100", "~d100", "ironsword~d100~d100",
     "tinyhealthpotion~d100",                # nothing on a potion rolls
+    "ironsword~d107\n",                     # $ matched before a final newline
+    "ironsword~d\u0661\u0660\u0667",          # \\d matched Arabic-Indic digits
+    "ironsword~d\uff11\uff10\uff17",          # and full-width ones
 ]
 bad = [m for m in MALFORMED if Q.split_variant(m) != (None, None) or Q.has_item(m) or Q.item_row(m)]
 check("everything that only looks like a roll is not an item (%d spellings)" % len(MALFORMED), not bad, bad)
@@ -316,8 +324,12 @@ check("taking it puts the roll in the backpack", res.status_code == 200 and hold
 # A STAFF GRANT, three ways.
 res = post(OWNER, "/api/staff/grant", {"slot": 0, "item_id": "jadeamulet", "quality": "perfect"})
 body = res.get_json() or {}
+granted = str(body.get("granted_item_id", ""))
 check("the owner can grant a Perfect piece", res.status_code == 200
-      and body.get("granted_item_id") == Q.perfect_id("jadeamulet"), [res.status_code, body.get("granted_item_id")])
+      and granted.startswith(Q.perfect_id("jadeamulet") + Q.RESIST_LETTER) and Q.is_perfect(granted),
+      [res.status_code, granted])
+check("  an amulet resisting at the top of its range, as a Perfect drop does",
+      (Q.item_row(granted) or {}).get("resist_percent") == Q.resist_range(Q.ITEMS["jadeamulet"])[1], granted)
 res = post(OWNER, "/api/staff/grant", {"slot": 0, "item_id": "jadeamulet", "quality": "roll"})
 rolled_grant = (res.get_json() or {}).get("granted_item_id", "")
 check("  a rolled one, like a drop", res.status_code == 200 and Q.base_id(rolled_grant) == "jadeamulet"
@@ -527,6 +539,160 @@ for match in re.finditer(r"ITEMS\.get\(\s*item_id|ITEMS\[\s*item_id\s*\]|item_id
         offenders.append(name)
 check("and gamedata.py asks ITEMS by id only inside the four functions that read a roll",
       not offenders, offenders)
+
+
+# =============================================================================
+section("Q-8 ARMOUR RESISTS AN ELEMENT")
+# =============================================================================
+# The owner, 7 Oct: "add resistance to armor with a ? random roll also in the
+# shop", "i want elements to do something" - and, of weapons, "the main goal
+# should be to keep players damage consistent with attack level and gear". So
+# every piece of armour rolls one of the seven lands' elements and a percent,
+# the last part of its id ("r605": fire, 5%), and no weapon ever does. What it
+# does to a hit is the game's (Player.take_damage); the server rolls and reads.
+check("gamedata.json carries the letter, the elements, the ranges and the cap",
+      (consts.get("resist_letter"), consts.get("resist_elements"), consts.get("resist_ranges"),
+       consts.get("resist_cap")) == (Q.RESIST_LETTER, list(Q.RESIST_ELEMENTS),
+                                     [list(r) for r in Q.RESIST_RANGES], Q.RESIST_CAP),
+      sorted(k for k in consts if k.startswith("resist")))
+check("the numbers agreed: the seven lands, iron 2-5 up to ember 6-13, at most 50%",
+      Q.RESIST_ELEMENTS == (1, 2, 3, 4, 5, 6, 7)
+      and Q.RESIST_RANGES == ((0, 0), (2, 5), (3, 7), (4, 9), (5, 11), (6, 13)) and Q.RESIST_CAP == 50)
+check("  its letter is no stat's", Q.RESIST_LETTER not in {l for l, _ in Q.QUALITY_FIELDS})
+armour = [i for i, r in Q.ITEMS.items() if r["type_name"] == "ARMOR" and int(r.get("equip_slot") or 0)]
+wrong = [(i, Q.resist_range(Q.ITEMS[i])) for i in armour
+         if Q.resist_range(Q.ITEMS[i]) != Q.RESIST_RANGES[min(int(Q.ITEMS[i]["tier"]), 5)]]
+check("every piece of armour resists, in its tier's range (%d pieces)" % len(armour),
+      len(armour) >= 40 and not wrong, wrong[:3])
+check("  helms to amulets, every slot but the weapon's", {Q.ITEMS[i]["equip_slot_name"] for i in armour}
+      >= {"HELM", "CHEST", "LEGS", "BOOTS", "SHIELD", "RING", "AMULET"},
+      sorted({Q.ITEMS[i]["equip_slot_name"] for i in armour}))
+never = [i for i, r in Q.ITEMS.items() if r["type_name"] != "ARMOR" or not int(r.get("equip_slot") or 0)]
+check("and nothing else ever does - no weapon, potion, rod or pet",
+      never and all(Q.resist_range(Q.ITEMS[i]) == (0, 0) for i in never)
+      and any(Q.ITEMS[i]["type_name"] == "WEAPON" for i in never))
+
+row = Q.item_row("jadechest~a104h96r605")
+plain_roll = Q.item_row("jadechest~a104h96")
+check("a resisting roll is an item, and says what it resists",
+      row is not None and Q.has_item("jadechest~a104h96r605")
+      and (row["resist_element"], row["resist_percent"]) == (6, 5), row and (row["resist_element"], row["resist_percent"]))
+check("  its stats are the same roll's without it - a resistance is not a stat",
+      all(row[f] == plain_roll[f] for _, f in Q.QUALITY_FIELDS) and row["rolls"] == plain_roll["rolls"]
+      and row["base_id"] == "jadechest" and not row["perfect"])
+check("a roll from before resistances is still read, and resists nothing",
+      plain_roll is not None and (plain_roll["resist_element"], plain_roll["resist_percent"]) == (0, 0))
+check("a Perfect resists at the top of its range", Q.has_item("jadechest~a120h120r607")
+      and Q.is_perfect("jadechest~a120h120r607"))
+check("every element and every percent in range reads, at every tier", all(
+      Q.has_item("%s~%s%s%d%02d" % (i, "".join("%s100" % l for l, _ in Q.rolled_fields(Q.ITEMS[i])),
+                                     Q.RESIST_LETTER, e, p))
+      for i in armour for e in Q.RESIST_ELEMENTS
+      for p in range(Q.resist_range(Q.ITEMS[i])[0], Q.resist_range(Q.ITEMS[i])[1] + 1)))
+
+# THE SAME LIST testrunner.gd's _test_armour_resistance holds.
+RESIST_MALFORMED = [
+    "ironsword~d107r605",                   # never on a weapon
+    "jadechest~a104h96r608",                # jade is 3-7
+    "jadechest~a104h96r602",
+    "jadechest~a104h96r005",                # no element
+    "jadechest~a104h96r805",                # lightning is not a land's
+    "jadechest~a104h96r905",                # nor poison
+    "jadechest~a104h96r65",                 # two digits of percent, always
+    "jadechest~a104h96r6005",
+    "jadechest~r605a104h96",                # last, after every stat
+    "jadechest~a104h96r605r605",            # once
+    "jadechest~r605",                       # not instead of the stats
+    "jadechest~a120h120r606",               # a Perfect at the top of its range
+    "jadechest~a104h96R605",
+    "jadechest~a104r605h96",
+]
+# Armour that could resist but has no stat to roll: none is in the catalogue,
+# so one is made for the check - a resistance on its own is still not a roll.
+# And armour that is never worn (no slot), which none in the catalogue is either.
+Q.ITEMS["qblankring"] = {"item_id": "qblankring", "type_name": "ARMOR", "equip_slot": 7,
+                         "equip_slot_name": "RING", "tier": 1, "display_name": "Blank Ring"}
+Q.ITEMS["qstone"] = {"item_id": "qstone", "type_name": "ARMOR", "equip_slot": 0,
+                     "equip_slot_name": "NONE", "tier": 2, "armor_value": 3, "display_name": "Stone"}
+try:
+    RESIST_MALFORMED.extend(["qblankring~r303", "qstone~a100r605"])
+    bad = [m for m in RESIST_MALFORMED if Q._parse_variant(m) != (None, None, None) or Q.has_item(m) or Q.item_row(m)]
+    unworn = Q.resist_range(Q.ITEMS["qstone"])
+finally:
+    del Q.ITEMS["qblankring"], Q.ITEMS["qstone"]
+check("armour that is never worn never resists", unworn == (0, 0), unworn)
+check("everything that only looks like a resistance is not an item (%d spellings)" % len(RESIST_MALFORMED),
+      not bad, bad)
+
+saved_rng = Q._rng
+Q._rng = random.Random(20261007)
+try:
+    chests = [Q.roll_quality("jadechest") for _ in range(14000)]
+    swords = [Q.roll_quality("ironsword") for _ in range(500)]
+    every_tier = {i: Q.roll_quality(i) for i in armour}
+    perfect_grants = [Q.perfect_id("jadechest", resist=True) for _ in range(200)]
+finally:
+    Q._rng = saved_rng
+parsed = [Q._parse_variant(c) for c in chests]
+check("every chest rolled reads back, and every one resists something",
+      all(p[0] == "jadechest" and p[2] is not None for p in parsed), [c for c, p in zip(chests, parsed) if p[2] is None][:3])
+elements = collections.Counter(p[2][0] for p in parsed if p[2])
+check("each of the seven elements about as often as the others (%s)" % dict(sorted(elements.items())),
+      set(elements) == set(Q.RESIST_ELEMENTS) and min(elements.values()) > 1700 and max(elements.values()) < 2300)
+ordinary = [p[2][1] for p in parsed if p[2] and set(p[1].values()) != {PERFECT}]
+check("and every percent from 3 to 7, evenly", set(ordinary) == set(range(3, 8))
+      and min(collections.Counter(ordinary).values()) > 0.15 * len(ordinary), collections.Counter(ordinary))
+perfect_rolls = [p for p in parsed if p[1] and set(p[1].values()) == {PERFECT}]
+check("a Perfect drop resists at 7, the top (%d of them)" % len(perfect_rolls),
+      perfect_rolls and all(p[2] and p[2][1] == 7 for p in perfect_rolls))
+check("a sword never resists", all(Q.RESIST_LETTER not in s.partition(Q.VARIANT_MARK)[2] and Q.has_item(s)
+                                   for s in swords), swords[:3])
+check("every armour piece in the catalogue rolls one inside its own range",
+      all(Q.item_row(r) and Q.item_row(r)["resist_percent"] > 0 for r in every_tier.values()),
+      [r for r in every_tier.values() if not (Q.item_row(r) and Q.item_row(r)["resist_percent"])][:3])
+check("the owner's Perfect grant: a random element, always at the top",
+      len({p[-3] for p in perfect_grants}) == 7 and all(p.endswith("07") and Q.is_perfect(p) for p in perfect_grants))
+check("  and perfect_id() alone is still one answer, for a test to compare",
+      Q.perfect_id("jadechest") == "jadechest~a120h120" == Q.perfect_id("jadechest"))
+
+Q._rng = random.Random(9)
+try:
+    boss = next(e for e in Q.ENEMIES.values() if e.get("slots_are_gear") and e.get("grants_rewards", True))
+    armour_drops = [c["item_id"] for _ in range(300) for c in Q.build_bag_contents(boss)
+                    if (Q.item_row(c["item_id"]) or {}).get("type_name") == "ARMOR"]
+finally:
+    Q._rng = saved_rng
+check("armour in a boss's bag resists (%d pieces)" % len(armour_drops),
+      armour_drops and all(Q.item_row(i)["resist_percent"] > 0 for i in armour_drops), armour_drops[:3])
+
+CAROL = account("qcarol")
+seed_gold("qcarol", 500000)
+seed_carry("qcarol", {})
+res = post(CAROL, "/api/shop/buy", {"slot": 0, "shop_id": "generalstore", "item_id": "jadechest"})
+got = str((res.get_json() or {}).get("item_id", ""))
+check("a chest bought from the shop arrives with its resistance, rolled at the till",
+      res.status_code == 200 and Q.base_id(got) == "jadechest" and holds("qcarol", got) == 1
+      and (Q.item_row(got) or {}).get("resist_percent", 0) > 0, [res.status_code, got])
+check("  at the shelf's price, whatever it resists",
+      (res.get_json() or {}).get("total_paid") == Q.shop_price("generalstore", "jadechest"))
+check("and the shelf still sells no resistance by name", post(CAROL, "/api/shop/buy",
+      {"slot": 0, "shop_id": "generalstore", "item_id": "jadechest~a100h100r605"}).status_code in (400, 404))
+sql("UPDATE saves SET level = ? WHERE user_id = ? AND slot = 0",
+    (int(Q.ITEMS["jadechest"]["required_level"]), uid("qcarol")))
+bare = Q.max_stats_for("warrior", int(Q.ITEMS["jadechest"]["required_level"]))
+res = post(CAROL, "/api/character/equip", {"slot": 0, "item_id": got})
+import json as _json
+worn = _json.loads(save_row("qcarol")["equipment"] or "{}")
+check("it is worn as itself, resistance and all", res.status_code == 200 and worn.get("chest") == got,
+      [res.status_code, worn])
+check("  and the server's maximum is the roll's health, nothing for the resistance",
+      int(save_row("qcarol")["max_hp"]) - bare["max_hp"] == (Q.item_row(got) or {}).get("bonus_max_hp"))
+check("a staff grant of a resistance that is not one is 400",
+      post(OWNER, "/api/staff/grant", {"slot": 0, "item_id": "jadechest~a100h100r609"}).status_code == 400
+      and post(OWNER, "/api/staff/grant", {"slot": 0, "item_id": "ironsword~d100r605"}).status_code == 400)
+check("  and one that is, is granted as typed",
+      (post(OWNER, "/api/staff/grant", {"slot": 0, "item_id": "jadechest~a100h100r605"}).get_json() or {})
+      .get("granted_item_id") == "jadechest~a100h100r605")
 
 
 print("\n" + "=" * 60)
