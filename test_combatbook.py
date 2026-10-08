@@ -188,18 +188,22 @@ spin = float(w.get("axe_spin_max_rate", 0))
 ba = gamedata.combat_bounds({"cls": "warrior", "lvl": 30, "gear": ["doubleaxe"], "skills": {}, "pets": []})
 check("the catalogue says how fast the Double Axe spins at the most",
       spin > 1.0, w)
-check("  and a warrior with it is bounded at that rate, plus a pass",
-      abs(ba["dps"] - hit_of(w["base"], "doubleaxe") * (1 / w["cooldown"] + (1 + spin) / w["swing_seconds"])) < 0.05,
-      [ba, spin])
+bleed = float(w.get("axe_bleed_share", 0)) / float(w.get("axe_bleed_every", 1) or 1)
+check("  and a warrior with it is bounded at that rate, plus a pass, plus the bleed its cuts leave (0.14.0)",
+      bleed > 0
+      and abs(ba["dps"] - hit_of(w["base"], "doubleaxe") * (1 / w["cooldown"] + (1 + spin) / w["swing_seconds"] + bleed)) < 0.05,
+      [ba, spin, bleed])
 _older_row = dict(w)
 _older_row.pop("axe_spin_max_rate", None)
+_older_row.pop("axe_bleed_share", None)
+_older_row.pop("axe_bleed_every", None)
 _saved_row = cls_rows["warrior"]
 cls_rows["warrior"] = _older_row
 try:
     bo = gamedata.combat_bounds({"cls": "warrior", "lvl": 30, "gear": ["doubleaxe"], "skills": {}, "pets": []})
 finally:
     cls_rows["warrior"] = _saved_row
-check("  a catalogue from before says nothing, and spins at 1x - the old bound",
+check("  a catalogue from before says nothing, and spins at 1x and bleeds nothing - the old bound",
       abs(bo["dps"] - hit_of(w["base"], "doubleaxe") * (1 / w["cooldown"] + 2 / w["swing_seconds"])) < 0.05, bo)
 
 m = cls_rows["mage"]
@@ -214,18 +218,34 @@ check("  the Meteorite twice, and its crater's burn on top (0.12.0)",
 t = cls_rows["tank"]
 b1 = gamedata.combat_bounds({"cls": "tank", "lvl": 30, "gear": ["embermaul"], "skills": {}, "pets": []})
 b2 = gamedata.combat_bounds({"cls": "tank", "lvl": 30, "gear": ["dynamite"], "skills": {}, "pets": []})
-sticks = t["dynamite_cooldown"] / t["cooldown"]
+ticks = t["dynamite_stick_ticks"]
+per_throw = max(2, t["dynamite_bundle_sticks"])
 check("a tank's aura ticks once a cooldown",
       b1["max_hit"] == math.ceil(hit_of(t["base"], "embermaul"))
       and abs(b1["dps"] - hit_of(t["base"], "embermaul") / t["cooldown"]) < 0.05, b1)
 chain = 1 + t.get("dynamite_chain_bonus", 0)
-check("  and a stick of Dynamite is a second of ticks, two at once, harder when a blast set it off (0.12.0),"
-      " with its scorch smouldering on top (0.13.0)",
-      chain > 1 and t.get("dynamite_field_share", 0) > 0
-      and b2["max_hit"] == math.ceil(hit_of(t["base"], "dynamite") * sticks * chain)
-      and abs(b2["dps"] - hit_of(t["base"], "dynamite") * (1 / t["cooldown"] + 2 * sticks * chain / t["dynamite_cooldown"]
-                                                           + sticks * t["dynamite_field_share"] / t["dynamite_field_every"])) < 0.05,
+check("  and with Dynamite the ring still burns (0.14.0), and on top of it every throw is a bundle of sticks"
+      " of dynamite_stick_ticks ticks each, harder when a blast set it off (0.12.0), with its scorch smouldering (0.13.0)",
+      chain > 1 and t.get("dynamite_field_share", 0) > 0 and ticks > 1 and per_throw == 3
+      and t["dynamite_bundle_every"] > 1
+      and b2["max_hit"] == math.ceil(hit_of(t["base"], "dynamite") * ticks * chain)
+      and abs(b2["dps"] - hit_of(t["base"], "dynamite") * (1 / t["cooldown"] + per_throw * ticks * chain / t["dynamite_cooldown"]
+                                                           + ticks * t["dynamite_field_share"] / t["dynamite_field_every"])) < 0.05,
       [b2, t])
+_older_tank = {k: v for k, v in t.items()
+               if k not in ("dynamite_stick_ticks", "dynamite_bundle_every", "dynamite_bundle_sticks")}
+_saved_tank = cls_rows["tank"]
+cls_rows["tank"] = _older_tank
+try:
+    bt = gamedata.combat_bounds({"cls": "tank", "lvl": 30, "gear": ["dynamite"], "skills": {}, "pets": []})
+finally:
+    cls_rows["tank"] = _saved_tank
+old_sticks = t["dynamite_cooldown"] / t["cooldown"]
+check("  a catalogue from before 0.14.0 says nothing: a stick is the cooldown's worth, two at most a throw - the old bound",
+      bt["max_hit"] == math.ceil(hit_of(t["base"], "dynamite") * old_sticks * chain)
+      and abs(bt["dps"] - hit_of(t["base"], "dynamite") * (1 / t["cooldown"] + 2 * old_sticks * chain / t["dynamite_cooldown"]
+                                                           + old_sticks * t["dynamite_field_share"] / t["dynamite_field_every"])) < 0.05,
+      bt)
 h = cls_rows["healer"]
 b1 = gamedata.combat_bounds({"cls": "healer", "lvl": 30, "gear": ["emberscepter"], "skills": {}, "pets": []})
 check("a healer fires once a cooldown",

@@ -1201,7 +1201,13 @@ def combat_bounds(identity):
             # to axe_spin_max_rate when it is left (spinningaxe.gd, SPIN UP,
             # 0.11.9). A catalogue from before says nothing and spun at 1x.
             spin = max(float(row.get("axe_spin_max_rate", 1.0) or 1.0), 1.0)
-            dps = max(dps, unit * haste * (1.0 / cooldown + (1.0 + spin) / swing))
+            # And every cut opens a wound that bites axe_bleed_share of a swing
+            # every axe_bleed_every seconds, one wound per monster at a time
+            # (bleed.gd, 0.14.0). Its own clock, so not hastened. A catalogue
+            # from before says nothing and bleeds nothing.
+            bleed_every = max(float(row.get("axe_bleed_every", 1.0) or 1.0), 0.01)
+            bleed = unit * max(float(row.get("axe_bleed_share", 0.0) or 0.0), 0.0) / bleed_every
+            dps = max(dps, unit * haste * (1.0 / cooldown + (1.0 + spin) / swing) + bleed)
     elif cls == "mage":
         casts = 2.0 if "METEOR" in specials else 1.0
         max_hit = unit
@@ -1214,22 +1220,32 @@ def combat_bounds(identity):
             every = max(float(row.get("meteor_burn_every", 1.0) or 1.0), 0.01)
             dps += unit * max(float(row.get("meteor_burn_share", 0.0) or 0.0), 0.0) / every
     elif cls == "tank":
+        # The ring: a tick every cooldown. Since 0.14.0 it burns with Dynamite
+        # too, lit by the throws, so the Dynamite's sticks are ON TOP of it.
         max_hit = unit
         dps = unit * haste / cooldown
         if "DYNAMITE" in specials:
+            # A throw every dynamite_cooldown. A stick is worth
+            # dynamite_stick_ticks ring ticks (tank.gd, 0.14.0); a catalogue
+            # from before says nothing, and a stick was the cooldown's worth.
             fuse = max(float(row.get("dynamite_cooldown", 1.0) or 1.0), 0.01)
-            sticks = fuse / cooldown
+            ticks = float(row.get("dynamite_stick_ticks", 0.0) or 0.0)
+            if ticks <= 0.0:
+                ticks = fuse / cooldown
             # A stick set off by another's blast hits dynamite_chain_bonus
             # harder (dynamite.gd, CHAIN REACTION, 0.12.0); a catalogue from
             # before says nothing and chains nothing.
             chain = 1.0 + max(float(row.get("dynamite_chain_bonus", 0.0) or 0.0), 0.0)
-            max_hit = unit * sticks * chain
-            dps += unit * sticks * haste * 2.0 / fuse * chain
+            max_hit = max(max_hit, unit * ticks * chain)
+            # The most sticks one throw can be: a double's two, or a bundle's
+            # dynamite_bundle_sticks (0.14.0), every throw, as if each were.
+            per_throw = max(2.0, float(int(row.get("dynamite_bundle_sticks", 0) or 0)))
+            dps += unit * ticks * haste * per_throw / fuse * chain
             # Each blast's scorch smoulders, biting dynamite_field_share of a
             # stick every dynamite_field_every seconds, one per monster at a
             # time (0.13.0). Its own clock, so not hastened.
             every = max(float(row.get("dynamite_field_every", 1.0) or 1.0), 0.01)
-            dps += unit * sticks * max(float(row.get("dynamite_field_share", 0.0) or 0.0), 0.0) / every
+            dps += unit * ticks * max(float(row.get("dynamite_field_share", 0.0) or 0.0), 0.0) / every
     else:
         max_hit = unit
         dps = unit * haste / cooldown
