@@ -1067,10 +1067,13 @@ def equip_check(item_id, slot_name, class_id, character_level):
 #           second (the attack period) while it spins, climbing to
 #           axe_spin_max_rate swings a second when it is left (0.11.9).
 #   mage    one circle a cast; the Meteorite casts twice one time in ten, so
-#           two a cast is the most.
+#           two a cast is the most, and its crater burns meteor_burn_share of
+#           a hit every meteor_burn_every seconds on top (0.12.0).
 #   healer  one shot a cooldown.
 #   tank    the aura ticks every cooldown; with Dynamite, a stick is a second
-#           of ticks (dynamite_cooldown / cooldown), and two one time in ten.
+#           of ticks (dynamite_cooldown / cooldown), and two one time in ten,
+#           and a stick set off by another's blast hits dynamite_chain_bonus
+#           harder (0.12.0).
 #   pet     half the character's multiplier on its own damage (pet_share),
 #           half the agility bonus on its cooldown (pet_speed_share); the boss
 #           pet's puddles tick for puddle_damage.
@@ -1202,14 +1205,25 @@ def combat_bounds(identity):
         casts = 2.0 if "METEOR" in specials else 1.0
         max_hit = unit
         dps = unit * haste * casts / cooldown
+        if "METEOR" in specials:
+            # The crater burns meteor_burn_share of a hit every
+            # meteor_burn_every seconds, one fire per monster at a time
+            # (burningcrater.gd, 0.12.0). Not hastened: the burn keeps its own
+            # clock. A catalogue from before says nothing and burns nothing.
+            every = max(float(row.get("meteor_burn_every", 1.0) or 1.0), 0.01)
+            dps += unit * max(float(row.get("meteor_burn_share", 0.0) or 0.0), 0.0) / every
     elif cls == "tank":
         max_hit = unit
         dps = unit * haste / cooldown
         if "DYNAMITE" in specials:
             fuse = max(float(row.get("dynamite_cooldown", 1.0) or 1.0), 0.01)
             sticks = fuse / cooldown
-            max_hit = unit * sticks
-            dps += unit * sticks * haste * 2.0 / fuse
+            # A stick set off by another's blast hits dynamite_chain_bonus
+            # harder (dynamite.gd, CHAIN REACTION, 0.12.0); a catalogue from
+            # before says nothing and chains nothing.
+            chain = 1.0 + max(float(row.get("dynamite_chain_bonus", 0.0) or 0.0), 0.0)
+            max_hit = unit * sticks * chain
+            dps += unit * sticks * haste * 2.0 / fuse * chain
     else:
         max_hit = unit
         dps = unit * haste / cooldown

@@ -207,7 +207,10 @@ b1 = gamedata.combat_bounds({"cls": "mage", "lvl": 30, "gear": ["emberstaff"], "
 b2 = gamedata.combat_bounds({"cls": "mage", "lvl": 30, "gear": ["meteorite"], "skills": {}, "pets": []})
 check("a mage casts once a cooldown",
       abs(b1["dps"] - hit_of(m["base"], "emberstaff") / m["cooldown"]) < 0.05, b1)
-check("  the Meteorite twice", abs(b2["dps"] - 2 * hit_of(m["base"], "meteorite") / m["cooldown"]) < 0.05, b2)
+check("  the Meteorite twice, and its crater's burn on top (0.12.0)",
+      m.get("meteor_burn_share", 0) > 0
+      and abs(b2["dps"] - hit_of(m["base"], "meteorite") * (2 / m["cooldown"] + m["meteor_burn_share"] / m["meteor_burn_every"])) < 0.05,
+      [b2, m])
 t = cls_rows["tank"]
 b1 = gamedata.combat_bounds({"cls": "tank", "lvl": 30, "gear": ["embermaul"], "skills": {}, "pets": []})
 b2 = gamedata.combat_bounds({"cls": "tank", "lvl": 30, "gear": ["dynamite"], "skills": {}, "pets": []})
@@ -215,9 +218,12 @@ sticks = t["dynamite_cooldown"] / t["cooldown"]
 check("a tank's aura ticks once a cooldown",
       b1["max_hit"] == math.ceil(hit_of(t["base"], "embermaul"))
       and abs(b1["dps"] - hit_of(t["base"], "embermaul") / t["cooldown"]) < 0.05, b1)
-check("  and a stick of Dynamite is a second of ticks, two at once",
-      b2["max_hit"] == math.ceil(hit_of(t["base"], "dynamite") * sticks)
-      and abs(b2["dps"] - hit_of(t["base"], "dynamite") * (1 / t["cooldown"] + 2 * sticks / t["dynamite_cooldown"])) < 0.05, b2)
+chain = 1 + t.get("dynamite_chain_bonus", 0)
+check("  and a stick of Dynamite is a second of ticks, two at once, harder when a blast set it off (0.12.0)",
+      chain > 1
+      and b2["max_hit"] == math.ceil(hit_of(t["base"], "dynamite") * sticks * chain)
+      and abs(b2["dps"] - hit_of(t["base"], "dynamite") * (1 / t["cooldown"] + 2 * sticks * chain / t["dynamite_cooldown"])) < 0.05,
+      [b2, t])
 h = cls_rows["healer"]
 b1 = gamedata.combat_bounds({"cls": "healer", "lvl": 30, "gear": ["emberscepter"], "skills": {}, "pets": []})
 check("a healer fires once a cooldown",

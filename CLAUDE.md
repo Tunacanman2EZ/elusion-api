@@ -1309,7 +1309,10 @@ finds. `test_combatbook.py` holds the books, `test_presence.py` P-8 the wiring.
   `equip_check()`), `skills` (attack, magic, agility) and `pets`, and the
   exported `combat` block (the warrior's row carries `axe_spin_max_rate`
   since 0.11.9: the Double Axe left spinning climbs to that many swings a
-  second, and the bound allows for it). Each class's formula is written out above the code;
+  second, and the bound allows for it; since 0.12.0 the mage's carries
+  `meteor_burn_share` / `meteor_burn_every`, the Meteorite crater's burn,
+  added to the rate, and the tank's `dynamite_chain_bonus`, a chained stick's
+  extra, on its biggest hit and rate). Each class's formula is written out above the code;
   the game's suite (`_test_combat_bounds_match_the_game`) holds the exported
   numbers to the game's own. Every bound gets `SLACK` (1.5) while watching.
 - **Hits**: one over the biggest is booked at the cap and waits
