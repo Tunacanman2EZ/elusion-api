@@ -433,6 +433,35 @@ else:
     print("[BOOT]   or put ELUSION_OWNER=yourname in a .env beside app.py")
 
 
+# THE CO-OWNERS (game 0.21.0). The owner, 10 Oct: "i would promote allmind to
+# owner but there can only be 1 however thats why i want to build another gate
+# that allows him to enter", and then "maybe a switch in my gm panel that gives
+# him access as long as i leave it on".
+#
+# TWO KEYS, AND BOTH ARE THE OWNER'S:
+#
+#   1. WHO MAY BE ONE is named here, in the environment, beside ELUSION_OWNER -
+#      ELUSION_CO_OWNERS=AllMind (commas between names, for more than one).
+#      For the owner's reason: no request can write it, it is not in
+#      elusion.db, and a stolen backup does not carry it. Nothing the game
+#      sends can make anybody a co-owner who is not named here.
+#   2. WHETHER THEY ARE ONE NOW is the owner's switch on the GM panel's Server
+#      tab (POST /api/server/coowners, THE owner only - a co-owner cannot keep
+#      it on). Off, which is how a server starts, a named account is the rank
+#      its row says and nothing more. On, it is a co-owner: every power the
+#      owner has, the GM panel with it, and the owner still above - a co-owner
+#      cannot kick, ban, mute, rank, level, roll back or give to the owner,
+#      and the owner can do all of those to a co-owner.
+#
+# A name equal to the owner's is dropped: the owner is already above it.
+CO_OWNER_USERNAMES = tuple(
+    name for name in (part.strip() for part in os.environ.get("ELUSION_CO_OWNERS", "").split(","))
+    if name and not (OWNER_USERNAME and name.casefold() == OWNER_USERNAME.casefold())
+)
+if CO_OWNER_USERNAMES:
+    print("[BOOT] co-owners, while the owner's switch is on: %s" % ", ".join(CO_OWNER_USERNAMES))
+
+
 # =============================================================================
 # E-4 - THE WERKZEUG DEBUGGER, AND EVERY DOOR IT CAN COME IN BY
 # =============================================================================
@@ -1635,6 +1664,37 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_save_snapshots_character
             ON save_snapshots(user_id, slot, taken_at);
+
+        -- WHAT THE OWNER HAS GIVEN AWAY, one row a gift (THE GIFTS LEDGER, by
+        -- the owner's give routes). A RECORD, NOT MONEY: nothing here is in
+        -- the gold supply, and gold_ledger still holds every gold that moved.
+        -- What each gift was worth is written when it is given, so the answer
+        -- does not move when a price does. user_id is who got it - the owner
+        -- too, for a gift to himself - and username is kept beside it, so the
+        -- row still says who after the account is gone.
+        CREATE TABLE IF NOT EXISTS owner_gifts (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            at          INTEGER NOT NULL,
+            actor_id    INTEGER,
+            actor_name  TEXT    NOT NULL,
+            user_id     INTEGER,
+            username    TEXT    NOT NULL,
+            slot        INTEGER,
+            kind        TEXT    NOT NULL,
+            item_id     TEXT    NOT NULL DEFAULT '',
+            quantity    INTEGER NOT NULL,
+            gold        INTEGER NOT NULL DEFAULT 0,
+            lusions     INTEGER NOT NULL DEFAULT 0,
+            value       INTEGER NOT NULL DEFAULT 0,
+            sells_for   INTEGER NOT NULL DEFAULT 0,
+            source      TEXT    NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_owner_gifts_user
+            ON owner_gifts(user_id, at);
+        CREATE INDEX IF NOT EXISTS idx_owner_gifts_at
+            ON owner_gifts(at);
 
         -- EVERY GOLD THAT ENTERS OR LEAVES THE ECONOMY, one row each.
         --
@@ -3705,6 +3765,49 @@ def is_owner(username):
     return str(username).casefold() == OWNER_USERNAME.casefold()
 
 
+def co_owners_on():
+    """True while the owner's co-owner switch is on (CO_OWNERS_KEY). Asked once
+    a request - role_for() runs for every name on a chat page - and OFF when it
+    cannot be read, outside a request included: a corrupt row must not hand
+    out the owner's powers."""
+    if not CO_OWNER_USERNAMES:
+        return False
+    try:
+        cached = g.get("_co_owners_on")
+    except RuntimeError:
+        cached = None
+        outside = True
+    else:
+        outside = False
+    if cached is not None:
+        return cached
+    try:
+        raw = get_server_setting(CO_OWNERS_KEY)
+        on = bool(json.loads(raw).get("on")) if raw else False
+    except Exception:
+        on = False
+    if not outside:
+        g._co_owners_on = on
+    return on
+
+
+def is_co_owner(username):
+    """True for an account ELUSION_CO_OWNERS names, while the owner's switch is
+    on. Case-insensitive, like is_owner(). Never the owner."""
+    if not username or not CO_OWNER_USERNAMES or is_owner(username):
+        return False
+    folded = str(username).casefold()
+    if not any(folded == name.casefold() for name in CO_OWNER_USERNAMES):
+        return False
+    return co_owners_on()
+
+
+def has_owner_powers(username):
+    """The owner, or a co-owner while the switch is on: what require_owner
+    lets in, and what the login answer's is_owner says."""
+    return is_owner(username) or is_co_owner(username)
+
+
 # The ranks, in order. Index is the comparison - "mod or above" is one
 # integer test rather than an expression repeated in every endpoint, which is
 # what a pile of booleans turns into the moment there is more than one of them.
@@ -3712,7 +3815,14 @@ def is_owner(username):
 # 'owner' is last and is NOT storable. users.role has a CHECK that refuses it,
 # and role_for() supplies it from the environment instead. That is what makes
 # the top rank ungrantable: there is no write that produces it.
-ROLES = ("player", "mod", "dev", "owner")
+#
+# 'coowner' (0.21.0) is the same: not storable, not grantable, supplied by
+# role_for() from ELUSION_CO_OWNERS and the owner's switch. Just below the
+# owner, so can_act_on() keeps the owner above every co-owner by itself.
+ROLES = ("player", "mod", "dev", "coowner", "owner")
+
+# The ranks that come from the environment, never from a row.
+ENVIRONMENT_ROLES = ("coowner", "owner")
 
 # What a fresh account is, and what an unrecognised value is read as. A row
 # holding something this server has never heard of - written by an older build,
@@ -3722,7 +3832,7 @@ DEFAULT_ROLE = "player"
 # The ranks a moderation endpoint may assign. 'owner' is absent and always will
 # be - it comes from ELUSION_OWNER, so no request can grant it. Mirrors
 # SETTABLE_ROLES in set_role.py.
-SETTABLE_ROLES = tuple(r for r in ROLES if r != "owner")
+SETTABLE_ROLES = tuple(r for r in ROLES if r not in ENVIRONMENT_ROLES)
 
 
 def role_for(user):
@@ -3735,9 +3845,11 @@ def role_for(user):
     """
     if is_owner(user["username"]):
         return "owner"
+    if is_co_owner(user["username"]):
+        return "coowner"
 
     stored = user["role"] if "role" in user.keys() else DEFAULT_ROLE
-    return stored if stored in ROLES and stored != "owner" else DEFAULT_ROLE
+    return stored if stored in ROLES and stored not in ENVIRONMENT_ROLES else DEFAULT_ROLE
 
 
 def role_at_least(user, minimum):
@@ -3946,6 +4058,12 @@ PVP_KEY = "pvp"
 # NO ROW READS ON, because trading was on before the switch existed; a row that
 # cannot be read reads OFF, because a corrupt row must not open the border.
 TRADE_KEY = "trade"
+
+# THE CO-OWNERS' SWITCH (0.21.0), the same shape: {"on": true}. Who it lets in
+# is ELUSION_CO_OWNERS, in the environment; this only says whether they are in
+# now. NO ROW READS OFF - a server starts with its co-owners out - and a row
+# that cannot be read reads OFF. Thrown by THE owner only (require_the_owner).
+CO_OWNERS_KEY = "coowners"
 
 # THE CLIENT BUILD GATE. Third row in server_settings, same shape as the two
 # above, and here for a reason neither of them has: this one cannot be added
@@ -4214,7 +4332,7 @@ def maintenance_refusal(username):
     reads this as "wrong password" would send the player to reset one.
     """
     state = maintenance_state()
-    if not state["on"] or is_owner(username):
+    if not state["on"] or has_owner_powers(username):
         return None
     return {
         "error": "Service Unavailable",
@@ -4239,7 +4357,7 @@ def maintenance_disconnect(user):
     screen, where /api/status explains why.
     """
     state = maintenance_state()
-    if not state["on"] or is_owner(user["username"]):
+    if not state["on"] or has_owner_powers(user["username"]):
         return None
     if int(time.time()) < int(state["kick_at"]):
         return None
@@ -4256,12 +4374,19 @@ def maintenance_disconnect(user):
 
 def _end_all_player_sessions(db):
     """
-    Sign out everyone but the owner. Only used when the switch is thrown with
-    no grace window at all, which means the caller has accepted the loss.
+    Sign out everyone but the owner (and a co-owner while the switch is on,
+    who is exempt from the switch like the owner). Only used when the switch is
+    thrown with no grace window at all, which means the caller has accepted the
+    loss.
     """
-    owner_row = _user_by_name(OWNER_USERNAME) if OWNER_USERNAME else None
-    owner_id = owner_row["id"] if owner_row is not None else -1
-    cursor = db.execute("DELETE FROM sessions WHERE user_id != ?", (owner_id,))
+    kept = [-1]
+    for name in ((OWNER_USERNAME,) if OWNER_USERNAME else ()) + (
+            CO_OWNER_USERNAMES if co_owners_on() else ()):
+        row = _user_by_name(name)
+        if row is not None:
+            kept.append(int(row["id"]))
+    cursor = db.execute("DELETE FROM sessions WHERE user_id NOT IN (%s)" % ",".join("?" * len(kept)),
+                        tuple(kept))
     return max(0, int(cursor.rowcount or 0))
 
 
@@ -5475,8 +5600,8 @@ def world_image_wait(user, now=None):
 
     # THE OWNER IS ANSWERED WITHOUT A QUERY, which is both the exemption and
     # the cheap path for the only account that polls while also being the one
-    # most likely to be testing pictures.
-    if is_owner(user["username"]):
+    # most likely to be testing pictures. A co-owner too, while the switch is on.
+    if has_owner_powers(user["username"]):
         return 0
 
     # READ FROM THE TABLE, NOT FROM g.user. user_for_token() selects a short
@@ -5817,20 +5942,59 @@ def require_role(minimum):
 
 def require_owner(view):
     """
-    Decorator for the handful of things only the server's owner may do.
+    Decorator for the things only the server's owner may do - and, since
+    0.21.0, a co-owner while the owner's switch is on (see CO_OWNER_USERNAMES).
 
     Deliberately NOT a check against a database column. See OWNER_USERNAME.
+
+    TAGGED "coowner", the lowest rank it lets in, so /api/staff/powers lists
+    these under the co-owner and the ladder reads true: the owner is above, and
+    has them too.
     """
     @wraps(view)
     def wrapped(*args, **kwargs):
-        if not is_owner(g.user["username"]):
+        if not has_owner_powers(g.user["username"]):
             # 404, not 403. A 403 confirms the route exists and that you are
             # not allowed to use it, which tells an attacker where to aim.
             return {"error": "Not Found", "message": "Not found."}, 404
         return view(*args, **kwargs)
 
+    wrapped._elusion_min_role = "coowner"
+    return wrapped
+
+
+def require_the_owner(view):
+    """
+    Decorator for what is THE owner's alone, a co-owner included out: the
+    co-owners' own switch, so a co-owner can never keep it on.
+    """
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not is_owner(g.user["username"]):
+            return {"error": "Not Found", "message": "Not found."}, 404
+        return view(*args, **kwargs)
+
     wrapped._elusion_min_role = "owner"
     return wrapped
+
+
+# What a co-owner is told when the target is the owner. 403, not the usual
+# 404: a co-owner knows who the owner is, and there is nothing to hide.
+OWNER_UNTOUCHABLE = ({"error": "Forbidden",
+                      "message": "That is the owner's account - a co-owner cannot change it."}, 403)
+
+
+def owner_may_touch(actor, target):
+    """
+    Whether the owner's powers may be turned on `target` by `actor` - a give,
+    a level, a rollback. The owner may touch anyone; a co-owner anyone but the
+    owner, which is the one thing that keeps the owner above. Moderation has
+    can_act_on() for this; these routes never asked, because only the owner
+    reached them.
+    """
+    if target is None:
+        return True
+    return is_owner(actor["username"]) or not is_owner(target["username"])
 
 
 def require_auth(view):
@@ -6118,11 +6282,13 @@ def register():
     #
     # A new account is always a player, but it can be the owner: registering
     # the account named by ELUSION_OWNER is exactly how a fresh server gets one.
+    # IS_OWNER IS "HAS THE OWNER'S POWERS" (0.21.0): true for a co-owner while
+    # the switch is on, and `role` says which of the two.
     return {
         "user_id": user_id,
         "username": username,
-        "role": "owner" if is_owner(username) else DEFAULT_ROLE,
-        "is_owner": is_owner(username),
+        "role": role_for({"username": username, "role": DEFAULT_ROLE}),
+        "is_owner": has_owner_powers(username),
         # A new account has chosen nothing yet; the client draws its default.
         "name_hue": None,
         "token": token,
@@ -6520,7 +6686,8 @@ def login():
         # Locking the owner out of their own server with an UPDATE should not
         # be possible, so role_for() answers from ELUSION_OWNER first.
         "role": role_for(row),
-        "is_owner": is_owner(row["username"]),
+        # The owner's powers: the owner, or a co-owner while the switch is on.
+        "is_owner": has_owner_powers(row["username"]),
         # THE COLOUR COMES WITH THE LOGIN, so a second machine draws the name
         # the player chose on the first one.
         "name_hue": name_hue_of(row),
@@ -6597,7 +6764,7 @@ def session_info():
         "user_id": g.user["id"],
         "username": g.user["username"],
         "role": role_for(g.user),
-        "is_owner": is_owner(g.user["username"]),
+        "is_owner": has_owner_powers(g.user["username"]),
         "name_hue": name_hue_of(g.user),
         "expires_at": g.user["expires_at"],
         "maintenance": maintenance_public(),
@@ -6652,7 +6819,7 @@ def resume_session():
         "user_id": g.user["id"],
         "username": g.user["username"],
         "role": role_for(g.user),
-        "is_owner": is_owner(g.user["username"]),
+        "is_owner": has_owner_powers(g.user["username"]),
         "name_hue": name_hue_of(g.user),
         "token": token,
         "expires_at": expires_at,
@@ -9581,7 +9748,7 @@ def write_bank():
     # THE OWNER, NOT "MOD AND UP". A whole write can hold any item, so it is an
     # item grant by another name, and the grant itself is owner-only now - see
     # staff_grant(). A mod's bank is ignored exactly like a player's.
-    if not is_owner(g.user["username"]):
+    if not has_owner_powers(g.user["username"]):
         body = account_payload(user_id)
         body["ignored"] = ["bank_inventory"]
         return body, 200
@@ -10740,7 +10907,7 @@ def set_account_role():
     new_role = str(payload.get("role", "")).strip().lower()
     if new_role not in SETTABLE_ROLES:
         return bad_request(
-            "role must be one of: %s. 'owner' comes from the environment."
+            "role must be one of: %s. 'owner' and 'coowner' come from the environment."
             % ", ".join(SETTABLE_ROLES)
         )
 
@@ -10872,6 +11039,9 @@ def staff_gold():
         db.rollback()
         return bad_request("that would take the balance below zero")
 
+    # THE GIFTS LEDGER: the owner's own gold is a gift too (one taken back is a
+    # negative one). Same transaction as the gold.
+    _record_gold_gift(db, g.user, user_id, g.user["username"], None if to_bank else slot, amount)
     db.commit()
 
     account = _ensure_account(user_id)
@@ -10897,7 +11067,7 @@ STAFF_LEVEL_MAX = 99
 @require_owner
 def staff_level():
     """
-    Set your own character's level, for testing (owner only)
+    Set a character's level - yours, or the one a player is playing (owner only)
     ---
     tags:
       - Staff
@@ -10911,10 +11081,11 @@ def staff_level():
         name: body
         schema:
           type: object
-          required: [slot, level]
+          required: [level]
           properties:
-            slot:  {type: integer, example: 0}
-            level: {type: integer, example: 22}
+            slot:     {type: integer, example: 0, description: "Your own character (no username)"}
+            username: {type: string, description: "Somebody else: the character they are playing"}
+            level:    {type: integer, example: 22}
     responses:
       200:
         description: The character's new level, XP and maxima
@@ -10922,17 +11093,26 @@ def staff_level():
         description: Bad slot or level
       401:
         description: Missing, invalid or expired token
+      403:
+        description: A co-owner naming the owner
       404:
-        description: Not the owner, or no character in that slot
+        description: Not the owner, no such account, or no character
     """
     # WHY THIS EXISTS. Day 2: tier 6 weapons that need level 22, and eight
     # hours of play between a new character and level 22. The person who has
     # to test them cannot, and the gold grant above is the precedent: the owner
     # may set up his own server's test fixtures.
     #
-    # OWNER ONLY, SELF ONLY - like the gold grant, and for the same reason. It
-    # takes a slot and a level and changes THE CALLER's character; there is no
-    # target parameter, and a username in the payload is ignored.
+    # OWNER ONLY. It was self only, like the gold grant, until 10 Oct (0.21.0):
+    # the owner, testing with first-time players who "want to try the new
+    # weapons", "i also need the ability to set a players level so they can try
+    # out the game". A `username` that is not your own is THE CHARACTER THEY ARE
+    # PLAYING, exactly as a give finds it (_playing_slot()), never a slot from
+    # the request; a snapshot first ("before-level"), so the save history can
+    # put it back; a "level" line about THEM; and their sessions ended, as a
+    # rollback ends them, because their game holds its own copy of the level
+    # and nothing short of a reload replaces it. A co-owner may name anyone but
+    # the owner (owner_may_touch()). Your own name, or none, is your own slot.
     #
     # A LEVEL SET IS A LEVEL-UP OR A LEVEL-DOWN, done the way the kill route
     # does one: XP to zero and the curve's xp_to_next for the new level, the
@@ -10942,10 +11122,7 @@ def staff_level():
     # transaction, like every staff action.
     payload = request.get_json(silent=True) or {}
     user_id = g.user["id"]
-
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+    db = get_db()
 
     raw = payload.get("level")
     if isinstance(raw, bool):
@@ -10957,13 +11134,32 @@ def staff_level():
     if level < 1 or level > STAFF_LEVEL_MAX:
         return bad_request("level must be 1-%d" % STAFF_LEVEL_MAX)
 
-    db = get_db()
+    target = None
+    wanted = str(payload.get("username", "") or "").strip()
+    if wanted and wanted.casefold() != str(g.user["username"]).casefold():
+        target = _user_by_name(wanted)
+        if target is None:
+            return {"error": "Not Found", "message": "No such account."}, 404
+        if not owner_may_touch(g.user, target):
+            return OWNER_UNTOUCHABLE
+        user_id = int(target["id"])
+        slot = _playing_slot(db, user_id)
+        if slot is None:
+            return {"error": "Not Found",
+                    "message": "%s has no character." % target["username"]}, 404
+    else:
+        slot = parse_slot(payload.get("slot"))
+        if slot is None:
+            return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+
     row = db.execute("SELECT * FROM saves WHERE user_id = ? AND slot = ?",
                      (user_id, slot)).fetchone()
     if row is None:
         return {"error": "Not Found",
                 "message": "No character in slot %d." % slot}, 404
 
+    if target is not None:
+        take_snapshot(db, user_id, slot, "before-level")
     was = int(row["level"] or 1)
     derived = _derived_stats(row, level=level)
     if derived is None:
@@ -10988,6 +11184,32 @@ def staff_level():
         "VALUES (?, ?, ?, '', 0, ?)",
         (user_id, slot, LEVELUP_GRANT_ID, int(time.time())),
     )
+    if target is not None:
+        # THEIR GAME RELOADS, as after a rollback: counted first, like a kick.
+        now = int(time.time())
+        ended = int(db.execute(
+            "SELECT COUNT(*) AS n FROM sessions WHERE user_id = ? AND expires_at > ?",
+            (user_id, now)).fetchone()["n"] or 0)
+        db.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        name = row["name"] or row["class_id"]
+        # "player_level", not "level": done to a player, so it is on their
+        # record with the gives and rollbacks (STAFF_ACTION_GROUPS).
+        log_staff_action(
+            g.user, "player_level", target["username"], user_id,
+            "%s (slot %d): level %d -> %d; %d session(s) ended" % (name, slot, was, level, ended),
+        )
+        db.commit()
+        return {
+            "username": target["username"],
+            "character": name,
+            "slot": slot,
+            "level": level,
+            "was": was,
+            "xp_to_next": xp_to_next,
+            "max_hp": derived["max_hp"],
+            "sessions_ended": ended,
+        }, 200
+
     log_staff_action(
         g.user, "level", g.user["username"], g.user["id"],
         "slot %d: level %d -> %d" % (slot, was, level),
@@ -11225,6 +11447,8 @@ def staff_grant():
         target = _user_by_name(wanted)
         if target is None:
             return {"error": "Not Found", "message": "No such account."}, 404
+        if not owner_may_touch(g.user, target):
+            return OWNER_UNTOUCHABLE
         slot = _playing_slot(get_db(), int(target["id"]))
         if slot is None:
             return {"error": "Not Found",
@@ -11302,6 +11526,7 @@ def staff_grant():
         g.user, "grant", g.user["username"], g.user["id"],
         "%d x %s into slot %d" % (quantity, item_id, slot),
     )
+    worth = _record_gift(db, g.user, user_id, g.user["username"], slot, item_id, quantity, "grant")
     db.commit()
 
     return {
@@ -11310,6 +11535,8 @@ def staff_grant():
         "granted_quantity": quantity,
         "carry_positions": written,
         "inventory": inventory_payload(user_id, slot),
+        # What it is worth (THE GIFTS LEDGER), so the panel can say it.
+        "worth": worth,
     }, 200
 
 
@@ -11338,6 +11565,7 @@ def _give_to_player(db, target, slot, item_id, quantity):
         g.user, "give", target["username"], receiver,
         "%d x %s into %s (slot %d)" % (quantity, item_id, name, slot),
     )
+    worth = _record_gift(db, g.user, receiver, target["username"], slot, item_id, quantity, "give")
     db.commit()
 
     now = int(time.time())
@@ -11355,6 +11583,9 @@ def _give_to_player(db, target, slot, item_id, quantity):
         # So the panel can say WHEN they will see it: within a poll, or at
         # their next login.
         "online": online,
+        # And what it is worth (THE GIFTS LEDGER): 999 Piles of Gold is
+        # 24,975,000 gold, which nobody should find out from the ledger.
+        "worth": worth,
     }, 200
 
 
@@ -11402,6 +11633,220 @@ def _mark_gift(db, user_id, slot, by, item_id, quantity):
 
 
 # =============================================================================
+# THE GIFTS LEDGER
+# =============================================================================
+#
+# The owner, 10 Oct, after eleven clicks of Give item put 10,990 Piles of Gold
+# - 274,750,000 gold - in the bag of the first other player to try the game:
+# "do not roll back but make a ledger for anthing i give to players so its
+# accounted for if i ever ask how much did i inflate my server".
+#
+# EVERY GIFT IS A ROW in owner_gifts, written in the same transaction as the
+# gift: a give to a player (_give_to_player), a grant to the owner himself
+# (staff_grant) and the owner's own gold (staff_gold, bank or purse; taking
+# some back is a negative row). Since 0.21.0 a co-owner's gifts too, with his
+# name as the giver (`actor_name`): "to yourself" is a giver to his own
+# account, and the report says who gave what (`by_giver`). What it was worth is worked out then
+# (gift_worth()) and kept, so a price changed later does not rewrite history:
+#
+#     kind "gold"     coins and piles, at what using them pays (gold_item_value),
+#                     and gold given straight; "gold" is that amount
+#     kind "lusions"  a pile of lusions; "lusions" is what it cashes into
+#     kind "item"     anything else: "value" is the catalogue's price for it,
+#                     "sells_for" what the general store would pay - the gold
+#                     it can still turn into
+#
+# A RECORD, NOT MONEY. The gold supply is still gold_ledger's, and a pile of
+# gold given and never used is not in it yet - so the ledger counts a gift at
+# what it CAN become, on the day it is given, and the report sets that beside
+# the gold actually in purses and banks now.
+#
+# THE PAST IS IN THE LOGS, so it is read back, once (_backfill_owner_gifts(),
+# at the end of this file): every "give" and "grant" in staff_actions and every
+# staff_gold row in gold_ledger, marked source "log". A tally that started
+# today would answer "how much have I given" with "nothing yet" (CLAUDE.md, "A
+# counter added by migration starts at zero").
+#
+# READ by GET /api/staff/gifts (gift_report(), owner only) and by giftwatch.py
+# on the server. test_gifts.py.
+
+OWNER_GIFTS_SINCE_KEY = "owner_gifts_since"
+# Whose prices "sells_for" is: the one shop there is.
+GIFT_SHOP_ID = "generalstore"
+
+
+def money_item_worth(item_id):
+    """("gold", each), ("lusions", each) or (None, 0): what a carried pile of
+    this cashes into, one at a time. THE ONE ANSWER for the cash route and the
+    gifts ledger."""
+    premium = gamedata.CONSTANTS.get("lusions_item_id", LUSIONS_ITEM_ID)
+    if item_id == premium:
+        return "lusions", max(1, int((gamedata.item_row(item_id) or {}).get("value", 1) or 1))
+    per = gold_item_value(item_id)
+    if per > 0:
+        return "gold", per
+    return None, 0
+
+
+def gift_worth(item_id, quantity):
+    """{kind, gold, lusions, value, sells_for} for `quantity` of `item_id`."""
+    quantity = int(quantity)
+    currency, per = money_item_worth(item_id)
+    if currency == "gold":
+        return {"kind": "gold", "gold": per * quantity, "lusions": 0, "value": 0, "sells_for": 0}
+    if currency == "lusions":
+        return {"kind": "lusions", "gold": 0, "lusions": per * quantity, "value": 0, "sells_for": 0}
+    row = gamedata.item_row(item_id) or {}
+    try:
+        each = max(0, int(row.get("value", 0) or 0))
+    except (TypeError, ValueError):
+        each = 0
+    sells = gamedata.shop_sell_price(GIFT_SHOP_ID, item_id) or 0
+    return {"kind": "item", "gold": 0, "lusions": 0, "value": each * quantity,
+            "sells_for": int(sells) * quantity}
+
+
+def _record_gift(db, actor, receiver_id, receiver_name, slot, item_id, quantity, source, at=None):
+    """A gift of an item, written to owner_gifts. NO COMMIT - the gift's own.
+    Returns what it was worth."""
+    worth = gift_worth(item_id, quantity)
+    db.execute(
+        "INSERT INTO owner_gifts (at, actor_id, actor_name, user_id, username, slot, kind, item_id,"
+        " quantity, gold, lusions, value, sells_for, source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (int(at if at is not None else time.time()), actor["id"], str(actor["username"]),
+         receiver_id, str(receiver_name), slot, worth["kind"], str(item_id), int(quantity),
+         worth["gold"], worth["lusions"], worth["value"], worth["sells_for"], source),
+    )
+    return worth
+
+
+def _record_gold_gift(db, actor, receiver_id, receiver_name, slot, amount, source="staff_gold", at=None):
+    """Gold given straight - a purse (slot) or the bank (slot None). NO COMMIT."""
+    db.execute(
+        "INSERT INTO owner_gifts (at, actor_id, actor_name, user_id, username, slot, kind, item_id,"
+        " quantity, gold, source) VALUES (?,?,?,?,?,?,'gold','',?,?,?)",
+        (int(at if at is not None else time.time()), actor["id"], str(actor["username"]),
+         receiver_id, str(receiver_name), slot, int(amount), int(amount), source),
+    )
+
+
+def _gift_sums(db, where="", params=()):
+    row = db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(gold), 0), COALESCE(SUM(lusions), 0),"
+        " COALESCE(SUM(value), 0), COALESCE(SUM(sells_for), 0), MIN(at), MAX(at)"
+        " FROM owner_gifts" + where, params).fetchone()
+    return {"gifts": int(row[0]), "gold": int(row[1]), "lusions": int(row[2]),
+            "item_value": int(row[3]), "item_sells_for": int(row[4]),
+            "first_at": int(row[5]) if row[5] is not None else None,
+            "last_at": int(row[6]) if row[6] is not None else None}
+
+
+def gift_report(db, user_id=None, recent=20):
+    """What the owner - and a co-owner - has given away and what it comes to,
+    for the route and the tests. `user_id` narrows it to one receiver."""
+    one = " WHERE user_id = ?" if user_id is not None else ""
+    params = (user_id,) if user_id is not None else ()
+    joiner = " AND " if one else " WHERE "
+    report = {
+        "totals": _gift_sums(db, one, params),
+        "to_players": _gift_sums(db, one + joiner + "(actor_id IS NULL OR user_id IS NOT actor_id)", params),
+        "to_yourself": _gift_sums(db, one + joiner + "user_id IS actor_id", params),
+    }
+    report["by_player"] = [
+        {"username": r[0], "gifts": int(r[1]), "gold": int(r[2]), "lusions": int(r[3]),
+         "item_value": int(r[4]), "item_sells_for": int(r[5]), "last_at": int(r[6])}
+        for r in db.execute(
+            "SELECT username, COUNT(*), SUM(gold), SUM(lusions), SUM(value), SUM(sells_for), MAX(at)"
+            " FROM owner_gifts" + one + " GROUP BY COALESCE(user_id, -1), username"
+            " ORDER BY SUM(gold) DESC, SUM(value) DESC, username LIMIT 50", params)
+    ]
+    # WHO GAVE IT (0.21.0): the owner, and a co-owner while the switch is on.
+    report["by_giver"] = [
+        {"username": r[0], "gifts": int(r[1]), "gold": int(r[2]), "lusions": int(r[3]),
+         "item_value": int(r[4]), "item_sells_for": int(r[5]), "last_at": int(r[6])}
+        for r in db.execute(
+            "SELECT actor_name, COUNT(*), SUM(gold), SUM(lusions), SUM(value), SUM(sells_for), MAX(at)"
+            " FROM owner_gifts" + one + " GROUP BY COALESCE(actor_id, -1), actor_name"
+            " ORDER BY SUM(gold) DESC, SUM(value) DESC, actor_name LIMIT 20", params)
+    ]
+    report["by_item"] = [
+        {"item_id": r[0], "kind": r[1], "quantity": int(r[2]), "gold": int(r[3]),
+         "lusions": int(r[4]), "item_value": int(r[5])}
+        for r in db.execute(
+            "SELECT item_id, kind, SUM(quantity), SUM(gold), SUM(lusions), SUM(value)"
+            " FROM owner_gifts" + one + " GROUP BY item_id, kind"
+            " ORDER BY SUM(gold) + SUM(value) + SUM(lusions) DESC LIMIT 15", params)
+    ]
+    report["recent"] = [
+        {"at": int(r[0]), "by": r[1], "username": r[2], "kind": r[3], "item_id": r[4],
+         "quantity": int(r[5]), "gold": int(r[6]), "lusions": int(r[7]), "item_value": int(r[8]),
+         "source": r[9]}
+        for r in db.execute(
+            "SELECT at, actor_name, username, kind, item_id, quantity, gold, lusions, value, source"
+            # BY WHEN, not by id: the gifts read back from the logs were written
+            # in one go at start-up, staff log first and gold ledger after.
+            " FROM owner_gifts" + one + " ORDER BY at DESC, id DESC LIMIT ?", params + (int(recent),))
+    ]
+    # THE ECONOMY NOW, to set it beside: every gold in a purse or a bank, and
+    # every gold the ledger says was ever made (gifts used, loot, sales).
+    purses = db.execute("SELECT COALESCE(SUM(gold), 0) FROM saves").fetchone()[0]
+    banks = db.execute("SELECT COALESCE(SUM(bank_gold), 0), COALESCE(SUM(lusions), 0) FROM accounts").fetchone()
+    made = db.execute("SELECT COALESCE(SUM(delta), 0) FROM gold_ledger WHERE delta > 0").fetchone()[0]
+    gold_now = int(purses) + int(banks[0])
+    report["economy"] = {"gold_now": gold_now, "lusions_now": int(banks[1]), "gold_ever_made": int(made)}
+    report["share_of_gold_now"] = (round(report["totals"]["gold"] / gold_now, 4) if gold_now > 0 else None)
+    since = db.execute("SELECT value FROM server_settings WHERE key = ?", (OWNER_GIFTS_SINCE_KEY,)).fetchone()
+    report["ledger_since"] = int(since[0]) if since is not None and str(since[0]).isdigit() else None
+    return report
+
+
+@app.get("/api/staff/gifts")
+@require_auth
+@require_owner
+def staff_gifts():
+    """
+    What the owner and the co-owners have given away, and what it comes to
+    ---
+    tags:
+      - Staff
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: query
+        name: username
+        type: string
+        description: Only what this account was given
+      - in: query
+        name: recent
+        type: integer
+        description: How many of the newest gifts to list (1-100, default 20)
+    responses:
+      200:
+        description: Totals, to players and to yourself, by player, by item, the newest, and the economy beside them
+      404:
+        description: Not the owner, or no such account
+    """
+    db = get_db()
+    user_id = None
+    wanted = str(request.args.get("username", "") or "").strip()
+    if wanted:
+        target = _user_by_name(wanted)
+        if target is None:
+            return {"error": "Not Found", "message": "No such account."}, 404
+        user_id = int(target["id"])
+    try:
+        recent = min(100, max(1, int(request.args.get("recent", 20))))
+    except (TypeError, ValueError):
+        recent = 20
+    report = gift_report(db, user_id, recent)
+    report["username"] = wanted or None
+    return report, 200
+
+
+# =============================================================================
 # SAVE SNAPSHOTS AND ROLLBACK
 # =============================================================================
 #
@@ -11423,6 +11868,7 @@ def _mark_gift(db, user_id, slot, by, item_id, quantity):
 #   save             on PUT /api/save, at most every SNAPSHOT_EVERY_SECONDS
 #   before-give      before the owner puts an item in somebody's bag
 #   before-rollback  before a rollback - so a rollback can itself be undone
+#   before-level     before the owner sets somebody else's level (0.21.0)
 # and never when nothing has changed since the newest one (`fingerprint`), so an
 # afternoon standing in town does not push the useful history out. The newest
 # SNAPSHOTS_KEPT per character are kept, pruned on write, and a character's go
@@ -11446,7 +11892,7 @@ def _mark_gift(db, user_id, slot, by, item_id, quantity):
 # owner rolling back their own character is signed out the same way.
 SNAPSHOT_EVERY_SECONDS = 600
 SNAPSHOTS_KEPT = 20
-SNAPSHOT_REASONS = ("save", "before-give", "before-rollback")
+SNAPSHOT_REASONS = ("save", "before-give", "before-rollback", "before-level")
 ROLLBACK_REASON = "staff_rollback"
 
 
@@ -11540,13 +11986,16 @@ def _snapshot_row(row):
 
 def _rollback_target(username):
     """The account named, or (None, 404). The owner may name anyone, themselves
-    included; a name that is not an account is the same 404 as any refusal."""
+    included; a co-owner anyone but the owner (owner_may_touch()); a name that
+    is not an account is the same 404 as any refusal."""
     username = str(username or "").strip()
     if not username:
         return None, bad_request("username is required")
     target = _user_by_name(username)
     if target is None:
         return None, ({"error": "Not Found", "message": "No such account."}, 404)
+    if not owner_may_touch(g.user, target):
+        return None, OWNER_UNTOUCHABLE
     return target, None
 
 
@@ -11870,10 +12319,10 @@ def staff_teleport():
         # MOVING THE WHOLE SERVER IS AN OWNER'S ACT. A dev may reach for one
         # player; emptying the world into one spot is the kind of thing that
         # wants the narrowest rank in the game behind it.
-        if not is_owner(g.user["username"]):
+        if not has_owner_powers(g.user["username"]):
             return {
                 "error": "Forbidden",
-                "message": "Only the owner may teleport everyone.",
+                "message": "Only the owner or a co-owner may teleport everyone.",
             }, 403
 
         rows = db.execute("SELECT id, username FROM users ORDER BY id").fetchall()
@@ -12068,10 +12517,19 @@ def staff_powers():
             "Ban permanently, and for any number of days.",
             "Mute for up to %s." % _days_words(MUTE_MAX_MINUTES),
         ],
-        "owner": [
-            "Cannot be granted or revoked - it comes from ELUSION_OWNER in the server's environment.",
+        # THE CO-OWNER HOLDS THE GM PANEL'S NOTES (0.21.0), because the
+        # co-owner is the lowest rank require_owner lets in, and that is where
+        # its routes are listed; the owner, above, has every one of them.
+        "coowner": [
+            "Cannot be granted or revoked here - an account the server's"
+            " ELUSION_CO_OWNERS names, and only while the owner's co-owner switch"
+            " (the GM panel's Server tab) is on. Off, it is the rank its row says.",
+            "Every power the owner has, with the GM panel - except over the owner:"
+            " a co-owner cannot kick, ban, mute, rank, give to, level, read the"
+            " save history of or roll back the owner's account. The owner can do"
+            " all of that to a co-owner.",
             "Exempt from the maintenance switch: never locked out or disconnected by it.",
-            "The only rank the GM panel opens for: its Account, Testing and Server tabs.",
+            "The GM panel opens for the owner and a co-owner: its Account, Testing and Server tabs.",
             "Testing tab: gold, any item by id or from the item catalogue, and"
             " the level and skill levels of their own character.",
             # CLIENT-SIDE, AND SAID SO. Everything else on this list is something
@@ -12088,15 +12546,24 @@ def staff_powers():
             "Also on the Testing tab (client-side): god mode, which takes no"
             " damage and earns no defense XP while it is on, and the game's"
             " performance readout.",
-            "The only account that can create items: the Testing tab, and"
-            " writing a whole bag or bank at once (everyone else moves one cell"
-            " at a time). The game has no debug keys.",
+            "The only accounts that can create items, with the owner: the Testing"
+            " tab, and writing a whole bag or bank at once (everyone else moves one"
+            " cell at a time). The game has no debug keys. Every gift goes in the"
+            " gifts ledger under the name of whoever gave it.",
             "Account tab: Give item puts anything from the item catalogue into"
-            " the bag of the character a player is playing, and Save history"
-            " puts a player's character back to one of its last %d snapshots"
-            " (one every %d minutes at most, while it changes). A rollback signs"
-            " them out so their game reloads it, and can return an item they"
-            " have since traded away." % (SNAPSHOTS_KEPT, SNAPSHOT_EVERY_SECONDS // 60),
+            " the bag of the character a player is playing, Set level sets that"
+            " character's level (they are signed out so their game loads it), and"
+            " Save history puts a player's character back to one of its last %d"
+            " snapshots (one every %d minutes at most, while it changes). A"
+            " rollback signs them out so their game reloads it, and can return an"
+            " item they have since traded away." % (SNAPSHOTS_KEPT, SNAPSHOT_EVERY_SECONDS // 60),
+        ],
+        "owner": [
+            "Cannot be granted or revoked - it comes from ELUSION_OWNER in the server's environment.",
+            "Everything a co-owner has, and above every co-owner: nobody can do"
+            " any of it to the owner.",
+            "The only one who lets the co-owners in or takes them out - the"
+            " co-owner switch on the GM panel's Server tab.",
         ],
     }
 
@@ -12155,6 +12622,8 @@ STAFF_ACTION_KINDS = (
     "guild_rename", "guild_disband",
     "maintenance", "minbuild", "pvp", "trade",
     "give", "rollback",
+    # 0.21.0: somebody else's level set, and the co-owners' switch.
+    "player_level", "coowners",
 )
 
 # NAMED SETS OF KINDS the log can be asked for by one name (?action=moderation).
@@ -12172,7 +12641,7 @@ STAFF_ACTION_GROUPS = {
     # rolled back before" is exactly what a mod reading their record asks.
     "moderation": ("ban", "unban", "kick", "warn", "note", "role", "chat_delete",
                    "mute", "unmute", "report", "guild_rename", "guild_disband",
-                   "give", "rollback"),
+                   "give", "rollback", "player_level"),
 }
 
 # WRITTEN FOR THE PEOPLE WHO CAN ACT ON THE ACCOUNT, NOT FOR THE ACCOUNT.
@@ -12244,6 +12713,11 @@ def _rank_level_sql(alias):
         # case-insensitive match, not a second rule beside it.
         whens.append("WHEN %s.username = ? THEN %d" % (alias, ROLES.index("owner")))
         params.append(OWNER_USERNAME)
+    # The co-owners, while the switch is on - role_for()'s second line.
+    if co_owners_on():
+        for name in CO_OWNER_USERNAMES:
+            whens.append("WHEN %s.username = ? THEN %d" % (alias, ROLES.index("coowner")))
+            params.append(name)
     for name in SETTABLE_ROLES:
         if name != DEFAULT_ROLE:
             whens.append("WHEN %s.role = '%s' THEN %d" % (alias, name, ROLES.index(name)))
@@ -13338,6 +13812,107 @@ def set_trade():
         "SELECT COUNT(*) FROM trades WHERE state = 'open' AND updated_at >= ?", (cutoff,)
     ).fetchone()[0]
     return {"trade": wanted, "open_trades": int(still_open)}, 200
+
+def _co_owners_payload():
+    raw = get_server_setting(CO_OWNERS_KEY)
+    try:
+        stored = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        stored = {}
+    row = get_db().execute("SELECT updated_by, updated_at FROM server_settings WHERE key = ?",
+                           (CO_OWNERS_KEY,)).fetchone()
+    return {
+        "on": co_owners_on(),
+        # Who the switch lets in: ELUSION_CO_OWNERS, as the .env names them.
+        "names": list(CO_OWNER_USERNAMES),
+        "by": row["updated_by"] if row is not None else "",
+        "at": int(row["updated_at"] or 0) if row is not None else 0,
+        "stored_on": bool(stored.get("on")) if isinstance(stored, dict) else False,
+    }
+
+
+@app.get("/api/server/coowners")
+@require_auth
+@require_owner
+def read_co_owners():
+    """
+    Whether the co-owners are in, and who they are (owner only)
+    ---
+    tags:
+      - Status
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+    responses:
+      200:
+        description: The switch, and the names ELUSION_CO_OWNERS gives it
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: Not the owner or a co-owner
+    """
+    return _co_owners_payload(), 200
+
+
+@app.post("/api/server/coowners")
+@require_auth
+@require_the_owner
+def set_co_owners():
+    """
+    Let the co-owners in, or take them out (the owner alone)
+    ---
+    tags:
+      - Status
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: switch
+        schema:
+          type: object
+          required: [on]
+          properties:
+            on: {type: boolean, description: "true gives the accounts ELUSION_CO_OWNERS names the owner's powers"}
+    responses:
+      200:
+        description: The switch as it now stands, and who it lets in
+      400:
+        description: No 'on' field
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: Not the owner - a co-owner included
+      409:
+        description: On, with nobody named in the server's ELUSION_CO_OWNERS
+    """
+    # THE OWNER'S ALONE (require_the_owner): a co-owner who could throw it
+    # could keep it on. Off takes effect on their next request - role_for()
+    # asks the switch every time - so there is nothing to sign out.
+    payload = request.get_json(silent=True) or {}
+    if "on" not in payload or not isinstance(payload.get("on"), bool):
+        return bad_request('send {"on": true} or {"on": false}')
+    wanted = payload["on"]
+    if wanted and not CO_OWNER_USERNAMES:
+        return {
+            "error": "Conflict",
+            "message": "Nobody is named to be a co-owner. Put ELUSION_CO_OWNERS=<name> in the"
+                       " server's .env and restart it, then switch this on.",
+        }, 409
+    db = get_db()
+    set_server_setting(CO_OWNERS_KEY, json.dumps({"on": wanted}), g.user["username"])
+    log_staff_action(g.user, "coowners", "server", None,
+                     ("on: " + ", ".join(CO_OWNER_USERNAMES)) if wanted else "off")
+    db.commit()
+    # Asked again, not the answer cached before the switch moved.
+    g.pop("_co_owners_on", None)
+    return _co_owners_payload(), 200
+
 
 @app.post("/api/server/broadcast")
 @require_auth
@@ -18119,7 +18694,7 @@ def guild_disband():
         # NAMING A GUILD IS AN OWNER'S POWER. Anyone else naming one - even
         # their own - gets the same 404 a stranger does, so the route never
         # confirms which guilds exist to somebody who may not ask.
-        if not is_owner(g.user["username"]):
+        if not has_owner_powers(g.user["username"]):
             return {"error": "Not Found", "message": "Not found."}, 404
         guild = guild_by_name(named)
         if guild is None:
@@ -18326,7 +18901,7 @@ def guild_list():
             "leader": leader["username"] if leader is not None else "",
         })
     return {"guilds": out, "now": now,
-            "may_disband": is_owner(g.user["username"])}, 200
+            "may_disband": has_owner_powers(g.user["username"])}, 200
 
 
 @app.get("/api/economy/kingdom")
@@ -18935,7 +19510,7 @@ def write_inventory():
     # now (6 Oct 2026), so this is too: otherwise a mod denied the grant would
     # write the same Perfect mythic in here instead. A mod's bag is ignored
     # exactly like a player's.
-    if not is_owner(g.user["username"]):
+    if not has_owner_powers(g.user["username"]):
         return {"slot": slot, "inventory": inventory_payload(user_id, slot),
                 "ignored": ["inventory"]}, 200
 
@@ -19147,12 +19722,9 @@ def cash_carried_pile():
     if error is not None:
         return error
     premium = gamedata.CONSTANTS.get("lusions_item_id", LUSIONS_ITEM_ID)
-    if item_id == premium:
-        per = max(1, int((gamedata.item_row(item_id) or {}).get("value", 1) or 1))
-    else:
-        per = gold_item_value(item_id)
-        if per <= 0:
-            return {"error": "Conflict", "message": "That is not money."}, 409
+    currency, per = money_item_worth(item_id)
+    if currency is None:
+        return {"error": "Conflict", "message": "That is not money."}, 409
 
     user_id = g.user["id"]
     db = get_db()
@@ -19272,7 +19844,7 @@ def write_skills():
     #
     # The ceiling that IS load-bearing today is in _grant_skill_xp(), which caps
     # every server grant. That one is on the path everything actually takes.
-    if not is_owner(g.user["username"]):
+    if not has_owner_powers(g.user["username"]):
         capped, hits = [], []
         for (uid, s, name, level, xp) in parsed:
             if level > MAX_SKILL_LEVEL or xp > MAX_SKILL_XP:
@@ -21417,6 +21989,72 @@ def read_loot_bag():
             for r in rows
         ],
     }, 200
+
+
+# =============================================================================
+# THE GIFTS LEDGER'S PAST (see THE GIFTS LEDGER)
+# =============================================================================
+#
+# HERE, AT THE END OF THE FILE, NOT IN init_db(). A gift's worth is
+# gift_worth(), which reads gold_item_value() and LUSIONS_ITEM_ID - defined far
+# below init_db()'s call, which runs at import (CLAUDE.md, "init_db() runs at
+# import time"). By this line everything exists. It still runs at import, so
+# every process that serves the routes has run it first.
+#
+# ONCE, under BEGIN IMMEDIATE: two workers importing together would otherwise
+# both find no marker and read the past in twice. The second waits for the
+# lock, finds the marker, and leaves.
+
+_GIFT_LINE = re.compile(r"^(\d+) x (\S+) into (?:.*\(slot (\d+)\)|slot (\d+))")
+
+
+def _backfill_owner_gifts():
+    db = sqlite3.connect(DB_PATH, timeout=30)
+    db.row_factory = sqlite3.Row
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        done = db.execute("SELECT value FROM server_settings WHERE key = ?",
+                          (OWNER_GIFTS_SINCE_KEY,)).fetchone()
+        if done is not None:
+            db.rollback()
+            return
+        read = passed_over = 0
+        for row in db.execute(
+                "SELECT created_at, actor_id, actor_name, target_id, target_name, detail"
+                " FROM staff_actions WHERE action IN ('give', 'grant') ORDER BY id").fetchall():
+            found = _GIFT_LINE.match(str(row["detail"] or ""))
+            if found is None:
+                passed_over += 1
+                continue
+            slot = found.group(3) if found.group(3) is not None else found.group(4)
+            _record_gift(db, {"id": row["actor_id"], "username": row["actor_name"]},
+                         row["target_id"], row["target_name"], int(slot) if slot is not None else None,
+                         found.group(2), int(found.group(1)), "log", at=row["created_at"])
+            read += 1
+        # The owner's own gold: staff_gold is only ever the owner to himself.
+        for row in db.execute(
+                "SELECT l.at, l.user_id, l.slot, l.delta, COALESCE(u.username, '') AS username"
+                " FROM gold_ledger l LEFT JOIN users u ON u.id = l.user_id"
+                " WHERE l.reason = 'staff_gold' ORDER BY l.id").fetchall():
+            who = {"id": row["user_id"], "username": row["username"]}
+            _record_gold_gift(db, who, row["user_id"], row["username"], row["slot"], row["delta"],
+                              "log", at=row["at"])
+            read += 1
+        first = db.execute("SELECT MIN(at) FROM owner_gifts").fetchone()[0]
+        now = int(time.time())
+        db.execute(
+            "INSERT INTO server_settings (key, value, updated_by, updated_at) VALUES (?, ?, ?, ?)",
+            (OWNER_GIFTS_SINCE_KEY, str(int(first) if first is not None else now), "migration", now),
+        )
+        db.commit()
+        if read or passed_over:
+            app.logger.info("[GIFTS] the gifts ledger read %d gift(s) back from the logs;"
+                            " %d log line(s) it could not read were passed over", read, passed_over)
+    finally:
+        db.close()
+
+
+_backfill_owner_gifts()
 
 
 # =============================================================================

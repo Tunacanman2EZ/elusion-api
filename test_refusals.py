@@ -192,8 +192,9 @@ check("every /api/staff/ route carries a rank decorator", untagged == [], untagg
 
 # And the owner's own routes are hidden from a dev, not just from a player -
 # the ladder has more than one rung and each one hides the rungs above it.
+# Since 0.21.0 most are tagged "coowner", the lowest rank require_owner lets in.
 for path, method, minimum in RANKED:
-    if minimum != "owner":
+    if minimum not in ("coowner", "owner"):
         continue
     res = client.open(path.replace("<username>", "spare"), method=method, headers=dev, json={})
     check("%s %s hides itself from a DEV too" % (method, path),

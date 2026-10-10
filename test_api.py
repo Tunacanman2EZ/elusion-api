@@ -194,8 +194,8 @@ body = status("a new account's rank", client.post("/api/auth/register",
 check("a fresh account is a player", body.get("role") == "player", body)
 RANK_H = {"Authorization": "Bearer " + body["token"]}
 
-check("the ordering is player < mod < dev < owner",
-      app_module.ROLES == ("player", "mod", "dev", "owner"), app_module.ROLES)
+check("the ordering is player < mod < dev < coowner < owner",
+      app_module.ROLES == ("player", "mod", "dev", "coowner", "owner"), app_module.ROLES)
 
 def _set_rank(username, role):
     conn = _owner_sq.connect(DB_PATH)

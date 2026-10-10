@@ -498,7 +498,8 @@ password, and it fails.
 
 ## Ranks
 
-Built. `owner > dev > mod > player`, as `users.role` - one ordered column, not a
+Built. `owner > coowner > dev > mod > player`, as `users.role` (the bottom
+three; the top two come from the environment) - one ordered column, not a
 pile of booleans. Two booleans is four states; four is sixteen, and most of
 those are nonsense.
 
@@ -507,6 +508,7 @@ What each one actually means, because the names do not say it:
 | rank | who that is |
 |---|---|
 | `owner` | The person running the server. Named in the environment, not the database. |
+| `coowner` | Somebody the owner trusts with all of it (0.21.0). Named in the environment too, and in only while the owner's switch is on. |
 | `dev` | Technical trust - someone hired, or met through a pull request. Knows the code; may never have played seriously. |
 | `mod` | Community trust - usually a player, who knows the other players. |
 | `player` | Everyone. The default. |
@@ -534,6 +536,43 @@ and `role_for()` consults it before the column - so revoking someone's row
 cannot lock the owner out, and a column set to `'owner'` by hand grants nothing.
 There is no write that produces the top rank.
 
+**Nor the co-owner (0.21.0).** The owner: "i would promote allmind to owner but
+there can only be 1 however thats why i want to build another gate that allows
+him to enter", and "maybe a switch in my gm panel that gives him access as long
+as i leave it on". Two keys, both the owner's:
+
+- **`ELUSION_CO_OWNERS`** names who may be one, in the environment beside
+  `ELUSION_OWNER` (commas for more than one; the owner's own name is dropped).
+  Nothing a request writes can make anybody a co-owner who is not named there.
+- **The switch**, `server_settings` `coowners` (`CO_OWNERS_KEY`), says whether
+  they are in now: `POST /api/server/coowners {on}`, `require_the_owner` - THE
+  owner, so a co-owner can never keep himself in. No row, or a row that cannot
+  be read, is off; a server starts with its co-owners out. `GET` is for the
+  owner and a co-owner, for the GM panel's Server tab.
+
+While both hold, `role_for()` answers `coowner` (`is_co_owner()`, after
+`is_owner()`, before the column), and `has_owner_powers()` - which
+`require_owner` and every other owner check now ask - is true. Off, the row's
+rank, on the next request: `co_owners_on()` reads the switch once a request
+(cached on `g`), so turning it off needs no signing out. The login, the
+session and the resume answer `"is_owner": true` for a co-owner: on the wire
+it means "has the owner's powers", and `role` says which of the two.
+
+**The owner stays above.** `coowner` sits just below `owner` in `ROLES`, so
+`can_act_on()` keeps a co-owner off the owner (kick, ban, mute, rank) and lets
+the owner do all of that to a co-owner. The owner's routes never asked
+`can_act_on()` - only the owner reached them - so they ask
+`owner_may_touch()` now: a co-owner cannot give to, level, read the save
+history of or roll back the owner's account, a 403 that says so
+(`OWNER_UNTOUCHABLE`; there is nothing to hide from a co-owner).
+
+**`require_owner` is tagged `coowner`** - the lowest rank it lets in - so the
+Powers window lists the owner's routes on the co-owner's rung and the GM
+panel's notes with them; the owner's own rung is the switch
+(`require_the_owner`, tagged `owner`) and what being above means. Every gift a
+co-owner makes is a row in the gifts ledger with his name; the report has
+`by_giver`. `test_coowner.py`.
+
 **Everything unrecognised fails toward less privilege.** A stored rank this
 build has never heard of reads as `player`. An unknown `minimum` passed to
 `role_at_least()` denies rather than raising - removing the `admin` rank turned
@@ -552,7 +591,8 @@ that `role_at_least(..., "admin")` denies rather than raising. Those tests are
 what keep it from coming back.
 
 **The CHECK constraint only reaches fresh databases.** A migrated `users` table
-gets `role` via ALTER and carries no constraint, so `'owner'` is storable there.
+gets `role` via ALTER and carries no constraint, so `'owner'` (and `'coowner'`)
+is storable there.
 `role_for()` is the guarantee; the CHECK is defence in depth. There is a test
 asserting a column reading `'owner'` grants nothing, precisely because the
 constraint cannot be relied on.
@@ -1586,13 +1626,68 @@ SNAPSHOTS AND ROLLBACK in app.py, `test_rollback.py`. All of it is
   `trade: null` and says its old "Your backpack was updated by the server".
   **A waiting trade result is never overwritten** by a gift: the bag delivered
   is read at delivery, so it holds the gift anyway.
-- **`give` and `rollback` are in the "moderation" group** of the log, unlike
+- **`POST /api/staff/level` takes `username` too** (0.21.0; the owner,
+  testing with first-time players: "i also need the ability to set a players
+  level so they can try out the game"). Another name is the character they are
+  PLAYING (`_playing_slot()`, as a give), a `before-level` snapshot first, the
+  level set the way the owner's own is (XP from zero, the maxima, full pools,
+  a level-up grant), a `player_level` line about them, and **their sessions
+  ended**, as a rollback ends them - their game holds its own copy of the
+  level. Offline is fine (`sessions_ended` 0). No name, or your own, is your
+  own `slot` as before. A co-owner may name anyone but the owner.
+- **`give`, `rollback` and `player_level` are in the "moderation" group** of the log, unlike
   `grant`: they are done to a player, and "has this player been rolled back
   before" is what a mod reading their record asks.
 - **The honest limit** (SECURITY.md): a rollback can return an item the
   character has since traded away, which then exists twice. The owner's call,
   logged on the player's record. And every burn counts as given on the Kingdom
   board, a rollback's included.
+
+## The gifts ledger: what the owner has given away
+
+The owner, 10 Oct, after giving the first other player 10,990 Piles of Gold
+(274,750,000 gold) and deciding to keep it: "do not roll back but make a
+ledger for anthing i give to players so its accounted for if i ever ask how
+much did i inflate my server". THE GIFTS LEDGER in app.py, `test_gifts.py`.
+
+- **`owner_gifts`, one row a gift**, written in the gift's own transaction:
+  a give to a player (`_give_to_player()`, source `give`), a grant to the
+  owner himself (`staff_grant`, `grant`), and the owner's own gold
+  (`staff_gold`, purse or bank - bank is `slot` NULL - and gold taken back is
+  a negative row). A refused gift (full bag, gold below zero, not the owner)
+  writes nothing, because it rolls back with the rest.
+- **What it was worth is kept, not looked up later** (`gift_worth()`): kind
+  `gold` for coins and piles at what using them pays, `lusions` for a pile of
+  lusions, `item` for anything else with the catalogue's `value` and
+  `sells_for`, what the general store (`GIFT_SHOP_ID`) would pay. A price
+  changed next week does not rewrite what was given today.
+- **`money_item_worth()` is the one answer** to "what does this pile cash
+  into", for the cash route and the ledger both. The cash route used to work
+  it out itself; two copies would drift.
+- **A record, not money.** The gold supply is still `gold_ledger`'s; a pile
+  given and still in a bag is in the gifts ledger and not yet in any purse.
+  So the report sets the gifts beside the gold in purses and banks now, and
+  the share can pass 100%.
+- **The past is read back from the logs, once** (`_backfill_owner_gifts()`):
+  every `give` and `grant` line in `staff_actions` (`_GIFT_LINE` reads "N x
+  item into ..."; a line it cannot read is passed over and counted in the
+  boot log, never guessed at) and every `staff_gold` row of `gold_ledger`,
+  marked source `log`. The marker is `server_settings` `owner_gifts_since`,
+  the time of the first gift the logs remember. **It is at the end of
+  app.py, not in `init_db()`**: it needs `gold_item_value()`, which is defined
+  below `init_db()`'s call (see "init_db() runs at import time"). It runs
+  under `BEGIN IMMEDIATE`, so two workers starting together read it once.
+- **`GET /api/staff/gifts?username=&recent=`** (`gift_report()`, owner only,
+  the same bare 404 to everybody else): totals, `to_players` and
+  `to_yourself` apart, `by_player`, `by_item`, the newest, the economy now
+  (`gold_now`, `lusions_now`, `gold_ever_made`), `share_of_gold_now` and
+  `ledger_since`. A grant or give answers its own `worth` as well, so the
+  game can say "999 x Pile of Gold, 24,975,000 gold" at the moment it is
+  given.
+- **`giftwatch.py`** prints the same report from the database on the
+  server, read only (`mode=ro`), `--player NAME` for one account. Its SQL is
+  written out again rather than imported: importing app.py runs the start-up,
+  and the start-up writes. GL-8 holds the two to the same numbers.
 
 ## The kill record
 
@@ -1690,6 +1785,11 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
   chardelete    deleting a character, and only the character
   rollback      the save history: snapshots, the owner's rollback, and
                 giving a player an item
+  coowner       the co-owners: named in the environment, let in by the
+                owner's switch, never above the owner; and setting a
+                player's level
+  gifts         the gifts ledger: every gift the owner makes, what it was
+                worth, the report, the past read back once, giftwatch.py
   killrecord    every paid kill counted per character and monster, kept for
                 good, and the two routes the Kills window reads
   concurrency   requests that arrive together: the write lock
@@ -1726,6 +1826,8 @@ killwatch.py    reads the LIVE database on a schedule: is anyone claiming kills
 deathwatch.py   read-only, run by hand: why the board's deaths column says what
                 it says - the counter, every character's stored hp, and every
                 revive in both ledgers with a date
+giftwatch.py    read-only, run by hand: what the owner has given away, to
+                whom, what it was worth, beside the gold in the game now
 ```
 
 `set_role.py` talks to the database directly rather than through a route, and

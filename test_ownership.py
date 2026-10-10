@@ -858,8 +858,9 @@ check("and the stale rows are pruned on the next delete, not by a sweeper job",
 section("O-7  THE OWNER'S LEVEL TOOL SETS THE OWNER'S OWN CHARACTER")
 # =============================================================================
 # Day 2: tier 6 weapons need level 22, and the owner has to be able to test
-# them. /api/staff/level is the gold grant's shape: owner only, and it changes
-# the caller's character - a username in the payload is ignored.
+# them. /api/staff/level is the gold grant's shape: owner only, and with no
+# username it changes the caller's character. (Naming a player sets the
+# character THEY are playing since 0.21.0 - test_coowner.py.)
 import gamedata as _gd  # noqa: E402
 
 res = client.post("/api/staff/level", headers=alice, json={"slot": 0, "level": 22})
@@ -868,7 +869,7 @@ res = client.post("/api/staff/level", headers=mod, json={"slot": 0, "level": 22}
 check("so is a mod - it is the owner's", res.status_code == 404, res.status_code)
 
 res = client.post("/api/staff/level", headers=owner,
-                  json={"username": "alice", "slot": 0, "level": 22})
+                  json={"slot": 0, "level": 22})
 body = res.get_json() or {}
 db = raw_db()
 mine = db.execute("SELECT level, xp, xp_to_next, max_hp, hp, max_mana, mana FROM saves"
@@ -892,7 +893,7 @@ check("  the refill recorded as a level-up, so the heal check does not clamp it"
       int(granted["n"]) >= 1, int(granted["n"]))
 check("  and a line in the staff log", logged is not None
       and logged["detail"] == "slot 0: level 1 -> 22", dict(logged) if logged else None)
-check("alice, who was named in the payload, is still level 1",
+check("alice, who was not named, is still level 1",
       hers is not None and int(hers["level"]) == 1, dict(hers) if hers else None)
 
 res = client.post("/api/staff/level", headers=owner, json={"slot": 0, "level": 5})
@@ -916,9 +917,11 @@ for label, body_in in [("level 0", {"slot": 0, "level": 0}),
 res = client.post("/api/staff/level", headers=owner, json={"slot": 2, "level": 10})
 check("an empty slot is a 404", res.status_code == 404, res.status_code)
 
+# Under the co-owner since 0.21.0: the lowest rank require_owner lets in, and
+# the owner is above it.
 powers = client.get("/api/staff/powers", headers=owner).get_json() or {}
 owner_routes = [r.get("path") for rank in powers.get("ladder", [])
-                if rank.get("rank") == "owner" for r in rank.get("routes", [])]
+                if rank.get("rank") == "coowner" for r in rank.get("routes", [])]
 check("the powers list shows it under the owner, so it surprises nobody",
       "/api/staff/level" in owner_routes, owner_routes)
 
@@ -1004,7 +1007,7 @@ check("  and a refusal writes nothing", "attack" not in skill_rows("boss", slot=
 
 powers = client.get("/api/staff/powers", headers=owner).get_json() or {}
 owner_routes = [r.get("path") for rank in powers.get("ladder", [])
-                if rank.get("rank") == "owner" for r in rank.get("routes", [])]
+                if rank.get("rank") == "coowner" for r in rank.get("routes", [])]
 check("the powers list shows it under the owner", "/api/staff/skill" in owner_routes, owner_routes)
 
 print("\n" + "=" * 70)

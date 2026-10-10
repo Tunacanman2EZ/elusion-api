@@ -242,9 +242,11 @@ r = client.get("/api/staff/snapshots?username=alice")
 check("no token at all is a 401, like every route", r.status_code == 401, r.status_code)
 ladder = {rank["rank"]: [x["path"] for x in rank["routes"]] for rank in
           client.get("/api/staff/powers", headers=bearer(boss)).get_json()["ladder"]}
+# Listed under the co-owner since 0.21.0: the lowest rank require_owner lets in,
+# with the owner above it.
 check("both routes are on the owner's list of powers, read from the decorators",
-      "/api/staff/snapshots" in ladder["owner"] and "/api/staff/rollback" in ladder["owner"],
-      ladder["owner"])
+      "/api/staff/snapshots" in ladder["coowner"] and "/api/staff/rollback" in ladder["coowner"],
+      ladder["coowner"])
 
 
 # =============================================================================

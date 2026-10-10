@@ -789,10 +789,13 @@ all_notes = " ".join(all_notes_list)
 check("nobody is told they have debug keys - the game has none",
       not any("debug item keys" in n or "A key in a debug build" in n for n in all_notes_list),
       all_notes_list)
+# THE GM PANEL'S NOTES ARE ON THE CO-OWNER'S RUNG since 0.21.0 - the lowest
+# rank require_owner lets in, where its routes are listed - and the owner,
+# above it, has every one.
 check("  and the owner is told so in words",
-      any("no debug keys" in n for n in notes.get("owner", [])), notes.get("owner"))
+      any("no debug keys" in n for n in notes.get("coowner", [])), notes.get("coowner"))
 check("god mode is the owner's, on the Testing tab",
-      any("god mode" in n for n in notes.get("owner", [])), notes.get("owner"))
+      any("god mode" in n for n in notes.get("coowner", [])), notes.get("coowner"))
 check("  and no lower rank is told it has it",
       not any("god mode" in n.lower() for rank in ("mod", "dev") for n in notes.get(rank, [])),
       [notes.get("mod"), notes.get("dev")])
@@ -800,15 +803,18 @@ check("  and no lower rank is told it has it",
 # routes are read from the decorators, so the list follows by itself.
 _where = {name: [r.get("path") for r in rank.get("routes", [])] for name, rank in ladder.items()}
 check("the item grant is on the owner's list",
-      "/api/staff/grant" in _where.get("owner", []), _where.get("owner"))
+      "/api/staff/grant" in _where.get("coowner", []), _where.get("coowner"))
 check("  and on nobody else's",
       not any("/api/staff/grant" in _where.get(name, []) for name in ("player", "mod", "dev")))
 check("  and a mod is told plainly that creating items is not theirs",
       any("Cannot create items" in n for n in notes.get("mod", [])), notes.get("mod"))
 check("the owner's tools are where they are now: the GM panel's Testing tab",
-      any("GM panel" in n for n in notes.get("owner", []))
+      any("GM panel" in n for n in notes.get("coowner", []))
       and any(n.startswith("Testing tab") and "item catalogue" in n and "level" in n
-              for n in notes.get("owner", [])), notes.get("owner"))
+              for n in notes.get("coowner", [])), notes.get("coowner"))
+check("  and the owner's own rung says it is above them, and holds the switch",
+      any("above every co-owner" in n for n in notes.get("owner", []))
+      and any("co-owner switch" in n for n in notes.get("owner", [])), notes.get("owner"))
 gone = [place for place in ("item menu", "owner panel") if place in all_notes.lower()]
 check("  and no note sends anybody to a place the game no longer has", gone == [], gone)
 

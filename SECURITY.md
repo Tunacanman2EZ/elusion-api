@@ -34,7 +34,8 @@ Role definitions, the ladder and how the owner is named: [`CLAUDE.md` → Ranks]
 | **Logged-in player** | Move, chat, save, and *request* loot, trades, purchases, revives, cooking, fishing — each as a claim the server re-derives | Their own level, XP, stat maxima, loot rolls, gold totals, lusion totals, any of the six skills, or any row that is not theirs |
 | **Mod** | Kick, ban up to 30 days, mute up to a day, take a chat line down, read and close chat reports, read the staff user list, the moderation log and linked accounts, write staff-only notes and warnings | Banning at or above their own rank, banning permanently, granting a rank at or above their own, touching the economy — including creating any item, which since 6 Oct 2026 no rank below the owner can do (`test_security.py` E-1, `test_api.py` STAFF GRANTS) |
 | **Dev** | Everything a mod can, plus permanent bans, longer mutes, teleporting a player, reading economy supply | Granting dev or owner, moving the whole server, minting gold, the metrics endpoint |
-| **Owner** | Everything, incl. broadcast, maintenance, metrics, moving everyone, test fixtures on their own characters (gold, level, skill levels, any item), giving any player an item, and putting a player's character back to a snapshot — the only account that can create an item or undo a character | Being stored anywhere. `ELUSION_OWNER` is an environment variable, so no request writes it and no database backup carries it |
+| **Co-owner** (0.21.0) | Everything the owner can — the GM panel, items, gold, levels (theirs and a player's), the save history, the server switches — while the owner's co-owner switch is on. Every gift goes in the gifts ledger under their name | Anything done to the owner's account (moderating, ranking, giving to, levelling, reading the history of or rolling it back), throwing their own switch, or being named anywhere a request can write: `ELUSION_CO_OWNERS` is an environment variable like the owner's. Off, they are the rank their row says (`test_coowner.py`) |
+| **Owner** | Everything, incl. broadcast, maintenance, metrics, moving everyone, test fixtures on their own characters (gold, level, skill levels, any item), giving any player an item or a level, and putting a player's character back to a snapshot — with a co-owner while the switch is on, the only accounts that can create an item or undo a character. The only one who lets a co-owner in | Being stored anywhere. `ELUSION_OWNER` is an environment variable, so no request writes it and no database backup carries it |
 | **The server** | Owns level, XP, derived maxima, loot rolls and loot bag contents, and every backpack and bank cell; sole author of the gold and lusion ledgers | Knowing whether the client is honest, or whether the IP it sees is the player's. Both are assumed false |
 
 One cell is deliberately weaker than it looks, and it is covered under
@@ -244,8 +245,9 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     hash that no route returns.
     → Held by: `test_security.py` — "a banned computer cannot register from a brand-new address", "the sibling on the family computer still logs in", "one banned account cannot stop a library computer making accounts", "the server keeps the SHA-256 of the id, not the id"
     → and in the game: `src/tools/testrunner.gd` — `_test_install_id_is_kept_and_sent()`
-29. **Only the owner can put a character back, or put an item in somebody
-    else's bag, and both are written down about the player.** The server keeps
+29. **Only the owner (and a co-owner, while the owner's switch is on) can put
+    a character back, put an item in somebody else's bag or set their level,
+    and each is written down about the player.** The server keeps
     each character's last 20 snapshots - level, XP, purse, gear, pet, bag and
     skills, never the account's bank or lusions. A rollback restores one, moves
     the gold through the ledger so the supply still balances, takes a snapshot
@@ -370,8 +372,8 @@ Anything not on this list that later turns out to be true belongs on it.
 | Ranks, conventions, and the traps that cost a day each | [`CLAUDE.md`](CLAUDE.md) |
 
 Secrets, for the avoidance of doubt: `.env` and `elusion.db` are never committed,
-`ELUSION_OWNER` lives only in the environment, and no password or token is ever
-written to a log.
+`ELUSION_OWNER` and `ELUSION_CO_OWNERS` live only in the environment, and no
+password or token is ever written to a log.
 
 ---
 

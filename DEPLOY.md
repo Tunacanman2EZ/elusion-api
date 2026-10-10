@@ -32,6 +32,7 @@ python presence.py              # 127.0.0.1:5001, path /ws/presence
 | Variable | Value | Why |
 |---|---|---|
 | `ELUSION_OWNER` | your username | The top rank comes from here, never from the database |
+| `ELUSION_CO_OWNERS` | a username, or several with commas (optional) | Who the owner's co-owner switch on the GM panel's Server tab lets in. Unset = nobody; named but switched off = their own rank |
 | `ELUSION_TRUSTED_PROXIES` | number of proxies you run | See **The proxy setting** below — wrong in either direction is bad |
 | `ELUSION_DB` | a path outside any web root | It holds real password hashes |
 | `ELUSION_DEBUG` | **unset** | `wsgi.py` refuses to start if it is set |
@@ -101,6 +102,7 @@ file itself, and nothing in it is in the repository. Names only here:
 
 ```
 ELUSION_OWNER=<the owner's username>
+ELUSION_CO_OWNERS=<a co-owner's username, optional>
 ELUSION_DB=/var/lib/elusion/elusion.db
 ELUSION_TRUSTED_PROXIES=1
 ELUSION_SMTP_HOST=<mail server>

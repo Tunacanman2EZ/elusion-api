@@ -10,12 +10,16 @@ holding elusion.db, never over the network. Keep that property.
     python set_role.py Someone mod        promote to mod
     python set_role.py Someone player     demote
 
-Ranks run player < mod < dev < owner.
+Ranks run player < mod < dev < coowner < owner.
     python set_role.py --list             show every account and its rank
 
 The OWNER is not settable here and never will be. It is named by the
 ELUSION_OWNER environment variable, so that no write to this table - by this
 script, by an endpoint, or by hand - can grant it.
+
+Nor is a CO-OWNER (0.21.0): the accounts ELUSION_CO_OWNERS names, and only
+while the owner's switch on the GM panel's Server tab is on. Off, they are the
+rank set here - which is what --list shows beside their name.
 """
 
 import argparse
@@ -25,7 +29,7 @@ import sys
 
 DB_PATH = os.environ.get("ELUSION_DB", os.path.join(os.path.dirname(__file__), "elusion.db"))
 
-# Must match ROLES in app.py, minus 'owner', which is not storable.
+# Must match ROLES in app.py, minus 'coowner' and 'owner', which are not storable.
 SETTABLE_ROLES = ("player", "mod", "dev")
 
 
@@ -45,10 +49,14 @@ def list_users(db):
         return
 
     owner = os.environ.get("ELUSION_OWNER", "").strip()
+    co_owners = [name.strip().casefold() for name in os.environ.get("ELUSION_CO_OWNERS", "").split(",")
+                 if name.strip()]
     for row in rows:
         rank = row["role"]
         if owner and row["username"].casefold() == owner.casefold():
             rank = "owner (ELUSION_OWNER)"
+        elif row["username"].casefold() in co_owners:
+            rank = f"{rank}; co-owner while the owner's switch is on (ELUSION_CO_OWNERS)"
         print(f'{row["id"]:>3}  {row["username"]:<20} {rank}')
 
     if not owner:
@@ -58,7 +66,8 @@ def list_users(db):
 def set_role(db, username, role):
     if role not in SETTABLE_ROLES:
         sys.exit(f"Rank must be one of: {', '.join(SETTABLE_ROLES)}. "
-                 f"'owner' is set by the ELUSION_OWNER environment variable, not here.")
+                 f"'owner' is set by the ELUSION_OWNER environment variable, and 'coowner'"
+                 f" by ELUSION_CO_OWNERS and the owner's switch - not here.")
 
     cursor = db.execute("UPDATE users SET role = ? WHERE username = ?", (role, username))
     db.commit()
