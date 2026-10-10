@@ -210,7 +210,7 @@ async def run(port, server):
     a, welcome = await enter(port, ALICE)
     check("a real ticket is welcomed, by account id",
           welcome == {"t": "welcome", "id": uid("presa"), "v": presence.SHARED_VERSION,
-                      "books": presence.BOOKS}, welcome)
+                      "books": presence.BOOKS, "x": presence.RELAY_VERSION}, welcome)
     await a.close()
 
     # =========================================================================
@@ -233,13 +233,14 @@ async def run(port, server):
     got_b = await collect(b)
     move = moved(got_b).get(uid("presa"))
     check("a step is heard by everyone in the area, about ten times a second",
-          move == [uid("presa"), 120.5, 205.2, "walkright", [], ""], got_b)
+          move == [uid("presa"), 120.5, 205.2, "walkright", [], "", -1], got_b)
     await a.send(state("field", x=120.5, y=205.2, m="attackright"))
     await a.send(state("field", x=121.0, y=205.2, m="attackright"))
     got_b = await collect(b)
     batched = [m for m in got_b if m.get("t") == "moves"]
-    check("  two steps inside one tick are one message, the newest",
-          len(batched) == 1 and moved(batched)[uid("presa")][1] == 121.0, got_b)
+    steps = [e for m in batched for e in m["p"] if e[0] == uid("presa")]
+    check("  two steps inside one tick are one message, both of them, in order",
+          len(batched) == 1 and [e[1] for e in steps] == [120.5, 121.0], got_b)
 
     c, _ = await enter(port, CAROL, "elusion", x=10.0, y=10.0)
     got_c = await collect(c)
@@ -289,7 +290,7 @@ async def run(port, server):
     await a.send(state("field", x=101.0, y=200.0, m="walkup", fx=["ring", "firering"]))
     got_b = await collect(b)
     check("  and the socket is still open for the good one after them",
-          moved(got_b).get(uid("presa")) == [uid("presa"), 101.0, 200.0, "walkup", ["firering", "ring"], ""],
+          moved(got_b).get(uid("presa")) == [uid("presa"), 101.0, 200.0, "walkup", ["firering", "ring"], "", -1],
           got_b)
 
     # A pet is shown only when the account holds it.
@@ -698,6 +699,151 @@ async def run(port, server):
           book.monsters and book.empty_since is not None, book.monsters)
     await asyncio.sleep(combatbook.EMPTY_KEEP + 0.2)
     check("  then forget them: the next game in loads the scene afresh", not book.monsters, book.monsters)
+
+    # =========================================================================
+    section("P-9 ATTACKS AND LEVERS: A PICTURE OF EVERY ATTACK, AND ONE GATE FOR EVERYONE")
+    # =========================================================================
+    # Game 0.19.0. The owner: "i could not see their attacks but they could see
+    # mine the had to lower the gate to boss". In an area of its own, "town".
+    HAL = account("presh", "mage")
+    IVY = account("presi", "tank")
+    JON = account("presj")
+    KIT = account("presk", "healer")
+    h, welcome = await enter(port, HAL, "town", x=500.0, y=500.0)
+    check("the welcome says attacks and levers are passed on", welcome.get("x") == presence.RELAY_VERSION, welcome)
+    i, _ = await enter(port, IVY, "town", x=520.0, y=500.0)
+    j, _ = await enter(port, JON, "elusion", x=10.0, y=10.0)
+    await collect(h), await collect(i), await collect(j)
+
+    # ---- the game's clock on every step ----
+    await h.send(json.dumps({"t": "s", "a": "town", "x": 501.0, "y": 500.0, "m": "walkright",
+                             "fx": [], "pet": "", "ts": 81234}))
+    move = moved(await collect(i)).get(uid("presh"))
+    check("a step carries the game's own clock to the others (ts)", move and move[6] == 81234, move)
+    await h.send(json.dumps({"t": "s", "a": "town", "x": 502.0, "y": 500.0, "m": "walkright",
+                             "fx": [], "pet": "", "ts": 81334.0}))
+    move = moved(await collect(i)).get(uid("presh"))
+    check("  a whole number sent as a float is that number", move and move[6] == 81334
+          and isinstance(move[6], int), move)
+    k, _ = await enter(port, KIT, "town", x=540.0, y=500.0)
+    entry = joined(await collect(k)).get(uid("presh"))
+    check("  and arriving, you are told everyone's latest", entry and entry.get("ts") == 81334, entry)
+    await collect(h), await collect(i)
+    bad_clocks = [-5, 1.5, "81434", True, presence.MAX_CLOCK + 1, None]
+    for clock in bad_clocks:
+        await h.send(json.dumps({"t": "s", "a": "town", "x": 503.0, "y": 500.0, "m": "walkright",
+                                 "fx": [], "pet": "", "ts": clock}))
+    check("a clock that is not one (%d kinds) refuses the state" % len(bad_clocks),
+          not moved(await collect(i)), None)
+    for n in range(presence.MAX_STEPS_PER_TICK + 3):
+        await h.send(json.dumps({"t": "s", "a": "town", "x": 510.0 + n, "y": 500.0, "m": "walkright",
+                                 "fx": [], "pet": "", "ts": 90000 + n}))
+    got_i = await collect(i)
+    per_message = [[e for e in m["p"] if e[0] == uid("presh")] for m in of(got_i, "moves")]
+    check("a burst of steps in one tick keeps the newest %d" % presence.MAX_STEPS_PER_TICK,
+          per_message and all(len(steps) <= presence.MAX_STEPS_PER_TICK for steps in per_message)
+          and per_message[-1][-1][1] == 510.0 + presence.MAX_STEPS_PER_TICK + 2, per_message)
+    await h.send(json.dumps({"t": "s", "a": "town", "x": 500.0, "y": 500.0, "m": "idleright",
+                             "fx": [], "pet": "", "ts": 91000}))
+    await collect(h), await collect(i), await collect(k)
+
+    # ---- attacks ----
+    attacks = [["meteor", 91100, 500.0, 500.0, 640.25, 410.0, 0, 1],
+               ["meteor", 91100, 500.0, 500.0, 660.0, 420.0, 250, 0],
+               ["dyn", 91200.0, 500.04, 499.96, 560.0, 500.0, 120.0, 0]]
+    await h.send(json.dumps({"t": "x", "e": attacks}))
+    got_i, got_h, got_j = await collect(i), await collect(h), await collect(j)
+    heard = of(got_i, "x")
+    check("an attack is passed to everyone else in the area, who made it named",
+          len(heard) == 1 and heard[0]["id"] == uid("presh") and len(heard[0]["e"]) == 3, got_i)
+    check("  checked and tidied: positions to a tenth, whole clocks and delays",
+          heard and heard[0]["e"][2] == ["dyn", 91200, 500.0, 500.0, 560.0, 500.0, 120, 0]
+          and heard[0]["e"][0] == ["meteor", 91100, 500.0, 500.0, 640.2, 410.0, 0, 1], heard)
+    check("  never back to the game that made it", not of(got_h, "x"), got_h)
+    check("  and never to another area", not of(got_j, "x"), got_j)
+    check("  a picture is not a hit: nothing goes to anyone as one", not of(got_i, "h") and not of(got_h, "h"))
+    await collect(k)
+    good = ["slash", 92000, 500.0, 500.0, 520.0, 500.0, 0, 0]
+    bad_attacks = [
+        [["laser"] + good[1:]],
+        [good[:7]],
+        [["slash", -1] + good[2:]],
+        [["slash", 92000, 950.0, 500.0, 960.0, 500.0, 0, 0]],
+        [["meteor", 92000, 500.0, 500.0, 1550.0, 500.0, 0, 0]],
+        [["meteor", 92000, 500.0, 500.0, 520.0, 500.0, presence.MAX_ATTACK_DELAY_MS + 1, 0]],
+        [["axe", 92000, 500.0, 500.0, 520.0, 500.0, 0, presence.MAX_ATTACK_FLAGS + 1]],
+        [["axe", 92000, 500.0, 500.0, 520.0, 500.0, 0, 1.5]],
+        [["orb", 92000, True, 500.0, 520.0, 500.0, 0, 0]],
+        [["orb", 92000, "500", 500.0, 520.0, 500.0, 0, 0]],
+        [good] * (presence.MAX_ATTACKS_PER_MESSAGE + 1),
+        [],
+        [good, ["slash", 92000, 500.0, 500.0, 1e9, 500.0, 0, 0]],
+    ]
+    for batch in bad_attacks:
+        await h.send(json.dumps({"t": "x", "e": batch}))
+    await h.send('{"t": "x", "e": [["slash", 92000, NaN, 500.0, 520.0, 500.0, 0, 0]]}')
+    await h.send(json.dumps({"t": "x", "e": "slash"}))
+    check("none of %d malformed attack messages reaches anyone - one bad attack refuses its message"
+          % (len(bad_attacks) + 2), not of(await collect(i), "x"), None)
+    await h.send(json.dumps({"t": "x", "e": [good]}))
+    check("  and the socket is still open for a good one after them",
+          [m["e"] for m in of(await collect(i), "x")] == [[good]])
+    lost, _ = await enter(port, HAL)
+    await collect(h)
+    await lost.send(json.dumps({"t": "x", "e": [good]}))
+    check("an attack from a game standing nowhere yet goes nowhere", not of(await collect(i), "x"))
+    await lost.close()
+    h, _ = await enter(port, HAL, "town", x=500.0, y=500.0)
+    await collect(h), await collect(i), await collect(k)
+    check("the rate leaves room for ten states, ten batches of hits and ten of attack pictures a second",
+          presence.RATE_PER_SECOND >= 3 * 10 + 5 and presence.BURST >= 2 * presence.RATE_PER_SECOND,
+          (presence.RATE_PER_SECOND, presence.BURST))
+
+    # ---- levers ----
+    OUT, IN = "ysortworld/interactables/levergatesout", "ysortworld/interactables/levergatesin"
+    await h.send(json.dumps({"t": "l", "n": OUT, "on": True}))
+    got_i, got_h, got_j = await collect(i), await collect(h), await collect(j)
+    check("a lever pulled is passed to everyone else in the area",
+          of(got_i, "l") == [{"t": "l", "id": uid("presh"), "n": OUT, "on": True}], got_i)
+    check("  not back, and not to another area", not of(got_h, "l") and not of(got_j, "l"))
+    await k.close()
+    await collect(h), await collect(i)
+    k, _ = await enter(port, KIT, "town", x=540.0, y=500.0)
+    got_k = await collect(k)
+    check("a game walking in later is told the levers pulled", of(got_k, "levers") == [
+        {"t": "levers", "p": [[OUT, True]]}], got_k)
+    await i.send(json.dumps({"t": "l", "n": IN, "on": False}))
+    await h.send(json.dumps({"t": "l", "n": OUT, "on": False}))
+    await collect(h), await collect(i), await collect(k)
+    await k.send(json.dumps({"t": "sync"}))
+    got_k = await collect(k)
+    check("  in the order they were last pulled, so two levers on one gate end where the last pull left it",
+          of(got_k, "levers") == [{"t": "levers", "p": [[IN, False], [OUT, False]]}], got_k)
+    bad_levers = [{"n": "../../db", "on": True}, {"n": "a b", "on": True}, {"n": "x" * 129, "on": True},
+                  {"n": OUT, "on": 1}, {"n": OUT}, {"on": True}, {"n": 5, "on": True}, {"n": "", "on": True}]
+    for bad_lever in bad_levers:
+        await h.send(json.dumps(dict(bad_lever, t="l")))
+    check("none of %d malformed lever pulls is passed on or remembered" % len(bad_levers),
+          not of(await collect(i), "l") and list(server.levers["town"]) == [IN, OUT], server.levers.get("town"))
+    for n in range(presence.MAX_LEVERS_PER_AREA):
+        await h.send(json.dumps({"t": "l", "n": "lever%d" % n, "on": True}))
+    await collect(h), await collect(i), await collect(k)
+    check("an area remembers at most %d levers - a new name past that is refused"
+          % presence.MAX_LEVERS_PER_AREA, len(server.levers["town"]) == presence.MAX_LEVERS_PER_AREA
+          and "lever%d" % (presence.MAX_LEVERS_PER_AREA - 1) not in server.levers["town"],
+          len(server.levers["town"]))
+    await h.send(json.dumps({"t": "l", "n": OUT, "on": True}))
+    check("  while one it knows can still be pulled", of(await collect(i), "l")
+          and list(server.levers["town"])[-1] == OUT and server.levers["town"][OUT] is True)
+    for ws in (h, i, k):
+        await ws.close()
+    await asyncio.sleep(0.15)
+    check("the area emptied, its levers are forgotten: the next game in loads every lever as built",
+          "town" not in server.levers, server.levers.keys())
+    h, _ = await enter(port, HAL, "town", x=500.0, y=500.0)
+    check("  and is told of none", not of(await collect(h), "levers"))
+    await h.close()
+    await j.close()
 
     # =========================================================================
     section("P-6 LEAVING")

@@ -31,7 +31,9 @@ file exists.
 
 WHAT IT RELAYS. Position, the body's animation (walking, idle, attacking,
 facing), the tank's aura and the pet a player has out - and, since 0.7.0, the
-MONSTERS, so everyone in an area fights the same ones.
+MONSTERS, so everyone in an area fights the same ones. Since game 0.19.0, the
+ATTACKS a player makes (a picture of each - see "ATTACKS AND LEVERS" below) and
+the LEVERS they pull, so a gate one player opens is open for everyone.
 
 SHARED MONSTERS: ONE GAME RUNS THEM, AND THIS ONLY PASSES THE NOTES. The server
 does not simulate a monster; it has no map, no collision and no AI, and growing
@@ -61,7 +63,11 @@ THE WIRE (JSON text frames):
     {"t": "hello", "ticket": "...", "v": 2}              first, within HELLO_SECONDS; "v" 2
                                                          = speaks shared monsters
     {"t": "s", "a": "field", "x": 1471.0, "y": 1090.5,
-     "m": "walkdown", "fx": ["ring"], "pet": "petsniper"}   where I am, when it changes
+     "m": "walkdown", "fx": ["ring"], "pet": "petsniper",
+     "ts": 81234}                                        where I am, when it changes; "ts" (0.19.0,
+                                                         optional) is the game's own clock in ms,
+                                                         passed on so others can play it back
+                                                         evenly
     {"t": "renew", "ticket": "..."}                      a fresh ticket, every minute
     {"t": "sync"}                                        tell me again who is here (the
                                                          game rebuilt its world: same area,
@@ -71,14 +77,29 @@ THE WIRE (JSON text frames):
                                                          since 0.10.0 "d" may carry "hits", the
                                                          leader's own, for the books
     {"t": "h", "p": [[monster, damage, element], ...]}   a follower's hits, for the leader
+    {"t": "x", "e": [[kind, ts, ox, oy, tx, ty, delay, flags], ...]}
+                                                         attacks I made (0.19.0): a picture for
+                                                         the others, never a hit - see below
+    {"t": "l", "n": "ysortworld/interactables/levergatesout", "on": true}
+                                                         I pulled a lever (0.19.0)
 
   here -> game
-    {"t": "welcome", "id": 12, "v": 2, "books": true}    you are in; this server shares monsters,
+    {"t": "welcome", "id": 12, "v": 2, "books": true, "x": 1}
+                                                         you are in; this server shares monsters,
                                                          and keeps books on them (0.10.0): send
-                                                         the world even alone, own hits inside it
-    {"t": "join", "p": [{id, name, cls, lvl, role, hue, guild, x, y, m, fx, pet}]}
+                                                         the world even alone, own hits inside it;
+                                                         and passes on attacks and levers ("x")
+    {"t": "join", "p": [{id, name, cls, lvl, role, hue, guild, x, y, m, fx, pet, ts}]}
                                                          people now in your area
-    {"t": "moves", "p": [[id, x, y, m, fx, pet], ...]}   who moved this tick (yourself included; skip it)
+    {"t": "moves", "p": [[id, x, y, m, fx, pet, ts], ...]}
+                                                         who moved this tick, every step each sent
+                                                         in it, in order (yourself included; skip
+                                                         it); ts -1 for a game that sends none
+    {"t": "x", "id": 40, "e": [[kind, ts, ...], ...]}    40's attacks, checked, to everyone else
+    {"t": "l", "id": 40, "n": "...", "on": true}         40 pulled a lever, to everyone else
+    {"t": "levers", "p": [["...", true], ...]}           (arriving, or sync) the levers pulled in
+                                                         this area since it was last empty, the
+                                                         latest pulled last
     {"t": "leave", "ids": [12, 40]}                      gone from your area
     {"t": "lead", "a": "field", "id": 12, "n": 2}        who runs this area's monsters, and how
                                                          many others share them (-1: nobody)
@@ -98,8 +119,28 @@ exactly what it was, a book that cannot read a message passes it on anyway,
 and kills are still paid by the API as before. E3_SCOPE.md, option C, step 1;
 killwatch.py reads the rows. ELUSION_BOOKS=off turns them off.
 
-test_presence.py holds every rule here, P-8 the books; test_combatbook.py the
-books themselves.
+ATTACKS AND LEVERS (game 0.19.0). The owner, after his first game with
+somebody else: "i could not see their attacks but they could see mine the had
+to lower the gate to boss". A body's swing was always relayed - it is the
+body's animation - but a meteor, a thrown axe, a stick of dynamite or a
+healer's orb is a thing in the world, and nothing carried those. Now the game
+that makes one says so ("x") and every other game in the area draws a COPY that
+cannot hurt anything: the monsters are the leader's, hits still go through "h",
+and an attack picture changes no number anywhere. The server checks each one's
+shape - a kind it knows, positions in range, the origin near where that player
+last said it stood, the target within ATTACK_REACH of it - and passes it on to
+the others in the area, never back.
+
+Levers were each game's own: a gate opened on one screen stayed shut on the
+next. A pull ("l") is passed to everyone in the area and REMEMBERED for the
+area, in the order pulled, so a game that walks in later is told ("levers")
+and opens what is open. Forgotten when the area empties, as the monsters are:
+the next game in loads the scene afresh. At most MAX_LEVERS_PER_AREA names per
+area, each a node path in the scene (LEVER_PATTERN) that each game looks up in
+its own copy.
+
+test_presence.py holds every rule here, P-8 the books, P-9 attacks and levers;
+test_combatbook.py the books themselves.
 """
 import envfile
 envfile.load()
@@ -151,8 +192,13 @@ MAX_SOCKET_BYTES = MAX_WORLD_BYTES
 # A game sends ten states a second while moving, and a leader ten world
 # messages or a follower ten batches of hits beside them; half again on top of
 # that is a bug or a script.
-RATE_PER_SECOND = 30.0
-BURST = 60.0
+#
+# 40, not 30, since game 0.19.0: a follower healer fires ten orbs a second, and
+# the pictures of them go out batched with the state, ten messages a second on
+# top of its ten states and ten batches of hits. 30 was exactly that, with no
+# room for a renew.
+RATE_PER_SECOND = 40.0
+BURST = 80.0
 MAX_CONNECTIONS = 1000
 
 # The shared-monster wire. A game says which it speaks in its hello.
@@ -183,6 +229,37 @@ AREA_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
 # The tank's aura rings, the only effect drawn on the body itself.
 EFFECTS = ("ring", "firering")
 POSITION_LIMIT = 100000.0
+# A game's own clock, in milliseconds since it started (Godot's ticks): what
+# "ts" may be. Past this it is not a clock a game has been running.
+MAX_CLOCK = 2 ** 42
+# The steps one game's state may put in one tick's moves: a game sends ten a
+# second and a tick is a tenth, so more than this is a burst, of which the
+# newest are kept.
+MAX_STEPS_PER_TICK = 4
+
+# ATTACKS (game 0.19.0): the pictures of attacks, and what each may be.
+#   slash   a warrior's slash wave: from where it starts, toward (tx, ty)
+#   axe     the Double Axe thrown at (tx, ty); flags 2 wide, 4 bloody
+#   recall  the Double Axe called back
+#   stalag  a mage's stalagmite at (tx, ty)
+#   meteor  a Meteorite meteor at (tx, ty), `delay` ms after the cast; flag 1 pulls
+#   dyn     a stick of Dynamite from (ox, oy) to (tx, ty), `delay` ms after the throw
+#   orb     a healer's orb from (ox, oy) toward (tx, ty)
+ATTACK_KINDS = ("slash", "axe", "recall", "stalag", "meteor", "dyn", "orb")
+MAX_ATTACKS_PER_MESSAGE = 16
+# How far from its origin an attack may land: a cursor across the screen.
+ATTACK_REACH = 1000.0
+# How far an attack's origin may be from where its player last said it stood:
+# a state is a tenth of a second old at most, and nobody runs this far in one.
+ATTACK_ORIGIN_SLACK = 400.0
+MAX_ATTACK_DELAY_MS = 3000
+MAX_ATTACK_FLAGS = 255
+# LEVERS (game 0.19.0): a node path in the area's scene, and how many one area
+# may remember.
+LEVER_PATTERN = re.compile(r"^[A-Za-z0-9_/-]{1,128}$")
+MAX_LEVERS_PER_AREA = 32
+# Said in the welcome: this server passes attacks and levers on.
+RELAY_VERSION = 1
 
 
 def _hash(raw):
@@ -303,6 +380,10 @@ class Player:
         self.anim = "idledown"
         self.fx = []
         self.pet = ""
+        # The game's clock at its newest state (-1: it sends none), and every
+        # step since the last tick, for the moves.
+        self.clock = -1
+        self.steps = []
         self.dirty = False
         self.dropped = False
         self.tokens = BURST
@@ -338,13 +419,23 @@ class Player:
             "hue": ident.get("hue"),
             "guild": str(ident.get("guild", "")),
             "x": self.x, "y": self.y, "m": self.anim, "fx": list(self.fx), "pet": self.pet,
+            "ts": self.clock,
             # Whether this game shares monsters: one that does not cannot be
             # hit by them, so a leader's monsters do not chase it.
             "v": self.version,
         }
 
     def move(self):
-        return [self.user_id, self.x, self.y, self.anim, list(self.fx), self.pet]
+        return [self.user_id, self.x, self.y, self.anim, list(self.fx), self.pet, self.clock]
+
+    def take_steps(self):
+        """Every step since the last tick, oldest first - or the newest alone
+        when none were kept. A game's ten states a second and the server's ten
+        ticks are two clocks, so two states often land in one tick: sending
+        only the newest left a hole a fifth of a second wide in what the
+        others had to play back, and they lurched across it."""
+        steps, self.steps = self.steps, []
+        return steps or [self.move()]
 
 
 def clean_state(msg, allowed_pets):
@@ -377,7 +468,80 @@ def clean_state(msg, allowed_pets):
     # is more likely than a forgery, and nothing is lost by drawing nothing.
     pet = msg.get("pet", "")
     out["pet"] = pet if isinstance(pet, str) and pet in allowed_pets else ""
+    # THE GAME'S CLOCK, optional: a game from before 0.19.0 sends none.
+    out["ts"] = -1
+    if "ts" in msg:
+        clock = clean_clock(msg.get("ts"))
+        if clock is None:
+            return None
+        out["ts"] = clock
     return out
+
+
+def clean_clock(value):
+    """A game's clock in whole milliseconds, or None when it is not one."""
+    return _whole(value, 0, MAX_CLOCK)
+
+
+def _whole(value, low, high):
+    """A whole number in [low, high], or None. A whole float is taken as the
+    number it is: JSON has no integer type, and Godot may send 3 as 3.0."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float):
+        if not math.isfinite(value) or value != int(value):
+            return None
+        value = int(value)
+    return value if low <= value <= high else None
+
+
+def _spot(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    if not math.isfinite(value) or abs(value) > POSITION_LIMIT:
+        return None
+    return round(value, 1)
+
+
+def clean_attacks(msg, at):
+    """A game's attacks, checked: [[kind, ts, ox, oy, tx, ty, delay, flags]],
+    or None when the message is not that. `at` is where the player last said
+    it stood. Each is passed to other players' games to draw, so every field
+    has one shape, as a state's does - and the whole message is refused for one
+    bad entry, as a batch of hits is."""
+    batch = msg.get("e")
+    if not isinstance(batch, list) or not batch or len(batch) > MAX_ATTACKS_PER_MESSAGE:
+        return None
+    out = []
+    for attack in batch:
+        if not isinstance(attack, list) or len(attack) != 8:
+            return None
+        kind = attack[0]
+        if not isinstance(kind, str) or kind not in ATTACK_KINDS:
+            return None
+        clock = clean_clock(attack[1])
+        spots = [_spot(v) for v in attack[2:6]]
+        delay = _whole(attack[6], 0, MAX_ATTACK_DELAY_MS)
+        flags = _whole(attack[7], 0, MAX_ATTACK_FLAGS)
+        if clock is None or None in spots or delay is None or flags is None:
+            return None
+        ox, oy, tx, ty = spots
+        if math.hypot(ox - at[0], oy - at[1]) > ATTACK_ORIGIN_SLACK:
+            return None
+        if math.hypot(tx - ox, ty - oy) > ATTACK_REACH:
+            return None
+        out.append([kind, clock, ox, oy, tx, ty, delay, flags])
+    return out
+
+
+def clean_lever(msg):
+    """(name, on) for a lever pull, or None."""
+    name = msg.get("n")
+    on = msg.get("on")
+    if not isinstance(name, str) or not LEVER_PATTERN.match(name) or not isinstance(on, bool):
+        return None
+    return name, on
 
 
 def clean_hits(msg):
@@ -407,6 +571,7 @@ class PresenceServer:
         self.players = {}     # user_id -> Player
         self.rooms = {}       # area -> set of Player
         self.leaders = {}     # area -> Player running its monsters
+        self.levers = {}      # area -> {lever name: on}, the latest pulled last
         self.sweep_seconds = SWEEP_SECONDS if sweep_seconds is None else sweep_seconds
         self.tick_seconds = TICK_SECONDS if tick_seconds is None else tick_seconds
         self.flush_seconds = FLUSH_SECONDS
@@ -448,6 +613,9 @@ class PresenceServer:
         if area not in self.rooms and area in self.books:
             # NOBODY LEFT: the next game in loads the scene afresh.
             self.books[area].emptied(time.time())
+        if area not in self.rooms:
+            # And its levers with it: a fresh scene has every lever as built.
+            self.levers.pop(area, None)
         if self.leaders.get(area) is player:
             # THE NEXT IN LINE TAKES THE MONSTERS OVER, where they stand: its
             # game has been drawing them all along, so it already knows where
@@ -468,6 +636,7 @@ class PresenceServer:
         player.joined_at = time.monotonic()
         if others:
             await self._send(player, {"t": "join", "p": others})
+        await self._send_levers(player)
         self._room_broadcast(area, {"t": "join", "p": [player.entry()]}, skip=player)
         if not player.shares:
             return
@@ -580,6 +749,42 @@ class PresenceServer:
                                           separators=(",", ":")))
         return True
 
+    # ---- attacks and levers (game 0.19.0) ---------------------------------------
+
+    def relay_attacks(self, player, msg):
+        """A player's attacks, checked, to everyone else in the area - never
+        back to the player, and never to the books: a picture is not a hit."""
+        if not player.area:
+            return False
+        attacks = clean_attacks(msg, (player.x, player.y))
+        if attacks is None:
+            return False
+        self._room_broadcast(player.area, {"t": "x", "id": player.user_id, "e": attacks}, skip=player)
+        return True
+
+    def pull_lever(self, player, msg):
+        """A lever pulled: remembered for the area, the latest pulled last,
+        and passed to everyone else in it."""
+        area = player.area
+        pulled = clean_lever(msg)
+        if not area or pulled is None:
+            return False
+        name, on = pulled
+        book = self.levers.setdefault(area, {})
+        if name not in book and len(book) >= MAX_LEVERS_PER_AREA:
+            return False
+        # Moved to the end: a game walking in is told them in the order they
+        # were pulled, so two levers on one gate end where the last pull left it.
+        book.pop(name, None)
+        book[name] = on
+        self._room_broadcast(area, {"t": "l", "id": player.user_id, "n": name, "on": on}, skip=player)
+        return True
+
+    async def _send_levers(self, player):
+        book = self.levers.get(player.area)
+        if book:
+            await self._send(player, {"t": "levers", "p": [[name, on] for name, on in book.items()]})
+
     async def apply_state(self, player, msg):
         state = clean_state(msg, player.identity.get("pets") or [])
         if state is None:
@@ -590,11 +795,16 @@ class PresenceServer:
             self._book_safely(player.fighter.moved, state["area"], state["x"], state["y"],
                               time.time(), moved_area)
         player.anim, player.fx, player.pet = state["anim"], state["fx"], state["pet"]
+        player.clock = state["ts"]
         if moved_area:
+            player.steps = []
             self._leave_room(player)
             await self._enter_room(player, state["area"])
             player.dirty = False
         else:
+            player.steps.append(player.move())
+            if len(player.steps) > MAX_STEPS_PER_TICK:
+                del player.steps[0]
             player.dirty = True
         return True
 
@@ -687,7 +897,8 @@ class PresenceServer:
         if player.fighter is not None:
             player.fighter.reports_hits = player.version >= BOOKS_VERSION
         self.players[user_id] = player
-        await self._send(player, {"t": "welcome", "id": user_id, "v": SHARED_VERSION, "books": BOOKS})
+        await self._send(player, {"t": "welcome", "id": user_id, "v": SHARED_VERSION, "books": BOOKS,
+                                  "x": RELAY_VERSION})
 
         try:
             async for raw in ws:
@@ -716,6 +927,7 @@ class PresenceServer:
                 elif kind == "sync" and player.area:
                     others = [p.entry() for p in self.rooms.get(player.area, ()) if p is not player]
                     await self._send(player, {"t": "join", "p": others})
+                    await self._send_levers(player)
                     # The game rebuilt its world: tell it again who leads, and
                     # have the leader send it the monsters again.
                     if player.fighter is not None:
@@ -727,6 +939,10 @@ class PresenceServer:
                     self.relay_world(player, raw, message)
                 elif kind == "h":
                     self.relay_hits(player, message)
+                elif kind == "x":
+                    self.relay_attacks(player, message)
+                elif kind == "l":
+                    self.pull_lever(player, message)
         except ConnectionClosed:
             pass
         finally:
@@ -744,9 +960,11 @@ class PresenceServer:
             movers = [p for p in room if p.dirty]
             if not movers:
                 continue
+            steps = []
             for p in movers:
                 p.dirty = False
-            self._room_broadcast(area, {"t": "moves", "p": [p.move() for p in movers]})
+                steps.extend(p.take_steps())
+            self._room_broadcast(area, {"t": "moves", "p": steps})
         if BOOKS:
             self._book_safely(self.tick_books, time.time())
 

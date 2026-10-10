@@ -1230,8 +1230,9 @@ every rule.
   `/ws/presence`, `wss://` for an https page - one address for the page, the
   API and the socket, which the browser build needs; run locally, the
   presence port on the host the game used.
-- **Limits**: one connection per account (a second replaces the first), 30
-  messages a second with a burst of 60, 2 KB a message (64 KB for a leader's
+- **Limits**: one connection per account (a second replaces the first), 40
+  messages a second with a burst of 80 (30 and 60 until game 0.19.0, when a
+  healer's ten orbs a second became ten more messages), 2 KB a message (64 KB for a leader's
   world message; anything else that big is closed with 1009, "too big"), 1000
   connections, hello within 5 seconds. Moves are relayed ten times a second
   per area.
@@ -1284,6 +1285,50 @@ only who that is and who hears what. The game side is the game repo's
   books (next section) - and still passes it on exactly as sent.
 
 `test_presence.py` P-7.
+
+## Attacks and levers, and every step (game 0.19.0)
+
+The owner, after his first game with somebody else: "i could not see their
+attacks but they could see mine the had to lower the gate to boss", and,
+running past them, "i noticed some lag wobble". `presence.py`'s header,
+"ATTACKS AND LEVERS", has the wire; `test_presence.py` P-9 holds every rule.
+
+- **`x`: a picture of every attack.** A game says which attacks it just made -
+  `[kind, ts, ox, oy, tx, ty, delay, flags]`, at most
+  `MAX_ATTACKS_PER_MESSAGE` - and `relay_attacks()` passes them to everyone
+  else in the area, never back. `clean_attacks()` refuses the whole message
+  for one bad attack, as `clean_hits()` does: a kind outside `ATTACK_KINDS`,
+  a clock that is not a whole number in `[0, MAX_CLOCK]`, a position outside
+  `POSITION_LIMIT`, an origin further than `ATTACK_ORIGIN_SLACK` from where
+  the player's last state stood, a target further than `ATTACK_REACH` from the
+  origin, a delay or flags out of range. **A picture is not a hit**: the books
+  never read it, and the games that draw one draw a copy that touches nothing.
+  The welcome's `"x": RELAY_VERSION` says this server takes them; a game sends
+  none to a server that does not.
+- **`l`: a lever pulled.** `pull_lever()` takes a node path in the area's
+  scene (`LEVER_PATTERN`) and where it was pulled to, passes it to everyone
+  else in the area, and REMEMBERS it in `self.levers[area]`, the latest pulled
+  last, so `_send_levers()` can tell a game that arrives (or says `sync`)
+  `{"t": "levers", "p": [[name, on], ...]}` and it opens what is open. In
+  order, because two levers drive the Field's gates and the last pull is the
+  one that counts. At most `MAX_LEVERS_PER_AREA` names an area; forgotten
+  when the area empties, with its monsters' books.
+- **Every step, with the game's clock.** A state may carry `ts`, the game's
+  own clock in ms (`clean_clock()`; absent from a game before 0.19.0, and a
+  bad one refuses the state). It goes out as the seventh field of a move and
+  in a join entry (-1 for none), and the games play other players back on it
+  instead of chasing the newest step. And a tick's `moves` now carries EVERY
+  step a game sent since the last tick (`Player.take_steps()`, the newest
+  `MAX_STEPS_PER_TICK`), not only the newest: the game's ten a second and the
+  server's ten ticks are two clocks, two states often landed in one tick, and
+  the one dropped left a hole a fifth of a second wide in the walk. A game
+  before 0.19.0 reads the six fields it knows and takes the steps in order,
+  so it ends where it always did.
+- **40 messages a second, burst 80** (`RATE_PER_SECOND`, `BURST`), from 30
+  and 60: a follower healer sends ten states, ten batches of hits and now ten
+  of attack pictures a second.
+- **Deploy order: this first.** A game ahead of its server sends neither `x`
+  nor `l` (its welcome has no `"x"`) and plays as 0.18.
 
 ## The books on every monster: the server watches (0.10.0)
 
@@ -1619,7 +1664,8 @@ wsgi.py         what gunicorn serves: a preflight of the settings, then app
 gamedata.py     loot rolls, XP curve, stat curves - the game's rules
 gamedata.json   exported from the Godot project, NOT hand-edited
 presence.py     the presence socket, a second process: who stands where,
-                whose game runs each area's monsters, and the books on them
+                whose game runs each area's monsters, the books on them,
+                and every player's attack pictures and lever pulls
 combatbook.py   the books: the server's own count of every monster's health,
                 every hit held to what its character could do (0.10.0)
 test_*.py       discovered and run by run_tests.ps1, which prints how many.
@@ -1656,7 +1702,8 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
                 carried whole by every path
   presence      the presence socket: tickets, areas, what the game may say,
                 limits, a login ended anywhere ending the connection, and
-                who leads each area's monsters (P-7), the books' wiring (P-8)
+                who leads each area's monsters (P-7), the books' wiring (P-8),
+                attacks, levers and every step's clock (P-9)
   combatbook    the books themselves: the bounds, every hit, spawn and death
                 judged, and that nothing a leader sends breaks them
   tradegates    the owner's trade switch, and the hold on fresh mythic and
