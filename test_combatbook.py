@@ -219,21 +219,23 @@ t = cls_rows["tank"]
 b1 = gamedata.combat_bounds({"cls": "tank", "lvl": 30, "gear": ["embermaul"], "skills": {}, "pets": []})
 b2 = gamedata.combat_bounds({"cls": "tank", "lvl": 30, "gear": ["dynamite"], "skills": {}, "pets": []})
 ticks = t["dynamite_stick_ticks"]
-per_throw = max(2, t["dynamite_bundle_sticks"])
+per_throw = max(2, t["dynamite_bundle_sticks"], t.get("dynamite_barrage_sticks", 0))
 check("a tank's aura ticks once a cooldown",
       b1["max_hit"] == math.ceil(hit_of(t["base"], "embermaul"))
       and abs(b1["dps"] - hit_of(t["base"], "embermaul") / t["cooldown"]) < 0.05, b1)
 chain = 1 + t.get("dynamite_chain_bonus", 0)
-check("  and with Dynamite the ring still burns (0.14.0), and on top of it every throw is a bundle of sticks"
-      " of dynamite_stick_ticks ticks each, harder when a blast set it off (0.12.0), with its scorch smouldering (0.13.0)",
-      chain > 1 and t.get("dynamite_field_share", 0) > 0 and ticks > 1 and per_throw == 3
-      and t["dynamite_bundle_every"] > 1
+check("  and with Dynamite the ring still burns (0.14.0), and on top of it every throw is the most sticks one can be"
+      " - a barrage's five since game 0.18.0 - of dynamite_stick_ticks ticks each, harder when a blast set it off"
+      " (0.12.0), with its scorch smouldering (0.13.0)",
+      chain > 1 and t.get("dynamite_field_share", 0) > 0 and ticks > 1 and per_throw == 5
+      and t["dynamite_barrage_sticks"] == 5 and 0 < t["dynamite_barrage_chance"] < t["dynamite_bundle_chance"] < 1
       and b2["max_hit"] == math.ceil(hit_of(t["base"], "dynamite") * ticks * chain)
       and abs(b2["dps"] - hit_of(t["base"], "dynamite") * (1 / t["cooldown"] + per_throw * ticks * chain / t["dynamite_cooldown"]
                                                            + ticks * t["dynamite_field_share"] / t["dynamite_field_every"])) < 0.05,
       [b2, t])
 _older_tank = {k: v for k, v in t.items()
-               if k not in ("dynamite_stick_ticks", "dynamite_bundle_every", "dynamite_bundle_sticks")}
+               if k not in ("dynamite_stick_ticks", "dynamite_bundle_chance", "dynamite_bundle_sticks",
+                            "dynamite_barrage_chance", "dynamite_barrage_sticks")}
 _saved_tank = cls_rows["tank"]
 cls_rows["tank"] = _older_tank
 try:
@@ -246,6 +248,16 @@ check("  a catalogue from before 0.14.0 says nothing: a stick is the cooldown's 
       and abs(bt["dps"] - hit_of(t["base"], "dynamite") * (1 / t["cooldown"] + 2 * old_sticks * chain / t["dynamite_cooldown"]
                                                            + old_sticks * t["dynamite_field_share"] / t["dynamite_field_every"])) < 0.05,
       bt)
+_mid_tank = {k: v for k, v in t.items() if k not in ("dynamite_barrage_chance", "dynamite_barrage_sticks")}
+cls_rows["tank"] = _mid_tank
+try:
+    bm = gamedata.combat_bounds({"cls": "tank", "lvl": 30, "gear": ["dynamite"], "skills": {}, "pets": []})
+finally:
+    cls_rows["tank"] = _saved_tank
+check("  a catalogue from 0.14.0 to 0.17 says nothing of the barrage: a bundle's three at most a throw",
+      abs(bm["dps"] - hit_of(t["base"], "dynamite") * (1 / t["cooldown"] + 3 * ticks * chain / t["dynamite_cooldown"]
+                                                           + ticks * t["dynamite_field_share"] / t["dynamite_field_every"])) < 0.05
+      and bm["dps"] < b2["dps"], [bm, b2])
 h = cls_rows["healer"]
 b1 = gamedata.combat_bounds({"cls": "healer", "lvl": 30, "gear": ["emberscepter"], "skills": {}, "pets": []})
 check("a healer fires once a cooldown",

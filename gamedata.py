@@ -1237,9 +1237,13 @@ def combat_bounds(identity):
             # before says nothing and chains nothing.
             chain = 1.0 + max(float(row.get("dynamite_chain_bonus", 0.0) or 0.0), 0.0)
             max_hit = max(max_hit, unit * ticks * chain)
-            # The most sticks one throw can be: a double's two, or a bundle's
-            # dynamite_bundle_sticks (0.14.0), every throw, as if each were.
-            per_throw = max(2.0, float(int(row.get("dynamite_bundle_sticks", 0) or 0)))
+            # The most sticks one throw can be, every throw, as if each were:
+            # a bundle's dynamite_bundle_sticks (0.14.0), or since game 0.18.0
+            # a barrage's dynamite_barrage_sticks (one throw in a hundred is
+            # five). Two at the least, the old double, for a catalogue from
+            # before either.
+            per_throw = max(2.0, float(int(row.get("dynamite_bundle_sticks", 0) or 0)),
+                            float(int(row.get("dynamite_barrage_sticks", 0) or 0)))
             dps += unit * ticks * haste * per_throw / fuse * chain
             # Each blast's scorch smoulders, biting dynamite_field_share of a
             # stick every dynamite_field_every seconds, one per monster at a

@@ -1320,7 +1320,12 @@ finds. `test_combatbook.py` holds the books, `test_presence.py` P-8 the wiring.
   where it was the cooldown's worth) and `dynamite_bundle_every` /
   `dynamite_bundle_sticks` (every fifth throw is three sticks, so the bound
   takes three a throw) - with the ring, which now burns while Dynamite is
-  thrown, already the base of the tank's rate). Each class's formula is written out above the code;
+  thrown, already the base of the tank's rate); since game 0.18.0 the tank's
+  throw is a roll - `dynamite_bundle_chance` / `dynamite_bundle_sticks` (one
+  in ten is three) and `dynamite_barrage_chance` / `dynamite_barrage_sticks`
+  (one in a hundred is five), `dynamite_bundle_every` gone - and the bound
+  takes the most of them, five, a throw. A catalogue without the barrage keeps
+  the bundle's three; one without either, two. Each class's formula is written out above the code;
   the game's suite (`_test_combat_bounds_match_the_game`) holds the exported
   numbers to the game's own. Every bound gets `SLACK` (1.5) while watching.
 - **Hits**: one over the biggest is booked at the cap and waits
