@@ -198,6 +198,16 @@ or a `too_quick`? Expected noise, already explained: kills by a game older
 than 0.10.0 or with its presence link down are "never seen"; teleporters and
 the GM's Go to are `jumped`; a pet's long arrow can be `too_far`.
 
+**What it answered** (8 to 11 October, 1,182 deaths judged). No
+`hit_too_big`, `too_fast`, `too_quick` or `too_far` for anyone: the bounds
+fit honest play, the mythics' rolls included. 41 SHORT (3.5%), every one a
+small slime alive about half a second - hits before the leader's game had
+numbered a monster born since its last tick, sent nowhere. Fixed in game
+0.21.2 and here (CLAUDE.md, "Born in the message that hits it"). 99 `jumped`
+were portals and Go to, as expected; 23 `unaccounted_spawn` were slime twins
+the books' twin rule did not match, and refused no kill. **Not enforced yet:**
+the next stretch has to show SHORT at about zero with 0.21.2 played.
+
 **Step 2 - enforce.** A kill is paid only with an AGREED row for that
 account, character and monster (the receipt), checked by `/api/combat/kill`;
 a game not connected to presence earns no kill rewards and says so. The bounds

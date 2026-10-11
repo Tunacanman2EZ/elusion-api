@@ -1447,6 +1447,16 @@ finds. `test_combatbook.py` holds the books, `test_presence.py` P-8 the wiring.
   to a server whose welcome says true.
 - **THE BOOKS NEVER BREAK THE RELAY.** `_book_safely()` catches anything a
   book cannot read and the message goes on exactly as it would have.
+- **Born in the message that hits it (game 0.21.2).** The first live week
+  was 1,141 AGREED and 41 SHORT, and every SHORT was a small slime alive about
+  half a second: born from a split or a respawn into a fire ring or a burning
+  crater, hit before the leader's next tick gave it a number, and that hit
+  sent nowhere. The game now numbers a monster on its first hit, so its
+  "spawn" and the hit share one world. `world()` holds a hit on a monster it
+  does not know yet and lands it as that monster's spawn is read - before a
+  "die" for it later in the message. Not every spawn read first: a split's
+  "die" must come before its smalls' "spawn", or they are not owed and read
+  NOT DUE. `test_combatbook.py` CB-14.
 - **Asking for everything.** A world about a monster the books never saw makes
   the server send the leader `{"t": "need", "id": 0}` (at most every 3 s); the
   leader's answer, addressed to game 0, reaches nobody and is read by the books.

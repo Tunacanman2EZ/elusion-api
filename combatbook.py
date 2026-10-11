@@ -311,15 +311,37 @@ class AreaBook:
     def world(self, leader, d, now):
         """A world message from the area's leader (a Fighter), already known to
         be the leader's. Its own hits first - they happened before the deaths
-        they caused - then what changed."""
+        they caused - then what changed; a hit on a monster this message
+        introduces lands as its spawn is read."""
         self.empty_since = None
         if leader.user_id != self.leader_id:
             self.leader_id = leader.user_id
             self.led_since = now
         self.leader_reports = bool(getattr(leader, "reports_hits", True))
+        # BORN IN THIS MESSAGE (game 0.21.2). A monster the leader's game had
+        # not numbered yet - a split's small slime, a respawn - is numbered by
+        # its first hit, so the hit and the monster's "spawn" arrive together.
+        # Read in order, the hit landed on nothing and the death came out
+        # SHORT: 41 of the books' first week's 1,182, every one a small slime.
+        # So a hit on a monster these books do not know yet waits for that
+        # monster's "spawn" in this message, and lands the moment it is read -
+        # before a "die" for it further on. Not every spawn moved first
+        # instead: a split's "die" has to be read before its smalls' "spawn",
+        # or the smalls are not owed and come out NOT DUE.
+        later = {}
         hits = clean_hit_list(d.get("hits", []))
         for monster_id, damage, _element in hits or ():
-            self.hit(leader, monster_id, damage, now)
+            if monster_id in self.monsters or monster_id in self.dying:
+                self.hit(leader, monster_id, damage, now)
+            else:
+                later.setdefault(monster_id, []).append(damage)
+
+        def landed(record):
+            """The waiting hits on a monster this message has just introduced."""
+            monster_id = _whole(record.get("id"), 0, 2 ** 31 - 1) if isinstance(record, dict) else None
+            for damage in later.pop(monster_id, ()):
+                self.hit(leader, monster_id, damage, now)
+
         if d.get("full") is True:
             reset = d.get("reset") is True
             self.reset_by = leader
@@ -344,10 +366,14 @@ class AreaBook:
             kind = event.get("k")
             if kind == "spawn":
                 self._record(event.get("r"), now, "spawn")
+                landed(event.get("r"))
             elif kind == "die":
                 self._died(event.get("id"), now)
             elif kind == "gone":
                 self._gone(event.get("id"))
+        for monster_id, waiting in later.items():
+            for damage in waiting:
+                self.hit(leader, monster_id, damage, now)
         snap = d.get("snap")
         for row in snap if isinstance(snap, list) else ():
             if not isinstance(row, list) or len(row) != 5:

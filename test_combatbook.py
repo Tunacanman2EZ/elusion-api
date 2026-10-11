@@ -38,6 +38,9 @@ wiring is test_presence.py P-8.
         is a teleport-sized step.
   CB-12 RANGE: a hit from beyond any screen is written down, and still booked.
   CB-13 NOTHING A LEADER SENDS BREAKS THE BOOKS.
+  CB-14 BORN IN THE MESSAGE THAT HITS IT (game 0.21.2): a monster numbered by
+        its first hit arrives in the same world as that hit, and the hit
+        counts - without reading a split's smalls ahead of its death.
 """
 import json, math, os, random, sys
 
@@ -679,6 +682,45 @@ for i in range(200):
     except Exception as exc:  # noqa: BLE001
         raised.append(repr(exc))
 check("  nor do malformed tickets", not raised, raised[:2])
+
+
+# =============================================================================
+section("CB-14 BORN IN THE MESSAGE THAT HITS IT")
+# =============================================================================
+# The books' first week on the live server: 41 deaths of 1,182 SHORT, every
+# one a small slime, alive about half a second. Born from a split into a fire
+# ring or a burning crater, hit before the leader's next tick numbered it -
+# and that hit went nowhere. Game 0.21.2 numbers a monster on its first hit,
+# so its "spawn" and the hit arrive in one world; the books read the hit
+# after the message's events.
+book, lead = fresh_field()
+large = "lightslimelarge"
+small = gamedata.ENEMIES[large]["splits_into"]
+shp = gamedata.ENEMIES[small]["max_hp"]
+lhp = gamedata.ENEMIES[large]["max_hp"]
+book.world(lead, {"full": True, "reset": True, "part": 0, "parts": 1, "spawn": [record(1, large)]}, 0.5)
+book.take()
+now = fight(book, lead, 1, lhp // 2 + 1, 1.0)
+half = shp // 2
+book.world(lead, {"hits": [[100, half, 0]],
+                  "ev": [{"k": "die", "id": 1, "x": 0, "y": 0},
+                         {"k": "spawn", "r": record(100, small, origin="", sm=True, du=True, sp=True)}]}, now)
+check("a hit on a small slime its own message introduces lands on it",
+      100 in book.monsters and book.monsters[100].hp == shp - half and book.stray == 0,
+      (book.monsters.get(100) and book.monsters[100].hp, book.stray))
+check("  and the split's death is still read before its small: owed, not from nowhere",
+      kinds(book.take()[1]) == [])
+book.world(lead, {"hits": [[100, shp - half, 0]], "ev": [{"k": "die", "id": 100, "x": 0, "y": 0}]}, now + 0.3)
+book.world(lead, {"hits": [[101, shp - half, 0], [101, half, 0]],
+                  "ev": [{"k": "spawn", "r": record(101, small, origin="", sm=True, du=True, sp=True)},
+                         {"k": "die", "id": 101, "x": 0, "y": 0}]}, now + 0.4)
+book.tick(now + 0.4 + combatbook.HOLD_SECONDS)
+kills, flags = book.take()
+check("born, hit and killed in one message is agreed - and so is one born and hit in one, killed in the next",
+      sorted((k["enemy_id"], k["verdict"]) for k in kills) == [(small, "agreed"), (small, "agreed")]
+      and not kinds(flags), (kills, flags))
+book.world(lead, {"hits": [[555, 10, 0]]}, now + 1.0)
+check("a hit on a monster no message ever introduced is still counted for nothing", book.stray == 1, book.stray)
 
 
 print("\n" + "=" * 60)
