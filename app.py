@@ -12662,8 +12662,17 @@ STAFF_NOTE_MAX = 500
 
 # How many are online right now, for the heading over the list. A constant so
 # test_moderation.py can ask SQLite for the plan of this exact statement.
+#
+# THE + IN "+user_id" IS LOAD-BEARING. Plain COUNT(DISTINCT user_id) is a seek
+# on idx_sessions_seen in SQLite 3.45 (the live server's) and a walk of EVERY
+# session through idx_sessions_user in 3.50 (Python 3.14's, on the owner's PC,
+# 11 Oct 2026) - the newer planner reads the user index in order to skip the
+# DISTINCT's temporary table, and sessions last thirty days. The unary plus
+# changes no value (user_id is an integer) and keeps the user index out of it,
+# so both versions seek the last 45 seconds of heartbeats. Not INDEXED BY: that
+# turns a missing index into an error on the staff desk.
 STAFF_ONLINE_COUNT_SQL = (
-    "SELECT COUNT(DISTINCT user_id) FROM sessions"
+    "SELECT COUNT(DISTINCT +user_id) FROM sessions"
     " WHERE last_seen_at >= ? AND expires_at > ?"
 )
 
