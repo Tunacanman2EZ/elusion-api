@@ -273,6 +273,27 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     → Held by: `test_combatbook.py` — "then it is judged: agreed", "a monster the leader kills with no hits is SHORT, on the leader, with all its health left", "a hit bigger than the character could land is booked at the most it could", "hits faster than the character's rate are refused past the burst it may land", "one back before the area's respawn", "three thousand malformed world messages raise nothing"
     → and: `test_presence.py` P-8, `test_killwatch.py` "books:"
     → and in the game: `src/tools/testrunner.gd` — `_test_shared_monsters_keep_the_books()`, `_test_combat_bounds_match_the_game()`
+31. **A co-owner is one only by name and switch, and never above the owner**
+    (0.21.0). `ELUSION_CO_OWNERS` names who may be one, in the environment
+    beside `ELUSION_OWNER`; the owner's switch says whether they are in now,
+    and only the owner can throw it, so a co-owner can neither keep himself in
+    nor put himself out. A server starts with the switch off, and off - or
+    unreadable - the name is nothing: his next request is the rank his row
+    says, with no signing out. The role route, the column's CHECK and
+    `set_role.py` all refuse the rank. On, he still cannot moderate, rank,
+    give to, level, read the history of or roll back the owner.
+    → Held by: `test_coowner.py` — "a co-owner is a co-owner only by name AND switch: off, the name alone is nothing", "off, which is how a server starts, AllMind is the dev his row says", "the owner switches it on, and is told who it lets in", "a co-owner cannot kick, ban or rank the owner - the moderation 404", "the role route refuses it, and says where it comes from"
+    → and in the game: `src/tools/testrunner.gd` — `_test_coowners_and_their_levels()`
+32. **Every gift from the owner's tools is written down, with what it was
+    worth** (0.20.0). A give to a player, a grant to the giver's own bag and
+    gold put straight into a purse or bank each write one row of
+    `owner_gifts`, in the gift's own transaction, with who gave it and what it
+    was worth that day - so a refused gift writes nothing, and a price changed
+    later rewrites nothing. The report is the owner's and a co-owner's alone;
+    `giftwatch.py` reads the same rows from the database, read only. It is a
+    record, not money: the gold supply is still the gold ledger's.
+    → Held by: `test_gifts.py` — "a give of 999 Piles of Gold to a player is one row: gold, at what using them pays", "a full bag is a 409 and no row", "a grant by a dev is a 404 and no row", "a player, a mod and a dev all get the same bare 404", "a pile's price changed tomorrow does not rewrite what was given today", "the gold supply holds: the gifts ledger is a record, not money"
+    → and in the game: `src/tools/testrunner.gd` — `_test_gifts_are_counted()`
 
 ---
 
@@ -336,7 +357,25 @@ No comforting lies. These are known, named and open.
   not hold - who a player is comes from the server's own rows, through a
   ticket tied to their login - and nothing over the socket deals damage or
   moves an item. Messages are size- and rate-limited, and an ended login ends
-  the connection within seconds.
+  the connection within seconds. Since game 0.19.0 the socket also carries
+  pictures of attacks (`test_presence.py` P-9): the server checks each one's
+  shape - a kind it knows, a start near where that player last stood, a
+  target within reach - so a modified game can draw an attack that never
+  happened, but a picture is never a hit, never reaches the books, and hurts
+  nobody.
+- **A lever is anybody's in its area.** Since game 0.19.0 a lever pulled is
+  passed to everyone in the area and remembered for whoever walks in later.
+  The server checks the name's shape, not that the player is standing at the
+  lever, so a modified game can open or shut any gate in its area for
+  everyone there, from anywhere in it. Each game moves only a real lever of
+  its own scene by that name, and a gate moves nobody's health, bag or gold.
+- **A co-owner is trusted like the owner, while the switch is on**
+  (invariant 31). He can create items and gold, set levels and put
+  characters back - the owner's powers, so the owner's risks, held by a
+  person the owner chose rather than by a rule. What bounds it: only the
+  owner lets him in, off takes effect on his next request, every gift is a
+  row in the gifts ledger under his name and every give, level and rollback a
+  line on the player's record, and he cannot touch the owner's own account.
 - **The monsters in a shared area are whatever the area's leader says.** Since
   0.7.0 one game - the area's leader, the sharing game that walked in first -
   runs the monsters for everyone there, and `presence.py` passes its messages
@@ -352,9 +391,10 @@ No comforting lies. These are known, named and open.
 
 - **A rollback can make a second copy of an item.** It puts back what the
   character held when the snapshot was taken; an item traded, banked or sold
-  since then is still wherever it went, too. That is why only the owner can do
-  it, why each one is a line on the player's record, and why the Save history
-  window says so under the buttons. The gold cannot be copied this way - it moves
+  since then is still wherever it went, too. That is why only the owner (and a
+  co-owner, while let in) can do it, why each one is a line on the player's
+  record, and why the Save history window says so under the buttons. The gold
+  cannot be copied this way - it moves
   through the ledger like any other mint or burn - but, like every burn, gold a
   rollback takes away is counted on the Kingdom board as given.
 
