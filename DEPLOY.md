@@ -235,7 +235,25 @@ found with `killwatch.py` (below), tier WATCHED.
 
 ### Updating the server
 
-After pushing to GitHub, from an SSH session on the droplet:
+**In one command**, from the PC (it asks for the server's password, as ssh
+always does):
+
+```
+ssh root@YOUR_SERVER_IP bash /opt/elusion/api/deploy/update_server.sh
+```
+
+`deploy/update_server.sh` does the steps below and the checks around them:
+it pulls, checks the settings file has every name this server needs (names
+only - it never prints a value), installs requirements only when they
+changed, backs the database up, restarts both services, prints the `[BOOT]`
+and `[DEPLOY]` lines and asks `/api/status`. It stops before restarting if a
+setting is missing, so the old process keeps serving. It remembers the last
+commit that came up healthy (`/var/lib/elusion/deployed_commit`), so a run that
+stopped half-way is finished by the next one rather than skipped.
+`--restart` restarts even when nothing new came down. The very first time,
+the script is not on the server yet: pull once by hand (below), then use it.
+
+By hand, from an SSH session on the droplet:
 
 ```
 cd /opt/elusion/api
@@ -553,6 +571,16 @@ rsync -rv --checksum --delete builds/web/ elusion@YOUR_SERVER_IP:/srv/elusion-we
 - **Caddy** compresses the `.wasm` and `.js` as it sends them. It leaves the
   `.pck` alone (octet-stream is not on its list), which costs about 2 MB a
   first visit.
+
+**The live server swaps folders instead**, with the game repo's
+`tools\deploy_web.ps1` (`-Export` exports first, `-Rollback` puts the last
+build back, `-DryRun` shows every command). It uploads to a new folder, then
+one ssh line makes the live build `/srv/elusion-web-old` and the upload
+`/srv/elusion-web`, so a half-copied build is never what players load. A swap
+on its own would undo what `--checksum` is for - every export writes every
+file fresh, so every ETag would change - so before swapping it gives each file
+whose bytes match the live one that file's date (`touch -r`). The ETag stays
+the same and a returning player downloads only what changed.
 
 **What this changes elsewhere: nothing.**
 
