@@ -492,14 +492,18 @@ mismatched = [
 ]
 check("rows restate the catalogue exactly", not mismatched, mismatched)
 
-# The general store's potions are the ladder's first three rungs. Hard-coded
-# rather than read back from the catalogue, because a test that derives its
+# The general store's potions are the whole ladder, all five rungs since game
+# 0.25.4 (the first three before; large and greater were drops only - the
+# owner: "need to unlock all of the potions we set up"). Hard-coded rather
+# than read back from the catalogue, because a test that derives its
 # expectation from the thing under test cannot catch the ladder being retuned
 # by accident - which is exactly how these numbers came to be checked at all.
 ladder = {r["item_id"]: r["required_level"] for r in stock}
 for item_id, expected in (("tinyhealthpotion", 1),
                           ("smallhealthpotion", 5),
-                          ("mediumhealthpotion", 10)):
+                          ("mediumhealthpotion", 10),
+                          ("largehealthpotion", 16),
+                          ("greaterhealthpotion", 22)):
     check("%s needs level %d" % (item_id, expected),
           ladder.get(item_id) == expected,
           "got %r" % ladder.get(item_id))

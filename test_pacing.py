@@ -232,6 +232,16 @@ check("so every piece costs exactly its value",
       all(gamedata.shop_price("generalstore", iid) == int(gear[iid]["value"]) for iid in stock if iid in gear))
 check("an ember piece has no price at all", gamedata.shop_price("generalstore", "embersword") is None)
 
+# EVERY POTION (game 0.25.4). The owner: "need to unlock all of the potions we
+# set up" - large and greater were drops only. Tiny to greater, health, mana
+# and stamina of each, at value.
+POTIONS = [size + pool + "potion" for size in ("tiny", "small", "medium", "large", "greater")
+           for pool in ("health", "mana", "stamina")]
+check("every potion, tiny to greater, is on the shelf",
+      all(iid in stock for iid in POTIONS), [iid for iid in POTIONS if iid not in stock])
+check("  at its value", all(gamedata.shop_price("generalstore", iid) == int(gamedata.ITEMS[iid]["value"])
+                            for iid in POTIONS))
+
 # FISHING. Only the iron rod could be had (a drop) and worms dropped one at a
 # time, so the deeper fish were out of reach. The owner chose the store: the
 # worm and every rod but ember, at value.
