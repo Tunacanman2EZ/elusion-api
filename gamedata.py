@@ -1250,6 +1250,21 @@ def combat_bounds(identity):
             # time (0.13.0). Its own clock, so not hastened.
             every = max(float(row.get("dynamite_field_every", 1.0) or 1.0), 0.01)
             dps += unit * ticks * max(float(row.get("dynamite_field_share", 0.0) or 0.0), 0.0) / every
+    elif cls == "healer":
+        # An orb every cooldown, and since game 0.36.0 THE FAN (healer.gd): every
+        # fan_every-th shot throws fan_orbs more beside it, each for fan_share of
+        # the shot - all of them on one monster at the most. Since 0.37.0 THE
+        # DOUBLE: a main orb in double_chance hits double_hit times as hard - the
+        # fan never - and the bound takes the worst, every one, as the tank's
+        # takes a barrage every throw. A catalogue from before says nothing and
+        # fans and doubles nothing.
+        every = int(row.get("fan_every", 0) or 0)
+        fan = (int(row.get("fan_orbs", 0) or 0) * max(float(row.get("fan_share", 0.0) or 0.0), 0.0) / every) \
+            if every > 0 else 0.0
+        double = max(float(row.get("double_hit", 1.0) or 1.0), 1.0) \
+            if float(row.get("double_chance", 0.0) or 0.0) > 0.0 else 1.0
+        max_hit = unit * double
+        dps = unit * haste / cooldown * (double + fan)
     else:
         max_hit = unit
         dps = unit * haste / cooldown

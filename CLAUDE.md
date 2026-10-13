@@ -1410,7 +1410,16 @@ finds. `test_combatbook.py` holds the books, `test_presence.py` P-8 the wiring.
   in ten is three) and `dynamite_barrage_chance` / `dynamite_barrage_sticks`
   (one in a hundred is five), `dynamite_bundle_every` gone - and the bound
   takes the most of them, five, a throw. A catalogue without the barrage keeps
-  the bundle's three; one without either, two. Each class's formula is written out above the code;
+  the bundle's three; one without either, two. Since game 0.36.0 the
+  healer's row carries `fan_every` / `fan_orbs` / `fan_share` (every fifth
+  orb throws two crypt-style orbs beside it, each for half a shot), so its
+  rate is a shot a cooldown times `1 + fan_orbs * fan_share / fan_every` (a
+  fifth more); a catalogue without them fans nothing. Since game 0.37.0 it
+  also carries `double_chance` / `double_hit` (one main orb in five hits
+  twice as hard - the fan never), and the bound takes every orb doubled: the
+  biggest hit is `unit * double_hit` and the rate `unit * (double_hit + fan) /
+  cooldown`. Update the server BEFORE players have 0.37.0, or a doubled orb is
+  past the old biggest hit times SLACK and flagged `hit_too_big`. Each class's formula is written out above the code;
   the game's suite (`_test_combat_bounds_match_the_game`) holds the exported
   numbers to the game's own. Every bound gets `SLACK` (1.5) while watching.
 - **Hits**: one over the biggest is booked at the cap and waits

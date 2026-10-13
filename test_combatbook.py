@@ -262,19 +262,53 @@ check("  a catalogue from 0.14.0 to 0.17 says nothing of the barrage: a bundle's
                                                            + ticks * t["dynamite_field_share"] / t["dynamite_field_every"])) < 0.05
       and bm["dps"] < b2["dps"], [bm, b2])
 h = cls_rows["healer"]
+# THE FAN (game 0.36.0): every fan_every-th shot throws fan_orbs more, each for
+# fan_share of the shot - all on one monster at the most.
+fan = 1.0 + int(h.get("fan_orbs", 0)) * float(h.get("fan_share", 0)) / int(h.get("fan_every", 1) or 1)
+check("the catalogue says the healer's fan: two orbs at half a shot, every fifth shot",
+      h.get("fan_every") == 5 and h.get("fan_orbs") == 2 and abs(float(h.get("fan_share", 0)) - 0.5) < 1e-9, h)
+# THE DOUBLE (game 0.37.0): a main orb in five hits twice as hard; the bound
+# takes every one doubled. The fan is figured before the roll, so never.
+double = float(h.get("double_hit", 1)) if float(h.get("double_chance", 0)) > 0 else 1.0
+check("the catalogue says the healer's double: one main orb in five, twice as hard",
+      abs(float(h.get("double_chance", 0)) - 0.2) < 1e-9 and float(h.get("double_hit", 0)) == 2.0, h)
 b1 = gamedata.combat_bounds({"cls": "healer", "lvl": 30, "gear": ["emberscepter"], "skills": {}, "pets": []})
-check("a healer fires once a cooldown",
-      abs(b1["dps"] - hit_of(h["base"], "emberscepter") / h["cooldown"]) < 0.05, b1)
+check("a healer's biggest hit is a doubled orb, and its rate every orb doubled plus the fan",
+      abs(b1["dps"] - hit_of(h["base"], "emberscepter") / h["cooldown"] * (double + fan - 1.0)) < 0.05
+      and b1["max_hit"] == math.ceil(hit_of(h["base"], "emberscepter") * double), b1)
+_fan_only = dict(h)
+_fan_only.pop("double_chance", None)
+_fan_only.pop("double_hit", None)
+_saved_row = cls_rows["healer"]
+cls_rows["healer"] = _fan_only
+try:
+    bf = gamedata.combat_bounds({"cls": "healer", "lvl": 30, "gear": ["emberscepter"], "skills": {}, "pets": []})
+finally:
+    cls_rows["healer"] = _saved_row
+check("  a catalogue from 0.36.0 says nothing of the double: a shot a cooldown and its fan - a fifth more",
+      abs(fan - 1.2) < 1e-9 and abs(bf["dps"] - hit_of(h["base"], "emberscepter") / h["cooldown"] * fan) < 0.05
+      and bf["max_hit"] == math.ceil(hit_of(h["base"], "emberscepter")), bf)
+_older_row = dict(h)
+for key in ("fan_every", "fan_orbs", "fan_share", "double_chance", "double_hit"):
+    _older_row.pop(key, None)
+_saved_row = cls_rows["healer"]
+cls_rows["healer"] = _older_row
+try:
+    bh = gamedata.combat_bounds({"cls": "healer", "lvl": 30, "gear": ["emberscepter"], "skills": {}, "pets": []})
+finally:
+    cls_rows["healer"] = _saved_row
+check("  a catalogue from before says nothing, and fans nothing - the old bound",
+      abs(bh["dps"] - hit_of(h["base"], "emberscepter") / h["cooldown"]) < 0.05, bh)
 
 pet = C["pets"]["petboss"]
 bp = gamedata.combat_bounds({"cls": "healer", "lvl": 1, "gear": [], "skills": {}, "pets": ["petboss"]})
 check("a pet hits for half the character's multiplier, and adds its rate and its puddles",
-      bp["max_hit"] == max(h["base"], int(pet["damage"] * C["pet_share"]))
-      and abs(bp["dps"] - (h["base"] / h["cooldown"] + int(pet["damage"] * C["pet_share"]) / pet["cooldown"]
+      bp["max_hit"] == max(math.ceil(h["base"] * double), int(pet["damage"] * C["pet_share"]))
+      and abs(bp["dps"] - (h["base"] / h["cooldown"] * (double + fan - 1.0) + int(pet["damage"] * C["pet_share"]) / pet["cooldown"]
                            + C["puddle_damage"] * gamedata.PUDDLE_TICKS_PER_SECOND)) < 0.05, bp)
 check("  only a pet the ticket says is held",
-      gamedata.combat_bounds({"cls": "healer", "lvl": 1, "gear": [], "skills": {}, "pets": ["nopet"]})["dps"]
-      == h["base"] / h["cooldown"])
+      abs(gamedata.combat_bounds({"cls": "healer", "lvl": 1, "gear": [], "skills": {}, "pets": ["nopet"]})["dps"]
+          - h["base"] / h["cooldown"] * (double + fan - 1.0)) < 0.05)
 rolled = gamedata.perfect_id("ironsword")
 br = gamedata.combat_bounds({"cls": "warrior", "lvl": 1, "gear": [rolled], "skills": {}, "pets": []})
 check("a Perfect roll's damage is the rolled damage", br["max_hit"] == w["base"] + top(rolled)
