@@ -511,6 +511,21 @@ for item_id, expected in (("tinyhealthpotion", 1),
 check("gear on the same ladder: ironchest is tier 1 and open",
       ladder.get("ironchest") == 1, "got %r" % ladder.get("ironchest"))
 
+# THE MAGE'S OFF HANDS ON THE SHELF (game 0.32.0): a tome and a wand at every
+# tier the store sells, beside that tier's shield; the ember pair and the three
+# grimoires are drops, like the rest of the ember gear.
+for t, lvl in (("iron", 1), ("jade", 5), ("cobalt", 10), ("amethyst", 16)):
+    check("the %s tome and wand are on the shelf at level %d" % (t, lvl),
+          ladder.get(t + "tome") == lvl and ladder.get(t + "wand") == lvl,
+          [ladder.get(t + "tome"), ladder.get(t + "wand")])
+check("  the ember pair and the grimoires are not - they drop",
+      not any(i in ladder for i in ("embertome", "emberwand", "arcanegrimoire",
+                                    "verdantgrimoire", "sapphiregrimoire")))
+check("  and every one of them can drop at its tier",
+      all(i in gamedata.loot_pool(gamedata.ITEMS[i]["tier"], "gear")
+          for i in ("irontome", "ironwand", "embertome", "emberwand", "arcanegrimoire",
+                    "verdantgrimoire", "sapphiregrimoire")))
+
 # NOTHING THE SHOP SELLS IS SKILL-GATED, and that is the point rather than an
 # oversight: a skill gate belongs on something you MADE, and a vendor sells
 # things you BUY. If a cooked fish ever appears on a shelf this flips, and it

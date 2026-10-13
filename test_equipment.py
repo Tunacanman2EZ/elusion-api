@@ -98,9 +98,36 @@ check("the refusal says why",
 mage = C.Player("mage", 1)
 check("a mage wears the cloth kit", all(mage.equip(i) for i in CLOTH),
       mage.equipped)
-check("seven pieces - a staff is held in both hands, so no shield",
+check("seven pieces - the cloth kit has no shield",
       len(mage.equipped) == 7 and "shield" not in mage.equipped, mage.equipped)
 check("and not a warrior's cuirass", mage.equip("ironchest") is False)
+
+# THE MAGE'S OFF HAND (game 0.32.0). The owner, of the mage: "has no offhand",
+# then "tombs grimoires and off hand wands ... give them some stats". A tome or
+# a wand at every tier, and three grimoires at the top, all in the shield
+# square and all the mage's alone.
+OFFHANDS = ["%s%s" % (t, kind) for t in ["iron", "jade", "cobalt", "amethyst", "ember"]
+            for kind in ["tome", "wand"]] + ["arcanegrimoire", "verdantgrimoire", "sapphiregrimoire"]
+check("thirteen mage off hands are in the catalogue",
+      all(i in C.ITEMS for i in OFFHANDS), [i for i in OFFHANDS if i not in C.ITEMS])
+check("  every one in the shield square, and the mage's alone",
+      all(C.slot_name(C.ITEMS[i]["equip_slot"]) == "shield"
+          and C.ITEMS[i]["required_classes"] == ["mage"] for i in OFFHANDS))
+check("  a mage holds an iron tome beside the cloth kit - eight pieces",
+      mage.equip("irontome") is True and len(mage.equipped) == 8 and mage.equipped.get("shield") == "irontome",
+      mage.equipped)
+check("  and a wand in its place", mage.equip("ironwand") is True and mage.equipped.get("shield") == "ironwand",
+      mage.equipped)
+check("  a warrior, a tank and a healer cannot",
+      all(C.Player(c, 22).equip_check("embertome")["reason"] == "class" for c in ["warrior", "tank", "healer"]))
+check("  a grimoire waits for level 22",
+      C.Player("mage", 21).equip_check("arcanegrimoire")["reason"] == "level"
+      and C.Player("mage", 22).equip("arcanegrimoire") is True)
+for t, shield in [("iron", "ironshield"), ("jade", "jadeshield"), ("cobalt", "cobaltshield"),
+                  ("amethyst", "amethystshield"), ("ember", "embershield")]:
+    check("  the %s tome and wand sit on the %s's rung: tier, level and value" % (t, shield),
+          all(C.ITEMS["%s%s" % (t, k)][f] == C.ITEMS[shield][f] for k in ["tome", "wand"]
+              for f in ["tier", "required_level", "value"]))
 
 check("a hood and a helm compete for the same slot",
       C.slot_name(C.ITEMS["ironhood"]["equip_slot"])
