@@ -131,6 +131,13 @@ shape - a kind it knows, positions in range, the origin near where that player
 last said it stood, the target within ATTACK_REACH of it - and passes it on to
 the others in the area, never back.
 
+ONE PICTURE IS ALSO A HEAL (game 0.40.0). A healer's aura ("heal") heals
+whoever stands in it, or near it, on their own games - so this server, which
+knows where everybody stands, writes those heals down for the API's healing
+check (THE AURA'S HEALS, by ATTACK_KINDS): a consume_grants row for each
+player within the aura's reach. That table and the books' are the only ones
+this process writes.
+
 Levers were each game's own: a gate opened on one screen stayed shut on the
 next. A pull ("l") is passed to everyone in the area and REMEMBERED for the
 area, in the order pulled, so a game that walks in later is told ("levers")
@@ -245,7 +252,9 @@ MAX_STEPS_PER_TICK = 4
 #   meteor  a Meteorite meteor at (tx, ty), `delay` ms after the cast; flag 1 pulls
 #   dyn     a stick of Dynamite from (ox, oy) to (tx, ty), `delay` ms after the throw
 #   orb     a healer's orb from (ox, oy) toward (tx, ty)
-ATTACK_KINDS = ("slash", "axe", "recall", "stalag", "meteor", "dyn", "orb")
+#   heal    a healer's aura dropped at (tx, ty) (game 0.40.0) - and the word
+#           that the players it reaches are healed: THE AURA'S HEALS below
+ATTACK_KINDS = ("slash", "axe", "recall", "stalag", "meteor", "dyn", "orb", "heal")
 MAX_ATTACKS_PER_MESSAGE = 16
 # How far from its origin an attack may land: a cursor across the screen.
 ATTACK_REACH = 1000.0
@@ -260,6 +269,30 @@ LEVER_PATTERN = re.compile(r"^[A-Za-z0-9_/-]{1,128}$")
 MAX_LEVERS_PER_AREA = 32
 # Said in the welcome: this server passes attacks and levers on.
 RELAY_VERSION = 1
+
+# THE AURA'S HEALS (game 0.40.0). A healer's aura heals every player standing
+# in its ring, and sends green blobs that heal the players outside it within
+# reach - each game healing its own player, from the picture this server
+# passes on. The API's healing check (app.py, _reconcile_heals) would see that
+# health as unexplained, so when a healer's "heal" goes through, this server -
+# the one place that knows where everybody stands - writes a grant for every
+# player in that area within the aura's reach: HEAL_GRANT_ID, 'HP', the share
+# of their own maximum the aura gives. Read from the catalogue's healer row
+# (aura_heal_share, aura_reach, aura_cooldown); a catalogue without them grants
+# nothing.
+#   HEAL_REACH_SLACK, HEAL_REACH_PAD  how much further than the reach a player
+#                    may stand and still be granted: what this server has is
+#                    their last state, up to a tenth of a second old, and their
+#                    origin, not their feet.
+#   HEAL_COOLDOWN_SLACK  a heal sooner than this share of the cooldown after
+#                    the healer's last is passed on as a picture and granted
+#                    nothing.
+#   HEAL_ROUNDING    hp over the share: the game rounds each tick up.
+HEAL_GRANT_ID = "__spellheal__"
+HEAL_REACH_SLACK = 1.25
+HEAL_REACH_PAD = 48.0
+HEAL_COOLDOWN_SLACK = 0.75
+HEAL_ROUNDING = 8
 
 
 def _hash(raw):
@@ -340,6 +373,64 @@ def write_books(kills, flags, prune_before=None):
         conn.close()
 
 
+def aura_numbers():
+    """(share, reach, cooldown) of the healer's aura, from the catalogue -
+    a share of 0 when it has none."""
+    if gamedata is None:
+        return 0.0, 0.0, 0.0
+    row = (gamedata.COMBAT.get("classes") or {}).get("healer") or {}
+    try:
+        share = float(row.get("aura_heal_share", 0) or 0)
+        reach = float(row.get("aura_reach", 0) or 0)
+        cooldown = float(row.get("aura_cooldown", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0, 0.0, 0.0
+    if not (math.isfinite(share) and math.isfinite(reach) and math.isfinite(cooldown)):
+        return 0.0, 0.0, 0.0
+    return max(share, 0.0), max(reach, 0.0), max(cooldown, 0.0)
+
+
+def write_heal_grants(rows, at):
+    """THE AURA'S HEALS: for each (user_id, slot, share), a consume_grants row
+    of that share of the character's own maximum hp, as app.py derives it -
+    gamedata.max_stats_for() with what it is wearing. Runs in a thread.
+    Returns the rows written."""
+    if not rows or gamedata is None:
+        return []
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    conn.row_factory = sqlite3.Row
+    out = []
+    try:
+        for user_id, slot, share in rows:
+            row = conn.execute("SELECT class_id, level, equipment FROM saves WHERE user_id = ? AND slot = ?",
+                               (int(user_id), int(slot))).fetchone()
+            if row is None:
+                continue
+            try:
+                worn = json.loads(row["equipment"]) if row["equipment"] else {}
+            except (TypeError, ValueError):
+                worn = {}
+            stats = gamedata.max_stats_for(row["class_id"], int(row["level"] or 1),
+                                           worn if isinstance(worn, dict) else {})
+            if not stats:
+                continue
+            amount = int(math.ceil(float(stats["max_hp"]) * float(share))) + HEAL_ROUNDING
+            out.append((int(user_id), int(slot), HEAL_GRANT_ID, "HP", amount, int(at)))
+        if out:
+            conn.executemany("INSERT INTO consume_grants (user_id, slot, item_id, target, amount, at)"
+                             " VALUES (?, ?, ?, ?, ?, ?)", out)
+            conn.commit()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
+        print("[PRESENCE] a heal cannot be written down (%s): start app.py once to add the table" % exc,
+              flush=True)
+        return []
+    finally:
+        conn.close()
+    return out
+
+
 def still_valid(ticket_hashes, now=None):
     """Which of these ticket hashes are in date with their login alive."""
     hashes = list(ticket_hashes)
@@ -366,6 +457,12 @@ class Player:
     def __init__(self, ws, user_id, ticket_hash, identity, expires_at, slot=-1):
         self.ws = ws
         self.user_id = user_id
+        # Which character: the books keep it on the fighter, but the books may
+        # be off, and THE AURA'S HEALS need it whatever they are.
+        self.slot = slot
+        # When this player last dropped an aura that was written down
+        # (time.monotonic()).
+        self.last_aura = float("-inf")
         self.ticket_hash = ticket_hash
         self.identity = identity
         self.expires_at = expires_at
@@ -583,6 +680,8 @@ class PresenceServer:
         self._flags = {}      # (user_id, area, kind) -> [count, detail, first_at, last_at]
         self._pruned_at = 0.0
         self._book_errors = 0
+        # THE AURA'S HEALS not yet written: (user_id, slot, share).
+        self._heals = []
 
     # ---- sending -------------------------------------------------------------
 
@@ -760,7 +859,39 @@ class PresenceServer:
         if attacks is None:
             return False
         self._room_broadcast(player.area, {"t": "x", "id": player.user_id, "e": attacks}, skip=player)
+        for attack in attacks:
+            if attack[0] == "heal":
+                self.note_heal(player, attack[4], attack[5])
         return True
+
+    def note_heal(self, player, x, y, now=None):
+        """THE AURA'S HEALS: a healer's aura at (x, y) - everyone in its area
+        within reach, the healer too, is owed the aura's share, unless it is
+        too soon after the healer's last or the caster is no healer. Returns
+        who, for the tests; grant_heals() writes them down."""
+        share, reach, cooldown = aura_numbers()
+        if share <= 0.0 or reach <= 0.0 or str(player.identity.get("cls", "")) != "healer":
+            return []
+        now = time.monotonic() if now is None else now
+        if now - player.last_aura < cooldown * HEAL_COOLDOWN_SLACK:
+            return []
+        player.last_aura = now
+        within = reach * HEAL_REACH_SLACK + HEAL_REACH_PAD
+        owed = [p for p in self.rooms.get(player.area, ())
+                if p.slot >= 0 and math.hypot(p.x - x, p.y - y) <= within]
+        self._heals.extend((p.user_id, p.slot, share) for p in owed)
+        return owed
+
+    async def grant_heals(self):
+        """Write down the heals noted since the last call."""
+        rows, self._heals = self._heals, []
+        if not rows:
+            return []
+        try:
+            return await asyncio.to_thread(write_heal_grants, rows, time.time())
+        except Exception as exc:  # noqa: BLE001
+            print("[PRESENCE] could not write a heal down: %r" % exc, flush=True)
+            return []
 
     def pull_lever(self, player, msg):
         """A lever pulled: remembered for the area, the latest pulled last,
@@ -843,6 +974,7 @@ class PresenceServer:
         if found is None or found[0] != player.user_id:
             return False
         _uid, identity, expires, slot = found
+        player.slot = slot
         changed = identity != player.identity
         if player.fighter is not None and changed:
             # A new weapon, a skill level, a pet: the books' bounds follow.
@@ -941,6 +1073,10 @@ class PresenceServer:
                     self.relay_hits(player, message)
                 elif kind == "x":
                     self.relay_attacks(player, message)
+                    if self._heals:
+                        # At once: the healed game's next save is checked
+                        # against them.
+                        await self.grant_heals()
                 elif kind == "l":
                     self.pull_lever(player, message)
         except ConnectionClosed:

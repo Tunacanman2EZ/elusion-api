@@ -1278,6 +1278,25 @@ every rule.
   per area.
 - **And, since 0.7.0, the monsters** - next section. PvP stays in "Decided,
   not built".
+- **THE AURA'S HEALS (game 0.40.0).** A healer's aura heals whoever stands in
+  its ring, and its blobs heal the players outside it within reach - each game
+  healing its own player from the "heal" picture this server passes on. The
+  healing check (`_reconcile_heals`) would call that health unexplained, so
+  when a healer's "heal" arrives presence.py, which knows where everyone
+  stands, writes a `consume_grants` row - `HEAL_GRANT_ID` (`__spellheal__`),
+  'HP', `ceil(max_hp * aura_heal_share) + HEAL_ROUNDING` (8) of that
+  character's own maximum, derived with what it wears - for every player in
+  the area within `aura_reach * HEAL_REACH_SLACK + HEAL_REACH_PAD` (1.25x +
+  48 px) of the aura's middle, the healer too. Not for a caster whose ticket
+  says another class, and not twice inside `aura_cooldown *
+  HEAL_COOLDOWN_SLACK` (0.75) - those still pass on as pictures. Written at
+  once (`grant_heals()`, a thread), since the healed game's next save is
+  checked against it; the reconciler adds it to `granted["hp"]` like a potion.
+  `Player.slot` is kept for it whether the books are on or not. The numbers
+  are the catalogue's (`aura_numbers()`); a catalogue without them grants
+  nothing. **Deploy this before players have game 0.40.0**: a server without
+  "heal" in `ATTACK_KINDS` refuses the whole batch it comes in, the healer's
+  orb pictures with it. Held by test_presence.py P-10.
 
 ## Shared monsters: one game runs them, presence.py passes the notes
 
@@ -1426,7 +1445,7 @@ finds. `test_combatbook.py` holds the books, `test_presence.py` P-8 the wiring.
   biggest hit `unit * max(1, wave)` and the rate `unit * haste * (1 + wave) /
   swing`. A finisher's wave (1.125 sword hits) and the rate (about 7% more)
   are both inside SLACK of the old bound, so this one can go out in either
-  order; a catalogue without them finishes nothing. Since game 0.39.0 it
+  order; a catalogue without them finishes nothing. Since game 0.39.0 the warrior's row
   also carries the crypt's orbs: `sword_fan_orbs` / `sword_fan_share` (three
   a swing at a tenth of one) and `finisher_fan_orbs` / `finisher_burst_orbs` /
   `finisher_orb_share` (twelve with every finisher, at 0.15 of its wave). The
@@ -1435,7 +1454,12 @@ finds. `test_combatbook.py` holds the books, `test_presence.py` P-8 the wiring.
   once in three, as the healer's fan is counted - 3.1 swings' worth a swing
   where 0.38.0 had 2.125; the biggest hit is unchanged. That is past SLACK of
   the 0.37.0 bound, so deploy this before players have game 0.39.0. A
-  catalogue without them throws none. Each class's formula is written out above the code;
+  catalogue without them throws none. Since game 0.40.0 the healer's row
+  also carries the aura (`aura_cooldown`, `aura_ticks`, `aura_damage_share`,
+  `aura_heal_share`, `aura_radius`, `aura_range`, `aura_reach`): its rate adds
+  the burn, `unit * aura_ticks * aura_damage_share / aura_cooldown` (one orb a
+  second, not hastened), and its biggest hit is the bigger of a doubled orb
+  and a tick; presence.py reads the heal numbers (THE AURA'S HEALS). Each class's formula is written out above the code;
   the game's suite (`_test_combat_bounds_match_the_game`) holds the exported
   numbers to the game's own. Every bound gets `SLACK` (1.5) while watching.
 - **Hits**: one over the biggest is booked at the cap and waits

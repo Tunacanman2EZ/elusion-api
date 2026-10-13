@@ -320,11 +320,33 @@ check("the catalogue says the healer's fan: two orbs at half a shot, every fifth
 double = float(h.get("double_hit", 1)) if float(h.get("double_chance", 0)) > 0 else 1.0
 check("the catalogue says the healer's double: one main orb in five, twice as hard",
       abs(float(h.get("double_chance", 0)) - 0.2) < 1e-9 and float(h.get("double_hit", 0)) == 2.0, h)
+# THE AURA (game 0.40.0): every aura_cooldown at most, aura_ticks ticks each
+# burning every monster in the ring for aura_damage_share of an orb - not
+# hastened, its own clock.
+_AURA_KEYS = ("aura_cooldown", "aura_damage_share", "aura_ticks", "aura_heal_share", "aura_radius",
+              "aura_range", "aura_reach")
+aura = int(h.get("aura_ticks", 0)) * float(h.get("aura_damage_share", 0)) / float(h.get("aura_cooldown", 1) or 1)
+check("the catalogue says the healer's aura: four ticks at two orbs each, once in eight seconds, healing a quarter",
+      h.get("aura_ticks") == 4 and abs(float(h.get("aura_damage_share", 0)) - 2.0) < 1e-9
+      and abs(float(h.get("aura_cooldown", 0)) - 8.0) < 1e-9 and abs(float(h.get("aura_heal_share", 0)) - 0.25) < 1e-9
+      and float(h.get("aura_reach", 0)) >= float(h.get("aura_radius", 0)) > 0 and abs(aura - 1.0) < 1e-9, h)
 b1 = gamedata.combat_bounds({"cls": "healer", "lvl": 30, "gear": ["emberscepter"], "skills": {}, "pets": []})
-check("a healer's biggest hit is a doubled orb, and its rate every orb doubled plus the fan",
-      abs(b1["dps"] - hit_of(h["base"], "emberscepter") / h["cooldown"] * (double + fan - 1.0)) < 0.05
-      and b1["max_hit"] == math.ceil(hit_of(h["base"], "emberscepter") * double), b1)
-_fan_only = dict(h)
+check("a healer's biggest hit is a doubled orb, and its rate every orb doubled plus the fan, plus the aura's burn",
+      abs(b1["dps"] - hit_of(h["base"], "emberscepter") * ((double + fan - 1.0) / h["cooldown"] + aura)) < 0.05
+      and b1["max_hit"] == math.ceil(hit_of(h["base"], "emberscepter") * max(double, h["aura_damage_share"])), b1)
+_no_aura = dict(h)
+for key in _AURA_KEYS:
+    _no_aura.pop(key, None)
+_saved_row = cls_rows["healer"]
+cls_rows["healer"] = _no_aura
+try:
+    bn = gamedata.combat_bounds({"cls": "healer", "lvl": 30, "gear": ["emberscepter"], "skills": {}, "pets": []})
+finally:
+    cls_rows["healer"] = _saved_row
+check("  a catalogue from before the aura (0.39.0) burns nothing - its bound",
+      abs(bn["dps"] - hit_of(h["base"], "emberscepter") / h["cooldown"] * (double + fan - 1.0)) < 0.05
+      and bn["dps"] < b1["dps"], bn)
+_fan_only = dict(_no_aura)
 _fan_only.pop("double_chance", None)
 _fan_only.pop("double_hit", None)
 _saved_row = cls_rows["healer"]
@@ -337,7 +359,7 @@ check("  a catalogue from 0.36.0 says nothing of the double: a shot a cooldown a
       abs(fan - 1.2) < 1e-9 and abs(bf["dps"] - hit_of(h["base"], "emberscepter") / h["cooldown"] * fan) < 0.05
       and bf["max_hit"] == math.ceil(hit_of(h["base"], "emberscepter")), bf)
 _older_row = dict(h)
-for key in ("fan_every", "fan_orbs", "fan_share", "double_chance", "double_hit"):
+for key in ("fan_every", "fan_orbs", "fan_share", "double_chance", "double_hit") + _AURA_KEYS:
     _older_row.pop(key, None)
 _saved_row = cls_rows["healer"]
 cls_rows["healer"] = _older_row
@@ -352,11 +374,11 @@ pet = C["pets"]["petboss"]
 bp = gamedata.combat_bounds({"cls": "healer", "lvl": 1, "gear": [], "skills": {}, "pets": ["petboss"]})
 check("a pet hits for half the character's multiplier, and adds its rate and its puddles",
       bp["max_hit"] == max(math.ceil(h["base"] * double), int(pet["damage"] * C["pet_share"]))
-      and abs(bp["dps"] - (h["base"] / h["cooldown"] * (double + fan - 1.0) + int(pet["damage"] * C["pet_share"]) / pet["cooldown"]
+      and abs(bp["dps"] - (h["base"] * ((double + fan - 1.0) / h["cooldown"] + aura) + int(pet["damage"] * C["pet_share"]) / pet["cooldown"]
                            + C["puddle_damage"] * gamedata.PUDDLE_TICKS_PER_SECOND)) < 0.05, bp)
 check("  only a pet the ticket says is held",
       abs(gamedata.combat_bounds({"cls": "healer", "lvl": 1, "gear": [], "skills": {}, "pets": ["nopet"]})["dps"]
-          - h["base"] / h["cooldown"] * (double + fan - 1.0)) < 0.05)
+          - h["base"] * ((double + fan - 1.0) / h["cooldown"] + aura)) < 0.05)
 rolled = gamedata.perfect_id("ironsword")
 br = gamedata.combat_bounds({"cls": "warrior", "lvl": 1, "gear": [rolled], "skills": {}, "pets": []})
 check("a Perfect roll's damage is the rolled damage", br["max_hit"] == math.ceil((w["base"] + top(rolled)) * big)

@@ -17,7 +17,7 @@ out - takes the player off everybody's screen within seconds.
 It runs the real presence server in this process, on a free port, against a
 throwaway database in the temp folder - never elusion.db.
 """
-import asyncio, importlib.util, json, os, sqlite3, sys, tempfile, time
+import asyncio, importlib.util, json, math, os, sqlite3, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_presence_test.db")
@@ -844,6 +844,77 @@ async def run(port, server):
     check("  and is told of none", not of(await collect(h), "levers"))
     await h.close()
     await j.close()
+
+    # =========================================================================
+    section("P-10 THE AURA'S HEALS: A HEALER'S AURA IS WRITTEN DOWN FOR EVERYONE IT REACHES")
+    # =========================================================================
+    # Game 0.40.0. The owner: "Heal players + hurt monsters", and of the blobs:
+    # "each blob travels to players outside of the circle giving them hp".
+    # Every game heals its own player from the picture; this server writes it
+    # down for the API's healing check.
+    share, reach, cooldown = presence.aura_numbers()
+    hrow = (presence.gamedata.COMBAT.get("classes") or {}).get("healer") or {}
+    check("the aura's numbers come from the catalogue's healer row",
+          share == float(hrow.get("aura_heal_share")) and reach == float(hrow.get("aura_reach"))
+          and cooldown == float(hrow.get("aura_cooldown")) and share > 0 and reach > 0 and cooldown > 0,
+          (share, reach, cooldown))
+    check("  \"heal\" is a kind of attack picture", "heal" in presence.ATTACK_KINDS)
+    MEND = account("presmend", "healer")
+    NEAR = account("presnear")
+    AFAR = account("presafar", "mage")
+    ELSE = account("preselse", "tank")
+    m, _ = await enter(port, MEND, "town", x=500.0, y=500.0)
+    n, _ = await enter(port, NEAR, "town", x=600.0, y=520.0)
+    f, _ = await enter(port, AFAR, "town", x=500.0, y=900.0)
+    e, _ = await enter(port, ELSE, "elusion", x=530.0, y=480.0)
+    for ws in (m, n, f, e):
+        await collect(ws)
+
+    def grants():
+        return {r["user_id"]: (r["target"], r["amount"]) for r in sql(
+            "SELECT user_id, target, amount FROM consume_grants WHERE item_id = ?", (presence.HEAL_GRANT_ID,))}
+
+    def owed(name, class_id):
+        top = presence.gamedata.max_stats_for(class_id, 1, {})["max_hp"]
+        return ("HP", math.ceil(top * share) + presence.HEAL_ROUNDING)
+
+    heal = ["heal", 93000, 500.0, 500.0, 530.0, 480.0, 0, 0]
+    await m.send(json.dumps({"t": "x", "e": [heal]}))
+    heard = of(await collect(n), "x")
+    await collect(m), await collect(f), await collect(e)
+    check("a healer's aura is passed on as a picture, as every attack is",
+          heard and heard[0]["e"] == [heal] and heard[0]["id"] == uid("presmend"), heard)
+    got = grants()
+    check("  and written down for the healer and everyone in the area within its reach",
+          got.get(uid("presmend")) == owed("presmend", "healer") and got.get(uid("presnear")) == owed("presnear", "warrior"),
+          got)
+    check("  'HP', the aura's share of each one's own maximum, rounded up, and a little for the game's rounding",
+          got.get(uid("presnear"), ("", 0))[1] == math.ceil(
+              presence.gamedata.max_stats_for("warrior", 1, {})["max_hp"] * share) + presence.HEAL_ROUNDING, got)
+    check("  not for anyone further than the reach, nor in another area",
+          uid("presafar") not in got and uid("preselse") not in got, got)
+    before = len(sql("SELECT id FROM consume_grants WHERE item_id = ?", (presence.HEAL_GRANT_ID,)))
+    await m.send(json.dumps({"t": "x", "e": [["heal", 93100, 500.0, 500.0, 530.0, 480.0, 0, 0]]}))
+    again = of(await collect(n), "x")
+    after = len(sql("SELECT id FROM consume_grants WHERE item_id = ?", (presence.HEAL_GRANT_ID,)))
+    check("a second aura sooner than the cooldown is passed on as a picture and written down for nobody",
+          again and before == after == 2, (before, after))
+    await n.send(json.dumps({"t": "x", "e": [["heal", 93200, 600.0, 520.0, 600.0, 520.0, 0, 0]]}))
+    from_warrior = of(await collect(m), "x")
+    check("  nor is one from anybody but a healer",
+          from_warrior and len(sql("SELECT id FROM consume_grants WHERE item_id = ?", (presence.HEAL_GRANT_ID,))) == 2)
+    mender = server.players[uid("presmend")]
+    mender.last_aura -= cooldown
+    owed_now = server.note_heal(mender, 500.0, 900.0)
+    written = await server.grant_heals()
+    check("once the cooldown has passed, the next is written down - here, for the one it reached",
+          [p.user_id for p in owed_now] == [uid("presafar")] and [w[0] for w in written] == [uid("presafar")],
+          (owed_now, written))
+    check("  the slot each grant is for is the character's own",
+          all(w[1] == 0 for w in written) and mender.slot == 0, written)
+    for ws in (m, n, f, e):
+        await ws.close()
+    await asyncio.sleep(0.1)
 
     # =========================================================================
     section("P-6 LEAVING")

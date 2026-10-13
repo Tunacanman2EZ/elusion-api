@@ -1287,6 +1287,17 @@ def combat_bounds(identity):
             if float(row.get("double_chance", 0.0) or 0.0) > 0.0 else 1.0
         max_hit = unit * double
         dps = unit * haste / cooldown * (double + fan)
+        # Since game 0.40.0 THE AURA (healer.gd, healaura.gd): at most every
+        # aura_cooldown, aura_ticks ticks each burning every monster in its ring
+        # for aura_damage_share of an orb - on its own clock, so not hastened.
+        # A tick is no bigger than a doubled orb at the share it ships with, and
+        # the biggest hit takes whichever is bigger. A catalogue from before
+        # says nothing and burns nothing.
+        aura_every = float(row.get("aura_cooldown", 0.0) or 0.0)
+        if aura_every > 0.0:
+            aura_share = max(float(row.get("aura_damage_share", 0.0) or 0.0), 0.0)
+            dps += unit * int(row.get("aura_ticks", 0) or 0) * aura_share / aura_every
+            max_hit = max(max_hit, unit * aura_share)
     else:
         max_hit = unit
         dps = unit * haste / cooldown
