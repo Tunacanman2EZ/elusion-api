@@ -1426,7 +1426,16 @@ finds. `test_combatbook.py` holds the books, `test_presence.py` P-8 the wiring.
   biggest hit `unit * max(1, wave)` and the rate `unit * haste * (1 + wave) /
   swing`. A finisher's wave (1.125 sword hits) and the rate (about 7% more)
   are both inside SLACK of the old bound, so this one can go out in either
-  order; a catalogue without them finishes nothing. Each class's formula is written out above the code;
+  order; a catalogue without them finishes nothing. Since game 0.39.0 it
+  also carries the crypt's orbs: `sword_fan_orbs` / `sword_fan_share` (three
+  a swing at a tenth of one) and `finisher_fan_orbs` / `finisher_burst_orbs` /
+  `finisher_orb_share` (twelve with every finisher, at 0.15 of its wave). The
+  rate adds every orb on the one monster - `sword_fan_orbs * sword_fan_share`
+  a swing, and the finisher's `(fan + burst) * share * wave / finisher_every`,
+  once in three, as the healer's fan is counted - 3.1 swings' worth a swing
+  where 0.38.0 had 2.125; the biggest hit is unchanged. That is past SLACK of
+  the 0.37.0 bound, so deploy this before players have game 0.39.0. A
+  catalogue without them throws none. Each class's formula is written out above the code;
   the game's suite (`_test_combat_bounds_match_the_game`) holds the exported
   numbers to the game's own. Every bound gets `SLACK` (1.5) while watching.
 - **Hits**: one over the biggest is booked at the cap and waits

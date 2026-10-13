@@ -1202,7 +1202,21 @@ def combat_bounds(identity):
         if int(row.get("finisher_every", 0) or 0) > 0:
             wave *= max(float(row.get("finisher_mult", 1.0) or 1.0), 1.0)
         max_hit = unit * max(1.0, wave)
-        dps = unit * haste * (1.0 + wave) / swing
+        # Since game 0.39.0 THE CRYPT'S ORBS (bladeorb.gd): every sword swing
+        # flings sword_fan_orbs, each for sword_fan_share of a swing, and every
+        # finisher_every-th swing's wave flies with finisher_fan_orbs beside it
+        # and bursts into finisher_burst_orbs, each for finisher_orb_share of
+        # that wave. Every orb on the one monster; the finisher's once in
+        # finisher_every swings, as the healer's fan is once in fan_every
+        # shots. None is bigger than a swing, so the biggest hit is unchanged.
+        # A catalogue from before says nothing and throws none.
+        orbs = max(int(row.get("sword_fan_orbs", 0) or 0), 0) * max(float(row.get("sword_fan_share", 0.0) or 0.0), 0.0)
+        finisher_every = int(row.get("finisher_every", 0) or 0)
+        if finisher_every > 0:
+            finisher_orbs = max(int(row.get("finisher_fan_orbs", 0) or 0), 0) \
+                + max(int(row.get("finisher_burst_orbs", 0) or 0), 0)
+            orbs += finisher_orbs * max(float(row.get("finisher_orb_share", 0.0) or 0.0), 0.0) * wave / finisher_every
+        dps = unit * haste * (1.0 + wave + orbs) / swing
         if "SPINNING_AXE" in specials:
             # A pass out or back is a swing (1 / cooldown at most), and the
             # spinning axe cuts a swing a second times its rate, which climbs

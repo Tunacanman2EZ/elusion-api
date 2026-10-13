@@ -159,23 +159,48 @@ big = max(1.0, wave)
 check("the catalogue says the warrior's finisher: every third swing's wave at one and a half",
       w.get("finisher_every") == 3 and abs(float(w.get("finisher_mult", 0)) - 1.5) < 1e-9
       and abs(wave - 1.125) < 1e-9, w)
+# THE CRYPT'S ORBS (game 0.39.0): every swing flings sword_fan_orbs at
+# sword_fan_share of a swing; every finisher_every-th swing's wave flies with
+# finisher_fan_orbs and bursts into finisher_burst_orbs, each at
+# finisher_orb_share of that wave - all counted on one monster, the finisher's
+# once in finisher_every swings.
+orbs = w["sword_fan_orbs"] * w["sword_fan_share"] \
+    + (w["finisher_fan_orbs"] + w["finisher_burst_orbs"]) * w["finisher_orb_share"] * wave / w["finisher_every"]
+per_swing = 1 + wave + orbs
+check("the catalogue says the warrior's crypt orbs: three a swing at a tenth, twelve a finisher at 0.15 of its wave",
+      w.get("sword_fan_orbs") == 3 and abs(w.get("sword_fan_share", 0) - 0.1) < 1e-9
+      and w.get("finisher_fan_orbs") == 4 and w.get("finisher_burst_orbs") == 8
+      and abs(w.get("finisher_orb_share", 0) - 0.15) < 1e-9 and abs(orbs - 0.975) < 1e-9, w)
 b = gamedata.combat_bounds({"cls": "warrior", "lvl": 1, "gear": ["ironsword"], "skills": {}, "pets": []})
 unit = w["base"] + top("ironsword")
 check("a warrior's biggest hit is a finisher's wave: its base and the sword's top roll, times the wave's share",
       b["max_hit"] == math.ceil(unit * big), (b, unit))
-check("  and its damage a second is a swing and its wave, once a swing, every wave a finisher",
-      abs(b["dps"] - unit * (1 + wave) / w["swing_seconds"]) < 0.02, b)
-_no_finisher = dict(w)
-_no_finisher.pop("finisher_every", None)
-_no_finisher.pop("finisher_mult", None)
-_saved_row = cls_rows["warrior"]
-cls_rows["warrior"] = _no_finisher
-try:
-    bn = gamedata.combat_bounds({"cls": "warrior", "lvl": 1, "gear": ["ironsword"], "skills": {}, "pets": []})
-finally:
-    cls_rows["warrior"] = _saved_row
-check("  a catalogue from before the finisher says nothing of it - the old bound",
+check("  and its damage a second is a swing, its wave and its orbs, once a swing, every wave a finisher",
+      abs(b["dps"] - unit * per_swing / w["swing_seconds"]) < 0.02, b)
+_ORB_KEYS = ("sword_fan_orbs", "sword_fan_share", "finisher_fan_orbs", "finisher_burst_orbs", "finisher_orb_share")
+
+
+def _bounds_without(keys):
+    row = dict(w)
+    for key in keys:
+        row.pop(key, None)
+    saved = cls_rows["warrior"]
+    cls_rows["warrior"] = row
+    try:
+        return gamedata.combat_bounds({"cls": "warrior", "lvl": 1, "gear": ["ironsword"], "skills": {}, "pets": []})
+    finally:
+        cls_rows["warrior"] = saved
+
+
+bo = _bounds_without(_ORB_KEYS)
+check("  a catalogue from before the orbs (0.38.0) throws none - its bound",
+      bo["max_hit"] == math.ceil(unit * big) and abs(bo["dps"] - unit * (1 + wave) / w["swing_seconds"]) < 0.02, bo)
+bn = _bounds_without(_ORB_KEYS + ("finisher_every", "finisher_mult"))
+check("  and one from before the finisher says nothing of either - the old bound",
       bn["max_hit"] == math.ceil(unit) and abs(bn["dps"] - unit * (1 + w["wave_ratio"]) / w["swing_seconds"]) < 0.02, bn)
+bf = _bounds_without(("finisher_every",))
+check("  orbs with no finisher are the sword's fan alone",
+      abs(bf["dps"] - unit * (1 + w["wave_ratio"] + w["sword_fan_orbs"] * w["sword_fan_share"]) / w["swing_seconds"]) < 0.02, bf)
 check("  and it walks at its own speed, sprinting",
       b["speed"] == w["speed"] * C["sprint"], b)
 
@@ -185,12 +210,12 @@ mult = 1 + 50 * C["skill_step"] + 10 * C["skill_step"]
 haste = 1 + 30 * C["agility_step"]
 check("skills raise the hit by their steps, agility the rate and the walk",
       b["max_hit"] == math.ceil(unit * mult * big)
-      and abs(b["dps"] - unit * mult * haste * (1 + wave) / w["swing_seconds"]) < 0.05
+      and abs(b["dps"] - unit * mult * haste * per_swing / w["swing_seconds"]) < 0.05
       and b["speed"] == (w["speed"] + 30 * C["agility_speed"]) * C["sprint"], b)
 b = gamedata.combat_bounds({"cls": "warrior", "lvl": 1, "gear": [], "skills": {"agility": 99}, "pets": []})
 check("  agility at its highest is its steps, under the cap the game puts on it",
       abs(b["dps"] - w["base"] * min(1 + 98 * C["agility_step"], C["agility_cap"])
-          * (1 + wave) / w["swing_seconds"]) < 0.05, b)
+          * per_swing / w["swing_seconds"]) < 0.05, b)
 
 held = gamedata.combat_bounds({"cls": "warrior", "lvl": 30, "gear": ["ironsword", "embersword"],
                                "skills": {}, "pets": []})
@@ -219,6 +244,10 @@ _older_row = dict(w)
 _older_row.pop("axe_spin_max_rate", None)
 _older_row.pop("axe_bleed_share", None)
 _older_row.pop("axe_bleed_every", None)
+# From before the finisher (0.38.0) and the orbs (0.39.0) too, as a catalogue
+# from before the spin is: with them, a sword's swings outrun a 1x axe.
+for _key in _ORB_KEYS + ("finisher_every", "finisher_mult"):
+    _older_row.pop(_key, None)
 _saved_row = cls_rows["warrior"]
 cls_rows["warrior"] = _older_row
 try:
