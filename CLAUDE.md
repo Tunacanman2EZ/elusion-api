@@ -1419,7 +1419,14 @@ finds. `test_combatbook.py` holds the books, `test_presence.py` P-8 the wiring.
   twice as hard - the fan never), and the bound takes every orb doubled: the
   biggest hit is `unit * double_hit` and the rate `unit * (double_hit + fan) /
   cooldown`. Update the server BEFORE players have 0.37.0, or a doubled orb is
-  past the old biggest hit times SLACK and flagged `hit_too_big`. Each class's formula is written out above the code;
+  past the old biggest hit times SLACK and flagged `hit_too_big`. Since game
+  0.38.0 the warrior's row carries `finisher_every` / `finisher_mult` (every
+  third sword swing's wave hits one and a half times as hard), and the bound
+  takes every wave a finisher's: `wave = wave_ratio * finisher_mult`, the
+  biggest hit `unit * max(1, wave)` and the rate `unit * haste * (1 + wave) /
+  swing`. A finisher's wave (1.125 sword hits) and the rate (about 7% more)
+  are both inside SLACK of the old bound, so this one can go out in either
+  order; a catalogue without them finishes nothing. Each class's formula is written out above the code;
   the game's suite (`_test_combat_bounds_match_the_game`) holds the exported
   numbers to the game's own. Every bound gets `SLACK` (1.5) while watching.
 - **Hits**: one over the biggest is booked at the cap and waits

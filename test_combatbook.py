@@ -151,12 +151,31 @@ def hit_of(base, item_id):
 
 cls_rows = C["classes"]
 w = cls_rows["warrior"]
+# THE FINISHER (game 0.38.0): every finisher_every-th swing's wave hits
+# finisher_mult as hard; the bound takes every wave a finisher, and that wave
+# (0.75 x 1.5 of a swing) is the biggest single hit.
+wave = w["wave_ratio"] * (float(w.get("finisher_mult", 1.0)) if int(w.get("finisher_every", 0) or 0) > 0 else 1.0)
+big = max(1.0, wave)
+check("the catalogue says the warrior's finisher: every third swing's wave at one and a half",
+      w.get("finisher_every") == 3 and abs(float(w.get("finisher_mult", 0)) - 1.5) < 1e-9
+      and abs(wave - 1.125) < 1e-9, w)
 b = gamedata.combat_bounds({"cls": "warrior", "lvl": 1, "gear": ["ironsword"], "skills": {}, "pets": []})
 unit = w["base"] + top("ironsword")
-check("a warrior's biggest hit is its base and the sword's top roll",
-      b["max_hit"] == math.ceil(unit), (b, unit))
-check("  and its damage a second is a swing and its wave, once a swing",
-      abs(b["dps"] - unit * (1 + w["wave_ratio"]) / w["swing_seconds"]) < 0.02, b)
+check("a warrior's biggest hit is a finisher's wave: its base and the sword's top roll, times the wave's share",
+      b["max_hit"] == math.ceil(unit * big), (b, unit))
+check("  and its damage a second is a swing and its wave, once a swing, every wave a finisher",
+      abs(b["dps"] - unit * (1 + wave) / w["swing_seconds"]) < 0.02, b)
+_no_finisher = dict(w)
+_no_finisher.pop("finisher_every", None)
+_no_finisher.pop("finisher_mult", None)
+_saved_row = cls_rows["warrior"]
+cls_rows["warrior"] = _no_finisher
+try:
+    bn = gamedata.combat_bounds({"cls": "warrior", "lvl": 1, "gear": ["ironsword"], "skills": {}, "pets": []})
+finally:
+    cls_rows["warrior"] = _saved_row
+check("  a catalogue from before the finisher says nothing of it - the old bound",
+      bn["max_hit"] == math.ceil(unit) and abs(bn["dps"] - unit * (1 + w["wave_ratio"]) / w["swing_seconds"]) < 0.02, bn)
 check("  and it walks at its own speed, sprinting",
       b["speed"] == w["speed"] * C["sprint"], b)
 
@@ -165,22 +184,22 @@ b = gamedata.combat_bounds({"cls": "warrior", "lvl": 1, "gear": ["ironsword"],
 mult = 1 + 50 * C["skill_step"] + 10 * C["skill_step"]
 haste = 1 + 30 * C["agility_step"]
 check("skills raise the hit by their steps, agility the rate and the walk",
-      b["max_hit"] == math.ceil(unit * mult)
-      and abs(b["dps"] - unit * mult * haste * (1 + w["wave_ratio"]) / w["swing_seconds"]) < 0.05
+      b["max_hit"] == math.ceil(unit * mult * big)
+      and abs(b["dps"] - unit * mult * haste * (1 + wave) / w["swing_seconds"]) < 0.05
       and b["speed"] == (w["speed"] + 30 * C["agility_speed"]) * C["sprint"], b)
 b = gamedata.combat_bounds({"cls": "warrior", "lvl": 1, "gear": [], "skills": {"agility": 99}, "pets": []})
 check("  agility at its highest is its steps, under the cap the game puts on it",
       abs(b["dps"] - w["base"] * min(1 + 98 * C["agility_step"], C["agility_cap"])
-          * (1 + w["wave_ratio"]) / w["swing_seconds"]) < 0.05, b)
+          * (1 + wave) / w["swing_seconds"]) < 0.05, b)
 
 held = gamedata.combat_bounds({"cls": "warrior", "lvl": 30, "gear": ["ironsword", "embersword"],
                                "skills": {}, "pets": []})
 check("the best weapon HELD counts, worn or not, with its own damage bonus",
-      held["max_hit"] == math.ceil(hit_of(w["base"], "embersword")), held)
+      held["max_hit"] == math.ceil(hit_of(w["base"], "embersword") * big), held)
 low = gamedata.combat_bounds({"cls": "warrior", "lvl": 1, "gear": ["ironsword", "embersword"],
                               "skills": {}, "pets": []})
 check("  but not one the character may not wear yet (its level)",
-      low["max_hit"] == w["base"] + top("ironsword"), low)
+      low["max_hit"] == math.ceil((w["base"] + top("ironsword")) * big), low)
 other = gamedata.combat_bounds({"cls": "mage", "lvl": 30, "gear": ["embersword"], "skills": {}, "pets": []})
 check("  nor another class's", other["max_hit"] == cls_rows["mage"]["base"], other)
 
@@ -311,14 +330,15 @@ check("  only a pet the ticket says is held",
           - h["base"] / h["cooldown"] * (double + fan - 1.0)) < 0.05)
 rolled = gamedata.perfect_id("ironsword")
 br = gamedata.combat_bounds({"cls": "warrior", "lvl": 1, "gear": [rolled], "skills": {}, "pets": []})
-check("a Perfect roll's damage is the rolled damage", br["max_hit"] == w["base"] + top(rolled)
-      and br["max_hit"] > w["base"] + top("ironsword"), br)
+check("a Perfect roll's damage is the rolled damage", br["max_hit"] == math.ceil((w["base"] + top(rolled)) * big)
+      and br["max_hit"] > math.ceil((w["base"] + top("ironsword")) * big), br)
 older = gamedata.combat_bounds({"cls": "warrior", "lvl": 1})
 check("an older ticket with no gear and no skills only loosens them",
       older["max_hit"] >= held["max_hit"] and older["dps"] >= held["dps"], older)
 check("a class nobody knows gets the loosest of the four",
       gamedata.combat_bounds({"cls": "bard", "lvl": 1, "gear": [], "skills": {}, "pets": []})["max_hit"]
-      == max(r["base"] for r in cls_rows.values()))
+      == max(gamedata.combat_bounds({"cls": c, "lvl": 1, "gear": [], "skills": {}, "pets": []})["max_hit"]
+             for c in cls_rows))
 
 
 # =============================================================================

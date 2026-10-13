@@ -1193,8 +1193,16 @@ def combat_bounds(identity):
     cooldown = max(float(row.get("cooldown", 1.0) or 1.0), 0.01)
     if cls == "warrior":
         swing = max(float(row.get("swing_seconds", 0.0) or 0.0), 0.05) or cooldown
-        max_hit = unit
-        dps = unit * haste * (1.0 + float(row.get("wave_ratio", 0.0))) / swing
+        # Since game 0.38.0 THE FINISHER (warrior.gd): every finisher_every-th
+        # swing's wave hits finisher_mult as hard. The bound takes the worst,
+        # every wave a finisher, as the tank's takes a barrage every throw - and
+        # a finisher's wave can be the biggest single hit. A catalogue from
+        # before says nothing and finishes nothing.
+        wave = float(row.get("wave_ratio", 0.0))
+        if int(row.get("finisher_every", 0) or 0) > 0:
+            wave *= max(float(row.get("finisher_mult", 1.0) or 1.0), 1.0)
+        max_hit = unit * max(1.0, wave)
+        dps = unit * haste * (1.0 + wave) / swing
         if "SPINNING_AXE" in specials:
             # A pass out or back is a swing (1 / cooldown at most), and the
             # spinning axe cuts a swing a second times its rate, which climbs
