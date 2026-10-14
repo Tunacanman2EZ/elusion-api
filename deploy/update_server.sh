@@ -2,7 +2,7 @@
 # update_server.sh - bring the live API up to what is on GitHub, in one command.
 #
 #     bash /opt/elusion/api/deploy/update_server.sh             # on the server, as root
-#     ssh root@159.65.67.51 bash /opt/elusion/api/deploy/update_server.sh   # from the PC
+#     ssh root@api.elusionrpg.com bash /opt/elusion/api/deploy/update_server.sh   # from the PC
 #     ... update_server.sh --restart     # restart even when nothing new was pulled
 #
 # It is DEPLOY.md's "Updating the server", by hand, plus the checks that were
@@ -38,7 +38,7 @@ DEPLOYED=/var/lib/elusion/deployed_commit
 # Every name here must be in the settings file, or the update stops before
 # anything restarts. The second list is only warned about.
 NEEDED=(ELUSION_OWNER ELUSION_DB ELUSION_TRUSTED_PROXIES)
-WANTED=(ELUSION_CO_OWNERS ELUSION_SMTP_HOST ELUSION_MAIL_FROM)
+WANTED=(ELUSION_CO_OWNERS ELUSION_SMTP_HOST ELUSION_MAIL_FROM ELUSION_TURN_KEY_ID ELUSION_TURN_KEY_TOKEN)
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }

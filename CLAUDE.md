@@ -930,6 +930,55 @@ held by `test_accounts.py`.
   token finds nothing and fails quietly, as a 401 or a heartbeat that stamps no
   row - the five ways this was broken on purpose all looked like that.
 
+## Token lifecycle: bound, rotated, short for staff (game 0.44.0)
+
+Students reviewing the project named one missing defence: "token-lifecycle
+hardening through rotation, short lifetime, binding, revocation, and secure
+storage". TOKEN LIFECYCLE in app.py is the answer; `test_tokens.py` (T-1 to
+T-7) holds it, and `_test_token_lifecycle()` holds the game's half.
+
+- **HARDENED is a session column, not a build check per request.** A login,
+  register, resume or password change from build `HARDENED_BUILD` (6) or
+  later that sends `X-Elusion-Install` is stored `hardened = 1` with the id's
+  hash (`login_hardening()`). Only those sessions are held to the rules below,
+  so a build-5 game and every older suite work exactly as before.
+- **Binding.** `user_for_token()` asks `_hardened_session_holds()`: a hardened
+  token without its own install hash is theft. `_end_for_theft()` ends every
+  session and trusted device of the account, records each as `why='stolen'` in
+  `ended_sessions`, and logs `[SECURITY] token theft suspected` with the name,
+  the address and the reason - never a token or a hash.
+- **Rotation.** `/resume` already swapped the token; `_end_other_sessions()`
+  now records the replaced one as `why='rotated'` with its install hash.
+  `_ended_refusal()` reads it on a 401: from the same copy of the game it is
+  `signed_in_elsewhere`; from any other it is theft.
+- **Short life for staff.** A hardened mod-or-above session is capped at
+  `STAFF_TOKEN_TTL` (12 h) when issued, and ended (`why='staff'`,
+  `staff_session_ended`) after `STAFF_IDLE_SECONDS` (30 min) since its last
+  heartbeat. Resuming keeps the cap; it never stretches it.
+- **Step-up.** `@require_fresh_password` (below `@require_auth` and the
+  rank's decorator, since it reads `g.user`) on ranks,
+  bans and unbans, gold, levels, skills, grants, rollback and the four server
+  switches: a hardened session whose `confirmed_at` is older than
+  `STEP_UP_SECONDS` (15 min) gets 403 `confirm_password`. A login with the
+  password sets `confirmed_at`; a resume does not. `POST /api/auth/confirm`
+  answers 403 on a wrong password - never 401, which the game reads as signed
+  out - and `CONFIRM_MAX_MISSES` (5) misses on one session is theft. **A new
+  route that moves gold, items or rank gets the decorator**, and the T-5 list
+  in `test_tokens.py` gets the path.
+- **The switch is the minimum build.** Until the owner sets it to 6 nothing is
+  enforced against an old game. At 6, `user_for_token()` ends every unhardened
+  session the next time it is shown (`why='old'`, `old_login`): otherwise a
+  token copied last week would live out its thirty days with a made-up build
+  number, and a `/resume` with it would bind a fresh token to the thief's copy.
+  Every player signs in once more.
+- **HSTS** on every `https` answer (`_security_headers()`); a local `http` run
+  gets none. The game refuses an `http://` server that is not this computer
+  (api.gd, `is_this_computer()`).
+- **A test that builds a hardened session sends both headers on every call.**
+  One request without `X-Elusion-Install` is theft and ends the account's
+  sessions, so the next check reads 401s - `game()` in `test_tokens.py` is the
+  helper.
+
 ## Deleting a character
 
 `POST /api/character/delete` (DELETING A CHARACTER in app.py,
@@ -1269,12 +1318,14 @@ letters come from the game through gamedata.json.
   still stored as typed - ids are not whitelisted).
 - **The broadcast names the piece, not the id**: `mythic_find_text()` reads
   `item_row()`, so a Perfect find says "found the Perfect Meteorite".
-- **`CURRENT_CLIENT_BUILD` is 5** (game 0.41.0): a build-2 game reads a
-  rolled id as its error item, a build-3 game a resisting one (below), and a
+- **`CURRENT_CLIENT_BUILD` is 6** (game 0.44.0): a build-2 game reads a
+  rolled id as its error item, a build-3 game a resisting one (below), a
   build-4 game - anything from 0.11 to 0.40 - draws nobody's aim or health and,
   in a browser left on an old upload, swings every keyboard attack at the
-  screen's corner (Gary's "only attack left" in Chrome). Raise the minimum to 5
-  once 0.41.0 is on the site, so every game in an area draws the same.
+  screen's corner (Gary's "only attack left" in Chrome), and a build-5 game
+  sends no install id, so its logins are not bound (TOKEN LIFECYCLE, below).
+  Raise the minimum to 6 once 0.44.0 is on the site: that binds every login,
+  ends every unbound one, and asks staff for the password again.
 - **One spelling means ASCII and the very end.** `_VARIANT_PART` and
   `_VARIANT_SUFFIX` said `\d` and `$` until 7 Oct: Python's `\d` is every
   Unicode digit and `$` matches before a final newline, so
@@ -1920,6 +1971,9 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
   staffcode     staff logins need the code from their email
   accounts      signing in: one game per account, the miss that locks,
                 no recovery-email demand with no mail
+  tokens        a token's life: bound to its copy of the game, rotated,
+                short for staff, the password again before the powerful
+                routes, HSTS, and the minimum build as the switch
   chatsafety    ignore, report and mute
   chardelete    deleting a character, and only the character
   rollback      the save history: snapshots, the owner's rollback, and

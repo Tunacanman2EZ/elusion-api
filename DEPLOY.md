@@ -450,7 +450,21 @@ address that changes every request, means it is not.
       that limitation is also the way back in if you ever lock yourself out:
       send the header by hand and set the minimum to 0. `set_min_build()`
       refuses a minimum above the newest build that exists, so getting into
-      that state takes deliberate effort rather than a typo.
+      that state takes deliberate effort rather than a typo. Since 0.44.0 a
+      login is bound to its copy of the game, so log in by hand first with a
+      made-up install id and use that token - the steps are in the docstring
+      of `_refuse_outdated_client()` in app.py, and `test_clientbuild.py` runs
+      them.
+
+- [ ] **Minimum build 6 turns on the token hardening (game 0.44.0).** Once
+      0.44.0 is on the site and the desktop download, set the minimum client
+      build to 6 on the GM panel's Server tab (it asks for your password
+      first). From then on every login is bound to its copy of the game, every
+      older login ends (everyone signs in once more), staff logins last 12
+      hours and end after 30 minutes away, and ranks, bans, gold, items,
+      rollback and the server switches ask for the password every 15 minutes.
+      A `[SECURITY] token theft suspected` line in the log is somebody's token
+      used from the wrong place; that account's sessions are already ended.
 
 - [ ] **Staff logins take a code, and you have seen one arrive.** A mod, dev
       or the owner with a confirmed recovery address gets a six-digit code by

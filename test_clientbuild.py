@@ -72,8 +72,16 @@ def check(label, condition, detail=""):
         print("  FAIL  %s   %s" % (label, detail))
 
 
+# WHICH COPY OF THE GAME, on every request (TOKEN LIFECYCLE, 0.44.0). The
+# accounts here register from a current game, so their logins are bound to
+# this id - and arming the gate at CURRENT (6 and up) ends every login that is
+# NOT bound. A suite whose sessions were unbound would read 401s from the
+# moment it armed the gate; test_tokens.py T-7 is where that rule is tested.
+INSTALL = "c" * 32
+
+
 def auth(token, build=None):
-    h = {"Authorization": "Bearer %s" % token}
+    h = {"Authorization": "Bearer %s" % token, app_module.INSTALL_HEADER: INSTALL}
     if build is not None:
         h[HEADER] = str(build)
     return h
@@ -81,7 +89,8 @@ def auth(token, build=None):
 
 def register(username, password="password123"):
     return client.post("/api/auth/register",
-                       json={"username": username, "password": password})
+                       json={"username": username, "password": password},
+                       headers={HEADER: str(CURRENT), app_module.INSTALL_HEADER: INSTALL})
 
 
 def set_min(token, build, my_build=CURRENT):
@@ -222,9 +231,7 @@ check("login itself is refused, rather than failing later", res.status_code == 4
 print("\n--- headers that are not numbers ---")
 
 for junk in ("banana", "1.0", "", "-4", "9999999999999999999999"):
-    res = client.get("/api/auth/session",
-                     headers={"Authorization": "Bearer %s" % player_token,
-                              HEADER: junk})
+    res = client.get("/api/auth/session", headers=auth(player_token, junk))
     # "-4" and the huge one parse as ints; max(0, ...) floors the negative at 0
     # and the huge one is genuinely newer than the minimum, so it passes. Both
     # are correct: the gate asks "older than", not "plausible".
@@ -260,10 +267,11 @@ check("an empty body is refused rather than read as zero", res.status_code == 40
 # THE WAY BACK IN, tested rather than promised. The gate is bypassable by
 # forging the header - that is stated plainly in its docstring - and that
 # limitation IS the recovery: an owner shut out by their own switch can send any
-# build number by hand and disarm it, with no shell on the box.
+# build number by hand and disarm it, with no shell on the box. Since 0.44.0 the
+# owner's login is bound to an install id, so the hand-made request sends one
+# (the docstring's recipe logs in fresh with a made-up id and uses that).
 res = client.post("/api/server/minbuild", json={"build": 0},
-                  headers={"Authorization": "Bearer %s" % owner_token,
-                           HEADER: "999999"})
+                  headers=auth(owner_token, "999999"))
 check("an owner can disarm it by forging the header - the documented way back",
       res.status_code == 200, str(res.status_code))
 check("and the gate is off afterwards",
@@ -331,6 +339,23 @@ res = client.get("/api/auth/session", headers=auth(player_token))
 check("and so does a setting with a non-number in it",
       res.status_code == 200, str(res.status_code))
 
+
+# THE DOCSTRING'S RECIPE, AS WRITTEN (0.44.0). An owner whose game is refused
+# has no game to send a bound token from, and the game's token without its id
+# is theft. So: log in by hand with a made-up id, then throw the switch with
+# the same two headers. Last in the file, because the fresh login ends the
+# owner's other session.
+print("\n--- the way back, by hand ---")
+set_min(owner_token, CURRENT)
+by_hand = {HEADER: "999", app_module.INSTALL_HEADER: "d" * 40}
+res = client.post("/api/auth/login", json={"username": "buildowner", "password": "password123"},
+                  headers=by_hand)
+hand_token = (res.get_json() or {}).get("token", "")
+res = client.post("/api/server/minbuild", json={"build": 0},
+                  headers=dict(by_hand, Authorization="Bearer %s" % hand_token))
+check("the recipe in the gate's docstring works: a login by hand with a made-up id, then the switch",
+      bool(hand_token) and res.status_code == 200
+      and client.get("/api/status").get_json().get("min_client_build") == 0, str(res.status_code))
 
 print("\n" + "=" * 70)
 print("  %d passed, %d failed" % (passed, failed))

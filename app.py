@@ -697,6 +697,12 @@ def _security_headers(resp):
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
     resp.headers.setdefault("X-Frame-Options", "DENY")
+    # HTTPS ONLY, FROM NOW ON (game 0.44.0, TOKEN LIFECYCLE): a browser that
+    # has reached this API over HTTPS once will not send a token over plain
+    # HTTP to it for a year. Only on an HTTPS answer - the header means
+    # nothing over HTTP, and a local run is HTTP.
+    if request.scheme == "https":
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
     return resp
 
 
@@ -855,14 +861,25 @@ def _refuse_outdated_client():
     THAT LIMITATION IS ALSO THE WAY BACK IN. Because the gate runs before
     authentication it has no idea who the owner is, so there is no exemption to
     build - but an owner shut out by their own switch can send the header by
-    hand and disarm it:
+    hand and disarm it. Since 0.44.0 (TOKEN LIFECYCLE) a login is bound to the
+    install id it came with, and the switch wants the password typed in the
+    last fifteen minutes, so the way back is a fresh login by hand with a
+    made-up id (32 or more hex characters), then the switch with the same two
+    headers and the token it answered:
 
+        curl -X POST https://host/api/auth/login \\
+             -H "X-Elusion-Build: 999" -H "X-Elusion-Install: <id>" \\
+             -H "Content-Type: application/json" \\
+             -d '{"username": "<owner>", "password": "<password>"}'
         curl -X POST https://host/api/server/minbuild \\
-             -H "Authorization: Bearer <owner-token>" \\
-             -H "X-Elusion-Build: 999" \\
+             -H "Authorization: Bearer <token>" \\
+             -H "X-Elusion-Build: 999" -H "X-Elusion-Install: <id>" \\
              -H "Content-Type: application/json" -d '{"build": 0}'
 
-    which needs no shell on the box. set_min_build() refuses a minimum above
+    (with staff login codes on, the first answers 202 and mails a code; send
+    it again with "code"). A bound token sent WITHOUT its id is theft and ends
+    every session, so the game's own token is no use here. None of it needs a
+    shell on the box. set_min_build() refuses a minimum above
     CURRENT_CLIENT_BUILD as well, so reaching that state takes deliberate effort
     rather than a typo.
     """
@@ -2402,6 +2419,17 @@ def init_db():
     # reads as offline until their client's next heartbeat - the truthful
     # default for a row nobody has vouched for yet.
     _migrate_add_column(db, "sessions", "last_seen_at", "INTEGER NOT NULL DEFAULT 0")
+    # TOKEN LIFECYCLE (game 0.44.0): which copy of the game the login is bound
+    # to, when it began, whether it is hardened, when its password was last
+    # typed, and wrong guesses at it since. Existing sessions are 0/'' - not
+    # hardened - and keep working exactly as before until they end.
+    _migrate_add_column(db, "sessions", "install_hash", "TEXT NOT NULL DEFAULT ''")
+    _migrate_add_column(db, "sessions", "created_at", "INTEGER NOT NULL DEFAULT 0")
+    _migrate_add_column(db, "sessions", "hardened", "INTEGER NOT NULL DEFAULT 0")
+    _migrate_add_column(db, "sessions", "confirmed_at", "INTEGER NOT NULL DEFAULT 0")
+    _migrate_add_column(db, "sessions", "confirm_misses", "INTEGER NOT NULL DEFAULT 0")
+    _migrate_add_column(db, "ended_sessions", "why", "TEXT NOT NULL DEFAULT 'elsewhere'")
+    _migrate_add_column(db, "ended_sessions", "install_hash", "TEXT NOT NULL DEFAULT ''")
 
     # "WHO IS ONLINE" IS A QUESTION ABOUT RECENT ROWS. Sessions last thirty
     # days, so the table holds every login of the last month and the ones
@@ -3053,23 +3081,30 @@ def validate_credentials(payload):
 # AUTH HELPERS
 # =============================================================================
 
-def issue_token(user_id, expires_at=None):
+def issue_token(user_id, expires_at=None, install_hash="", hardened=False, staff=False,
+                confirmed=False):
     """Mint a session token and store it. Returns (token, expires_at).
 
-    `expires_at` keeps an existing login's end date - see resume_session()."""
+    `expires_at` keeps an existing login's end date - see resume_session().
+    A HARDENED session (TOKEN LIFECYCLE) is bound to `install_hash`, and a
+    staff one ends STAFF_TOKEN_TTL after it began at the latest. `confirmed`
+    is a login whose password was just typed."""
     token = secrets.token_urlsafe(32)
     now = int(time.time())
     if expires_at is None:
         expires_at = now + TOKEN_TTL
+    if hardened and staff:
+        expires_at = min(int(expires_at), now + STAFF_TOKEN_TTL)
 
     db = get_db()
     # Seen NOW: whoever just logged in is, by definition, at the keyboard.
     # Only the hash is stored - see SESSION TOKENS ARE STORED AS HASHES. The
     # token itself leaves in the answer and is never written down here.
     db.execute(
-        "INSERT INTO sessions (token_hash, user_id, expires_at, last_seen_at)"
-        " VALUES (?, ?, ?, ?)",
-        (_token_hash(token), user_id, expires_at, now),
+        "INSERT INTO sessions (token_hash, user_id, expires_at, last_seen_at, install_hash, created_at,"
+        " hardened, confirmed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (_token_hash(token), user_id, expires_at, now, install_hash if hardened else "", now,
+         1 if hardened else 0, now if confirmed else 0),
     )
     db.commit()
 
@@ -3097,14 +3132,20 @@ def issue_token(user_id, expires_at=None):
 # else" instead of "signed out by the server". _token_hash() is defined above
 # init_db(); sessions are stored by the same hash.
 
-def _end_other_sessions(db, user_id, keep_token):
-    """Ends every session `user_id` holds except `keep_token`. Caller commits."""
+def _end_other_sessions(db, user_id, keep_token, rotated_token=None):
+    """Ends every session `user_id` holds except `keep_token`. Caller commits.
+
+    `rotated_token` is the session a /resume replaced: its row says so
+    ("rotated"), with the copy of the game it was bound to, so the token
+    coming back from anywhere else is caught (TOKEN LIFECYCLE)."""
     now = int(time.time())
     keep = _token_hash(keep_token)
-    for row in db.execute("SELECT token_hash FROM sessions WHERE user_id = ? AND token_hash != ?",
+    rotated = _token_hash(rotated_token) if rotated_token else ""
+    for row in db.execute("SELECT token_hash, install_hash FROM sessions WHERE user_id = ? AND token_hash != ?",
                           (user_id, keep)).fetchall():
-        db.execute("INSERT OR REPLACE INTO ended_sessions (token_hash, user_id, ended_at)"
-                   " VALUES (?, ?, ?)", (row["token_hash"], user_id, now))
+        why = "rotated" if row["token_hash"] == rotated else "elsewhere"
+        db.execute("INSERT OR REPLACE INTO ended_sessions (token_hash, user_id, ended_at, why, install_hash)"
+                   " VALUES (?, ?, ?, ?, ?)", (row["token_hash"], user_id, now, why, row["install_hash"] or ""))
     db.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?", (user_id, keep))
 
 
@@ -3120,6 +3161,160 @@ SIGNED_IN_ELSEWHERE_MESSAGE = ("This account signed in somewhere else, so this g
                                "was signed out.")
 
 
+# =============================================================================
+# TOKEN LIFECYCLE (game 0.44.0)
+# =============================================================================
+# The students' review of the hashed tokens, 6 October: "Your ticket closes
+# the database-leak vulnerability, but it doesn't cover token theft from
+# anywhere else" - a raw token copied out of browser storage, a log, a crash
+# dump, an extension or a clipboard still signs its holder in, with every
+# power the account has. "Your missing defense is Token-lifecycle hardening
+# through rotation, short lifetime, binding, revocation, and secure storage."
+# What each of those is here:
+#
+#   BINDING       A HARDENED session belongs to one copy of the game: the
+#                 install id the game sends with every request
+#                 (X-Elusion-Install), hashed, stored on the session. A
+#                 request on that session without it, or with another, is
+#                 THEFT - the token travelled without the game it came with.
+#   ROTATION      Unchanged: a new token at every login and every game start
+#                 (/resume), every other session ended. NEW: the token a
+#                 /resume replaced is remembered as "rotated", with its copy
+#                 of the game. That token coming back FROM ANOTHER COPY is
+#                 THEFT - somebody kept it. From the same copy (a second tab,
+#                 a request in flight) it is "signed in somewhere else", as
+#                 before.
+#   THEFT         Ends every session and trusted computer the account has,
+#                 tells every game why, and says so in the server log. The
+#                 password still works; the thief never had it.
+#   SHORT LIFE    A hardened STAFF session ends STAFF_TOKEN_TTL (12 hours)
+#                 after its login at the latest, and after STAFF_IDLE_SECONDS
+#                 (30 minutes) with no game running it (the heartbeat). A
+#                 player's still lasts TOKEN_TTL.
+#   STEP-UP       The most powerful routes (require_fresh_password: ranks,
+#                 bans, gold and items, rollback, the server's switches) need
+#                 the password typed within STEP_UP_SECONDS (15 minutes) -
+#                 POST /api/auth/confirm - so a token alone, staff or not,
+#                 cannot do them. CONFIRM_MAX_MISSES wrong guesses end every
+#                 session, as theft does.
+#   REVOCATION    Unchanged: logout, log out everywhere, a password change,
+#                 a ban, a kick, a reset.
+#   STORAGE       The server keeps only hashes (SESSION TOKENS ARE STORED AS
+#                 HASHES); HSTS keeps a browser from ever sending the token
+#                 over plain HTTP; the game refuses an http:// server that is
+#                 not this computer (api.gd).
+#
+# HARDENED means the login came from a game that sends the install id with
+# every request - client build HARDENED_BUILD (6) or later, saying so. Older
+# games keep the old sessions until the owner sets the minimum build to 6,
+# which is the switch that turns all of this on for everyone: an older game
+# is then refused, updates, and signs in again hardened.
+#
+# AND EVERY OLD LOGIN ENDS AT THAT SWITCH, not when it runs out. An unbound
+# token copied last week would otherwise keep working for up to TOKEN_TTL
+# with a made-up build number - and a /resume with it would even bind a fresh
+# token to the THIEF's copy of the game. So once the minimum build is
+# HARDENED_BUILD or more, an unhardened session is over the next time it is
+# shown, and the game says why ("old_login"). Every player types the password
+# once more; that is the price, paid once.
+HARDENED_BUILD = 6
+INSTALL_HEADER = "X-Elusion-Install"
+STAFF_TOKEN_TTL = 12 * 3600
+STAFF_IDLE_SECONDS = 30 * 60
+STEP_UP_SECONDS = 15 * 60
+CONFIRM_MAX_MISSES = 5
+TOKEN_STOLEN_MESSAGE = ("This login was used from somewhere it should not have been, so every "
+                        "session on the account was ended. Sign in again - and if that was not "
+                        "you, change your password.")
+STAFF_SESSION_ENDED_MESSAGE = "A staff login lasts 12 hours, and half an hour away. Sign in again."
+STEP_UP_MESSAGE = "Enter your password to do this."
+OLD_LOGIN_MESSAGE = "The game was updated, and logins from before the update have ended. Sign in again."
+
+
+def request_install_hash():
+    """The install id this request came with, hashed - "" for none."""
+    if not has_request_context():
+        return ""
+    return _install_hash(request.headers.get(INSTALL_HEADER))
+
+
+def login_hardening():
+    """(hardened, install hash) for a login or resume happening now: hardened
+    when the game is build HARDENED_BUILD or later and sends its install id."""
+    install = request_install_hash()
+    return bool(install) and client_build() >= HARDENED_BUILD, install
+
+
+def _end_for_theft(db, user_id, why_text):
+    """THEFT: every session and trusted computer of `user_id` ended, each
+    game told why, and the server log told. Caller need not commit."""
+    now = int(time.time())
+    rows = db.execute("SELECT token_hash, install_hash FROM sessions WHERE user_id = ?", (user_id,)).fetchall()
+    for row in rows:
+        db.execute("INSERT OR REPLACE INTO ended_sessions (token_hash, user_id, ended_at, why, install_hash)"
+                   " VALUES (?, ?, ?, 'stolen', ?)", (row["token_hash"], user_id, now, row["install_hash"] or ""))
+    db.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+    db.execute("DELETE FROM trusted_devices WHERE user_id = ?", (user_id,))
+    db.commit()
+    who = db.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+    app.logger.warning("[SECURITY] token theft suspected  user=%r  ip=%s  %s - %d session(s) ended",
+                       who["username"] if who else user_id, client_ip() if has_request_context() else "-",
+                       why_text, len(rows))
+
+
+def _hardened_session_holds(db, row, token):
+    """A hardened session's own rules, on every request: its copy of the game,
+    and for staff its short life. False (and the session gone) when broken."""
+    if has_request_context() and (row["session_install"] or "") != request_install_hash():
+        _end_for_theft(db, int(row["id"]), "a bound token came without its copy of the game")
+        return False
+    if role_at_least(row, "mod"):
+        now = int(time.time())
+        began = int(row["session_created"] or 0)
+        seen = int(row["session_seen"] or 0)
+        if (began and now - began > STAFF_TOKEN_TTL) or (seen and now - seen > STAFF_IDLE_SECONDS):
+            db.execute("INSERT OR REPLACE INTO ended_sessions (token_hash, user_id, ended_at, why, install_hash)"
+                       " VALUES (?, ?, ?, 'staff', ?)", (_token_hash(token), int(row["id"]), now,
+                                                          row["session_install"] or ""))
+            db.execute("DELETE FROM sessions WHERE token_hash = ?", (_token_hash(token),))
+            db.commit()
+            return False
+    return True
+
+
+def _ended_refusal(token):
+    """The 401 for a token that was ended rather than never valid, saying
+    why - or None. A REPLACED token back from another copy of the game is
+    theft, and ends everything the account still has."""
+    if not token:
+        return None
+    db = get_db()
+    row = db.execute("SELECT user_id, why, install_hash FROM ended_sessions WHERE token_hash = ?",
+                     (_token_hash(token),)).fetchone()
+    if row is None:
+        return None
+    why = str(row["why"] or "elsewhere")
+    if why == "rotated" and row["install_hash"] and row["install_hash"] != request_install_hash():
+        _end_for_theft(db, int(row["user_id"]), "a replaced token came back from another copy of the game")
+        why = "stolen"
+    if why == "stolen":
+        return {"error": "Unauthorized", "message": TOKEN_STOLEN_MESSAGE, "token_stolen": True}, 401
+    if why == "staff":
+        return {"error": "Unauthorized", "message": STAFF_SESSION_ENDED_MESSAGE, "staff_session_ended": True}, 401
+    if why == "old":
+        return {"error": "Unauthorized", "message": OLD_LOGIN_MESSAGE, "old_login": True}, 401
+    return {"error": "Unauthorized", "message": SIGNED_IN_ELSEWHERE_MESSAGE, "signed_in_elsewhere": True}, 401
+
+
+def _end_old_login(db, row, token):
+    """An unhardened session, shown after the minimum build reached
+    HARDENED_BUILD: ended, remembered as 'old' so the game can say why."""
+    db.execute("INSERT OR REPLACE INTO ended_sessions (token_hash, user_id, ended_at, why, install_hash)"
+               " VALUES (?, ?, ?, 'old', '')", (_token_hash(token), int(row["id"]), int(time.time())))
+    db.execute("DELETE FROM sessions WHERE token_hash = ?", (_token_hash(token),))
+    db.commit()
+
+
 def user_for_token(token):
     """Resolve a bearer token to a user row, or None if missing/expired."""
     if not token:
@@ -3132,7 +3327,8 @@ def user_for_token(token):
                u.is_banned, u.ban_expires_at, u.ban_reason, u.banned_by, u.banned_at,
                u.email_verified, u.name_hue,
                u.chat_muted_until, u.chat_mute_reason,
-               s.expires_at
+               s.expires_at, s.install_hash AS session_install, s.hardened, s.created_at AS session_created,
+               s.last_seen_at AS session_seen, s.confirmed_at
         FROM sessions s
         JOIN users u ON u.id = s.user_id
         WHERE s.token_hash = ?
@@ -3158,6 +3354,13 @@ def user_for_token(token):
     if ban_state(row) is not None:
         db.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
         db.commit()
+        return None
+
+    if int(row["hardened"] or 0):
+        if not _hardened_session_holds(db, row, token):
+            return None
+    elif min_client_build() >= HARDENED_BUILD:
+        _end_old_login(db, row, token)
         return None
 
     return row
@@ -4159,7 +4362,13 @@ CLIENT_BUILD_HEADER = "X-Elusion-Build"
 # but draws nobody's aim or health, and a browser left on an old upload swings
 # every keyboard attack at the screen's corner. Set the minimum to 5 once
 # 0.41.0 is on the site, and everyone in an area sees the same.
-CURRENT_CLIENT_BUILD = 5
+#
+# 6 (game 0.44.0): every request says which copy of the game sent it
+# (X-Elusion-Install), and a login from it is bound to that copy (TOKEN
+# LIFECYCLE). A build-5 game plays on with the old, unbound logins. Set the
+# minimum to 6 once 0.44.0 is on the site: that is the switch that binds every
+# login, ends every old one, and asks staff for the password again.
+CURRENT_CLIENT_BUILD = 6
 
 MAINTENANCE_DEFAULT_MESSAGE = "Update in progress - please come back later."
 
@@ -6118,6 +6327,23 @@ def require_role(minimum):
     return decorator
 
 
+def require_fresh_password(view):
+    """STEP-UP (TOKEN LIFECYCLE): the route needs the password typed within
+    STEP_UP_SECONDS on a hardened session - POST /api/auth/confirm - or it
+    answers 403 with confirm_password, and the game asks for it and tries
+    again. Below @require_auth and the rank's own decorator. An unhardened
+    session (an older game) is not asked: the minimum build is the switch."""
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        user = g.user
+        if int(user["hardened"] or 0) and int(time.time()) - int(user["confirmed_at"] or 0) > STEP_UP_SECONDS:
+            return {"error": "Forbidden", "message": STEP_UP_MESSAGE, "confirm_password": True}, 403
+        return view(*args, **kwargs)
+
+    wrapped._elusion_fresh_password = True
+    return wrapped
+
+
 def require_owner(view):
     """
     Decorator for the things only the server's owner may do - and, since
@@ -6185,12 +6411,9 @@ def require_auth(view):
         user = user_for_token(bearer_token())
         if user is None:
             # Only a refusal pays for this lookup, never a request that works.
-            if _ended_elsewhere(bearer_token()):
-                return {
-                    "error": "Unauthorized",
-                    "message": SIGNED_IN_ELSEWHERE_MESSAGE,
-                    "signed_in_elsewhere": True,
-                }, 401
+            ended = _ended_refusal(bearer_token())
+            if ended is not None:
+                return ended
             return {
                 "error": "Unauthorized",
                 "message": "Missing, invalid or expired token.",
@@ -6445,7 +6668,8 @@ def register():
         (ip, username, now - IP_WINDOW_SECONDS),
     )
     db.commit()
-    token, expires_at = issue_token(user_id)
+    hardened, bound_to = login_hardening()
+    token, expires_at = issue_token(user_id, install_hash=bound_to, hardened=hardened, confirmed=True)
     # The account's first address. Recorded here as well as on login, so an
     # account that registers and is banned before it ever logs in still carries
     # the link that makes its next sibling visible.
@@ -6843,7 +7067,9 @@ def login():
         )
         db.commit()
 
-    token, expires_at = issue_token(row["id"])
+    hardened, bound_to = login_hardening()
+    token, expires_at = issue_token(row["id"], install_hash=bound_to, hardened=hardened,
+                                    staff=role_at_least(row, "mod"), confirmed=True)
     # ONE LOGIN AT A TIME: only a login that got its token. A wrong password,
     # a ban or a staff code still to come ends nothing.
     _end_other_sessions(db, row["id"], token)
@@ -6982,8 +7208,12 @@ def resume_session():
     # here would let a remembered login - or a stolen token - renew itself
     # forever without anybody typing a password. It is the same login, moved.
     db = get_db()
-    token, expires_at = issue_token(g.user["id"], int(g.user["expires_at"]))
-    _end_other_sessions(db, g.user["id"], token)
+    hardened, bound_to = login_hardening()
+    token, expires_at = issue_token(g.user["id"], int(g.user["expires_at"]), install_hash=bound_to,
+                                    hardened=hardened, staff=role_at_least(g.user, "mod"))
+    # THE TOKEN IT CAME IN ON IS "ROTATED" (TOKEN LIFECYCLE): back from another
+    # copy of the game, it is theft.
+    _end_other_sessions(db, g.user["id"], token, rotated_token=bearer_token())
     db.commit()
     # A REMEMBERED LOGIN IS STILL A LOGIN from this computer and this address.
     # "Remember me" can carry a player for thirty days without a password, and
@@ -7005,6 +7235,62 @@ def resume_session():
         "email_verified": not needs_recovery_email(g.user),
         "needs_email": needs_recovery_email(g.user),
     }, 200
+
+
+@app.post("/api/auth/confirm")
+@require_auth
+def confirm_password():
+    """
+    Type the password again, for the routes that ask (STEP-UP)
+    ---
+    tags:
+      - Auth
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [password]
+          properties:
+            password: {type: string}
+    responses:
+      200:
+        description: Confirmed for STEP_UP_SECONDS on this session
+      400:
+        description: No password given
+      401:
+        description: Missing, invalid or expired token - or, after CONFIRM_MAX_MISSES wrong ones, every session ended
+      403:
+        description: The wrong password
+    """
+    # TOKEN LIFECYCLE, STEP-UP. A wrong one is 403, never 401: the game reads
+    # 401 as "signed out". CONFIRM_MAX_MISSES wrong ones on one session is
+    # somebody with the token guessing at the password, and is theft.
+    payload = request.get_json(silent=True) or {}
+    password = payload.get("password")
+    if not isinstance(password, str) or not password:
+        return bad_request("password is required")
+    db = get_db()
+    row = db.execute("SELECT password_hash FROM users WHERE id = ?", (int(g.user["id"]),)).fetchone()
+    token_hash = _token_hash(bearer_token())
+    if row is None or not check_password_hash(row["password_hash"], password):
+        db.execute("UPDATE sessions SET confirm_misses = confirm_misses + 1 WHERE token_hash = ?", (token_hash,))
+        db.commit()
+        misses = db.execute("SELECT confirm_misses FROM sessions WHERE token_hash = ?", (token_hash,)).fetchone()
+        if misses is not None and int(misses["confirm_misses"]) >= CONFIRM_MAX_MISSES:
+            _end_for_theft(db, int(g.user["id"]), "%d wrong passwords to confirm" % CONFIRM_MAX_MISSES)
+            return {"error": "Unauthorized", "message": TOKEN_STOLEN_MESSAGE, "token_stolen": True}, 401
+        return {"error": "Forbidden", "message": "That is not your password.", "confirm_password": True}, 403
+    now = int(time.time())
+    db.execute("UPDATE sessions SET confirmed_at = ?, confirm_misses = 0 WHERE token_hash = ?", (now, token_hash))
+    db.commit()
+    return {"confirmed": True, "until": now + STEP_UP_SECONDS}, 200
 
 
 @app.post("/api/auth/logout")
@@ -7215,7 +7501,9 @@ def change_password():
     db.commit()
 
     revoked = cursor.rowcount
-    token, expires_at = issue_token(row["id"])
+    hardened, bound_to = login_hardening()
+    token, expires_at = issue_token(row["id"], install_hash=bound_to, hardened=hardened,
+                                    staff=role_at_least(row, "mod"), confirmed=True)
     _record_login_attempt(db, row["username"], ip, True, "password-changed")
 
     app.logger.warning(
@@ -10790,6 +11078,7 @@ ONLINE_WINDOW_SECONDS = 45
 @app.post("/api/staff/ban")
 @require_auth
 @require_role("mod")
+@require_fresh_password
 def ban_account():
     """
     Ban an account
@@ -10990,6 +11279,7 @@ def kick_account():
 @app.post("/api/staff/unban")
 @require_auth
 @require_role("mod")
+@require_fresh_password
 def unban_account():
     """
     Lift a ban
@@ -11044,6 +11334,7 @@ def unban_account():
 @app.put("/api/staff/role")
 @require_auth
 @require_role("mod")
+@require_fresh_password
 def set_account_role():
     """
     Change an account's rank
@@ -11121,6 +11412,7 @@ DEBUG_GOLD_MAX = 1000000
 @app.post("/api/staff/gold")
 @require_auth
 @require_owner
+@require_fresh_password
 def staff_gold():
     """
     Give yourself gold for testing (owner only)
@@ -11243,6 +11535,7 @@ STAFF_LEVEL_MAX = 99
 @app.post("/api/staff/level")
 @require_auth
 @require_owner
+@require_fresh_password
 def staff_level():
     """
     Set a character's level - yours, or the one a player is playing (owner only)
@@ -11420,6 +11713,7 @@ STAFF_SKILL_ORDER = ("attack", "defense", "agility", "magic", "fishing", "cookin
 @app.post("/api/staff/skill")
 @require_auth
 @require_owner
+@require_fresh_password
 def staff_skill():
     """
     Set your own character's skill levels, for testing (owner only)
@@ -11535,6 +11829,7 @@ def staff_skill():
 @app.post("/api/staff/grant")
 @require_auth
 @require_owner
+@require_fresh_password
 def staff_grant():
     """
     Give an item to yourself or to a player (owner only)
@@ -12259,6 +12554,7 @@ def staff_snapshots():
 @app.post("/api/staff/rollback")
 @require_auth
 @require_owner
+@require_fresh_password
 def staff_rollback():
     """
     Put a player's character back to a snapshot (owner only)
@@ -13654,6 +13950,7 @@ def server_status():
 @app.post("/api/server/maintenance")
 @require_auth
 @require_owner
+@require_fresh_password
 def set_maintenance():
     """
     Close or reopen the server (owner only)
@@ -13787,6 +14084,7 @@ def set_maintenance():
 @app.post("/api/server/minbuild")
 @require_auth
 @require_owner
+@require_fresh_password
 def set_min_build():
     """
     Set the oldest client build allowed to connect (owner only)
@@ -13867,6 +14165,7 @@ def set_min_build():
 @app.post("/api/server/pvp")
 @require_auth
 @require_owner
+@require_fresh_password
 def set_pvp():
     """
     Turn player-versus-player on or off (owner only)
@@ -13945,6 +14244,7 @@ def set_pvp():
 @app.post("/api/server/trade")
 @require_auth
 @require_owner
+@require_fresh_password
 def set_trade():
     """
     Let players open trades, or stop them (owner only)

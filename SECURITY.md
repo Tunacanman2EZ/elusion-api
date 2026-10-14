@@ -294,6 +294,24 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     record, not money: the gold supply is still the gold ledger's.
     → Held by: `test_gifts.py` — "a give of 999 Piles of Gold to a player is one row: gold, at what using them pays", "a full bag is a 409 and no row", "a grant by a dev is a 404 and no row", "a player, a mod and a dev all get the same bare 404", "a pile's price changed tomorrow does not rewrite what was given today", "the gold supply holds: the gifts ledger is a record, not money"
     → and in the game: `src/tools/testrunner.gd` — `_test_gifts_are_counted()`
+33. **A login is bound to the copy of the game that made it, staff logins are
+    short, and the most powerful routes want the password again** (0.44.0,
+    TOKEN LIFECYCLE in app.py). A login or resume from game build 6 or later
+    sends the game's install id with every request and is bound to its hash.
+    The same token without it, or from another copy, is treated as stolen:
+    every session and trusted computer on the account ends, the real game is
+    told to sign in again and change the password if it was not them, and the
+    server log says so - never with the token. A token replaced by a resume
+    that comes back from another copy is theft too. A staff login lasts at most
+    12 hours and ends after 30 minutes with no game using it. Ranks, bans,
+    gold, levels, skills, items, rollback and the server's switches need the
+    password typed in the last 15 minutes, and five wrong guesses on one
+    session count as theft. HTTPS answers carry HSTS for a year, and the game
+    sends nothing over plain http that leaves the computer. **It switches on
+    with the minimum build**: until the owner sets it to 6 an older game's
+    login is unbound, and at 6 every unbound login ends.
+    → Held by: `test_tokens.py` — "THE SAME TOKEN WITHOUT ITS GAME - copied from a log, a clipboard, a crash dump - is refused as theft", "the replaced token from ANYWHERE ELSE is theft: somebody kept it", "a hardened staff login ends within STAFF_TOKEN_TTL (12 hours)", "a staff session with no game running it for half an hour is over, and says so", "fifteen minutes on, the token alone is not enough: 403, asking for the password", "CONFIRM_MAX_MISSES wrong guesses at the password on one session is theft: every session ends", "an HTTPS answer carries HSTS for a year", "once the minimum build is 6, an unbound login is over - whatever build it claims to come from", "  and no token, or its hash, in any line of it"
+    → and in the game: `src/tools/testrunner.gd` — `_test_token_lifecycle()`
 
 ---
 
@@ -321,6 +339,13 @@ No comforting lies. These are known, named and open.
   deleting its file, a second browser for the web build, or a modified game
   that sends a fresh id each time gets past it. It stops the VPN, not someone
   who knows where to look - the staff link view is still what catches them.
+- **The binding is to what the game says it is, not to the computer.** The
+  install id is a random file the game keeps, and a token is bound to the hash
+  of whatever id comes with it. Malware that can read the session file can read
+  `install.cfg` beside it, and send both. Binding stops a token copied from a
+  log, a screenshot or a shared file; it does not stop somebody who already
+  owns the computer. Proof of possession (a key the game never sends, signing
+  each request) would, and is not built.
 - **A patched client can ignore a 401 and keep drawing the world.** What it
   cannot do is **save, trade, loot, or report a kill the server will accept** —
   all four are authenticated server-side. The heartbeat fixes the honest client
