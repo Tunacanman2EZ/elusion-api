@@ -941,6 +941,113 @@ async def run(port, server):
     await asyncio.sleep(0.1)
 
     # =========================================================================
+    section("P-11 PARTY VOICE: A CALL'S SETUP PASSES ONLY BETWEEN TWO IN VOICE IN ONE PARTY")
+    # =========================================================================
+    # Game 0.43.0. The owner: "I really really want the option for voice chat
+    # in game for parties". The voice never comes here; what starts a call does.
+    VA = account("presva")
+    VB = account("presvb", "mage")
+    VC = account("presvc", "healer")
+    VD = account("presvd", "tank")
+    va, _ = await enter(port, VA, "town")
+    vb, _ = await enter(port, VB, "voiceside")
+    vc_, _ = await enter(port, VC, "town")
+    vd, _ = await enter(port, VD, "town")
+    for ws in (va, vb, vc_, vd):
+        await collect(ws)
+
+    def voice(messages):
+        return of(messages, "vs")
+
+    await va.send(json.dumps({"t": "vs", "on": True}))
+    got = voice(await collect(va))
+    check("joining voice in no party: told no (off: party), and not in it",
+          got == [{"t": "vs", "off": "party"}] and not server.players[uid("presva")].voice, got)
+    client.post("/api/party/invite", headers=VA, json={"username": "presvb"})
+    client.post("/api/party/respond", headers=VB, json={"from": "presva", "accept": True})
+    client.post("/api/party/invite", headers=VA, json={"username": "presvc"})
+    client.post("/api/party/respond", headers=VC, json={"from": "presva", "accept": True})
+    await va.send(json.dumps({"t": "vs", "on": True}))
+    got = voice(await collect(va))
+    check("the first in voice in a party is told nobody else is", got == [{"t": "vs", "in": []}], got)
+    await vb.send(json.dumps({"t": "vs", "on": True}))
+    got_b, got_a = voice(await collect(vb)), voice(await collect(va))
+    check("the next is told who is (it calls them) - in another area, too",
+          got_b == [{"t": "vs", "in": [{"id": uid("presva"), "name": "presva"}]}], got_b)
+    check("  and they are told it came (they wait for its call)",
+          got_a == [{"t": "vs", "join": {"id": uid("presvb"), "name": "presvb"}}], got_a)
+    offer = {"k": "sdp", "sdp": {"type": "offer", "sdp": "v=0\r\n" + "a=x\r\n" * 600}}
+    await vb.send(json.dumps({"t": "vc", "to": uid("presva"), "d": offer}))
+    got = of(await collect(va), "vc")
+    check("a call's setup passes between two in voice in one party, as sent, with who from - "
+          "even past the socket's usual size (a description is kilobytes)",
+          got == [{"t": "vc", "from": uid("presvb"), "d": offer}]
+          and len(json.dumps(offer)) > presence.MAX_MESSAGE_BYTES, len(json.dumps(offer)))
+    await vd.send(json.dumps({"t": "vc", "to": uid("presva"), "d": {"k": "ice"}}))
+    await vc_.send(json.dumps({"t": "vc", "to": uid("presva"), "d": {"k": "ice"}}))
+    await va.send(json.dumps({"t": "vc", "to": uid("presvc"), "d": {"k": "ice"}}))
+    await va.send(json.dumps({"t": "vc", "to": uid("presvd"), "d": {"k": "ice"}}))
+    heard = [of(await collect(ws), "vc") for ws in (va, vc_, vd)]
+    check("nothing passes from somebody in no party, from a member not in voice, "
+          "or to somebody not in voice or not in the party", heard == [[], [], []], heard)
+    # ANOTHER PARTY, IN VOICE TOO: in voice is not enough - the same party is.
+    VE = account("presve", "mage")
+    ve, _ = await enter(port, VE, "town")
+    await collect(ve)
+    client.post("/api/party/invite", headers=VD, json={"username": "presve"})
+    client.post("/api/party/respond", headers=VE, json={"from": "presvd", "accept": True})
+    await vd.send(json.dumps({"t": "vs", "on": True}))
+    await ve.send(json.dumps({"t": "vs", "on": True}))
+    await collect(vd), await collect(ve)
+    await vd.send(json.dumps({"t": "vc", "to": uid("presva"), "d": {"k": "ice"}}))
+    await va.send(json.dumps({"t": "vc", "to": uid("presve"), "d": {"k": "ice"}}))
+    crossed = [of(await collect(ws), "vc") for ws in (va, ve)]
+    await vd.send(json.dumps({"t": "vc", "to": uid("presve"), "d": {"k": "ice"}}))
+    own = of(await collect(ve), "vc")
+    check("nor between two in voice in two different parties - while within one, it does",
+          crossed == [[], []] and own == [{"t": "vc", "from": uid("presvd"), "d": {"k": "ice"}}], (crossed, own))
+    for bad in ({"t": "vc", "to": True, "d": {}}, {"t": "vc", "to": uid("presva"), "d": "text"},
+                {"t": "vc", "to": uid("presvb"), "d": {}}, {"t": "vc", "d": {}}):
+        await vb.send(json.dumps(bad))
+    check("  nor anything not shaped as a call's setup, or to yourself", of(await collect(va), "vc") == []
+          and of(await collect(vb), "vc") == [])
+    sent = int(presence.VOICE_BURST) + 10
+    for i in range(sent):
+        await vb.send(json.dumps({"t": "vc", "to": uid("presva"), "d": {"k": "ice", "n": i}}))
+    passed_on = len(of(await collect(va, 0.6), "vc"))
+    check("at most VOICE_BURST at once pass on, however many are sent",
+          int(presence.VOICE_BURST) - 1 <= passed_on <= int(presence.VOICE_BURST) + 2 and passed_on < sent,
+          (passed_on, sent))
+    big, _ = await enter(port, account("presvbig"), "town")
+    await collect(big)
+    await big.send(json.dumps({"t": "vc", "to": uid("presva"), "d": {"x": "y" * (presence.VOICE_MAX_BYTES + 10)}}))
+    check("  and none bigger than VOICE_MAX_BYTES: the socket goes",
+          "too big" in byes(await collect(big)), "")
+    await vc_.send(json.dumps({"t": "vs", "on": True}))
+    await collect(vc_)
+    await collect(va), await collect(vb)
+    client.post("/api/party/leave", headers=VB)
+    await asyncio.sleep(0.5)
+    got_b, got_a, got_c = voice(await collect(vb)), voice(await collect(va)), voice(await collect(vc_))
+    check("leaving the party takes you out of its voice within a sweep",
+          {"t": "vs", "off": "party"} in got_b and not server.players[uid("presvb")].voice, got_b)
+    check("  and the others are told you left it",
+          {"t": "vs", "left": uid("presvb")} in got_a and {"t": "vs", "left": uid("presvb")} in got_c, (got_a, got_c))
+    await vb.send(json.dumps({"t": "vc", "to": uid("presva"), "d": {"k": "ice"}}))
+    check("  after which nothing of yours reaches them", of(await collect(va), "vc") == [])
+    await vc_.send(json.dumps({"t": "vs", "on": False}))
+    got = voice(await collect(va))
+    check("switching voice off tells the others", got == [{"t": "vs", "left": uid("presvc")}], got)
+    await vc_.send(json.dumps({"t": "vs", "on": True}))
+    await collect(vc_), await collect(va)
+    await va.close()
+    got = voice(await collect(vc_))
+    check("closing the game is leaving voice", got == [{"t": "vs", "left": uid("presva")}], got)
+    for ws in (vb, vc_, vd, ve, big):
+        await ws.close()
+    await asyncio.sleep(0.1)
+
+    # =========================================================================
     section("P-6 LEAVING")
     # =========================================================================
     await a.close()

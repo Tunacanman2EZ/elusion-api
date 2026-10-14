@@ -84,6 +84,8 @@ THE WIRE (JSON text frames):
                                                          the others, never a hit - see below
     {"t": "l", "n": "ysortworld/interactables/levergatesout", "on": true}
                                                          I pulled a lever (0.19.0)
+    {"t": "vs", "on": true}                              my party's voice: in, or out (0.43.0)
+    {"t": "vc", "to": 40, "d": {...}}                    a voice call's setup, for 40 (0.43.0)
 
   here -> game
     {"t": "welcome", "id": 12, "v": 2, "books": true, "x": 1}
@@ -110,6 +112,12 @@ THE WIRE (JSON text frames):
                                                          id 0 is the server's books
     {"t": "w", "d": {...}}                               the leader's monsters, passed on as sent
     {"t": "h", "from": 40, "p": [[m, dmg, el], ...]}     (to the leader) 40's hits
+    {"t": "vs", "in": [{"id": 40, "name": "bob"}]}       (you joined voice) who is already in it;
+                                                         call each of them
+    {"t": "vs", "join": {"id": 41, "name": "ann"}}       41 joined your party's voice; they call you
+    {"t": "vs", "left": 40}                              40 left it, or the party
+    {"t": "vs", "off": "party"}                          you are out of voice: no party, or a new one
+    {"t": "vc", "from": 40, "d": {...}}                  40's call setup, as sent
     {"t": "bye", "why": "..."}                           and then the socket closes
 
 THE BOOKS (0.10.0). Every world message from a leader and every hit from a
@@ -149,8 +157,22 @@ the next game in loads the scene afresh. At most MAX_LEVERS_PER_AREA names per
 area, each a node path in the scene (LEVER_PATTERN) that each game looks up in
 its own copy.
 
-test_presence.py holds every rule here, P-8 the books, P-9 attacks and levers;
-test_combatbook.py the books themselves.
+PARTY VOICE (game 0.43.0). The owner: "I really really want the option for voice
+chat in game for parties". The voice itself never comes here: each game's
+browser calls the others in its party directly - WebRTC, through a TURN relay,
+so nobody learns anybody's address (GET /api/party/voice hands out the relay's
+short-lived credentials). What a call needs to start is a few messages each
+way, and this socket carries them ("vc"), opaque, but ONLY BETWEEN TWO GAMES IN
+VOICE IN THE SAME PARTY. "vs" says who is in voice: a game that joins is told
+who already is and calls each of them; they are told it joined and wait for its
+call - so for any two, exactly one calls. The party is read from party_members
+when a game joins voice and again every SWEEP_SECONDS; a game that left its
+party, or whose party changed, is taken out of voice ("off") and the others
+are told ("left"). At most VOICE_MAX_BYTES a message (a call's description is a
+few kilobytes) and VOICE_RATE a second, on top of the socket's own bucket.
+
+test_presence.py holds every rule here, P-8 the books, P-9 attacks and levers,
+P-11 party voice; test_combatbook.py the books themselves.
 """
 import envfile
 envfile.load()
@@ -209,6 +231,12 @@ MAX_SOCKET_BYTES = MAX_WORLD_BYTES
 # room for a renew.
 RATE_PER_SECOND = 40.0
 BURST = 80.0
+# PARTY VOICE (0.43.0): a call's description (SDP) is a few kilobytes; its
+# candidates a few hundred bytes each. A call to three others is about twenty
+# messages; this allows several times that at once, and a steady few a second.
+VOICE_MAX_BYTES = 16384
+VOICE_BURST = 60.0
+VOICE_RATE_PER_SECOND = 6.0
 MAX_CONNECTIONS = 1000
 
 # The shared-monster wire. A game says which it speaks in its hello.
@@ -436,6 +464,25 @@ def write_heal_grants(rows, at):
     return out
 
 
+def parties_of(user_ids):
+    """{user_id: party_id} for those of these accounts that are in a party."""
+    ids = [int(u) for u in user_ids]
+    if not ids:
+        return {}
+    conn = _connect()
+    try:
+        marks = ",".join("?" * len(ids))
+        rows = conn.execute("SELECT user_id, party_id FROM party_members WHERE user_id IN (%s)" % marks,
+                            ids).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
+        return {}
+    finally:
+        conn.close()
+    return {int(r["user_id"]): int(r["party_id"]) for r in rows}
+
+
 def still_valid(ticket_hashes, now=None):
     """Which of these ticket hashes are in date with their login alive."""
     hashes = list(ticket_hashes)
@@ -497,6 +544,11 @@ class Player:
         # walked into its current area - the leader is the earliest.
         self.version = 0
         self.joined_at = 0.0
+        # PARTY VOICE: in it, and the party it was in when it last checked.
+        self.voice = False
+        self.voice_party = 0
+        self.voice_tokens = VOICE_BURST
+        self.voice_stamp = time.monotonic()
 
     @property
     def shares(self):
@@ -511,6 +563,19 @@ class Player:
             return False
         self.tokens -= 1.0
         return True
+
+    def allow_voice(self):
+        """PARTY VOICE's own bucket, beside allow()."""
+        now = time.monotonic()
+        self.voice_tokens = min(VOICE_BURST, self.voice_tokens + (now - self.voice_stamp) * VOICE_RATE_PER_SECOND)
+        self.voice_stamp = now
+        if self.voice_tokens < 1.0:
+            return False
+        self.voice_tokens -= 1.0
+        return True
+
+    def voice_entry(self):
+        return {"id": self.user_id, "name": str(self.identity.get("name", ""))}
 
     def entry(self):
         """Who this is and where, for a join."""
@@ -990,6 +1055,81 @@ class PresenceServer:
         if self.players.get(player.user_id) is player:
             del self.players[player.user_id]
         self._leave_room(player)
+        self._voice_out(player)
+
+    # ---- party voice ---------------------------------------------------------
+
+    def _voice_mates(self, player):
+        """The others in voice in this player's party."""
+        if not player.voice or not player.voice_party:
+            return []
+        return [p for p in self.players.values()
+                if p is not player and p.voice and p.voice_party == player.voice_party and not p.dropped]
+
+    def _voice_out(self, player, why=None):
+        """Out of voice, and the others in it told. `why` tells the player too."""
+        if not player.voice:
+            return
+        mates = self._voice_mates(player)
+        player.voice = False
+        player.voice_party = 0
+        if mates:
+            broadcast([p.ws for p in mates], json.dumps({"t": "vs", "left": player.user_id},
+                                                        separators=(",", ":")))
+        if why is not None and not player.dropped:
+            broadcast([player.ws], json.dumps({"t": "vs", "off": why}, separators=(",", ":")))
+
+    async def voice_state(self, player, msg):
+        """In or out of the party's voice. In: told who is already there (it
+        calls them), and they are told it came (they wait for its call)."""
+        if msg.get("on") is not True:
+            self._voice_out(player)
+            return
+        party = (await asyncio.to_thread(parties_of, [player.user_id])).get(player.user_id, 0)
+        if player.dropped or self.players.get(player.user_id) is not player:
+            return
+        if not party:
+            self._voice_out(player)
+            await self._send(player, {"t": "vs", "off": "party"})
+            return
+        if player.voice and player.voice_party == party:
+            # Already in: say again who is, and nothing else changes.
+            await self._send(player, {"t": "vs", "in": [p.voice_entry() for p in self._voice_mates(player)]})
+            return
+        self._voice_out(player)
+        player.voice = True
+        player.voice_party = party
+        mates = self._voice_mates(player)
+        await self._send(player, {"t": "vs", "in": [p.voice_entry() for p in mates]})
+        if mates:
+            broadcast([p.ws for p in mates], json.dumps({"t": "vs", "join": player.voice_entry()},
+                                                        separators=(",", ":")))
+
+    async def voice_signal(self, player, msg):
+        """A call's setup to one other game - only to one in voice in the same
+        party, and only as fast as VOICE_RATE_PER_SECOND."""
+        if not player.voice or not player.allow_voice():
+            return
+        to = msg.get("to")
+        data = msg.get("d")
+        if isinstance(to, bool) or not isinstance(to, int) or not isinstance(data, dict):
+            return
+        target = self.players.get(to)
+        if target is None or target is player or not player.voice or not target.voice \
+                or not player.voice_party or target.voice_party != player.voice_party or target.dropped:
+            return
+        await self._send(target, {"t": "vc", "from": player.user_id, "d": data})
+
+    async def sweep_voice(self):
+        """Everybody in voice still in the party they joined it with - read
+        again, and anybody who is not taken out."""
+        talking = [p for p in self.players.values() if p.voice]
+        if not talking:
+            return
+        parties = await asyncio.to_thread(parties_of, [p.user_id for p in talking])
+        for p in talking:
+            if p.voice and parties.get(p.user_id, 0) != p.voice_party and self.players.get(p.user_id) is p:
+                self._voice_out(p, "party")
 
     async def renew(self, player, msg):
         found = await asyncio.to_thread(lookup_ticket, msg.get("ticket"))
@@ -1071,7 +1211,7 @@ class PresenceServer:
                 # ONLY A WORLD MESSAGE MAY BE BIG. The socket takes up to
                 # MAX_SOCKET_BYTES so a leader can describe Big Field to a game
                 # that walked in; anything else that size is not a game.
-                if kind != "w" and len(raw) > MAX_MESSAGE_BYTES:
+                if kind != "w" and len(raw) > (VOICE_MAX_BYTES if kind == "vc" else MAX_MESSAGE_BYTES):
                     await self.drop(player, "too big", 1009)
                     continue
                 if kind == "s":
@@ -1101,6 +1241,10 @@ class PresenceServer:
                         await self.grant_heals()
                 elif kind == "l":
                     self.pull_lever(player, message)
+                elif kind == "vs":
+                    await self.voice_state(player, message)
+                elif kind == "vc":
+                    await self.voice_signal(player, message)
         except ConnectionClosed:
             pass
         finally:
@@ -1192,6 +1336,7 @@ class PresenceServer:
         for p in players:
             if p.ticket_hash not in valid and self.players.get(p.user_id) is p:
                 await self.drop(p, "signed out", 1008)
+        await self.sweep_voice()
 
     def start_clocks(self):
         self._tasks = [asyncio.create_task(self.tick_loop()), asyncio.create_task(self.sweep_loop())]

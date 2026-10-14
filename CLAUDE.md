@@ -770,6 +770,42 @@ with "Party chat" and "Party on the map".
   `PARTY_CHAT_NO_PARTY` for somebody in none - guild chat's rules exactly.
 - test_parties.py.
 
+## Party voice and reporting a player (game 0.43.0)
+
+The owner: "I really really want the option for voice chat in game for
+parties", and "clicking over a person should have add friend inv to guild or
+party and report button that syncs to our mod/dev/owner". He chose the
+browser's own calling through Cloudflare's TURN relay.
+
+- **The sound never comes here.** Each game in a party calls each other one
+  (WebRTC, a mesh of at most four) through the TURN relay, told to use the
+  relay and nothing else (`iceTransportPolicy: "relay"`), so nobody learns an
+  address. `GET /api/party/voice` (`party_voice()`, PARTY VOICE) hands a party
+  member the relay's short-lived credentials, made from the server's TURN key
+  (`ELUSION_TURN_KEY_ID`, `ELUSION_TURN_KEY_TOKEN`) by asking Cloudflare
+  (`_turn_fetch()`, a seam). A day's credentials, handed out again while 12
+  hours are left; at most `VOICE_FETCHES_PER_HOUR` asks of the relay per
+  player. What the relay answers is checked (`clean_ice_servers()`: STUN and
+  TURN addresses only, none on port 53, TURN ones only with their password).
+  No key: 503, "not set up". `ELUSION_VOICE_DIRECT=on` - a test on one
+  computer - hands out no relay and allows direct calls; never live.
+- **Who may pass a call's setup to whom** is presence.py's (PARTY VOICE): `vs`
+  in and out of voice, `vc` a call's setup, passed only between two games in
+  voice in the same party, the party read from `party_members` on joining and
+  every sweep. Only `vc` may be up to `VOICE_MAX_BYTES` (16 KB), on its own
+  bucket.
+- **Reporting a player** (`POST /api/report/player`, `report_player()`): a
+  `chat_reports` row with channel `player` and `message_id`
+  `-((reported_id << 32) | reporter_id)` - negative, which no line has - so it
+  sits on that player's card on the Reports tab, counts in the badge, shares
+  the hour's report limit and closes with the same buttons
+  (`/api/staff/reports/resolve` takes a negative id). One per reporter and
+  player while open; reporting again after it closed opens it again. The body
+  is where they were seen ("Reported in big field"), from an area id or "in
+  the world".
+- test_voice.py (V-1 to V-8) and test_presence.py P-11. DEPLOY.md, "Party
+  voice: the TURN relay", is the key's setup.
+
 ## Chat is one line, as typed, and a whisper finds you
 
 **`clean_player_text(raw, limit)`** is the one rule for text other players

@@ -233,6 +233,46 @@ settings file and restart `elusion-presence`. **Nothing a player sees depends
 on them** - a kill is paid as before - so off is always safe. Read what they
 found with `killwatch.py` (below), tier WATCHED.
 
+### Party voice: the TURN relay (game 0.43.0)
+
+Party voice is the browser's own calling (api/CLAUDE.md, "Party voice"). The
+sound never passes through this server: every call goes through **Cloudflare's
+TURN relay**, so no player sees another's internet address, and this server
+hands each party member short-lived credentials for it (`GET /api/party/voice`).
+It needs a TURN key, which only you handle:
+
+1. In the Cloudflare dashboard, under **Realtime**, create a **TURN key**
+   (any name, e.g. `elusion-voice`). It shows two values: the key's **ID** and
+   its **API token**. The token is shown once; keep it like a password.
+2. On the droplet, add both to the settings file - never to the repository:
+
+   ```
+   sudo nano /etc/elusion/elusion.env
+   ```
+
+   ```
+   ELUSION_TURN_KEY_ID=<the key's ID>
+   ELUSION_TURN_KEY_TOKEN=<its API token>
+   ```
+
+3. Restart the API: `update_server.sh --restart`.
+4. In the game: two players in a party, Party > Voice on, in the browser. The
+   first time, the browser asks for the microphone.
+
+Without the key the switch says "Voice is not set up on this server yet." and
+nothing else changes. The API reaches `rtc.live.cloudflare.com` over HTTPS
+(outbound 443, open on a default droplet); a refused or unreachable relay is
+logged as `[VOICE] the TURN relay answered <status>` - never with the token.
+
+**What it costs**, as Cloudflare listed it in October 2026: the first 1,000 GB
+of relayed traffic a month free, then $0.05 a GB. A voice is tens of kilobits a
+second, so that is thousands of party-hours a month
+(developers.cloudflare.com/realtime/pricing/).
+
+`ELUSION_VOICE_DIRECT=on` makes the route hand out no relay and allow direct
+calls - **for a test on one computer only**; on a public server it would show
+players each other's addresses. Leave it out of the live settings file.
+
 ### Updating the server
 
 **In one command**, from the PC (it asks for the server's password, as ssh

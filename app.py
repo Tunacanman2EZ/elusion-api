@@ -15330,6 +15330,91 @@ def report_chat_line():
     return {"id": message_id, "reported": True}, 200
 
 
+@app.post("/api/report/player")
+@require_auth
+def report_player():
+    """
+    Tell staff about a player - not one line, the player (game 0.43.0)
+    ---
+    tags:
+      - Chat
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [username, reason]
+          properties:
+            username: {type: string}
+            reason:   {type: string, enum: [spam, harassment, hate, cheating, other]}
+            area:     {type: string, description: "Where you saw them, an area id - for the staff card"}
+    responses:
+      200:
+        description: Reported (or already reported by you and still open - "already" says so)
+      400:
+        description: A bad reason, or yourself
+      404:
+        description: No such account
+      429:
+        description: Too many reports this hour
+    """
+    # THE OWNER: "clicking over a person should have add friend inv to guild or
+    # party and report button that syncs to our mod/dev/owner". A report about
+    # a player is a row in chat_reports beside the reported lines, so it lands
+    # on the same card on the staff Reports tab, counts in the same badge, and
+    # is closed by the same buttons. Its channel is "player", and its
+    # message_id - the key a line's reports share - is NEGATIVE: one per
+    # reporter and player, -((reported_id << 32) | reporter_id), which no chat
+    # line ever has. So one person reporting one player again is not a second
+    # report while the first is open, and re-opens it once it was closed.
+    payload = request.get_json(silent=True) or {}
+    name = str(payload.get("username", "")).strip()
+    reason = str(payload.get("reason", "")).strip().lower()
+    if reason not in REPORT_REASONS:
+        return bad_request("reason must be one of: %s" % ", ".join(REPORT_REASONS))
+    target = _user_by_name(name) if name and len(name) <= 64 else None
+    if target is None:
+        return {"error": "Not Found", "message": "No such account."}, 404
+    me = int(g.user["id"])
+    if int(target["id"]) == me:
+        return bad_request("That is you.")
+    area = str(payload.get("area", "")).strip().lower()
+    where = "in %s" % area.replace("_", " ") if re.match(r"^[a-z0-9_]{1,64}$", area) else "in the world"
+    key = -((int(target["id"]) << 32) | me)
+    db = get_db()
+    now = int(time.time())
+    row = db.execute("SELECT resolved_at FROM chat_reports WHERE message_id = ? AND reporter_id = ?",
+                     (key, me)).fetchone()
+    if row is not None and int(row["resolved_at"] or 0) == 0:
+        return {"username": target["username"], "reported": True, "already": True}, 200
+    recent = int(db.execute("SELECT COUNT(*) FROM chat_reports WHERE reporter_id = ? AND created_at > ?",
+                            (me, now - 3600)).fetchone()[0])
+    if recent >= REPORTS_PER_HOUR:
+        return {"error": "Too Many Requests",
+                "message": "You have sent a lot of reports this hour. Staff have them - "
+                           "try again later."}, 429
+    body = "Reported %s" % where
+    if row is not None:
+        db.execute("UPDATE chat_reports SET reason = ?, body = ?, said_at = ?, created_at = ?,"
+                   " resolved_at = 0, resolved_by = '', outcome = '', reported_name = ?"
+                   " WHERE message_id = ? AND reporter_id = ?",
+                   (reason, body, now, now, target["username"], key, me))
+    else:
+        _prune_reports(db, now)
+        db.execute(
+            "INSERT INTO chat_reports (message_id, reporter_id, reporter_name, reported_id,"
+            " reported_name, channel, body, image_id, said_at, reason, created_at)"
+            " VALUES (?, ?, ?, ?, ?, 'player', ?, '', ?, ?, ?)",
+            (key, me, g.user["username"], int(target["id"]), target["username"], body, now, reason, now))
+    db.commit()
+    return {"username": target["username"], "reported": True}, 200
+
+
 @app.get("/api/staff/reports")
 @require_auth
 @require_role("mod")
@@ -15520,7 +15605,8 @@ def resolve_reports():
         message_id = int(payload.get("message_id", 0))
     except (TypeError, ValueError):
         message_id = 0
-    if message_id <= 0:
+    # NEGATIVE IS A PLAYER, not a line (report_player(), game 0.43.0).
+    if message_id == 0 or isinstance(payload.get("message_id"), bool):
         return bad_request("message_id must be a whole number")
     first = db.execute("SELECT * FROM chat_reports WHERE message_id = ? AND resolved_at = 0"
                        " ORDER BY id LIMIT 1", (message_id,)).fetchone()
@@ -19456,6 +19542,163 @@ def party_lead():
     db.execute("UPDATE party_members SET is_leader = 1 WHERE user_id = ?", (int(target["id"]),))
     db.commit()
     return dict(_party_body(db, me), state="handed"), 200
+
+
+# =============================================================================
+# PARTY VOICE (game 0.43.0)
+# =============================================================================
+# The owner: "I really really want the option for voice chat in game for
+# parties". The voice is the browser's own - WebRTC, with its echo
+# cancellation and noise suppression - from each game in a party to each
+# other, set up through the presence socket (presence.py, PARTY VOICE). It
+# never passes through this server.
+#
+# THROUGH A RELAY, ALWAYS. Two browsers calling each other directly learn each
+# other's internet address, and in a game with strangers that is somebody's
+# home. So every call goes through a TURN relay (Cloudflare's), and the game
+# is told to use nothing else (policy "relay"): each player sees only the
+# relay. The relay needs a username and password; this route makes short-lived
+# ones from the server's TURN key, which never leaves the server
+# (ELUSION_TURN_KEY_ID and ELUSION_TURN_KEY_TOKEN in elusion.env - DEPLOY.md).
+# Without a key the route says voice is not set up, and the game says so.
+#
+# ELUSION_VOICE_DIRECT=on is for a test on one computer: no relay, every
+# address allowed. Never on a public server.
+VOICE_TURN_URL = "https://rtc.live.cloudflare.com/v1/turn/keys/%s/credentials/generate-ice-servers"
+VOICE_TURN_TTL = 24 * 3600
+# A player's credentials are handed out again while they have this long left.
+VOICE_TURN_REUSE_SECONDS = 12 * 3600
+VOICE_TURN_TIMEOUT = 6
+VOICE_FETCHES_PER_HOUR = 30
+VOICE_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+# user_id -> (expires_at, ice_servers); and user_id -> [times it asked the relay].
+_voice_issued = {}
+_voice_asks = {}
+_voice_lock = threading.Lock()
+
+
+def voice_settings():
+    """("direct" | "relay" | "", key id, key token) from the environment."""
+    if os.environ.get("ELUSION_VOICE_DIRECT", "").strip().lower() in ("1", "on", "yes", "true"):
+        return "direct", "", ""
+    key_id = os.environ.get("ELUSION_TURN_KEY_ID", "").strip()
+    token = os.environ.get("ELUSION_TURN_KEY_TOKEN", "").strip()
+    if key_id and token and VOICE_KEY_PATTERN.match(key_id):
+        return "relay", key_id, token
+    return "", "", ""
+
+
+def _turn_fetch(key_id, token, ttl):
+    """The relay's answer: its iceServers list, or None. A seam the tests
+    replace; the real one asks Cloudflare."""
+    body = json.dumps({"ttl": int(ttl)}).encode("utf-8")
+    request_obj = urllib.request.Request(VOICE_TURN_URL % key_id, data=body, method="POST", headers={
+        "Authorization": "Bearer " + token,
+        "Content-Type": "application/json",
+        "User-Agent": "ElusionRPG/1.0 (+party voice)",
+    })
+    try:
+        with urllib.request.urlopen(request_obj, timeout=VOICE_TURN_TIMEOUT) as answer:
+            data = json.loads(answer.read(65536).decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        # The status only: the request carried the key's token.
+        app.logger.warning("[VOICE] the TURN relay answered %d", error.code)
+        return None
+    except (urllib.error.URLError, socket.timeout, TimeoutError, OSError, ValueError) as error:
+        app.logger.warning("[VOICE] the TURN relay could not be reached: %s", type(error).__name__)
+        return None
+    return data.get("iceServers") if isinstance(data, dict) else None
+
+
+def clean_ice_servers(servers):
+    """Only what a browser needs from the relay's answer, checked: STUN and
+    TURN addresses (none on port 53, which browsers block - Cloudflare's
+    advice), with the username and password the TURN ones need."""
+    if isinstance(servers, dict):
+        servers = [servers]
+    if not isinstance(servers, list):
+        return []
+    out = []
+    for entry in servers[:8]:
+        if not isinstance(entry, dict):
+            continue
+        urls = entry.get("urls")
+        urls = [urls] if isinstance(urls, str) else urls
+        if not isinstance(urls, list):
+            continue
+        kept = [u for u in urls[:12] if isinstance(u, str) and len(u) <= 200
+                and re.match(r"^(stun|turn|turns):[A-Za-z0-9.:-]+(\?transport=(udp|tcp))?$", u)
+                and not re.search(r":53(\?|$)", u)]
+        if not kept:
+            continue
+        item = {"urls": kept}
+        if any(u.startswith("turn") for u in kept):
+            user, cred = entry.get("username"), entry.get("credential")
+            if not isinstance(user, str) or not isinstance(cred, str) or not user or not cred \
+                    or len(user) > 512 or len(cred) > 512:
+                continue
+            item["username"], item["credential"] = user, cred
+        out.append(item)
+    return out
+
+
+@app.get("/api/party/voice")
+@require_auth
+def party_voice():
+    """
+    The relay a party's voice call goes through - for somebody in a party
+    ---
+    tags:
+      - Parties
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+    responses:
+      200:
+        description: '{"ice_servers": [...], "policy": "relay", "expires_at": t}'
+      401:
+        description: Missing, invalid or expired token
+      409:
+        description: You are in no party
+      429:
+        description: Asked for too many relays this hour
+      502:
+        description: The relay did not answer
+      503:
+        description: Voice is not set up on this server
+    """
+    db = get_db()
+    me = int(g.user["id"])
+    if party_membership(db, me) is None:
+        return {"error": "Conflict", "message": "Voice is for parties: invite somebody first."}, 409
+    mode, key_id, token = voice_settings()
+    if mode == "direct":
+        return {"ice_servers": [], "policy": "all", "expires_at": 0}, 200
+    if mode != "relay":
+        return {"error": "Service Unavailable",
+                "message": "Voice is not set up on this server yet."}, 503
+    now = int(time.time())
+    with _voice_lock:
+        issued = _voice_issued.get(me)
+        if issued is not None and issued[0] - now >= VOICE_TURN_REUSE_SECONDS:
+            return {"ice_servers": issued[1], "policy": "relay", "expires_at": issued[0]}, 200
+        asks = [t for t in _voice_asks.get(me, []) if t > now - 3600]
+        if len(asks) >= VOICE_FETCHES_PER_HOUR:
+            _voice_asks[me] = asks
+            return {"error": "Too Many Requests",
+                    "message": "Voice was switched on a lot this hour. Try again later."}, 429
+        asks.append(now)
+        _voice_asks[me] = asks
+    servers = clean_ice_servers(_turn_fetch(key_id, token, VOICE_TURN_TTL))
+    if not any("username" in s for s in servers):
+        return {"error": "Bad Gateway", "message": "The voice relay did not answer. Try again in a minute."}, 502
+    expires = now + VOICE_TURN_TTL
+    with _voice_lock:
+        _voice_issued[me] = (expires, servers)
+    return {"ice_servers": servers, "policy": "relay", "expires_at": expires}, 200
 
 
 @app.get("/api/economy/kingdom")
