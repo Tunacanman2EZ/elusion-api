@@ -331,8 +331,9 @@ with app_module.app.app_context():
     db.set_trace_callback(None)
     plans = [" | ".join(str(r[-1]) for r in db.execute("EXPLAIN QUERY PLAN " + sql))
              for sql in ran if sql.lstrip().upper().startswith("SELECT")]
+# FIVE SINCE PARTIES (game 0.42.0): the party invitations waiting are one more.
 check("every read behind it is an index search, not a scan",
-      len(plans) == 4 and not any(step.startswith("SCAN ") for plan in plans for step in plan.split(" | ")),
+      len(plans) == 5 and not any(step.startswith("SCAN ") for plan in plans for step in plan.split(" | ")),
       plans)
 wipe()
 

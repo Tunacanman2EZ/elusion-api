@@ -739,6 +739,37 @@ it with `_record_account_install()` wherever `_record_account_ip()` runs, plus
 on a banned login with the right password (never a wrong one).
 `test_security.py` E-5f.
 
+## Parties (game 0.42.0)
+
+The owner: "we need to be able to start parties so we need a tab for parties",
+with "Party chat" and "Party on the map".
+
+- **Tables**: `parties` (id, created_at), `party_members` (user_id PRIMARY
+  KEY - one party per player, as guild_members - party_id, is_leader,
+  joined_at) and `party_invites` (user_id, from_id, created_at). An invitation
+  is from a PERSON, not a party: somebody with no party asks, and the party is
+  made when it is accepted, the asker leading it.
+- **Rules**: `MAX_PARTY_MEMBERS` 4; an invitation lasts `PARTY_INVITE_SECONDS`
+  (120) and is pruned on read; `MAX_PARTY_INVITES` (8) waiting from one player;
+  only the leader asks once there is a party; nobody in a party can be asked
+  into another; somebody who ignores you refuses your invitations (403).
+  `party_fix()` after every leave, removal or deleted account: one left and the
+  party is gone; two or more always have exactly one leader, the longest there
+  (`joined_at` kept strictly increasing within a second).
+- **Routes**: `GET /api/party` (your party - each member's playing character:
+  class, level, area, hp, max_hp, online - and invitations waiting on you),
+  `POST /api/party/invite {username}`, `respond {from, accept}`, `leave`,
+  `kick {username}` and `lead {username}` (leader only). Every route answers
+  with the whole party again (`_party_body()`).
+- **The broadcast poll** carries `party` (`_own_party()`: id, leader, member
+  names) and `asks.party` (count, newest asker, at); `chat_news.party` is the
+  newest party line somebody else said.
+- **Party chat**: `CHAT_CHANNELS` gained `party`; a line is stamped with the
+  party's id at post time (`target_id`), read and reported only by members of
+  that party (`read_chat`, `_can_read_chat_row`), refused with 409 and
+  `PARTY_CHAT_NO_PARTY` for somebody in none - guild chat's rules exactly.
+- test_parties.py.
+
 ## Chat is one line, as typed, and a whisper finds you
 
 **`clean_player_text(raw, limit)`** is the one rule for text other players

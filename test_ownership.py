@@ -697,6 +697,15 @@ SWEEPS_ALLOWED = [
     # a picture's uploaders go with the picture: eviction, or a mod deleting
     # the last line that shows it (O-4)
     ("chat_image_holders", "image_id =", "a picture's uploaders go with the picture"),
+    # PARTIES (game 0.42.0). A party's seats are the party's: party_fix()
+    # takes them all down at one member left, and a hand-on clears every
+    # leader mark before setting one - both reached only through a route that
+    # found the caller in that party (and, for a hand-on, its leader) first.
+    ("party_members", "party_id =", "a party's seats: disbanded at one, one leader kept"),
+    ("party_invites", "created_at <=", "retention: invitations past PARTY_INVITE_SECONDS"),
+    # Your own invitations, by you as the one who asked: leaving takes back
+    # every one you sent.
+    ("party_invites", "from_id =", "the invitations you sent, as you leave"),
 ]
 
 unscoped = []

@@ -2191,6 +2191,45 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_guild_events_guild
             ON guild_events(guild_id, id);
 
+        -- PARTIES (game 0.42.0). A few players together for a while: a Party
+        -- window, a party chat and each other on the map. Not a guild - no
+        -- name, no ranks, no cost, gone when it is down to one.
+        --
+        -- ONE PARTY PER PLAYER, enforced by party_members' primary key, as
+        -- guild_members' is. is_leader marks the one who may invite, remove
+        -- and hand it on; party_fix() keeps exactly one while two remain.
+        CREATE TABLE IF NOT EXISTS parties (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS party_members (
+            user_id   INTEGER PRIMARY KEY,
+            party_id  INTEGER NOT NULL,
+            is_leader INTEGER NOT NULL DEFAULT 0,
+            joined_at INTEGER NOT NULL,
+            FOREIGN KEY (user_id)  REFERENCES users(id)   ON DELETE CASCADE,
+            FOREIGN KEY (party_id) REFERENCES parties(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_party_members_party
+            ON party_members(party_id, joined_at);
+
+        -- AN INVITATION FROM A PERSON, not from a party: somebody with no
+        -- party yet asks somebody else, and the party is made when it is
+        -- accepted. Waits PARTY_INVITE_SECONDS for an answer.
+        CREATE TABLE IF NOT EXISTS party_invites (
+            user_id    INTEGER NOT NULL,
+            from_id    INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (user_id, from_id),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (from_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_party_invites_from
+            ON party_invites(from_id);
+
         -- A MOVE WAITING TO BE COLLECTED.
         --
         -- ONE PER PLAYER, enforced by the primary key: issuing a second
@@ -4901,13 +4940,136 @@ def guild_dict(db, guild_row, now=None):
     }
 
 
+# =============================================================================
+# PARTIES (game 0.42.0)
+# =============================================================================
+# The owner: "we need to be able to start parties so we need a tab for
+# parties", and of what a party should do: its members in the Party window,
+# "Party chat", "Party on the map". Two to MAX_PARTY_MEMBERS players; the
+# leader invites, removes and hands it on; anybody leaves; down to one, it is
+# gone. Asked, never put in: an invitation waits PARTY_INVITE_SECONDS for an
+# answer, like a guild's but short - a party is made for what you are doing
+# now.
+MAX_PARTY_MEMBERS = 4
+PARTY_INVITE_SECONDS = 120
+# How many invitations one player may have waiting at once.
+MAX_PARTY_INVITES = 8
+
+# WHAT PARTY CHAT SAYS TO SOMEBODY WITH NO PARTY, read or written - one
+# sentence, as GUILD_CHAT_NO_GUILD is, saying where to go.
+PARTY_CHAT_NO_PARTY = "You are not in a party. Open Party to invite somebody, or answer an invite."
+
+
+def party_membership(db, user_id):
+    """The caller's party_members row, or None."""
+    return db.execute("SELECT * FROM party_members WHERE user_id = ?",
+                      (int(user_id),)).fetchone()
+
+
+def party_member_rows(db, party_id):
+    """A party's members, the leader first, then by when they joined."""
+    return db.execute(
+        "SELECT m.user_id, m.is_leader, m.joined_at, u.username"
+        "  FROM party_members m JOIN users u ON u.id = m.user_id"
+        " WHERE m.party_id = ? ORDER BY m.is_leader DESC, m.joined_at, m.user_id",
+        (int(party_id),)).fetchall()
+
+
+def party_fix(db, party_id):
+    """After somebody left, was removed or deleted their account: a party of
+    one is no party - it goes - and two or more always have exactly one
+    leader, the longest there. Returns True if the party is gone."""
+    rows = db.execute("SELECT user_id, is_leader FROM party_members WHERE party_id = ?"
+                      " ORDER BY joined_at, user_id", (int(party_id),)).fetchall()
+    if len(rows) <= 1:
+        db.execute("DELETE FROM party_members WHERE party_id = ?", (int(party_id),))
+        db.execute("DELETE FROM parties WHERE id = ?", (int(party_id),))
+        return True
+    leaders = [r for r in rows if int(r["is_leader"] or 0)]
+    if len(leaders) != 1:
+        db.execute("UPDATE party_members SET is_leader = 0 WHERE party_id = ?", (int(party_id),))
+        db.execute("UPDATE party_members SET is_leader = 1 WHERE user_id = ?",
+                   (int(rows[0]["user_id"]),))
+    return False
+
+
+def _party_invites_to(db, user_id, now=None):
+    """Invitations waiting on this player's answer, newest first. A READ, on
+    the poll every ten seconds: the ones run out are skipped here and pruned by
+    the invite route, never deleted from a GET."""
+    now = int(time.time()) if now is None else now
+    return db.execute(
+        "SELECT u.username, i.created_at FROM party_invites i JOIN users u ON u.id = i.from_id"
+        " WHERE i.user_id = ? AND i.created_at > ? ORDER BY i.created_at DESC, i.rowid DESC",
+        (int(user_id), now - PARTY_INVITE_SECONDS)).fetchall()
+
+
+def party_dict(db, party_id, now=None):
+    """A party as the Party window draws it: who is in it and the character
+    each is playing - class, level, area and health, from their save - and
+    whether they are on."""
+    now = int(time.time()) if now is None else now
+    rows = party_member_rows(db, party_id)
+    ids = [int(r["user_id"]) for r in rows]
+    playing = {}
+    seen = {}
+    if ids:
+        marks = ",".join("?" * len(ids))
+        for save in db.execute(
+            "SELECT user_id, name, class_id, level, area, hp, max_hp FROM saves"
+            " WHERE user_id IN (%s) AND slot = %s"
+            % (marks, PLAYING_SLOT_SQL.format(user="saves.user_id")),
+            ids + [now - ONLINE_WINDOW_SECONDS, now],
+        ).fetchall():
+            playing[int(save["user_id"])] = save
+        for row in db.execute(
+            "SELECT user_id, MAX(last_seen_at) AS seen FROM sessions"
+            " WHERE user_id IN (%s) GROUP BY user_id" % marks, ids).fetchall():
+            seen[int(row["user_id"])] = int(row["seen"] or 0)
+    members = []
+    leader = ""
+    for row in rows:
+        save = playing.get(int(row["user_id"]))
+        last = seen.get(int(row["user_id"]), 0)
+        if int(row["is_leader"] or 0):
+            leader = row["username"]
+        members.append({
+            "username": row["username"],
+            "leader": bool(int(row["is_leader"] or 0)),
+            "online": bool(last and now - last <= ONLINE_WINDOW_SECONDS),
+            "character": save["name"] if save is not None else "",
+            "class_id": save["class_id"] if save is not None else "",
+            "level": int(save["level"] or 1) if save is not None else 0,
+            "area": save["area"] if save is not None else "",
+            "hp": int(save["hp"] or 0) if save is not None else 0,
+            "max_hp": int(save["max_hp"] or 0) if save is not None else 0,
+        })
+    return {"id": int(party_id), "leader": leader, "members": members,
+            "size": len(members), "capacity": MAX_PARTY_MEMBERS}
+
+
+def _own_party(db, user_id):
+    """{"id", "leader", "members": [usernames]} for the broadcast poll - id 0
+    and nobody for a player in no party. The game colours its party's names
+    and draws them on the map from this, within one poll of any change."""
+    seat = party_membership(db, user_id)
+    if seat is None:
+        return {"id": 0, "leader": "", "members": []}
+    rows = party_member_rows(db, int(seat["party_id"]))
+    return {"id": int(seat["party_id"]),
+            "leader": next((r["username"] for r in rows if int(r["is_leader"] or 0)), ""),
+            "members": [r["username"] for r in rows]}
+
+
 # 'guild' WAS DECLARED HERE BEFORE GUILDS EXISTED, so that the day they arrived
 # would be one branch in chat_write_check() rather than a change to every
 # client, cursor and tab. That day came: guild chat is live, gated only on
 # being in a guild (chat_write_check, read_chat). The client took longer - its
 # Guild tab went on saying "Guilds are not in the game yet." and never asked,
 # until a player typed "oi bruv" into it and nothing happened.
-CHAT_CHANNELS = ("world", "private", "friends", "guild")
+# 'party' joined in game 0.42.0: a party's own room, stamped with its id like a
+# guild line, so a line said in one party never shows in another.
+CHAT_CHANNELS = ("world", "private", "friends", "guild", "party")
 CHAT_DEFAULT_CHANNEL = "world"
 
 # WHAT GUILD CHAT SAYS TO SOMEBODY WITH NO GUILD - reading it, or writing to it.
@@ -4958,6 +5120,12 @@ def chat_write_check(channel, target_row):
                 "error": "Conflict",
                 "message": GUILD_CHAT_NO_GUILD,
             }, 409
+        return None
+
+    if channel == "party":
+        # IN A PARTY, OR THERE IS NOWHERE FOR IT TO GO - a 409, as guild's.
+        if party_membership(get_db(), g.user["id"]) is None:
+            return {"error": "Conflict", "message": PARTY_CHAT_NO_PARTY}, 409
         return None
 
     return bad_request("unknown channel")
@@ -5052,6 +5220,9 @@ def _can_read_chat_row(db, user_id, row):
     if channel == "guild":
         seat = guild_membership(user_id)
         return seat is not None and int(seat["guild_id"]) == int(row["target_id"] or 0)
+    if channel == "party":
+        seat = party_membership(db, user_id)
+        return seat is not None and int(seat["party_id"]) == int(row["target_id"] or 0)
     return False
 
 
@@ -14110,6 +14281,10 @@ def read_broadcasts():
         # the whole system to answer this, which is why it is answered here
         # rather than by a second timer in the client.
         **_own_guild(db, int(g.user["id"])),
+        # THE PARTY YOU ARE IN (game 0.42.0): its id, leader and members, so
+        # the game colours their names and draws them on the map, and hears a
+        # change within one poll. See _own_party().
+        "party": _own_party(db, int(g.user["id"])),
         # THE TRADE YOU ARE IN, if any, in one line - so somebody who has not
         # opened the trade window finds out a trade was opened WITH them. The
         # window polls /api/trade itself, but only while it is open, and before
@@ -14159,6 +14334,14 @@ def _chat_news(db, user_id):
             " WHERE channel = 'guild' AND target_id = ? AND user_id != ?"
             + IGNORED_AUTHORS_CLAUSE,
             (int(seat["guild_id"]), user_id, user_id)).fetchone()["n"] or 0
+    party_seat = party_membership(db, user_id)
+    party_line = 0
+    if party_seat is not None:
+        party_line = db.execute(
+            "SELECT MAX(id) AS n FROM chat_messages"
+            " WHERE channel = 'party' AND target_id = ? AND user_id != ?"
+            + IGNORED_AUTHORS_CLAUSE,
+            (int(party_seat["party_id"]), user_id, user_id)).fetchone()["n"] or 0
     friend_line = 0
     friends = sorted(_friend_ids(db, user_id))
     if friends:
@@ -14176,6 +14359,7 @@ def _chat_news(db, user_id):
         },
         "guild": int(guild_line),
         "friends": int(friend_line),
+        "party": int(party_line),
     }
 
 
@@ -14206,6 +14390,7 @@ def _waiting_asks(db, user_id):
         " ORDER BY f.created_at DESC, f.rowid DESC LIMIT 1", (user_id,)).fetchone()
     invites = db.execute(
         "SELECT COUNT(*) AS n FROM guild_invites WHERE user_id = ?", (user_id,)).fetchone()
+    party_asks = _party_invites_to(db, user_id)
     newest_invite = db.execute(
         "SELECT gl.name, i.created_at FROM guild_invites i JOIN guilds gl ON gl.id = i.guild_id"
         " WHERE i.user_id = ? ORDER BY i.created_at DESC, i.rowid DESC LIMIT 1",
@@ -14217,6 +14402,10 @@ def _waiting_asks(db, user_id):
         "guild": {"count": int(invites["n"] or 0),
                   "newest": newest_invite["name"] if newest_invite else "",
                   "at": int(newest_invite["created_at"] or 0) if newest_invite else 0},
+        # A PARTY INVITATION (game 0.42.0): who asked, the newest first.
+        "party": {"count": len(party_asks),
+                  "newest": party_asks[0]["username"] if party_asks else "",
+                  "at": int(party_asks[0]["created_at"] or 0) if party_asks else 0},
     }
 
 
@@ -14347,6 +14536,13 @@ def chat_send():
             return {"error": "Conflict",
                     "message": GUILD_CHAT_NO_GUILD}, 409
         target_id = int(seat["guild_id"])
+
+    # A PARTY LINE CARRIES ITS PARTY, for the same reason (game 0.42.0).
+    if channel == "party":
+        seat = party_membership(db, g.user["id"])
+        if seat is None:
+            return {"error": "Conflict", "message": PARTY_CHAT_NO_PARTY}, 409
+        target_id = int(seat["party_id"])
 
     # A PRIVATE LINE GETS ITS OWN COPY of the picture - see WHO MAY SEE A
     # PICTURE. After every refusal above, so a send that is turned away never
@@ -14490,6 +14686,20 @@ def read_chat():
         # good, whoever moves afterwards.
         where += " AND target_id = ?"
         params += [int(seat["guild_id"])]
+
+    elif channel == "party":
+        # A PARTY'S ROOM, by the party the line was said in (game 0.42.0).
+        seat = party_membership(db, me)
+        if seat is None:
+            return {
+                "messages": [], "removed": [], "latest_id": 0,
+                "now": int(time.time()), "channel": channel, "available": False,
+                "notice": PARTY_CHAT_NO_PARTY,
+                "world_image_wait": world_image_wait(g.user),
+                "muted": chat_mute_state(g.user),
+            }, 200
+        where += " AND target_id = ?"
+        params += [int(seat["party_id"])]
 
     # NOBODY YOU IGNORE, in any channel. In the WHERE with everything else, so
     # the cursor, the tail and the removed list all agree about it.
@@ -18918,6 +19128,334 @@ def guild_list():
         })
     return {"guilds": out, "now": now,
             "may_disband": has_owner_powers(g.user["username"])}, 200
+
+
+# =============================================================================
+# PARTY ROUTES (game 0.42.0) - see PARTIES
+# =============================================================================
+
+def _party_body(db, user_id, now=None):
+    """GET /api/party's answer, which every party route returns too: your
+    party (or None) and the invitations waiting on you."""
+    now = int(time.time()) if now is None else now
+    seat = party_membership(db, user_id)
+    party = None
+    if seat is not None:
+        # A LEADER WHO DELETED THEIR ACCOUNT took their row with them: the
+        # read puts things right before it answers.
+        if party_fix(db, int(seat["party_id"])):
+            db.commit()
+        elif party_membership(db, user_id) is not None:
+            party = party_dict(db, int(seat["party_id"]), now)
+    invites = [{"from": r["username"], "at": int(r["created_at"] or 0)}
+               for r in _party_invites_to(db, user_id, now)]
+    return {"party": party, "invites": invites,
+            "capacity": MAX_PARTY_MEMBERS, "invite_seconds": PARTY_INVITE_SECONDS}
+
+
+@app.get("/api/party")
+@require_auth
+def party_read():
+    """
+    Your party and the invitations waiting on you
+    ---
+    tags:
+      - Parties
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+    responses:
+      200:
+        description: Your party (null for none), each member's character, and your invitations
+      401:
+        description: Missing, invalid or expired token
+    """
+    db = get_db()
+    body = _party_body(db, int(g.user["id"]))
+    db.commit()
+    return body, 200
+
+
+@app.post("/api/party/invite")
+@require_auth
+def party_invite():
+    """
+    Ask somebody to join your party - or to start one with you
+    ---
+    tags:
+      - Parties
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: who
+        schema:
+          type: object
+          required: [username]
+          properties:
+            username: {type: string}
+    responses:
+      200:
+        description: The invitation is waiting for them
+      400:
+        description: Yourself, already in a party, your party is full, too many waiting, or you are not its leader
+      401:
+        description: Missing, invalid or expired token
+      403:
+        description: They are not taking invitations from you
+      404:
+        description: No such account
+    """
+    payload = request.get_json(silent=True) or {}
+    who = str(payload.get("username", "")).strip()
+    if who == "":
+        return bad_request("username is required")
+    db = get_db()
+    me = int(g.user["id"])
+    target = _user_by_name(who)
+    if target is None:
+        return {"error": "Not Found", "message": "No such account."}, 404
+    if int(target["id"]) == me:
+        return bad_request("you cannot invite yourself")
+    seat = party_membership(db, me)
+    if seat is not None:
+        if not int(seat["is_leader"] or 0):
+            return bad_request("only the party's leader can invite")
+        if len(party_member_rows(db, int(seat["party_id"]))) >= MAX_PARTY_MEMBERS:
+            return bad_request("a party holds %d" % MAX_PARTY_MEMBERS)
+    if party_membership(db, int(target["id"])) is not None:
+        return bad_request("%s is already in a party" % target["username"])
+    if ignores(db, int(target["id"]), me):
+        return {"error": "Forbidden",
+                "message": "%s is not taking party invites from you." % target["username"]}, 403
+    now = int(time.time())
+    db.execute("DELETE FROM party_invites WHERE created_at <= ?", (now - PARTY_INVITE_SECONDS,))
+    waiting = db.execute("SELECT COUNT(*) AS n FROM party_invites WHERE from_id = ? AND user_id != ?",
+                         (me, int(target["id"]))).fetchone()["n"]
+    if int(waiting or 0) >= MAX_PARTY_INVITES:
+        return bad_request("you already have %d invitations waiting" % MAX_PARTY_INVITES)
+    # ASKED AGAIN, ASKED FRESH: a second press restarts the clock rather than
+    # making a second invitation.
+    db.execute("INSERT OR REPLACE INTO party_invites (user_id, from_id, created_at) VALUES (?, ?, ?)",
+               (int(target["id"]), me, now))
+    db.commit()
+    return {"username": target["username"], "state": "invited",
+            "expires_in": PARTY_INVITE_SECONDS}, 200
+
+
+@app.post("/api/party/respond")
+@require_auth
+def party_respond():
+    """
+    Accept or turn down a party invitation
+    ---
+    tags:
+      - Parties
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: answer
+        schema:
+          type: object
+          required: [from, accept]
+          properties:
+            from:   {type: string}
+            accept: {type: boolean}
+    responses:
+      200:
+        description: Joined (or started) their party, or the invitation is gone
+      400:
+        description: You are already in a party, or theirs is full
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: No invitation from them, or it ran out
+    """
+    payload = request.get_json(silent=True) or {}
+    wanted = str(payload.get("from", "")).strip()
+    accept = bool(payload.get("accept", False))
+    if wanted == "":
+        return bad_request("from is required")
+    db = get_db()
+    me = int(g.user["id"])
+    now = int(time.time())
+    asker = _user_by_name(wanted)
+    invite = None
+    if asker is not None:
+        invite = db.execute(
+            "SELECT * FROM party_invites WHERE user_id = ? AND from_id = ? AND created_at > ?",
+            (me, int(asker["id"]), now - PARTY_INVITE_SECONDS)).fetchone()
+    if invite is None:
+        return {"error": "Not Found", "message": "No invitation from them - it may have run out."}, 404
+    if not accept:
+        # TURNED DOWN SILENTLY, as a guild's or a friend's is.
+        db.execute("DELETE FROM party_invites WHERE user_id = ? AND from_id = ?", (me, int(asker["id"])))
+        db.commit()
+        return {"from": asker["username"], "state": "declined"}, 200
+    if party_membership(db, me) is not None:
+        return bad_request("leave your party first")
+    theirs = party_membership(db, int(asker["id"]))
+    if theirs is None:
+        # THE PARTY IS MADE NOW, with the one who asked leading it.
+        party_id = int(db.execute("INSERT INTO parties (created_at) VALUES (?)", (now,)).lastrowid)
+        db.execute("INSERT INTO party_members (user_id, party_id, is_leader, joined_at) VALUES (?, ?, 1, ?)",
+                   (int(asker["id"]), party_id, now))
+    else:
+        party_id = int(theirs["party_id"])
+        if len(party_member_rows(db, party_id)) >= MAX_PARTY_MEMBERS:
+            return bad_request("that party is full")
+    # IN THE ORDER THEY CAME, to the second and past it: two joining in one
+    # second still have an order, which the leader's hand-on reads.
+    last = db.execute("SELECT MAX(joined_at) AS n FROM party_members WHERE party_id = ?",
+                      (party_id,)).fetchone()["n"]
+    db.execute("INSERT INTO party_members (user_id, party_id, is_leader, joined_at) VALUES (?, ?, 0, ?)",
+               (me, party_id, max(now, int(last or 0) + 1)))
+    # EVERY OTHER INVITATION GOES TOO: they are in a party now.
+    db.execute("DELETE FROM party_invites WHERE user_id = ?", (me,))
+    db.commit()
+    return dict(_party_body(db, me, now), state="joined"), 200
+
+
+@app.post("/api/party/leave")
+@require_auth
+def party_leave():
+    """
+    Leave your party
+    ---
+    tags:
+      - Parties
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+    responses:
+      200:
+        description: You are out - and the party is gone if one was left
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: You are not in a party
+    """
+    db = get_db()
+    me = int(g.user["id"])
+    seat = party_membership(db, me)
+    if seat is None:
+        return {"error": "Not Found", "message": "You are not in a party."}, 404
+    db.execute("DELETE FROM party_members WHERE user_id = ?", (me,))
+    db.execute("DELETE FROM party_invites WHERE from_id = ?", (me,))
+    # A LEADER LEAVING HANDS IT ON to the longest there; the last but one
+    # leaving takes it down.
+    gone = party_fix(db, int(seat["party_id"]))
+    db.commit()
+    return dict(_party_body(db, me), state="left", disbanded=gone), 200
+
+
+@app.post("/api/party/kick")
+@require_auth
+def party_kick():
+    """
+    Remove somebody from your party (its leader only)
+    ---
+    tags:
+      - Parties
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: who
+        schema:
+          type: object
+          required: [username]
+          properties:
+            username: {type: string}
+    responses:
+      200:
+        description: They are out
+      400:
+        description: Yourself - leave instead
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: You lead no party, or they are not in it
+    """
+    payload = request.get_json(silent=True) or {}
+    who = str(payload.get("username", "")).strip()
+    db = get_db()
+    me = int(g.user["id"])
+    seat = party_membership(db, me)
+    if seat is None or not int(seat["is_leader"] or 0):
+        return {"error": "Not Found", "message": "You are not leading a party."}, 404
+    target = _user_by_name(who) if who else None
+    theirs = party_membership(db, int(target["id"])) if target is not None else None
+    if theirs is None or int(theirs["party_id"]) != int(seat["party_id"]):
+        return {"error": "Not Found", "message": "They are not in your party."}, 404
+    if int(target["id"]) == me:
+        return bad_request("leave the party instead")
+    db.execute("DELETE FROM party_members WHERE user_id = ?", (int(target["id"]),))
+    gone = party_fix(db, int(seat["party_id"]))
+    db.commit()
+    return dict(_party_body(db, me), state="removed", disbanded=gone), 200
+
+
+@app.post("/api/party/lead")
+@require_auth
+def party_lead():
+    """
+    Hand your party on to somebody in it (its leader only)
+    ---
+    tags:
+      - Parties
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: who
+        schema:
+          type: object
+          required: [username]
+          properties:
+            username: {type: string}
+    responses:
+      200:
+        description: They lead it now
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: You lead no party, or they are not in it
+    """
+    payload = request.get_json(silent=True) or {}
+    who = str(payload.get("username", "")).strip()
+    db = get_db()
+    me = int(g.user["id"])
+    seat = party_membership(db, me)
+    if seat is None or not int(seat["is_leader"] or 0):
+        return {"error": "Not Found", "message": "You are not leading a party."}, 404
+    target = _user_by_name(who) if who else None
+    theirs = party_membership(db, int(target["id"])) if target is not None else None
+    if theirs is None or int(theirs["party_id"]) != int(seat["party_id"]):
+        return {"error": "Not Found", "message": "They are not in your party."}, 404
+    db.execute("UPDATE party_members SET is_leader = 0 WHERE party_id = ?", (int(seat["party_id"]),))
+    db.execute("UPDATE party_members SET is_leader = 1 WHERE user_id = ?", (int(target["id"]),))
+    db.commit()
+    return dict(_party_body(db, me), state="handed"), 200
 
 
 @app.get("/api/economy/kingdom")
