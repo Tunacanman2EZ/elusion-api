@@ -64,10 +64,12 @@ THE WIRE (JSON text frames):
                                                          = speaks shared monsters
     {"t": "s", "a": "field", "x": 1471.0, "y": 1090.5,
      "m": "walkdown", "fx": ["ring"], "pet": "petsniper",
-     "ts": 81234}                                        where I am, when it changes; "ts" (0.19.0,
+     "ts": 81234, "aim": 344, "hp": 87}                  where I am, when it changes; "ts" (0.19.0,
                                                          optional) is the game's own clock in ms,
                                                          passed on so others can play it back
-                                                         evenly
+                                                         evenly; "aim" and "hp" (0.41.0, optional)
+                                                         are where my aim ring points, in whole
+                                                         degrees, and my health in whole percent
     {"t": "renew", "ticket": "..."}                      a fresh ticket, every minute
     {"t": "sync"}                                        tell me again who is here (the
                                                          game rebuilt its world: same area,
@@ -89,12 +91,13 @@ THE WIRE (JSON text frames):
                                                          and keeps books on them (0.10.0): send
                                                          the world even alone, own hits inside it;
                                                          and passes on attacks and levers ("x")
-    {"t": "join", "p": [{id, name, cls, lvl, role, hue, guild, x, y, m, fx, pet, ts}]}
+    {"t": "join", "p": [{id, name, cls, lvl, role, hue, guild, x, y, m, fx, pet, ts, aim, hp}]}
                                                          people now in your area
-    {"t": "moves", "p": [[id, x, y, m, fx, pet, ts], ...]}
+    {"t": "moves", "p": [[id, x, y, m, fx, pet, ts, aim, hp], ...]}
                                                          who moved this tick, every step each sent
                                                          in it, in order (yourself included; skip
-                                                         it); ts -1 for a game that sends none
+                                                         it); ts, aim and hp -1 for a game that
+                                                         sends none
     {"t": "x", "id": 40, "e": [[kind, ts, ...], ...]}    40's attacks, checked, to everyone else
     {"t": "l", "id": 40, "n": "...", "on": true}         40 pulled a lever, to everyone else
     {"t": "levers", "p": [["...", true], ...]}           (arriving, or sync) the levers pulled in
@@ -254,6 +257,8 @@ MAX_STEPS_PER_TICK = 4
 #   orb     a healer's orb from (ox, oy) toward (tx, ty)
 #   heal    a healer's aura dropped at (tx, ty) (game 0.40.0) - and the word
 #           that the players it reaches are healed: THE AURA'S HEALS below
+# The highest aim a state may carry: whole degrees, 0 to 359 (game 0.41.0).
+MAX_AIM_DEGREES = 359
 ATTACK_KINDS = ("slash", "axe", "recall", "stalag", "meteor", "dyn", "orb", "heal")
 MAX_ATTACKS_PER_MESSAGE = 16
 # How far from its origin an attack may land: a cursor across the screen.
@@ -477,6 +482,9 @@ class Player:
         self.anim = "idledown"
         self.fx = []
         self.pet = ""
+        # Where its aim ring points and its health (game 0.41.0); -1 for none.
+        self.aim = -1
+        self.hp = -1
         # The game's clock at its newest state (-1: it sends none), and every
         # step since the last tick, for the moves.
         self.clock = -1
@@ -517,13 +525,15 @@ class Player:
             "guild": str(ident.get("guild", "")),
             "x": self.x, "y": self.y, "m": self.anim, "fx": list(self.fx), "pet": self.pet,
             "ts": self.clock,
+            "aim": self.aim, "hp": self.hp,
             # Whether this game shares monsters: one that does not cannot be
             # hit by them, so a leader's monsters do not chase it.
             "v": self.version,
         }
 
     def move(self):
-        return [self.user_id, self.x, self.y, self.anim, list(self.fx), self.pet, self.clock]
+        return [self.user_id, self.x, self.y, self.anim, list(self.fx), self.pet, self.clock,
+                self.aim, self.hp]
 
     def take_steps(self):
         """Every step since the last tick, oldest first - or the newest alone
@@ -572,6 +582,17 @@ def clean_state(msg, allowed_pets):
         if clock is None:
             return None
         out["ts"] = clock
+    # THEIR AIM AND THEIR HEALTH (game 0.41.0), optional: where the aim ring's
+    # ball points, in whole degrees, and health in whole percent, for the
+    # others to draw ("i want players to see everything i see"). A game from
+    # before sends neither: -1.
+    for key, high in (("aim", MAX_AIM_DEGREES), ("hp", 100)):
+        out[key] = -1
+        if key in msg:
+            value = _whole(msg.get(key), -1, high)
+            if value is None:
+                return None
+            out[key] = value
     return out
 
 
@@ -927,6 +948,7 @@ class PresenceServer:
                               time.time(), moved_area)
         player.anim, player.fx, player.pet = state["anim"], state["fx"], state["pet"]
         player.clock = state["ts"]
+        player.aim, player.hp = state["aim"], state["hp"]
         if moved_area:
             player.steps = []
             self._leave_room(player)

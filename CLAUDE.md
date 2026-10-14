@@ -1202,9 +1202,12 @@ letters come from the game through gamedata.json.
   still stored as typed - ids are not whitelisted).
 - **The broadcast names the piece, not the id**: `mythic_find_text()` reads
   `item_row()`, so a Perfect find says "found the Perfect Meteorite".
-- **`CURRENT_CLIENT_BUILD` is 4**: a build-2 game reads a rolled id as its
-  error item, and a build-3 game a resisting one (below). Raise the minimum to
-  4 once 0.11.0 is out.
+- **`CURRENT_CLIENT_BUILD` is 5** (game 0.41.0): a build-2 game reads a
+  rolled id as its error item, a build-3 game a resisting one (below), and a
+  build-4 game - anything from 0.11 to 0.40 - draws nobody's aim or health and,
+  in a browser left on an old upload, swings every keyboard attack at the
+  screen's corner (Gary's "only attack left" in Chrome). Raise the minimum to 5
+  once 0.41.0 is on the site, so every game in an area draws the same.
 - **One spelling means ASCII and the very end.** `_VARIANT_PART` and
   `_VARIANT_SUFFIX` said `\d` and `$` until 7 Oct: Python's `\d` is every
   Unicode digit and `$` matches before a final newline, so
@@ -1297,6 +1300,16 @@ every rule.
   nothing. **Deploy this before players have game 0.40.0**: a server without
   "heal" in `ATTACK_KINDS` refuses the whole batch it comes in, the healer's
   orb pictures with it. Held by test_presence.py P-10.
+- **THEIR AIM AND THEIR HEALTH (game 0.41.0).** The owner: "i need to be able
+  to see other players directional bar etc ... i want players to see
+  everything i see". A state may carry `aim` (where the aim ring's ball points,
+  whole degrees 0-359) and `hp` (health, whole percent 0-100); `clean_state()`
+  refuses the state for one out of range or not a whole number, and keeps -1
+  for a game that sends none. Both ride on every step - `[id, x, y, m, fx,
+  pet, ts, aim, hp]`, nine where there were seven, so a game from before reads
+  the first seven as ever - and in the join entry. Nothing else reads them;
+  the books do not. test_presence.py: carried, refused out of range, told in
+  a join.
 
 ## Shared monsters: one game runs them, presence.py passes the notes
 

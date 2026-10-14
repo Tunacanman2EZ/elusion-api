@@ -4113,7 +4113,14 @@ CLIENT_BUILD_HEADER = "X-Elusion-Build"
 # ("jadechest~a104h96r605", ELEMENT RESISTANCE in gamedata.py). A build-3 game
 # reads that whole id as a malformed roll - the error item - exactly as build 2
 # read a quality roll. Set the minimum to 4 once 0.11.0 is out.
-CURRENT_CLIENT_BUILD = 4
+#
+# 5 (game 0.41.0): a game's state carries its aim and health (presence.py) and
+# every other game draws them; an attack with no cursor on the game aims where
+# the character faces. A build-4 game - anything from 0.11 to 0.40 - plays on,
+# but draws nobody's aim or health, and a browser left on an old upload swings
+# every keyboard attack at the screen's corner. Set the minimum to 5 once
+# 0.41.0 is on the site, and everyone in an area sees the same.
+CURRENT_CLIENT_BUILD = 5
 
 MAINTENANCE_DEFAULT_MESSAGE = "Update in progress - please come back later."
 

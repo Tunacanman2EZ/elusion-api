@@ -92,8 +92,10 @@ def ticket(headers, slot=0):
     return (res.get_json() or {}).get("ticket", ""), res
 
 
-def state(area="field", x=100.0, y=200.0, m="idledown", fx=None, pet=""):
-    return json.dumps({"t": "s", "a": area, "x": x, "y": y, "m": m, "fx": fx or [], "pet": pet})
+def state(area="field", x=100.0, y=200.0, m="idledown", fx=None, pet="", **more):
+    msg = {"t": "s", "a": area, "x": x, "y": y, "m": m, "fx": fx or [], "pet": pet}
+    msg.update(more)
+    return json.dumps(msg)
 
 
 async def collect(ws, seconds=0.35):
@@ -233,7 +235,7 @@ async def run(port, server):
     got_b = await collect(b)
     move = moved(got_b).get(uid("presa"))
     check("a step is heard by everyone in the area, about ten times a second",
-          move == [uid("presa"), 120.5, 205.2, "walkright", [], "", -1], got_b)
+          move == [uid("presa"), 120.5, 205.2, "walkright", [], "", -1, -1, -1], got_b)
     await a.send(state("field", x=120.5, y=205.2, m="attackright"))
     await a.send(state("field", x=121.0, y=205.2, m="attackright"))
     got_b = await collect(b)
@@ -290,8 +292,30 @@ async def run(port, server):
     await a.send(state("field", x=101.0, y=200.0, m="walkup", fx=["ring", "firering"]))
     got_b = await collect(b)
     check("  and the socket is still open for the good one after them",
-          moved(got_b).get(uid("presa")) == [uid("presa"), 101.0, 200.0, "walkup", ["firering", "ring"], "", -1],
+          moved(got_b).get(uid("presa")) == [uid("presa"), 101.0, 200.0, "walkup", ["firering", "ring"], "", -1, -1, -1],
           got_b)
+
+    # THEIR AIM AND THEIR HEALTH (game 0.41.0): "i want players to see
+    # everything i see".
+    await a.send(state("field", x=101.0, y=200.0, m="walkup", aim=344, hp=87))
+    got_b = await collect(b)
+    carried = moved(got_b).get(uid("presa"))
+    check("a state's aim (whole degrees) and health (whole percent) go on to everyone in the area",
+          carried is not None and carried[7:] == [344, 87], got_b)
+    for raw_bad in (state(aim=360), state(aim=-2), state(aim="up"), state(aim=1.5), state(aim=True),
+                    state(hp=101), state(hp=-5), state(hp="full"), state(hp=None)):
+        await a.send(raw_bad)
+    got_b = await collect(b)
+    check("  an aim past 359 or a health past 100, or either not a whole number, reaches nobody",
+          not moved(got_b), got_b)
+    await a.send(json.dumps({"t": "sync"}))
+    told = joined(await collect(a)).get(uid("presb"))
+    await b.send(state("field", x=140.0, y=200.0, aim=0, hp=100))
+    await collect(a), await collect(b)
+    await a.send(json.dumps({"t": "sync"}))
+    told = joined(await collect(a)).get(uid("presb"))
+    check("  and somebody arriving is told everyone's, in the join",
+          told is not None and told.get("aim") == 0 and told.get("hp") == 100, told)
 
     # A pet is shown only when the account holds it.
     sql("INSERT INTO carry_items (user_id, slot, position, item_id, quantity) VALUES (?, 0, 0, 'petsniper', 1)",
