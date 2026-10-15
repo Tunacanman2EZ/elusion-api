@@ -23609,6 +23609,29 @@ _backfill_owner_gifts()
 
 
 # =============================================================================
+# PLAYER STATS (game 0.47.0) - the playerstats/ package
+# =============================================================================
+# The owner: "build this and add it in my gm menu as a button somewhere" - who
+# signs up, who comes back, where players stop, what gets played. GET
+# /api/server/stats, owner only. THE FIRST FEATURE BUILT THE BE105 WAY: its
+# route, its arithmetic and its SQL are three files of their own
+# (playerstats/routes.py, services.py, data.py), handed this file's app,
+# decorators and database here rather than importing them, so the package
+# stands on its own and test_stats.py can drive each layer apart.
+# Registered above ENTRY POINT, like every route.
+import playerstats  # noqa: E402
+
+playerstats.register(
+    app,
+    require_auth=require_auth,
+    require_owner=require_owner,
+    get_db=get_db,
+    # Never counted as players: the owner and the co-owners, whoever is in.
+    left_out_names=lambda: (OWNER_USERNAME,) + tuple(CO_OWNER_USERNAMES),
+)
+
+
+# =============================================================================
 # ENTRY POINT
 # =============================================================================
 #

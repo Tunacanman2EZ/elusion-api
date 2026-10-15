@@ -7,6 +7,10 @@ Writes CODEMAP.md beside app.py: every section banner, every route (with the
 rank it demands), and every top-level function, each with the line number to
 jump to. Re-run it whenever the file grows - it is generated, never edited.
 
+FEATURE PACKAGES (game 0.47.0): a folder beside app.py with a routes.py - the
+BE105 layout, playerstats/ the first - is listed too, its routes found by
+their add_url_rule() lines and its layers (routes, services, data) named.
+
 WHY: app.py is past ten thousand lines and grepping for "def login" finds the
 docstring, the call site and the definition. An index answers the two questions
 actually being asked - "where is X" and "what does this server even expose" -
@@ -26,6 +30,31 @@ DECORATOR = re.compile(r"^@(require_auth|require_owner|require_role\([^)]*\))")
 FUNCTION = re.compile(r"^def ([A-Za-z_][A-Za-z0-9_]*)\(")
 BANNER = re.compile(r"^# =+\s*$")
 CONSTANT = re.compile(r"^([A-Z][A-Z0-9_]{2,})\s*=")
+PACKAGE_ROUTE = re.compile(r'add_url_rule\(\s*"([^"]+)".*methods=\[\s*"([A-Z]+)"')
+PACKAGE_LAYERS = ("routes.py", "services.py", "data.py")
+
+
+def feature_packages():
+    """[(folder, [(line, method, path)], [layer files present])] for every
+    folder beside app.py that app.py imports and that holds a routes.py - a
+    practice folder or a stray copy lying beside the code is not the server."""
+    with open(SOURCE, encoding="utf-8") as handle:
+        imported = set(re.findall(r"^import ([A-Za-z_][A-Za-z0-9_]*)", handle.read(), re.M))
+    found = []
+    for name in sorted(os.listdir(HERE)):
+        if name not in imported:
+            continue
+        folder = os.path.join(HERE, name)
+        routes_py = os.path.join(folder, "routes.py")
+        if not os.path.isdir(folder) or not os.path.exists(routes_py):
+            continue
+        with open(routes_py, encoding="utf-8") as handle:
+            rows = [(index, match.group(2), match.group(1))
+                    for index, line in enumerate(handle.read().splitlines(), start=1)
+                    for match in [PACKAGE_ROUTE.search(line)] if match]
+        layers = [layer for layer in PACKAGE_LAYERS if os.path.exists(os.path.join(folder, layer))]
+        found.append((name, rows, layers))
+    return found
 
 
 def main():
@@ -106,6 +135,16 @@ def main():
     for r in sorted(routes, key=lambda r: r["path"]):
         out.append("| %d | %s | `%s` | %s | `%s()` |"
                    % (r["line"], r["method"], r["path"], guard_label(r["guards"]), r["handler"]))
+
+    packages = feature_packages()
+    if packages:
+        out.append("\n## Feature packages\n")
+        out.append("Folders beside app.py, each in layers (BE105): routes, services, data.\n")
+        out.append("\n| Package | Layers | Line | Method | Path |")
+        out.append("|---------|--------|-----:|--------|------|")
+        for name, rows, layers in packages:
+            for line_no, method, path in rows:
+                out.append("| `%s/` | %s | %d | %s | `%s` |" % (name, ", ".join(layers), line_no, method, path))
 
     out.append("\n## Sections\n")
     for line_no, title in sections:

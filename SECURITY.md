@@ -328,6 +328,14 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     flagged as ever.
     → Held by: `test_world.py` — "a row that cannot be read: OFF - a broken setting never makes the game harder", "nobody but the owner sees or changes it - the same bare 404 as no route", "  and both changes ask for the password again on a hardened session (STEP-UP)", "the table gone: no land, and the poll - the heartbeat - still answers", "the XP paid is the server's, with the stir in it", "  a water monster with more health while fire stirs: flagged, and counted at the catalogue's", "  and LESS than the catalogue's - the way a cheat would go - is flagged as ever"
     → and in the game: `src/tools/testrunner.gd` — `_test_stirring_lands()`
+35. **The player stats only read, only the owner reads them, and they name
+    nobody** (0.47.0, the playerstats/ package). `GET /api/server/stats` is
+    require_owner - the same bare 404 to a player or a dev as no route - and
+    its SQL layer holds no write at all. The report is counts, areas,
+    monsters and classes: no username, address or character name. Staff, the
+    owner and co-owners are left out of the numbers.
+    → Held by: `test_stats.py` — "a player gets the same bare 404 as a route that does not exist", "a dev gets the same bare 404 as a route that does not exist", "data.py only reads: not one INSERT, UPDATE, DELETE, REPLACE, DROP, CREATE, ALTER or commit", "asking changes nothing", "the report names nobody: no username in it, so it can be shown or shared", "  the owner and the dev are not players: Ann and Bo are"
+    → and in the game: `src/tools/testrunner.gd` — `_test_player_stats_window()`
 
 ---
 

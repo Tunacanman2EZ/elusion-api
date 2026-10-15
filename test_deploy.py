@@ -242,6 +242,11 @@ section("C  boot the real files with nothing but a .env")
 CODE = scratch("code", "x")[:-2]
 for name in ("app.py", "envfile.py", "gamedata.py", "wsgi.py"):
     shutil.copy(os.path.join(HERE, name), os.path.join(CODE, name))
+# And the feature packages app.py imports (game 0.47.0, playerstats/ the
+# first): the code a server needs is now a folder or two as well as the files.
+for package in ("playerstats",):
+    shutil.copytree(os.path.join(HERE, package), os.path.join(CODE, package),
+                    ignore=shutil.ignore_patterns("__pycache__"))
 DATA_DIR = scratch("var", "x")[:-2]
 LIVE_DB = os.path.join(DATA_DIR, "live.db")
 CATALOGUE = os.path.join(DATA_DIR, "catalogue_under_another_name.json")

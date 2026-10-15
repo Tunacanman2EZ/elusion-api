@@ -1964,6 +1964,40 @@ dark, light, ice, wind, earth, fire, water; 8 and 9 are not lands) stirs.
   (`test_broadcast.py`, `test_maintenance.py`): the first poll writes stir 1
   and announces it, one message more than the suite expects.
 
+## Player stats, and the first feature package (game 0.47.0)
+
+The owner, after "they log in noone is here it is pretty discouraging": "build
+this and add it in my gm menu as a button somewhere" - who signs up, who comes
+back, where players stop, what gets played. `GET /api/server/stats`, owner
+only, `test_stats.py`.
+
+- **Built the BE105 way, in its own folder** - the first feature not in
+  app.py: `playerstats/routes.py` (the route, its query, its refusals),
+  `services.py` (the arithmetic: pure functions of plain rows and a clock),
+  `data.py` (the SQL, reads only). app.py hands it the app, `require_auth`,
+  `require_owner`, `get_db` and the owner's names through `register()`,
+  above ENTRY POINT; **the package never imports app.py**, so each layer is
+  tested on its own. The next feature built outside app.py follows the same
+  shape. `test_deploy.py` copies the package with the files a server needs,
+  and `codemap.py` lists feature packages under their own heading.
+- **Nothing new is recorded.** Every number comes from rows kept for other
+  reasons: `users.created_at`; "seen" is the latest of `saves.updated_at`,
+  `account_ips.last_seen`, `sessions.last_seen_at` and `kill_tally.last_at`;
+  levels and areas from `saves`; kills from `kill_tally` (ever) and
+  `kill_reports` (two weeks); logins from `login_attempts` (two weeks). So
+  "played on this day" and the monster counts reach back 14 days at most.
+- **Players only.** Staff (mod, dev) by role and the owner and co-owners by
+  name are left out, and the count of them is said - the owner testing all
+  day would be half of a small game's numbers.
+- **No names in it.** The report is counts, areas, monsters and classes; no
+  username, address or character name, so it can be shown or shared.
+- **Days are the owner's**: the game sends `offset` (minutes east of UTC,
+  held to +/-14 h) and a day starts at the owner's midnight. `days` (1-365,
+  default 30) is how far back a new player signed up.
+- **"Came back" is a floor**, read from the last time an account was seen:
+  seen 24 h or more after signing up, out of those who signed up over a day
+  ago. Read only, so it takes no write lock and asks for no password again.
+
 ## Decided, not built: staff commands
 
 **Put the required rank on the command definition, not in the handler.** A
