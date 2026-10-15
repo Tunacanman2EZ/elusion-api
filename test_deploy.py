@@ -243,8 +243,9 @@ CODE = scratch("code", "x")[:-2]
 for name in ("app.py", "envfile.py", "gamedata.py", "wsgi.py"):
     shutil.copy(os.path.join(HERE, name), os.path.join(CODE, name))
 # And the feature packages app.py imports (game 0.47.0, playerstats/ the
-# first): the code a server needs is now a folder or two as well as the files.
-for package in ("playerstats",):
+# first; events/ in 0.48.0): the code a server needs is now a folder or two
+# as well as the files.
+for package in ("playerstats", "events"):
     shutil.copytree(os.path.join(HERE, package), os.path.join(CODE, package),
                     ignore=shutil.ignore_patterns("__pycache__"))
 DATA_DIR = scratch("var", "x")[:-2]

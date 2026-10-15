@@ -336,6 +336,20 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     owner and co-owners are left out of the numbers.
     → Held by: `test_stats.py` — "a player gets the same bare 404 as a route that does not exist", "a dev gets the same bare 404 as a route that does not exist", "data.py only reads: not one INSERT, UPDATE, DELETE, REPLACE, DROP, CREATE, ALTER or commit", "asking changes nothing", "the report names nobody: no username in it, so it can be shown or shared", "  the owner and the dev are not players: Ann and Bo are"
     → and in the game: `src/tools/testrunner.gd` — `_test_player_stats_window()`
+36. **The world's events are the owner's to set, the server's to pay, and an
+    event that fails costs nobody a kill** (0.48.0, the events/ package).
+    Double XP, more loot or a land made to stir are scheduled and called off
+    by the owner alone (a co-owner while the switch is on), with the
+    password again; to anyone else those routes are the same bare 404 as no
+    route. What is on travels on the broadcast poll for the game to show,
+    but the XP and loot of a kill are paid at `/api/combat/kill` from the
+    server's own table: the game sends no multiplier and none it sends is
+    read. Two events of one kind at once give the bigger, never the product,
+    and amounts are held to 1.25x-3x, an event to 1-72 hours, at most 60
+    days ahead and 20 waiting. An events table that cannot be read, or a
+    rule that throws, is "no event": the kill is paid and the poll answers.
+    → Held by: `test_events.py` — "a player gets the same bare 404 from the owner's three", "a dev gets the same bare 404 from the owner's three", "the owner's two that change the world ask for the password again; reading does not", "a kill while Double Loot is on: twice the bag chance", "what a kill gets: the bigger of two XP events (not 3x); a land's own; the stirring land's; nothing before it starts", "an events table that cannot be read: the kill is paid, the poll answers, nothing is on", "  and a rule that throws, not just a missing table: the same - and the land still stirs"
+    → and in the game: `src/tools/testrunner.gd` — `_test_world_events()`
 
 ---
 

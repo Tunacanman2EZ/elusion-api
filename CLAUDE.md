@@ -1998,6 +1998,48 @@ only, `test_stats.py`.
   seen 24 h or more after signing up, out of those who signed up over a day
   ago. Read only, so it takes no write lock and asks for no password again.
 
+## The world's events, the second feature package (game 0.48.0)
+
+The owner: "Treat events (double XP, double loot, forced stir, etc.) as their
+own feature area with a clean public contract, not just 'some extra flags in
+config.'" `events/` beside app.py, the playerstats/ shape: `routes.py` (the
+edge, and `EventsAPI`, the one object app.py keeps), `services.py` (the rules,
+pure functions of rows and a clock), `data.py` (the `world_events` table and
+its SQL). `test_events.py`.
+
+- **The contract.** `GET /api/world/events/active` (any login): `{"events":
+  [...on now], "next": [...the nearest five within a week], "now"}`, each
+  event `{id, name, kind, description, starts_at, ends_at, land,
+  multipliers}`. The same body rides the broadcast poll as `"events"`, so the
+  game needs no second request; the route is there for anything else.
+- **The owner's three.** `GET /api/world/events/schedule` (everything from
+  the last 30 days on, with `state` coming/on/over/cancelled, who set it, and
+  the `limits`); `POST /api/world/events` `{kind, starts_at, hours, amount |
+  land, name?}` (201, or a 400 that says why, or 409 with 20 waiting);
+  `POST /api/world/events/cancel` `{id}` (404 if it is over or gone). All
+  require_owner; the two writes ask for the password again and are logged as
+  `event`. No build is needed to run an event.
+- **Kinds.** `xp` and `loot` take `amount` 1.25-3 and `land` 0 (every
+  monster), -1 (whichever land is stirring at the kill) or 1-7. `stir` takes
+  a land 1-7. 1-72 hours, at most 60 days ahead; a start up to 5 minutes in
+  the past is "now" (two clocks). A name is optional - "Double XP", "1.5x
+  Loot", "The Fire Lands Stir" - and cleaned like chat.
+- **Two of a kind take the bigger, never the product.** Events multiply with
+  the stirring lands' own XP and loot (`world_stir_for()`): a stir is the
+  world, an event is an event.
+- **A stir event wins the rhythm.** `current_world_tick()` asks
+  `forced_stir()`: while one is on, the stir running ends and tick+1 begins
+  with its land, `chosen_by` "event #id", until the event's end. Called off,
+  that stir ends at once and the rhythm starts again from there. With the
+  stirring lands switched off nothing stirs, event or not - off is off.
+- **Told once.** Scheduling a future event posts "Coming up: ..."; the first
+  poll after one begins posts "... has begun" (`announced`, set once in
+  SQL); calling one off says so. Broadcast kind `event`.
+- **Failing safe, again.** Every `EventsAPI` answer catches everything: a
+  table that cannot be read or a rule that throws is "no event", and the
+  kill is still paid. `world_events` is None until registration, and the
+  three places that ask carry on without it.
+
 ## Decided, not built: staff commands
 
 **Put the required rank on the command definition, not in the handler.** A

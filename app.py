@@ -13115,6 +13115,8 @@ STAFF_ACTION_KINDS = (
     "player_level", "coowners",
     # 0.46.0: the stirring lands' settings, and a land stirred by hand.
     "world",
+    # 0.48.0: an event scheduled or called off (events/).
+    "event",
 )
 
 # NAMED SETS OF KINDS the log can be asked for by one name (?action=moderation).
@@ -14397,6 +14399,9 @@ WORLD_LIMITS = {
     "xp_percent": (0, 100, True),
 }
 WORLD_SWITCHES = ("on", "hit_on", "health_on", "speed_on", "bags_on", "resist_on", "xp_on")
+# THE WORLD'S EVENTS (game 0.48.0): the EventsAPI the events/ package hands
+# back, registered near the end of this file. None until then.
+world_events = None
 
 
 def world_settings():
@@ -14486,11 +14491,12 @@ def stir_text(element, settings, hours):
     return text + "."
 
 
-def _begin_stir(db, tick, element, started_at, settings, chosen_by=""):
+def _begin_stir(db, tick, element, started_at, settings, chosen_by="", ends_at=None):
     """Write stir `tick`. True if this call wrote it - and only then is it
     announced; a tick somebody else wrote first is theirs to announce.
+    `ends_at` for a stir an event set (game 0.48.0), else a whole stir.
     Caller commits."""
-    ends_at = int(started_at) + int(settings["hours"]) * 3600
+    ends_at = int(started_at) + int(settings["hours"]) * 3600 if ends_at is None else int(ends_at)
     cursor = db.execute(
         "INSERT OR IGNORE INTO world_ticks (tick, element, started_at, ends_at, chosen_by)"
         " VALUES (?, ?, ?, ?, ?)",
@@ -14498,7 +14504,8 @@ def _begin_stir(db, tick, element, started_at, settings, chosen_by=""):
     )
     if cursor.rowcount != 1:
         return False
-    post_broadcast(stir_text(element, settings, int(settings["hours"])), "world", chosen_by)
+    hours = max(1, int(round((ends_at - int(started_at)) / 3600.0)))
+    post_broadcast(stir_text(element, settings, hours), "world", chosen_by)
     return True
 
 
@@ -14510,6 +14517,24 @@ def current_world_tick(db, settings=None, now=None):
         return None
     now = int(time.time()) if now is None else int(now)
     last = db.execute("SELECT * FROM world_ticks ORDER BY tick DESC LIMIT 1").fetchone()
+    # A STIR EVENT (game 0.48.0, events/) WINS: while one is on, its land
+    # stirs until the event ends. The stir going on when it begins ends then;
+    # once it is over, the rhythm carries on from its end.
+    forced = world_events.forced_stir(db, now) if world_events is not None else None
+    if forced is not None:
+        by = "event #%d" % int(forced["id"])
+        if last is not None and (last["chosen_by"] or "") == by and now < int(last["ends_at"]):
+            return _world_row(last)
+        if last is not None and int(last["ends_at"]) > now:
+            db.execute("UPDATE world_ticks SET ends_at = ? WHERE tick = ?", (now, int(last["tick"])))
+        tick = int(last["tick"]) + 1 if last is not None else 1
+        _begin_stir(db, tick, int(forced["land"]), now, settings, by, ends_at=int(forced["ends_at"]))
+        return _world_row(db.execute("SELECT * FROM world_ticks WHERE tick = ?", (tick,)).fetchone())
+    if last is not None and (last["chosen_by"] or "").startswith("event #") and now < int(last["ends_at"]):
+        # ITS EVENT WAS CALLED OFF: the stir it set ends now, and the rhythm
+        # starts again from here.
+        db.execute("UPDATE world_ticks SET ends_at = ? WHERE tick = ?", (now, int(last["tick"])))
+        last = db.execute("SELECT * FROM world_ticks ORDER BY tick DESC LIMIT 1").fetchone()
     if last is not None and now < int(last["ends_at"]):
         return _world_row(last)
     tick = int(last["tick"]) + 1 if last is not None else 1
@@ -14556,20 +14581,27 @@ def world_public(db):
 
 def world_stir_for(db, enemy_id):
     """(bag scale, XP scale) for a kill of `enemy_id`: the stirring land's, if
-    the monster is of it, else (1.0, 1.0) - which is also the answer to
-    anything going wrong."""
+    the monster is of it, times the events on now (game 0.48.0, events/) -
+    and (1.0, 1.0) for any part that goes wrong."""
+    element = 0
+    stirring = 0
+    bags, xp = 1.0, 1.0
     try:
+        enemy = gamedata.ENEMIES.get(enemy_id) or {}
+        element = int(enemy.get("element", 0) or 0)
         settings = world_settings()
         row = current_world_tick(db, settings)
-        enemy = gamedata.ENEMIES.get(enemy_id) or {}
-        if row is None or int(enemy.get("element", 0) or 0) != row["element"]:
-            return 1.0, 1.0
-        bags = float(settings["bags_times"]) if settings["bags_on"] else 1.0
-        xp = 1.0 + (settings["xp_percent"] / 100.0 if settings["xp_on"] else 0.0)
-        return bags, xp
+        stirring = int(row["element"]) if row is not None else 0
+        if row is not None and element == row["element"]:
+            bags = float(settings["bags_times"]) if settings["bags_on"] else 1.0
+            xp = 1.0 + (settings["xp_percent"] / 100.0 if settings["xp_on"] else 0.0)
     except Exception:
         app.logger.exception("[WORLD] could not read the stirring lands for a kill; an ordinary kill")
-        return 1.0, 1.0
+        bags, xp = 1.0, 1.0
+    if world_events is not None:
+        event_bags, event_xp = world_events.kill_scales(db, element, stirring)
+        bags, xp = bags * event_bags, xp * event_xp
+    return bags, xp
 
 
 def _world_owner_payload(db):
@@ -14966,6 +14998,8 @@ def read_broadcasts():
     # THE STIRRING LANDS, asked before the messages are read: a stir this poll
     # begins is announced in this poll's own answer.
     world = world_public(db)
+    # THE WORLD'S EVENTS (game 0.48.0, events/): what is on, what is coming.
+    events_now = world_events.public(db) if world_events is not None else {"events": [], "next": []}
     db.commit()
 
     # A FIRST POLL ASKS FOR THE TAIL, NOT THE WHOLE TABLE. since=0 means "I just
@@ -15013,6 +15047,7 @@ def read_broadcasts():
         # how hard its monsters hit and how much resistance to it counts - the
         # two the game applies itself. See world_public().
         "world": world,
+        "events": events_now,
         # Rides the same poll as everything else. None when there is nowhere
         # to be; the client applies it and then acks it away.
         "teleport": pending_teleport_for(g.user["id"]),
@@ -23620,6 +23655,7 @@ _backfill_owner_gifts()
 # stands on its own and test_stats.py can drive each layer apart.
 # Registered above ENTRY POINT, like every route.
 import playerstats  # noqa: E402
+import events as events_package  # noqa: E402
 
 playerstats.register(
     app,
@@ -23628,6 +23664,37 @@ playerstats.register(
     get_db=get_db,
     # Never counted as players: the owner and the co-owners, whoever is in.
     left_out_names=lambda: (OWNER_USERNAME,) + tuple(CO_OWNER_USERNAMES),
+)
+
+
+# =============================================================================
+# THE WORLD'S EVENTS (game 0.48.0) - the events/ package
+# =============================================================================
+# Double XP, more loot, a land made to stir - scheduled ahead by the owner on
+# the GM panel's Events tab, and on every game's screen while they are on.
+# The owner's plan: "Treat events ... as their own feature area with a clean
+# public contract". The contract is events/routes.py's; this file asks the
+# EventsAPI it hands back in three places: the broadcast poll (what is on),
+# world_stir_for() (what a kill pays) and current_world_tick() (which land a
+# stir event makes stir). Until it is registered - at import, just here - it
+# is None, and those three carry on without it.
+def _log_event_action(detail):
+    """An owner's event, in the staff log. A named function, not a lambda,
+    so test_moderation.py's walk of log_staff_action's callers finds the
+    "event" kind written somewhere."""
+    log_staff_action(g.user, "event", "server", None, detail)
+
+
+world_events = events_package.register(
+    app,
+    require_auth=require_auth,
+    require_owner=require_owner,
+    require_fresh_password=require_fresh_password,
+    get_db=get_db,
+    announce=lambda body, by="": post_broadcast(body, "event", by),
+    log_action=_log_event_action,
+    clean_text=clean_player_text,
+    lands=LANDS,
 )
 
 

@@ -272,12 +272,14 @@ check("an older game's owner session is not asked (the minimum build is the swit
 fresh = {r.rule: getattr(app_module.app.view_functions[r.endpoint], "_elusion_fresh_password", False)
          for r in app_module.app.url_map.iter_rules() if r.rule.startswith("/api/")}
 asks = sorted(path for path, on in fresh.items() if on)
-check("the routes that ask: ranks, bans, gold, levels, skills, items, rollback and the server's switches",
+check("the routes that ask: ranks, bans, gold, levels, skills, items, rollback, the server's switches, events",
       asks == sorted(["/api/staff/ban", "/api/staff/unban", "/api/staff/role", "/api/staff/gold", "/api/staff/level",
                       "/api/staff/skill", "/api/staff/grant", "/api/staff/rollback", "/api/server/maintenance",
                       "/api/server/minbuild", "/api/server/pvp", "/api/server/trade",
                       # The stirring lands' two switches (game 0.46.0, test_world.py).
-                      "/api/server/world", "/api/server/world/stir"]), asks)
+                      "/api/server/world", "/api/server/world/stir",
+                      # Scheduling and calling off events (game 0.48.0, test_events.py).
+                      "/api/world/events", "/api/world/events/cancel"]), asks)
 check("  and not a moderator's everyday ones: mute, kick, a deleted line, reports",
       not any(fresh.get(p) for p in ("/api/staff/mute", "/api/staff/kick", "/api/chat/delete",
                                      "/api/staff/reports/resolve")))

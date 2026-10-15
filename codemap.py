@@ -30,7 +30,9 @@ DECORATOR = re.compile(r"^@(require_auth|require_owner|require_role\([^)]*\))")
 FUNCTION = re.compile(r"^def ([A-Za-z_][A-Za-z0-9_]*)\(")
 BANNER = re.compile(r"^# =+\s*$")
 CONSTANT = re.compile(r"^([A-Z][A-Z0-9_]{2,})\s*=")
-PACKAGE_ROUTE = re.compile(r'add_url_rule\(\s*"([^"]+)".*methods=\[\s*"([A-Z]+)"')
+# One add_url_rule call, which may run over several lines (events/ in 0.48.0
+# wraps them), up to its methods - and never into the next call's.
+PACKAGE_ROUTE = re.compile(r'add_url_rule\(\s*"([^"]+)"(?:(?!add_url_rule).)*?methods=\[\s*"([A-Z]+)"', re.S)
 PACKAGE_LAYERS = ("routes.py", "services.py", "data.py")
 
 
@@ -49,9 +51,9 @@ def feature_packages():
         if not os.path.isdir(folder) or not os.path.exists(routes_py):
             continue
         with open(routes_py, encoding="utf-8") as handle:
-            rows = [(index, match.group(2), match.group(1))
-                    for index, line in enumerate(handle.read().splitlines(), start=1)
-                    for match in [PACKAGE_ROUTE.search(line)] if match]
+            text = handle.read()
+        rows = [(text.count("\n", 0, match.start()) + 1, match.group(2), match.group(1))
+                for match in PACKAGE_ROUTE.finditer(text)]
         layers = [layer for layer in PACKAGE_LAYERS if os.path.exists(os.path.join(folder, layer))]
         found.append((name, rows, layers))
     return found
