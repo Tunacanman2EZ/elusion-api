@@ -260,6 +260,11 @@ BOOKS = (combatbook is not None and bool(gamedata.AREAS) and gamedata.COMBAT_EXP
 # How often what the books found is written down, and how long it is kept.
 FLUSH_SECONDS = 2.0
 BOOKS_KEPT_SECONDS = 14 * 86400
+# THE STIRRING LANDS (game 0.46.0): how often the books learn which lands are
+# stirring (stirred_lands()), and how long after a stir ends its land still
+# counts - a monster born in its last minute lives on after it.
+STIR_READ_SECONDS = 30.0
+STIR_GRACE_SECONDS = 3600
 
 # What a body may claim to be doing: the player scenes' own animation names.
 ANIM_PATTERN = re.compile(r"^(idle|walk|attack|death|hitflash)(up|down|left|right)$")
@@ -371,6 +376,26 @@ def lookup_ticket(raw, now=None):
 # app.py creates them (its schema block), and a database from before them is
 # not an error - the rows are dropped and the boot log says so once.
 _BOOK_TABLES_MISSING = []
+
+
+def stirred_lands(now=None):
+    """The lands (Element.Type 1-7) stirring now or whose stir ended within
+    STIR_GRACE_SECONDS, from app.py's world_ticks: a monster of one may be
+    born with more health than the catalogue's, and the books take its
+    leader's word for it (combatbook.AreaBook._stirred_max()). Nothing, when
+    the table is not there yet or cannot be read. Runs in a thread."""
+    now = int(time.time() if now is None else now)
+    try:
+        conn = _connect()
+        try:
+            rows = conn.execute(
+                "SELECT element FROM world_ticks WHERE started_at <= ? AND ends_at >= ?",
+                (now + 60, now - STIR_GRACE_SECONDS)).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return frozenset()
+    return frozenset(int(r["element"]) for r in rows if 1 <= int(r["element"] or 0) <= 7)
 
 
 def write_books(kills, flags, prune_before=None):
@@ -766,6 +791,9 @@ class PresenceServer:
         self._flags = {}      # (user_id, area, kind) -> [count, detail, first_at, last_at]
         self._pruned_at = 0.0
         self._book_errors = 0
+        # The lands the books count stirred monsters for, and when last read.
+        self.stirred = frozenset()
+        self._stirred_at = -1e9
         # THE AURA'S HEALS not yet written: (user_id, slot, share).
         self._heals = []
 
@@ -863,7 +891,15 @@ class PresenceServer:
         book = self.books.get(area)
         if book is None:
             book = self.books[area] = combatbook.AreaBook(area, gamedata.AREAS[area])
+            book.stirred_lands = self.stirred
         return book
+
+    def set_stirred(self, lands):
+        """Every book, and every one made from now on, counts these lands'
+        monsters as stirred."""
+        self.stirred = frozenset(lands)
+        for book in self.books.values():
+            book.stirred_lands = self.stirred
 
     def _book_safely(self, what, *args):
         """THE BOOKS NEVER BREAK THE RELAY. Whatever a book cannot read, the
@@ -1311,6 +1347,12 @@ class PresenceServer:
     async def flush_books(self):
         kills, flags = self.take_books()
         now = time.time()
+        if now - self._stirred_at >= STIR_READ_SECONDS:
+            self._stirred_at = now
+            try:
+                self.set_stirred(await asyncio.to_thread(stirred_lands, now))
+            except Exception as exc:  # noqa: BLE001
+                print("[PRESENCE] could not read the stirring lands: %r" % exc, flush=True)
         prune = None
         if now - self._pruned_at >= 3600.0:
             self._pruned_at = now

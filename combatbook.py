@@ -71,6 +71,12 @@ HOLD_SECONDS = 1.0
 # A death the books leave this much health on, as a share of the monster's
 # maximum, still agrees.
 AGREED_LEFT = 0.02
+# THE STIRRING LANDS (game 0.46.0): a monster of a land that is stirring - or
+# stirred lately, for one born just before its stir ended - may be born with
+# up to this many times the catalogue's health (app.py WORLD_LIMITS, 200%
+# more). The leader's word for it is taken, and counted: more health than the
+# catalogue's only ever makes a death harder to agree, never easier.
+STIRRED_MAX_TIMES = 3
 # A large slime splits at half its health (poisonslime.gd split_hp_ratio).
 SPLIT_AT = 0.55
 # How long the smalls a split released may take to appear (the large flashes
@@ -305,6 +311,9 @@ class AreaBook:
         self.kills = []
         self.flags = []
         self.stray = 0
+        # The lands (Element.Type 1-7) stirring now or lately, as presence.py
+        # last read them (stirred_lands()); nothing stirs in a book alone.
+        self.stirred_lands = frozenset()
 
     # ---- what the leader says ------------------------------------------------
 
@@ -459,8 +468,14 @@ class AreaBook:
             if int(enemy.get("split_count", 0) or 0) > 0 and enemy.get("splits_into"):
                 m.splitter = (int(enemy["split_count"]), str(enemy["splits_into"]))
             if sent_max is not None and sent_max != max_hp:
-                self._flag(leader, "max_hp_differs", "%s %d, the catalogue %d"
-                           % (m.enemy_id, sent_max, max_hp), now)
+                if self._stirred_max(enemy, max_hp, sent_max):
+                    # BORN WHILE ITS LAND STIRS, with the health the stir gave
+                    # it: counted at that, so its death agrees where the
+                    # game's does.
+                    max_hp = m.max_hp = m.hp = sent_max
+                else:
+                    self._flag(leader, "max_hp_differs", "%s %d, the catalogue %d"
+                               % (m.enemy_id, sent_max, max_hp), now)
             if kind == "full":
                 # JOINED PART-WAY (the books started after the leader did):
                 # its health is the leader's word, the only one there is.
@@ -468,6 +483,16 @@ class AreaBook:
                 m.hp = min(max_hp, hp) if hp is not None else max_hp
             self._judge_spawn(m, enemy, props, now, kind)
         self.monsters[monster_id] = m
+
+    def _stirred_max(self, enemy, catalogue_max, sent_max):
+        """Whether `sent_max` is a stirred monster's health: more than the
+        catalogue's, no more than STIRRED_MAX_TIMES it, and of a land that is
+        stirring (or did lately)."""
+        try:
+            element = int(enemy.get("element", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        return element in self.stirred_lands and catalogue_max < sent_max <= catalogue_max * STIRRED_MAX_TIMES
 
     def _judge_spawn(self, m, enemy, props, now, kind):
         leader = self.leader_id if self.leader_id is not None else 0

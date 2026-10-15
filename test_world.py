@@ -1,9 +1,10 @@
 """The stirring lands (game 0.46.0): a world that changes on its own.
 
 Every few hours one of the seven lands stirs: its monsters can hit harder,
-drop loot more often and give more XP, and resistance to it can count for
-more - each an owner's switch with an amount, the whole thing one switch more.
-The server picks the land and pays the loot and XP; the game is told the rest.
+have more health, move faster, drop loot more often and give more XP, and
+resistance to it can count for more - each an owner's switch with an amount,
+the whole thing one switch more. The server picks the land and pays the loot
+and XP; the game is told the rest.
 
   W-1  the settings: defaults with no row, OFF when the row cannot be read,
        held to their ranges; the owner's route checks every value, is the
@@ -21,6 +22,8 @@ The server picks the land and pays the loot and XP; the game is told the rest.
        switched off or not one of the seven
   W-6  the owner's view: settings, the stir now, the last few, each land's
        hunting
+  W-7  the books (combatbook.py, presence.py): a stirring land's monster born
+       with more health is counted at it, not flagged; any other is flagged
 
 Runs against a THROWAWAY database in the temp folder, like every other suite.
 Run: python test_world.py
@@ -149,26 +152,31 @@ check("the seven lands are Element.Type 1 to 7, named as the game names them",
 check("every land has monsters that pay and can drop a bag", sorted(BY_LAND) == list(range(1, 8)), BY_LAND)
 with app_module.app.app_context():
     defaults = app_module.world_settings()
-check("with no row: on, 3-hour stirs, hits +25%, loot 1.5x, resistance 1.5x, more XP there but off",
-      defaults == {"on": True, "hours": 3, "hit_on": True, "hit_percent": 25, "bags_on": True, "bags_times": 1.5,
+check("with no row: on, 3-hour stirs, hits +25%, health +50%, speed +15%, loot 1.5x, resistance 1.5x, more XP there but off",
+      defaults == {"on": True, "hours": 3, "hit_on": True, "hit_percent": 25, "health_on": True, "health_percent": 50,
+                   "speed_on": True, "speed_percent": 15, "bags_on": True, "bags_times": 1.5,
                    "resist_on": True, "resist_times": 1.5, "xp_on": False, "xp_percent": 25}, defaults)
 sql("INSERT OR REPLACE INTO server_settings (key, value) VALUES (?, ?)", (app_module.WORLD_KEY, "{not json"))
 with app_module.app.app_context():
     broken = app_module.world_settings()
 check("a row that cannot be read: OFF - a broken setting never makes the game harder", broken["on"] is False)
 sql("INSERT OR REPLACE INTO server_settings (key, value) VALUES (?, ?)", (app_module.WORLD_KEY,
-    json.dumps({"hours": 99, "hit_percent": -5, "bags_times": "lots", "resist_times": 1.75, "xp_on": "yes"})))
+    json.dumps({"hours": 99, "hit_percent": -5, "bags_times": "lots", "resist_times": 1.75, "xp_on": "yes",
+                "health_percent": 900, "speed_percent": 80, "speed_on": 1})))
 with app_module.app.app_context():
     held = app_module.world_settings()
 check("values out of range are held to it, values of the wrong kind are the default",
       held["hours"] == 24 and held["hit_percent"] == 0 and held["bags_times"] == 1.5 and held["resist_times"] == 1.75
-      and held["xp_on"] is False and held["on"] is True, held)
+      and held["xp_on"] is False and held["on"] is True and held["health_percent"] == 200 and held["speed_percent"] == 50
+      and held["speed_on"] is True, held)
 reset_world()
 
 for body, why in [({}, "nothing"), ({"color": "red"}, "unknown"), ({"on": "yes"}, "switch not a bool"),
                   ({"hours": 0}, "hours under 1"), ({"hours": 2.5}, "hours not whole"), ({"hit_percent": 101}, "hit over 100"),
                   ({"bags_times": 3.5}, "bags over 3"), ({"resist_times": 0.5}, "resist under 1"),
-                  ({"xp_percent": True}, "a bool for a number")]:
+                  ({"xp_percent": True}, "a bool for a number"), ({"health_percent": 201}, "health over 200"),
+                  ({"speed_percent": 51}, "speed over 50"), ({"speed_percent": 10.5}, "speed not whole"),
+                  ({"health_on": "on"}, "health switch not a bool")]:
     res = client.post("/api/server/world", headers=auth(owner), json=body)
     check("  refused with 400: %s" % why, res.status_code == 400, (res.status_code, res.get_json()))
 check("nobody but the owner sees or changes it - the same bare 404 as no route",
@@ -261,17 +269,26 @@ world = body.get("world") or {}
 check("the broadcast poll carries the world: land, name, when, and the numbers the game applies",
       res.status_code == 200 and world.get("on") is True and world.get("tick") == 1 and world.get("element") in app_module.LANDS
       and world.get("name") == app_module.LANDS[world["element"]] and world["ends_at"] - world["started_at"] == 3 * 3600
-      and world["hit"] == 0.25 and world["resist"] == 1.5 and world["bags"] == 1.5 and world["xp"] == 0.0, world)
+      and world["hit"] == 0.25 and world["resist"] == 1.5 and world["bags"] == 1.5 and world["xp"] == 0.0
+      and world["health"] == 0.5 and world["speed"] == 0.15, world)
 check("  and the stir this poll began is announced in this poll's own messages",
       any(m["kind"] == "world" and m["body"].startswith("The %s lands stir" % world["name"]) for m in body["messages"]),
       body.get("messages"))
-client.post("/api/server/world", headers=auth(owner), json={"hit_on": False, "resist_on": False})
+said = [m["body"] for m in body["messages"] if m["kind"] == "world"]
+check("  saying what it does: harder hits, more health, faster, more loot, resistance counting more",
+      said and said[0] == "The %s lands stir for 3 hours: %s monsters hit 25%% harder, have 50%% more health, "
+      "move 15%% faster and drop loot 1.5x as often, and %s resistance counts 1.5x." % (world["name"], world["name"], world["name"]),
+      said)
+client.post("/api/server/world", headers=auth(owner), json={"hit_on": False, "resist_on": False, "health_on": False,
+                                                          "speed_on": False})
 world = poll(player).get_json()["world"]
-check("an effect switched off is sent as nothing: hits +0, resistance 1x", world["hit"] == 0.0 and world["resist"] == 1.0, world)
+check("an effect switched off is sent as nothing: hits +0, health +0, speed +0, resistance 1x",
+      world["hit"] == 0.0 and world["resist"] == 1.0 and world["health"] == 0.0 and world["speed"] == 0.0, world)
 client.post("/api/server/world", headers=auth(owner), json={"on": False})
 world = poll(player).get_json()["world"]
 check("switched off: no land", world == {"on": False, "tick": 0, "element": 0}, world)
-client.post("/api/server/world", headers=auth(owner), json={"on": True, "hit_on": True, "resist_on": True})
+client.post("/api/server/world", headers=auth(owner), json={"on": True, "hit_on": True, "resist_on": True,
+                                                          "health_on": True, "speed_on": True})
 sql("DROP TABLE world_ticks")
 res = poll(player)
 check("the table gone: no land, and the poll - the heartbeat - still answers",
@@ -370,7 +387,66 @@ check("the settings, the stir now, the last few, each land's hunting, and the ra
       set(view) >= {"settings", "state", "recent", "lands", "limits", "now"}
       and view["state"]["element"] in app_module.LANDS and view["recent"][0]["tick"] == view["state"]["tick"]
       and [l["name"] for l in view["lands"]] == ["dark", "light", "ice", "wind", "earth", "fire", "water"]
-      and view["lands"][6]["kills"] >= 1 and view["limits"]["hours"] == [1, 24], view)
+      and view["lands"][6]["kills"] >= 1 and view["limits"]["hours"] == [1, 24]
+      and view["limits"]["health_percent"] == [0, 200] and view["limits"]["speed_percent"] == [0, 50], view)
+
+# =============================================================================
+section("W-7  the books")
+import combatbook  # noqa: E402
+spec_p = importlib.util.spec_from_file_location("elusion_presence_world", os.path.join(HERE, "presence.py"))
+presence = importlib.util.module_from_spec(spec_p)
+spec_p.loader.exec_module(presence)
+AREA = next(iter(gamedata.AREAS)) if gamedata.AREAS else None
+if AREA is None:
+    print("  skip  the books: this catalogue has no areas' maps")
+else:
+    fire_id = next(e for e in sorted(gamedata.ENEMIES) if int(gamedata.ENEMIES[e].get("element", 0)) == 6
+                   and gamedata.ENEMIES[e].get("resource"))
+    water_id = next(e for e in sorted(gamedata.ENEMIES) if int(gamedata.ENEMIES[e].get("element", 0)) == 7
+                    and gamedata.ENEMIES[e].get("resource"))
+
+    class Leader:
+        user_id = 1
+        slot = 0
+        reports_hits = True
+
+    def born(book, monster_id, enemy_id, sent_max):
+        enemy = gamedata.ENEMIES[enemy_id]
+        book.world(Leader(), {"ev": [{"k": "spawn", "r": {"id": monster_id, "o": "", "x": 0, "y": 0,
+                                                          "hp": sent_max, "mh": sent_max,
+                                                          "p": {"ed": enemy["resource"]}}}]}, time.time())
+        flags = [f for f in book.flags if f[2] == "max_hp_differs" and f[3].startswith(enemy_id + " ")]
+        return book.monsters.get(monster_id), flags
+
+    fire_max = int(gamedata.ENEMIES[fire_id]["max_hp"])
+    water_max = int(gamedata.ENEMIES[water_id]["max_hp"])
+    book = combatbook.AreaBook(AREA, gamedata.AREAS[AREA])
+    book.stirred_lands = frozenset({6})
+    m, flags = born(book, 101, fire_id, fire_max + fire_max // 2)
+    check("a fire monster born with 50%% more health while fire stirs: counted at %d, not flagged" % (fire_max + fire_max // 2),
+          m is not None and m.max_hp == fire_max + fire_max // 2 and m.hp == m.max_hp and not flags, (m and m.max_hp, flags))
+    m, flags = born(book, 102, water_id, water_max * 2)
+    check("  a water monster with more health while fire stirs: flagged, and counted at the catalogue's",
+          m is not None and m.max_hp == water_max and flags, (m and m.max_hp, flags))
+    book = combatbook.AreaBook(AREA, gamedata.AREAS[AREA])
+    book.stirred_lands = frozenset({6})
+    m, flags = born(book, 103, fire_id, fire_max * 4)
+    check("  more than three times the catalogue's, stirring or not: flagged", m.max_hp == fire_max and flags,
+          (m.max_hp, flags))
+    book = combatbook.AreaBook(AREA, gamedata.AREAS[AREA])
+    book.stirred_lands = frozenset({6})
+    m, flags = born(book, 104, fire_id, fire_max - 1)
+    check("  and LESS than the catalogue's - the way a cheat would go - is flagged as ever", m.max_hp == fire_max and flags,
+          (m.max_hp, flags))
+    reset_world()
+    now = int(time.time())
+    sql("INSERT INTO world_ticks (tick, element, started_at, ends_at) VALUES (1, 3, ?, ?)", (now - 9000, now - 5000))
+    sql("INSERT INTO world_ticks (tick, element, started_at, ends_at) VALUES (2, 4, ?, ?)", (now - 5000, now - 600))
+    sql("INSERT INTO world_ticks (tick, element, started_at, ends_at) VALUES (3, 6, ?, ?)", (now - 600, now + 3000))
+    check("presence.py reads the lands stirring now and lately - not one long over",
+          presence.stirred_lands(now) == frozenset({4, 6}), presence.stirred_lands(now))
+    sql("DROP TABLE world_ticks")
+    check("  and none from a database from before them", presence.stirred_lands(now) == frozenset())
 
 print("\n=== %d passed, %d failed ===" % (passed, failed))
 if failures:

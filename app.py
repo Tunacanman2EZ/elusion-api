@@ -14324,18 +14324,26 @@ def set_trade():
 # The owner: "lets build it in my game if you think it will elavate it" - a
 # world that changes on its own. Every few hours one of the seven lands (an
 # element: dark, light, ice, wind, earth, fire, water - Element.Type 1 to 7)
-# STIRS. While it does, its monsters can hit harder, drop loot more often and
-# give more XP, and armour's resistance to it can count for more - each of the
-# four an owner's switch with an amount (the GM panel's World tab), and the
-# whole thing one switch more. Players' own damage never changes: "elements
-# defend; they do not change what anybody hits for" (GameConstants, 0.11.0).
+# STIRS. While it does, its monsters can hit harder, have more health, move
+# faster, drop loot more often and give more XP, and armour's resistance to it
+# can count for more - each of the six an owner's switch with an amount (the
+# GM panel's World tab), and the whole thing one switch more. Players' own
+# damage never changes: "elements defend; they do not change what anybody hits
+# for" (GameConstants, 0.11.0).
+#
+# THE OWNER, after the first try: "i did not notice dps change on enemies or
+# anything". Harder hits alone were too quiet to feel, so a stirring land's
+# monsters also glow in its colour, and have more health and speed (game
+# 0.46.0, the same release).
 #
 # WHO DECIDES WHAT. The server picks the land and pays the loot and XP (this
 # file: the kill route asks world_stir_for()), so a modded game cannot stir a
-# land or fake its drops. The game is TOLD which land and how hard its
-# monsters hit and how much resistance counts (the broadcast poll's "world"),
-# and applies those two in Player.damage_taken(), the same as every hit it
-# takes today.
+# land or fake its drops. The game is TOLD which land and the numbers it
+# applies itself (the broadcast poll's "world"): how hard its monsters hit and
+# how much resistance counts, in Player.damage_taken(), and their health and
+# speed, in BaseEnemy. The combat books (combatbook.py, through presence.py's
+# stirred_lands()) count a stirring land's monster at the health its leader
+# says it was born with - more than the catalogue's, never less.
 #
 # TICKS, NOT CLOCKS. world_ticks holds one row per stir, numbered 1, 2, 3...
 # with when it began and ends. Nothing runs on a timer: whoever asks first
@@ -14364,13 +14372,16 @@ WORLD_KEY = "world"
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 WORLD_HUNT_WINDOW = 24 * 3600
 WORLD_RECENT_TICKS = 8
-# Shipped ON, with three of the four effects: the owner's choice of 3-hour
-# stirs, harder hits, more loot and resistance counting for more. More XP is
-# there, switched off, for the owner to try.
+# Shipped ON, with five of the six effects: the owner's choice of 3-hour
+# stirs, harder hits, more loot and resistance counting for more, and - to be
+# felt - more health and speed. More XP is there, switched off, for the owner
+# to try.
 WORLD_DEFAULTS = {
     "on": True,
     "hours": 3,
     "hit_on": True, "hit_percent": 25,
+    "health_on": True, "health_percent": 50,
+    "speed_on": True, "speed_percent": 15,
     "bags_on": True, "bags_times": 1.5,
     "resist_on": True, "resist_times": 1.5,
     "xp_on": False, "xp_percent": 25,
@@ -14379,11 +14390,13 @@ WORLD_DEFAULTS = {
 WORLD_LIMITS = {
     "hours": (1, 24, True),
     "hit_percent": (0, 100, True),
+    "health_percent": (0, 200, True),
+    "speed_percent": (0, 50, True),
     "bags_times": (1.0, 3.0, False),
     "resist_times": (1.0, 2.0, False),
     "xp_percent": (0, 100, True),
 }
-WORLD_SWITCHES = ("on", "hit_on", "bags_on", "resist_on", "xp_on")
+WORLD_SWITCHES = ("on", "hit_on", "health_on", "speed_on", "bags_on", "resist_on", "xp_on")
 
 
 def world_settings():
@@ -14457,6 +14470,10 @@ def stir_text(element, settings, hours):
     does = []
     if settings["hit_on"] and settings["hit_percent"] > 0:
         does.append("hit %d%% harder" % settings["hit_percent"])
+    if settings["health_on"] and settings["health_percent"] > 0:
+        does.append("have %d%% more health" % settings["health_percent"])
+    if settings["speed_on"] and settings["speed_percent"] > 0:
+        does.append("move %d%% faster" % settings["speed_percent"])
     if settings["bags_on"] and settings["bags_times"] > 1.0:
         does.append("drop loot %sx as often" % ("%g" % settings["bags_times"]))
     if settings["xp_on"] and settings["xp_percent"] > 0:
@@ -14526,6 +14543,8 @@ def world_public(db):
         "started_at": row["started_at"],
         "ends_at": row["ends_at"],
         "hit": settings["hit_percent"] / 100.0 if settings["hit_on"] else 0.0,
+        "health": settings["health_percent"] / 100.0 if settings["health_on"] else 0.0,
+        "speed": settings["speed_percent"] / 100.0 if settings["speed_on"] else 0.0,
         "resist": settings["resist_times"] if settings["resist_on"] else 1.0,
         "bags": settings["bags_times"] if settings["bags_on"] else 1.0,
         "xp": settings["xp_percent"] / 100.0 if settings["xp_on"] else 0.0,
@@ -14609,8 +14628,8 @@ def read_world():
 def set_world():
     """
     Change the stirring lands' settings (owner only): any of on, hours,
-    hit_on, hit_percent, bags_on, bags_times, resist_on, resist_times, xp_on,
-    xp_percent
+    hit_on, hit_percent, health_on, health_percent, speed_on, speed_percent,
+    bags_on, bags_times, resist_on, resist_times, xp_on, xp_percent
     ---
     tags:
       - Status

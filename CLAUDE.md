@@ -1914,10 +1914,23 @@ dark, light, ice, wind, earth, fire, water; 8 and 9 are not lands) stirs.
 
 - **Who decides what.** The server picks the land and pays what it pays at
   the kill: `world_stir_for()` gives the kill route a bag scale and an XP
-  scale, passed to `gamedata.roll_kill_rewards()`. The game is told the land,
-  the hit and the resistance numbers on the broadcast poll (`"world"`) and
-  applies those two itself in `Player.damage_taken()`. Players' own damage
-  never changes.
+  scale, passed to `gamedata.roll_kill_rewards()`. The game is told the land
+  and the numbers it applies itself on the broadcast poll (`"world"`): the
+  hit and the resistance in `Player.damage_taken()`, the monsters' health
+  and speed in `BaseEnemy`, which also glow in the land's colour. Players'
+  own damage never changes.
+- **Felt, not just counted.** The owner's first try: "i did not notice dps
+  change on enemies or anything" - +25% on one land's hits in seven was too
+  quiet. So health (+50%) and speed (+15%) were added, both shipped on.
+- **The books know about health.** A monster born while its land stirs is
+  sent to presence.py with more health than the catalogue's (`"mh"`), which
+  would read as `max_hp_differs`. `presence.stirred_lands()` reads the lands
+  stirring now or within `STIR_GRACE_SECONDS` (an hour) every
+  `STIR_READ_SECONDS`, and `AreaBook._stirred_max()` takes such a monster's
+  word - more than the catalogue's, at most `STIRRED_MAX_TIMES` it - and
+  counts it at that. Less than the catalogue's is flagged as ever: that is
+  the way a cheat would go. The game never lowers a stirred monster's health
+  when the stir ends, for the same reason.
 - **Ticks, not timers.** `world_ticks`, one row per stir, numbered from 1.
   Whoever asks first after one ends - the poll, a kill, the owner's view -
   writes the next (`current_world_tick()`), with `INSERT OR IGNORE` on the
@@ -1930,11 +1943,11 @@ dark, light, ice, wind, earth, fire, water; 8 and 9 are not lands) stirs.
   on purpose: nothing a player gains from predicting it is hidden - the land
   is announced to everyone.
 - **The settings** are `WORLD_KEY` in `server_settings`: `on`, `hours` and
-  four effects, each a switch and an amount (`WORLD_DEFAULTS`,
-  `WORLD_LIMITS`). No row reads the defaults (on; 3 hours; hits +25%, loot
-  1.5x, resistance 1.5x on; XP +25% off); an unreadable row reads OFF; a
-  stored value out of range is held to it. `hours` applies from the next
-  stir, not the one running.
+  six effects, each a switch and an amount (`WORLD_DEFAULTS`,
+  `WORLD_LIMITS`). No row reads the defaults (on; 3 hours; hits +25%, health
+  +50%, speed +15%, loot 1.5x, resistance 1.5x on; XP +25% off); an
+  unreadable row reads OFF; a stored value out of range is held to it.
+  `hours` applies from the next stir, not the one running.
 - **The owner's routes**, all `require_owner` (404 to everyone else), the two
   writes also `require_fresh_password`: `GET /api/server/world` (settings,
   the stir now, the last eight, each land's hunting); `POST

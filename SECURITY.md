@@ -321,8 +321,12 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     the settings or stirs a land by hand, with the password again; to anyone
     else the routes are the same bare 404 as no route. A setting that cannot
     be read is off, anything else going wrong is "no land" while the poll
-    still answers, and the game drops a stir a minute past its end.
-    → Held by: `test_world.py` — "a row that cannot be read: OFF - a broken setting never makes the game harder", "nobody but the owner sees or changes it - the same bare 404 as no route", "  and both changes ask for the password again on a hardened session (STEP-UP)", "the table gone: no land, and the poll - the heartbeat - still answers", "the XP paid is the server's, with the stir in it"
+    still answers, and the game drops a stir a minute past its end. A
+    stirring land's monsters are born with more health, and the combat books
+    take their leader's word for that - but only more than the catalogue's,
+    at most three times it, and only for a land that is stirring; less is
+    flagged as ever.
+    → Held by: `test_world.py` — "a row that cannot be read: OFF - a broken setting never makes the game harder", "nobody but the owner sees or changes it - the same bare 404 as no route", "  and both changes ask for the password again on a hardened session (STEP-UP)", "the table gone: no land, and the poll - the heartbeat - still answers", "the XP paid is the server's, with the stir in it", "  a water monster with more health while fire stirs: flagged, and counted at the catalogue's", "  and LESS than the catalogue's - the way a cheat would go - is flagged as ever"
     → and in the game: `src/tools/testrunner.gd` — `_test_stirring_lands()`
 
 ---
