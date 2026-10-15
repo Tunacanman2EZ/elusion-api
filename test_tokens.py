@@ -275,7 +275,9 @@ asks = sorted(path for path, on in fresh.items() if on)
 check("the routes that ask: ranks, bans, gold, levels, skills, items, rollback and the server's switches",
       asks == sorted(["/api/staff/ban", "/api/staff/unban", "/api/staff/role", "/api/staff/gold", "/api/staff/level",
                       "/api/staff/skill", "/api/staff/grant", "/api/staff/rollback", "/api/server/maintenance",
-                      "/api/server/minbuild", "/api/server/pvp", "/api/server/trade"]), asks)
+                      "/api/server/minbuild", "/api/server/pvp", "/api/server/trade",
+                      # The stirring lands' two switches (game 0.46.0, test_world.py).
+                      "/api/server/world", "/api/server/world/stir"]), asks)
 check("  and not a moderator's everyday ones: mute, kick, a deleted line, reports",
       not any(fresh.get(p) for p in ("/api/staff/mute", "/api/staff/kick", "/api/chat/delete",
                                      "/api/staff/reports/resolve")))

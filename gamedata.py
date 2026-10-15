@@ -1903,11 +1903,17 @@ def rarest_first(contents):
     return sorted(contents, key=rank)
 
 
-def roll_kill_rewards(enemy_id, class_id=""):
+def roll_kill_rewards(enemy_id, class_id="", bag_scale=1.0, xp_scale=1.0):
     """
     The whole reward for one kill. Port of BaseEnemy._die() plus
     _roll_and_spawn_loot(), minus everything to do with spawning a node.
     class_id is the killer's, for the mythic roll (roll_mythic()).
+
+    bag_scale and xp_scale are THE STIRRING LANDS' (app.py, game 0.46.0): a
+    monster of the land that is stirring drops a bag bag_scale times as often
+    (never past certain) and gives xp_scale times its XP. 1.0 is an ordinary
+    kill; nothing else about the roll changes - the tier, the items, the pet
+    and the mythic odds are the monster's own.
 
     Returns:
         {
@@ -1928,7 +1934,10 @@ def roll_kill_rewards(enemy_id, class_id=""):
         raise KeyError(enemy_id)
 
     pet_won = roll_pet(enemy)
-    bag_drops = _rng.random() <= float(enemy.get("bag_drop_chance", 0.0))
+    chance = float(enemy.get("bag_drop_chance", 0.0))
+    if bag_scale != 1.0 and chance > 0.0:
+        chance = min(1.0, chance * max(0.0, float(bag_scale)))
+    bag_drops = _rng.random() <= chance
     # A mythic rolls like any other dropped piece. The answer's "mythic" is
     # the rolled id, the one in the bag.
     mythic = roll_mythic(enemy, class_id)
@@ -1946,7 +1955,7 @@ def roll_kill_rewards(enemy_id, class_id=""):
 
     return {
         "enemy_id": enemy_id,
-        "xp": int(enemy.get("xp_reward", 0)),
+        "xp": int(round(int(enemy.get("xp_reward", 0)) * max(0.0, float(xp_scale)))),
         "attack_xp": int(enemy.get("attack_xp_reward", 0)),
         "pet_won": pet_won,
         "mythic": mythic,

@@ -38,6 +38,13 @@ app_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(app_module)
 client = app_module.app.test_client()
 
+# THE STIRRING LANDS (game 0.46.0) announce each stir on the poll, and this
+# suite counts announcements, so the lands are switched off for it.
+# test_world.py holds theirs.
+with app_module.app.app_context():
+    app_module.set_server_setting(app_module.WORLD_KEY, '{"on": false}')
+    app_module.get_db().commit()
+
 passed = 0
 failed = 0
 failures = []

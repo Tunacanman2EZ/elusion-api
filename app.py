@@ -19,6 +19,7 @@ import json
 import logging
 import collections
 import sqlite3
+import random
 import secrets
 import time
 import os
@@ -1871,6 +1872,17 @@ def init_db():
             value      TEXT    NOT NULL,
             updated_by TEXT    NOT NULL DEFAULT '',
             updated_at INTEGER NOT NULL DEFAULT 0
+        );
+
+        -- THE STIRRING LANDS (game 0.46.0): one row per stir, numbered from 1.
+        -- element is Element.Type 1-7; chosen_by '' when the world picked it,
+        -- the owner's name when they stirred it by hand.
+        CREATE TABLE IF NOT EXISTS world_ticks (
+            tick       INTEGER PRIMARY KEY,
+            element    INTEGER NOT NULL,
+            started_at INTEGER NOT NULL,
+            ends_at    INTEGER NOT NULL,
+            chosen_by  TEXT    NOT NULL DEFAULT ''
         );
 
         -- WHAT THE SERVER SAYS TO EVERYONE.
@@ -10869,7 +10881,10 @@ def combat_kill():
 
     # The killer's class goes in for the mythic roll: a win is their own
     # class's piece. See gamedata.roll_mythic().
-    rewards = gamedata.roll_kill_rewards(enemy_id, row["class_id"])
+    # THE STIRRING LANDS: a monster of the land stirring now drops loot more
+    # often and gives more XP, as the owner has set it (world_stir_for()).
+    bag_scale, xp_scale = world_stir_for(db, enemy_id)
+    rewards = gamedata.roll_kill_rewards(enemy_id, row["class_id"], bag_scale, xp_scale)
 
     level, xp, xp_to_next, levels_gained = gamedata.apply_xp(
         int(row["level"]), int(row["xp"]), int(row["xp_to_next"]), rewards["xp"]
@@ -13098,6 +13113,8 @@ STAFF_ACTION_KINDS = (
     "give", "rollback",
     # 0.21.0: somebody else's level set, and the co-owners' switch.
     "player_level", "coowners",
+    # 0.46.0: the stirring lands' settings, and a land stirred by hand.
+    "world",
 )
 
 # NAMED SETS OF KINDS the log can be asked for by one name (?action=moderation).
@@ -14300,6 +14317,417 @@ def set_trade():
     ).fetchone()[0]
     return {"trade": wanted, "open_trades": int(still_open)}, 200
 
+# =============================================================================
+# THE STIRRING LANDS (game 0.46.0)
+# =============================================================================
+#
+# The owner: "lets build it in my game if you think it will elavate it" - a
+# world that changes on its own. Every few hours one of the seven lands (an
+# element: dark, light, ice, wind, earth, fire, water - Element.Type 1 to 7)
+# STIRS. While it does, its monsters can hit harder, drop loot more often and
+# give more XP, and armour's resistance to it can count for more - each of the
+# four an owner's switch with an amount (the GM panel's World tab), and the
+# whole thing one switch more. Players' own damage never changes: "elements
+# defend; they do not change what anybody hits for" (GameConstants, 0.11.0).
+#
+# WHO DECIDES WHAT. The server picks the land and pays the loot and XP (this
+# file: the kill route asks world_stir_for()), so a modded game cannot stir a
+# land or fake its drops. The game is TOLD which land and how hard its
+# monsters hit and how much resistance counts (the broadcast poll's "world"),
+# and applies those two in Player.damage_taken(), the same as every hit it
+# takes today.
+#
+# TICKS, NOT CLOCKS. world_ticks holds one row per stir, numbered 1, 2, 3...
+# with when it began and ends. Nothing runs on a timer: whoever asks first
+# after one ends - the broadcast poll every game in the world sends, or a kill
+# - writes the next (current_world_tick()). The next begins where the last
+# ended, so the rhythm holds while people play; after a quiet spell longer than
+# a stir it begins when somebody next asks. Two asking at once both try to
+# write the same tick number; the PRIMARY KEY lets exactly one in, and only
+# that one announces it.
+#
+# WHICH LAND. The one hunted least in the last WORLD_HUNT_WINDOW seconds
+# (kill_reports - every paid kill), never the one that just stirred, so the
+# world sends people to where they have not been. A tie, which with a quiet
+# server is most of the time, is broken by a Random seeded with the tick
+# number: the same tick always picks the same land, whoever asks.
+#
+# AND IF ANY OF IT FAILS, NOTHING STIRS. A setting that cannot be read is off
+# (world_settings(), like pvp_enabled()); a table that cannot be read or
+# written is "no land" (world_public(), world_stir_for()), which is simply the
+# game as it was. The poll that carries it is also the heartbeat, so the world
+# must never be the reason it fails.
+
+WORLD_KEY = "world"
+# Element.Type 1 to 7 in the game (src/shared/element.gd), named as the game
+# names them. ELECTRIC and POISON (8, 9) are creatures' colours, not lands.
+LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
+WORLD_HUNT_WINDOW = 24 * 3600
+WORLD_RECENT_TICKS = 8
+# Shipped ON, with three of the four effects: the owner's choice of 3-hour
+# stirs, harder hits, more loot and resistance counting for more. More XP is
+# there, switched off, for the owner to try.
+WORLD_DEFAULTS = {
+    "on": True,
+    "hours": 3,
+    "hit_on": True, "hit_percent": 25,
+    "bags_on": True, "bags_times": 1.5,
+    "resist_on": True, "resist_times": 1.5,
+    "xp_on": False, "xp_percent": 25,
+}
+# What each number may be: (lowest, highest, whole numbers only).
+WORLD_LIMITS = {
+    "hours": (1, 24, True),
+    "hit_percent": (0, 100, True),
+    "bags_times": (1.0, 3.0, False),
+    "resist_times": (1.0, 2.0, False),
+    "xp_percent": (0, 100, True),
+}
+WORLD_SWITCHES = ("on", "hit_on", "bags_on", "resist_on", "xp_on")
+
+
+def world_settings():
+    """The owner's settings for the stirring lands: WORLD_DEFAULTS where none
+    were ever saved, and OFF where what was saved cannot be read. A saved
+    value out of its range is held to it; one of the wrong kind is the
+    default."""
+    raw = get_server_setting(WORLD_KEY)
+    if raw is None:
+        return dict(WORLD_DEFAULTS)
+    try:
+        stored = json.loads(raw)
+    except (ValueError, TypeError):
+        stored = None
+    if not isinstance(stored, dict):
+        return dict(WORLD_DEFAULTS, on=False)
+    out = dict(WORLD_DEFAULTS)
+    for key in WORLD_SWITCHES:
+        if isinstance(stored.get(key), bool):
+            out[key] = stored[key]
+    for key, (low, high, whole) in WORLD_LIMITS.items():
+        value = stored.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        value = min(max(value, low), high)
+        out[key] = int(round(value)) if whole else round(float(value), 2)
+    return out
+
+
+def _world_row(row):
+    if row is None:
+        return None
+    return {"tick": int(row["tick"]), "element": int(row["element"]),
+            "name": LANDS.get(int(row["element"]), ""), "started_at": int(row["started_at"]),
+            "ends_at": int(row["ends_at"]), "chosen_by": row["chosen_by"] or ""}
+
+
+def land_hunts(db, now=None):
+    """{element: paid kills of that land's monsters in the last
+    WORLD_HUNT_WINDOW} for all seven lands."""
+    now = int(time.time()) if now is None else int(now)
+    counts = {element: 0 for element in LANDS}
+    rows = db.execute(
+        "SELECT enemy_id, COUNT(*) AS n FROM kill_reports WHERE at >= ? GROUP BY enemy_id",
+        (now - WORLD_HUNT_WINDOW,),
+    ).fetchall()
+    for row in rows:
+        enemy = gamedata.ENEMIES.get(row["enemy_id"]) or {}
+        element = int(enemy.get("element", 0) or 0)
+        if element in counts:
+            counts[element] += int(row["n"])
+    return counts
+
+
+def pick_land(db, tick, previous, now=None):
+    """The land that stirs at `tick`: the least hunted lately, never
+    `previous`; a tie settled by a Random seeded with the tick."""
+    candidates = sorted(e for e in LANDS if e != previous)
+    chooser = random.Random(tick * 7919 + 104729)
+    try:
+        hunts = land_hunts(db, now)
+    except sqlite3.Error:
+        return chooser.choice(candidates)
+    least = min(hunts[e] for e in candidates)
+    return chooser.choice([e for e in candidates if hunts[e] == least])
+
+
+def stir_text(element, settings, hours):
+    """What the world says when a land stirs, from the effects that are on."""
+    name = LANDS.get(int(element), "unknown")
+    does = []
+    if settings["hit_on"] and settings["hit_percent"] > 0:
+        does.append("hit %d%% harder" % settings["hit_percent"])
+    if settings["bags_on"] and settings["bags_times"] > 1.0:
+        does.append("drop loot %sx as often" % ("%g" % settings["bags_times"]))
+    if settings["xp_on"] and settings["xp_percent"] > 0:
+        does.append("give %d%% more XP" % settings["xp_percent"])
+    text = "The %s lands stir for %d hour%s" % (name, hours, "" if hours == 1 else "s")
+    if does:
+        text += ": %s monsters %s" % (name, ", ".join(does[:-1]) + (" and " if len(does) > 1 else "") + does[-1])
+    if settings["resist_on"] and settings["resist_times"] > 1.0:
+        text += (", and " if does else ": ") + "%s resistance counts %sx" % (name, "%g" % settings["resist_times"])
+    return text + "."
+
+
+def _begin_stir(db, tick, element, started_at, settings, chosen_by=""):
+    """Write stir `tick`. True if this call wrote it - and only then is it
+    announced; a tick somebody else wrote first is theirs to announce.
+    Caller commits."""
+    ends_at = int(started_at) + int(settings["hours"]) * 3600
+    cursor = db.execute(
+        "INSERT OR IGNORE INTO world_ticks (tick, element, started_at, ends_at, chosen_by)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (int(tick), int(element), int(started_at), ends_at, chosen_by),
+    )
+    if cursor.rowcount != 1:
+        return False
+    post_broadcast(stir_text(element, settings, int(settings["hours"])), "world", chosen_by)
+    return True
+
+
+def current_world_tick(db, settings=None, now=None):
+    """The stir going on now - writing the next one if the last has ended -
+    or None while the lands are switched off. Caller commits."""
+    settings = world_settings() if settings is None else settings
+    if not settings["on"]:
+        return None
+    now = int(time.time()) if now is None else int(now)
+    last = db.execute("SELECT * FROM world_ticks ORDER BY tick DESC LIMIT 1").fetchone()
+    if last is not None and now < int(last["ends_at"]):
+        return _world_row(last)
+    tick = int(last["tick"]) + 1 if last is not None else 1
+    length = int(settings["hours"]) * 3600
+    # THE RHYTHM HOLDS while people are playing: the next stir begins where
+    # the last one ended. After a quiet spell longer than a whole stir, it
+    # begins now - nobody was there to see the ones in between.
+    started = int(last["ends_at"]) if last is not None and now - int(last["ends_at"]) < length else now
+    previous = int(last["element"]) if last is not None else 0
+    _begin_stir(db, tick, pick_land(db, tick, previous, now), started, settings)
+    return _world_row(db.execute("SELECT * FROM world_ticks WHERE tick = ?", (tick,)).fetchone())
+
+
+def world_public(db):
+    """The world as the game needs it, on the broadcast poll: which land
+    stirs, until when, and the numbers the game applies itself. "element" 0
+    for none - switched off, or anything at all going wrong."""
+    try:
+        settings = world_settings()
+        row = current_world_tick(db, settings)
+    except Exception:   # the heartbeat must outlive the world
+        app.logger.exception("[WORLD] could not read the stirring lands; nothing stirs")
+        return {"on": False, "tick": 0, "element": 0}
+    if row is None:
+        return {"on": bool(settings["on"]), "tick": 0, "element": 0}
+    return {
+        "on": True,
+        "tick": row["tick"],
+        "element": row["element"],
+        "name": row["name"],
+        "started_at": row["started_at"],
+        "ends_at": row["ends_at"],
+        "hit": settings["hit_percent"] / 100.0 if settings["hit_on"] else 0.0,
+        "resist": settings["resist_times"] if settings["resist_on"] else 1.0,
+        "bags": settings["bags_times"] if settings["bags_on"] else 1.0,
+        "xp": settings["xp_percent"] / 100.0 if settings["xp_on"] else 0.0,
+        # The server's clock, so the game counts down to ends_at on it rather
+        # than on a computer clock that may be minutes out.
+        "now": int(time.time()),
+    }
+
+
+def world_stir_for(db, enemy_id):
+    """(bag scale, XP scale) for a kill of `enemy_id`: the stirring land's, if
+    the monster is of it, else (1.0, 1.0) - which is also the answer to
+    anything going wrong."""
+    try:
+        settings = world_settings()
+        row = current_world_tick(db, settings)
+        enemy = gamedata.ENEMIES.get(enemy_id) or {}
+        if row is None or int(enemy.get("element", 0) or 0) != row["element"]:
+            return 1.0, 1.0
+        bags = float(settings["bags_times"]) if settings["bags_on"] else 1.0
+        xp = 1.0 + (settings["xp_percent"] / 100.0 if settings["xp_on"] else 0.0)
+        return bags, xp
+    except Exception:
+        app.logger.exception("[WORLD] could not read the stirring lands for a kill; an ordinary kill")
+        return 1.0, 1.0
+
+
+def _world_owner_payload(db):
+    settings = world_settings()
+    state = world_public(db)
+    recent = [_world_row(r) for r in db.execute(
+        "SELECT * FROM world_ticks ORDER BY tick DESC LIMIT ?", (WORLD_RECENT_TICKS,)).fetchall()]
+    try:
+        hunts = land_hunts(db)
+    except sqlite3.Error:
+        hunts = {element: 0 for element in LANDS}
+    return {
+        "settings": settings,
+        "state": state,
+        "recent": recent,
+        "lands": [{"element": e, "name": LANDS[e], "kills": hunts.get(e, 0)} for e in sorted(LANDS)],
+        "limits": {k: [low, high] for k, (low, high, _) in WORLD_LIMITS.items()},
+        "now": int(time.time()),
+    }
+
+
+@app.get("/api/server/world")
+@require_auth
+@require_owner
+def read_world():
+    """
+    The stirring lands: the settings, the land stirring now, the last few, and
+    how hunted each land has been (owner only)
+    ---
+    tags:
+      - Status
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+    responses:
+      200:
+        description: settings, state, recent, lands, limits
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: Not the owner
+    """
+    db = get_db()
+    payload = _world_owner_payload(db)
+    db.commit()   # a stir written by asking is kept
+    return payload, 200
+
+
+@app.post("/api/server/world")
+@require_auth
+@require_owner
+@require_fresh_password
+def set_world():
+    """
+    Change the stirring lands' settings (owner only): any of on, hours,
+    hit_on, hit_percent, bags_on, bags_times, resist_on, resist_times, xp_on,
+    xp_percent
+    ---
+    tags:
+      - Status
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: settings
+        schema:
+          type: object
+    responses:
+      200:
+        description: The settings as they now stand, with the world
+      400:
+        description: An unknown setting, or a value of the wrong kind or out of range
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: Not the owner
+    """
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or not payload:
+        return bad_request("send the settings to change, e.g. {\"on\": true}")
+    current = world_settings()
+    changed = dict(current)
+    for key, value in payload.items():
+        if key in WORLD_SWITCHES:
+            if not isinstance(value, bool):
+                return bad_request("%s is true or false" % key)
+            changed[key] = value
+        elif key in WORLD_LIMITS:
+            low, high, whole = WORLD_LIMITS[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or (whole and float(value) != int(value)) or not low <= value <= high:
+                return bad_request("%s is %s from %g to %g" % (key, "a whole number" if whole else "a number",
+                                                                 low, high))
+            changed[key] = int(value) if whole else round(float(value), 2)
+        else:
+            return bad_request("%s is not a setting of the stirring lands" % key)
+
+    db = get_db()
+    set_server_setting(WORLD_KEY, json.dumps(changed), g.user["username"])
+    if current["on"] and not changed["on"]:
+        post_broadcast("The lands grow still.", "world", g.user["username"])
+    elif changed["on"] and not current["on"]:
+        # BACK ON: a stir still running is said again; one that ended is
+        # replaced by asking, and that one announces itself.
+        before = db.execute("SELECT MAX(tick) AS t FROM world_ticks").fetchone()["t"]
+        row = current_world_tick(db, changed)
+        if row is not None and row["tick"] == (before or 0):
+            post_broadcast(stir_text(row["element"], changed, int(changed["hours"])), "world",
+                           g.user["username"])
+    log_staff_action(g.user, "world", "server", None,
+                     ", ".join("%s=%s" % (k, payload[k]) for k in sorted(payload)))
+    db.commit()
+    return _world_owner_payload(db), 200
+
+
+@app.post("/api/server/world/stir")
+@require_auth
+@require_owner
+@require_fresh_password
+def stir_world():
+    """
+    Stir a land now, for a whole stir (owner only)
+    ---
+    tags:
+      - Status
+    parameters:
+      - in: header
+        name: Authorization
+        type: string
+        required: true
+        description: "Bearer <token>"
+      - in: body
+        name: land
+        schema:
+          type: object
+          required: [element]
+          properties:
+            element: {type: integer, description: "1 dark, 2 light, 3 ice, 4 wind, 5 earth, 6 fire, 7 water"}
+    responses:
+      200:
+        description: The world, with the new stir
+      400:
+        description: Not one of the seven lands
+      401:
+        description: Missing, invalid or expired token
+      404:
+        description: Not the owner
+      409:
+        description: The stirring lands are switched off
+    """
+    payload = request.get_json(silent=True) or {}
+    element = payload.get("element")
+    if isinstance(element, bool) or not isinstance(element, int) or element not in LANDS:
+        return bad_request("element is one of the seven lands, 1 to 7")
+    settings = world_settings()
+    if not settings["on"]:
+        return {"error": "Conflict", "message": "The stirring lands are switched off - switch them on first."}, 409
+    db = get_db()
+    now = int(time.time())
+    last = db.execute("SELECT * FROM world_ticks ORDER BY tick DESC LIMIT 1").fetchone()
+    # THE STIR GOING ON ENDS NOW, and the owner's begins: a whole stir long,
+    # not the rest of the one it replaced.
+    if last is not None and int(last["ends_at"]) > now:
+        db.execute("UPDATE world_ticks SET ends_at = ? WHERE tick = ?", (now, int(last["tick"])))
+    tick = int(last["tick"]) + 1 if last is not None else 1
+    _begin_stir(db, tick, element, now, settings, g.user["username"])
+    log_staff_action(g.user, "world", "server", None, "stirred the %s lands" % LANDS[element])
+    db.commit()
+    return _world_owner_payload(db), 200
+
+
 def _co_owners_payload():
     raw = get_server_setting(CO_OWNERS_KEY)
     try:
@@ -14516,6 +14944,9 @@ def read_broadcasts():
     # recorded as a beat - and committed with the read below rather than on its
     # own, so this is one transaction, not two.
     stamp_presence(db, playing)
+    # THE STIRRING LANDS, asked before the messages are read: a stir this poll
+    # begins is announced in this poll's own answer.
+    world = world_public(db)
     db.commit()
 
     # A FIRST POLL ASKS FOR THE TAIL, NOT THE WHOLE TABLE. since=0 means "I just
@@ -14559,6 +14990,10 @@ def read_broadcasts():
         # question from the one a player who just logged in is asking. See
         # pvp_since(); 0 when it has never been touched.
         "pvp_at": pvp_since(),
+        # THE STIRRING LANDS (game 0.46.0): which land stirs, until when, and
+        # how hard its monsters hit and how much resistance to it counts - the
+        # two the game applies itself. See world_public().
+        "world": world,
         # Rides the same poll as everything else. None when there is nowhere
         # to be; the client applies it and then acks it away.
         "teleport": pending_teleport_for(g.user["id"]),

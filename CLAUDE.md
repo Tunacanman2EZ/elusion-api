@@ -1905,6 +1905,52 @@ with icons of the enemies". THE KILL RECORD in app.py, `test_killrecord.py`.
   routes: the seed runs at import ("init_db() runs at import time").
 - Deleting a character deletes its record with its other rows.
 
+## The stirring lands (game 0.46.0)
+
+The owner, 15 Oct: "lets build it in my game if you think it will elavate
+it" - a world that changes on its own. THE STIRRING LANDS in app.py,
+`test_world.py`. Every few hours one of the seven lands (Element.Type 1-7:
+dark, light, ice, wind, earth, fire, water; 8 and 9 are not lands) stirs.
+
+- **Who decides what.** The server picks the land and pays what it pays at
+  the kill: `world_stir_for()` gives the kill route a bag scale and an XP
+  scale, passed to `gamedata.roll_kill_rewards()`. The game is told the land,
+  the hit and the resistance numbers on the broadcast poll (`"world"`) and
+  applies those two itself in `Player.damage_taken()`. Players' own damage
+  never changes.
+- **Ticks, not timers.** `world_ticks`, one row per stir, numbered from 1.
+  Whoever asks first after one ends - the poll, a kill, the owner's view -
+  writes the next (`current_world_tick()`), with `INSERT OR IGNORE` on the
+  tick, so of two askers exactly one writes it and only that one announces it
+  (broadcast kind `world`). The next begins where the last ended; after a gap
+  longer than a whole stir it begins now.
+- **Which land**: the least hunted in the last 24 hours (`kill_reports`),
+  never the one that just stirred; ties by `random.Random` seeded with the
+  tick, so the same tick picks the same land whoever asks. Not SystemRandom
+  on purpose: nothing a player gains from predicting it is hidden - the land
+  is announced to everyone.
+- **The settings** are `WORLD_KEY` in `server_settings`: `on`, `hours` and
+  four effects, each a switch and an amount (`WORLD_DEFAULTS`,
+  `WORLD_LIMITS`). No row reads the defaults (on; 3 hours; hits +25%, loot
+  1.5x, resistance 1.5x on; XP +25% off); an unreadable row reads OFF; a
+  stored value out of range is held to it. `hours` applies from the next
+  stir, not the one running.
+- **The owner's routes**, all `require_owner` (404 to everyone else), the two
+  writes also `require_fresh_password`: `GET /api/server/world` (settings,
+  the stir now, the last eight, each land's hunting); `POST
+  /api/server/world` (any of the settings; an unknown key or a bad value is
+  400, nothing half-saved; off says "The lands grow still.", back on says the
+  stir again); `POST /api/server/world/stir` `{"element": 1-7}` (409 while
+  off; ends the stir running now and starts a whole one, `chosen_by` the
+  owner). Both writes are logged as `world`.
+- **Failing safe is the design.** The poll is also the heartbeat, so
+  `world_public()` and `world_stir_for()` catch everything and answer "no
+  land" - the game as it was. The game in turn drops a stir 60 seconds past
+  its `ends_at`, so a server that cannot be heard never makes it harder.
+- **Tests that count broadcasts switch the lands off first**
+  (`test_broadcast.py`, `test_maintenance.py`): the first poll writes stir 1
+  and announces it, one message more than the suite expects.
+
 ## Decided, not built: staff commands
 
 **Put the required rank on the command definition, not in the handler.** A

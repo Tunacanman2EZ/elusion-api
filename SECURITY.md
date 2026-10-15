@@ -312,6 +312,18 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     login is unbound, and at 6 every unbound login ends.
     → Held by: `test_tokens.py` — "THE SAME TOKEN WITHOUT ITS GAME - copied from a log, a clipboard, a crash dump - is refused as theft", "the replaced token from ANYWHERE ELSE is theft: somebody kept it", "a hardened staff login ends within STAFF_TOKEN_TTL (12 hours)", "a staff session with no game running it for half an hour is over, and says so", "fifteen minutes on, the token alone is not enough: 403, asking for the password", "CONFIRM_MAX_MISSES wrong guesses at the password on one session is theft: every session ends", "an HTTPS answer carries HSTS for a year", "once the minimum build is 6, an unbound login is over - whatever build it claims to come from", "  and no token, or its hash, in any line of it"
     → and in the game: `src/tools/testrunner.gd` — `_test_token_lifecycle()`
+34. **The stirring lands are decided by the server, and a world that fails
+    never makes the game harder** (0.46.0, THE STIRRING LANDS in app.py).
+    Which land stirs, and the extra loot and XP a kill of its monsters pays,
+    are the server's: the game is told the land on the broadcast poll and
+    applies only the two numbers it is sent, to the hits its own player takes.
+    Only the owner (and a co-owner while the switch is on) reads or changes
+    the settings or stirs a land by hand, with the password again; to anyone
+    else the routes are the same bare 404 as no route. A setting that cannot
+    be read is off, anything else going wrong is "no land" while the poll
+    still answers, and the game drops a stir a minute past its end.
+    → Held by: `test_world.py` — "a row that cannot be read: OFF - a broken setting never makes the game harder", "nobody but the owner sees or changes it - the same bare 404 as no route", "  and both changes ask for the password again on a hardened session (STEP-UP)", "the table gone: no land, and the poll - the heartbeat - still answers", "the XP paid is the server's, with the stir in it"
+    → and in the game: `src/tools/testrunner.gd` — `_test_stirring_lands()`
 
 ---
 
