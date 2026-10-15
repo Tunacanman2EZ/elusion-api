@@ -2040,6 +2040,61 @@ its SQL). `test_events.py`.
   kill is still paid. `world_events` is None until registration, and the
   three places that ask carry on without it.
 
+## Guardrails, the dry run and the event report (game 0.49.0)
+
+The owner's two asks on top of events: "dashboards that show, for each event:
+XP/hour and gold/hour before/during/after; player count online vs time; which
+events actually move the needle on 'empty world'", and "guardrails on your
+event DSL: don't allow 3x XP + 3x loot + 3x gold all at once in the same
+area; or a dry-run page". All in `events/`, still three layers.
+
+- **The ceilings** (`services.MOST_XP` 3, `MOST_LOOT` 3, `MOST_TOGETHER` 6 -
+  XP times loot for one monster). The unit is a land's monsters, not an area:
+  monsters are paid by kind, and a land's live in many areas. There is no
+  gold kind: gold comes out of loot bags, so loot is the gold.
+- **When an event is set** (`guard()`): for each land, the most its monsters
+  could be paid at any moment the event is on - this event, every event over
+  it (`data.overlapping()`), and the stirring land's own XP and loot as the
+  World tab has them (worst case: any land may be the one stirring; a "the
+  stirring land's" event covers every land while the lands are on). Past a
+  ceiling, POST /api/world/events is a 409 that says whose monsters, with
+  what, and the ceilings. Double XP and Double Loot together (2 x 2 x the
+  stir's 1.5 = 6) is allowed; 3x XP with 2x loot is not; 3x loot alone is
+  not while the stirring land's own loot is 1.5x (4.5x).
+- **When a kill is paid** (`ceiling()`, called in `world_stir_for()`): the
+  whole scale held to the same ceilings, loot giving way first - the World
+  tab can be raised after an event was set.
+- **Warnings, not refusals**: a stir event while the lands are off, a "the
+  stirring land's" event while they are off, two stir events at once. On the
+  201 as `warnings`, and in the dry run.
+- **The dry run**, POST /api/world/events/preview (owner, reads only, no
+  password again): the same payload as scheduling plus `players` (1-500, 20
+  if not sent). Answers `allowed`, `why`, `warnings`, `worst` (each land),
+  `with` (the events over it), `limits`, `peak_online` (the most players at
+  once in two weeks) and `forecast`: from the last 14 days, what each
+  account's kills paid in each hour it played (a player-hour) and the gold it
+  earned (`loot` and `shop_sell` in gold_ledger) - the 25th to 75th
+  percentile, times players times hours, without the event and with it (an
+  event on one land scales only that land's share of the kills). Hours an XP
+  or loot event was on are left out. Under 10 player-hours, `enough` is
+  false. Everyone's play, staff too: a rate of play, not a count of players.
+- **Who is online** (`online_samples`, owned by the package): the poll
+  (`read_broadcasts()`) asks `EventsAPI.sample()`, which counts at most once
+  a minute per process - everyone with a session seen in ONLINE_WINDOW, and
+  players (the player rank, the owner and co-owners left out) - into a row
+  per five minutes that keeps the most it was told. No row is nobody: an open
+  game polls. Kept 120 days. The first row ever is when counting began.
+- **The event report**, GET /api/world/events/report (owner): each event that
+  began in the last 30 days, with three windows of its length - before, its
+  own (to the end, or when called off, or now), after - and in each the
+  kills, XP and gold per hour, who played and who signed up (players only),
+  and online (average players, the most at once, average everyone). A window
+  before the counting began has `online` null; one older than the kill log
+  (14 days) has XP null, not 0. `lift` is players online during less before;
+  `verdict` says it in a sentence; `kinds` averages the lift of each kind's
+  finished events - "which events move the needle". `online` is the last 7
+  days of rows for the chart.
+
 ## Decided, not built: staff commands
 
 **Put the required rank on the command definition, not in the handler.** A

@@ -350,6 +350,19 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     rule that throws, is "no event": the kill is paid and the poll answers.
     → Held by: `test_events.py` — "a player gets the same bare 404 from the owner's three", "a dev gets the same bare 404 from the owner's three", "the owner's two that change the world ask for the password again; reading does not", "a kill while Double Loot is on: twice the bag chance", "what a kill gets: the bigger of two XP events (not 3x); a land's own; the stirring land's; nothing before it starts", "an events table that cannot be read: the kill is paid, the poll answers, nothing is on", "  and a rule that throws, not just a missing table: the same - and the land still stirs"
     → and in the game: `src/tools/testrunner.gd` — `_test_world_events()`
+37. **No kill is paid more than 3x XP, 3x loot, or 6x the two together,
+    whatever is on** (0.49.0, the events/ package's guardrails). An event is
+    refused when it is set if, with every event over it and the stirring
+    land's own XP and loot as set then, any land's monsters could pass those
+    ceilings at any moment it is on - said in words, nothing written, nobody
+    told. And at the kill the whole scale, events and the stirring land
+    together, is held to the same ceilings (loot giving way first), so
+    raising the stirring lands after an event was set cannot pass them
+    either. The dry run and the event report only read, and only the owner
+    sees them: the same bare 404 to anyone else. Who was online is counted as
+    numbers - everyone, and players - never names.
+    → Held by: `test_events.py` — "Triple XP over Double Loot: refused, saying whose monsters, with what, and the ceilings", "Triple XP set over it: a 409 that says why - and nothing written, nobody told", "the stirring lands' loot raised to 3x after Double Loot was set: a kill is still paid 3x loot, not 6x", "a kill's whole pay is held to the ceilings, loot giving way first", "a player gets the same bare 404 from the dry run and the report", "a dev gets the same bare 404 from the dry run and the report", "  and neither asks for the password again - they only read"
+    → and in the game: `src/tools/testrunner.gd` — `_test_event_report()`
 
 ---
 

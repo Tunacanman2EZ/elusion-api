@@ -14601,6 +14601,10 @@ def world_stir_for(db, enemy_id):
     if world_events is not None:
         event_bags, event_xp = world_events.kill_scales(db, element, stirring)
         bags, xp = bags * event_bags, xp * event_xp
+        # THE GUARDRAILS' CEILING (game 0.49.0): whatever is on, and whatever
+        # the stirring lands were raised to after an event was set, a kill is
+        # paid at most 3x XP, 3x loot and 6x the two together.
+        bags, xp = world_events.ceiling(bags, xp)
     return bags, xp
 
 
@@ -15000,6 +15004,10 @@ def read_broadcasts():
     world = world_public(db)
     # THE WORLD'S EVENTS (game 0.48.0, events/): what is on, what is coming.
     events_now = world_events.public(db) if world_events is not None else {"events": [], "next": []}
+    # WHO IS ONLINE, counted for the event report (game 0.49.0) - at most once
+    # a minute per process, after this player's own beat above.
+    if world_events is not None:
+        world_events.sample(db)
     db.commit()
 
     # A FIRST POLL ASKS FOR THE TAIL, NOT THE WHOLE TABLE. since=0 means "I just
@@ -23678,6 +23686,15 @@ playerstats.register(
 # world_stir_for() (what a kill pays) and current_world_tick() (which land a
 # stir event makes stir). Until it is registered - at import, just here - it
 # is None, and those three carry on without it.
+def _event_stir_settings():
+    """The stirring lands' own XP and loot as set now, for the events'
+    guardrails: {on, xp (a scale), bags (a scale)}."""
+    settings = world_settings()
+    return {"on": bool(settings["on"]),
+            "xp": 1.0 + (settings["xp_percent"] / 100.0 if settings["xp_on"] else 0.0),
+            "bags": float(settings["bags_times"]) if settings["bags_on"] else 1.0}
+
+
 def _log_event_action(detail):
     """An owner's event, in the staff log. A named function, not a lambda,
     so test_moderation.py's walk of log_staff_action's callers finds the
@@ -23695,6 +23712,12 @@ world_events = events_package.register(
     log_action=_log_event_action,
     clean_text=clean_player_text,
     lands=LANDS,
+    # The guardrails, the dry run and the report (game 0.49.0).
+    left_out_names=lambda: (OWNER_USERNAME,) + tuple(CO_OWNER_USERNAMES),
+    stir=_event_stir_settings,
+    element_of=lambda enemy_id: int((gamedata.ENEMIES.get(enemy_id) or {}).get("element", 0) or 0),
+    online_window=ONLINE_WINDOW_SECONDS,
+    kills_kept=KILL_LOG_RETENTION_SECONDS,
 )
 
 

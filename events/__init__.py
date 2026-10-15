@@ -11,6 +11,8 @@ what is coming, through one contract:
     GET  /api/world/events/schedule   the owner's list: past, present, future
     POST /api/world/events            the owner schedules one
     POST /api/world/events/cancel     the owner calls one off
+    POST /api/world/events/preview    the owner's dry run (0.49.0)
+    GET  /api/world/events/report     the owner's event report (0.49.0)
 
 Built like playerstats/, in three layers:
 
@@ -21,7 +23,9 @@ Built like playerstats/, in three layers:
 THE GAME APPLIES NO MULTIPLIER. More XP and more loot are paid by the server at
 the kill (app.py world_stir_for() asks EventsAPI.kill_scales()); a stir event
 is the stirring lands' own (current_world_tick() asks forced_stir()). The game
-is told so it can show them. This package never imports app.py: register() is
+is told so it can show them. And never too much at once (0.49.0): an event is
+refused when set if any land's monsters could pass the ceilings with
+everything else on, and a kill is held to them when paid (ceiling()). This package never imports app.py: register() is
 handed what it needs.
 """
 from .routes import register  # noqa: F401

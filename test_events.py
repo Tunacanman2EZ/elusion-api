@@ -1,4 +1,4 @@
-"""The world's events (game 0.48.0): double XP, more loot, a land made to stir.
+"""The world's events (game 0.48.0, 0.49.0): double XP, more loot, a land made to stir.
 
 The owner's plan: "Treat events (double XP, double loot, forced stir, etc.)
 as their own feature area with a clean public contract". Built like
@@ -14,6 +14,12 @@ playerstats/, so each layer is held on its own:
   E-4  the world: on every poll, said once when one begins, paid at the kill,
        a stir event's land stirring until it ends (or is called off), and an
        events table that cannot be read costing nobody a kill
+  E-5  the guardrails (0.49.0): never too much at once for any land's
+       monsters, refused when set and held to the ceilings when paid
+  E-6  the dry run: allowed or not and why, the most each land pays, and
+       what 20 players might earn, from the last two weeks' play
+  E-7  the event report: before, during and after each event, who was
+       online (counted once a minute), and which kind brings players
 
 Runs against a THROWAWAY database in the temp folder, like every other suite.
 Run: python test_events.py
@@ -352,6 +358,257 @@ finally:
 check("  and a rule that throws, not just a missing table: the same - and the land still stirs",
       res.status_code == 200 and body["events"]["events"] == [] and body["world"]["element"] != 0,
       (res.status_code, body.get("world")))
+
+# =============================================================================
+section("E-5  the guardrails - never too much at once")
+# The owner's: "don't allow 3x XP + 3x loot + 3x gold all at once in the same
+# area". Gold comes out of loot bags here, so loot is the gold.
+conn = sqlite3.connect(DB_PATH)
+data.ensure_tables(conn)
+conn.commit()
+conn.close()
+STIR = {"on": True, "xp": 1.0, "bags": 1.5}
+
+
+def guarded(candidate, others=(), stir=None):
+    return services.guard(candidate, list(others), STIR if stir is None else stir, LANDS)[0]
+
+
+double_xp = ev(None, "xp", 2.0, name="Double XP")
+double_loot = ev(2, "loot", 2.0, name="Double Loot")
+triple_xp = ev(None, "xp", 3.0, name="Triple XP")
+check("Double XP and Double Loot together on every monster: allowed - 2x XP and 3x loot with the stirring land's own",
+      guarded(double_xp, [double_loot]) is None)
+why = guarded(triple_xp, [double_loot]) or ""
+check("Triple XP over Double Loot: refused, saying whose monsters, with what, and the ceilings",
+      why.startswith("Too much at once for the stirring land's monsters: 3x XP and 3x loot (9x together), with Double Loot, "
+                     "the stirring land's own 1.5x loot - the most a kill can be is 3x XP, 3x loot and 6x the two together."),
+      why)
+check("  Triple Loot alone: allowed with the stirring lands' loot off, refused with it on (4.5x)",
+      guarded(ev(None, "loot", 3.0), [], {"on": True, "xp": 1.0, "bags": 1.0}) is None
+      and "4.5x loot" in (guarded(ev(None, "loot", 3.0)) or ""))
+check("  3x XP for the fire lands and 3x loot for the ice lands do not meet",
+      guarded(ev(None, "xp", 3.0, land=6), [ev(2, "loot", 3.0, land=3)], {"on": False}) is None)
+check("  on one land they do, and the land is named",
+      (guarded(ev(None, "xp", 3.0, land=6), [ev(2, "loot", 2.5, land=6, name="Fire Loot")], {"on": False}) or "")
+      .startswith("Too much at once for the fire lands' monsters: 3x XP and 2.5x loot (7.5x together), with Fire Loot -"))
+check("  one that ends as the other begins does not meet it; one that begins halfway through does",
+      guarded(ev(None, "xp", 3.0, starts=NOW, ends=NOW + HOUR), [ev(2, "loot", 2.5, starts=NOW + HOUR, ends=NOW + 2 * HOUR)],
+              {"on": False}) is None
+      and guarded(ev(None, "xp", 3.0, starts=NOW, ends=NOW + 2 * HOUR),
+                  [ev(2, "loot", 2.5, starts=NOW + HOUR, ends=NOW + 3 * HOUR)], {"on": False}) is not None)
+check("  the stirring land's monsters: they meet a land's own whenever the lands stir - not while they are off",
+      guarded(ev(None, "xp", 3.0, land=services.LAND_STIRRING), [ev(2, "loot", 2.5, land=6)], {"on": True, "xp": 1.0, "bags": 1.0})
+      is not None
+      and guarded(ev(None, "xp", 3.0, land=services.LAND_STIRRING), [ev(2, "loot", 2.5, land=6)], {"on": False}) is None)
+check("  and one called off is not counted",
+      guarded(triple_xp, [ev(2, "loot", 2.0, cancelled=NOW - 5, name="Double Loot")]) is None)
+check("a kill's whole pay is held to the ceilings, loot giving way first",
+      services.ceiling(4.5, 1.0) == (3.0, 1.0) and services.ceiling(3.0, 3.0) == (2.0, 3.0)
+      and services.ceiling(2.0, 2.0) == (2.0, 2.0) and services.ceiling(1.0, 5.0) == (1.0, 3.0))
+check("allowed, but said: a stir event while the lands are off; two stir events at once",
+      services.warnings(ev(None, "stir", 1.0, land=6), [], {"on": False}, LANDS)
+      == ["The stirring lands are switched off, so this will stir nothing until they are on (World tab)."]
+      and services.warnings(ev(None, "stir", 1.0, land=6), [ev(2, "stir", 1.0, land=3, name="The Ice Lands Stir")],
+                            STIR, LANDS) == ["It overlaps The Ice Lands Stir: while both are on, the one that began last stirs."])
+sql("DELETE FROM world_events")
+sql("DELETE FROM broadcasts")
+now = int(time.time())
+res = client.post("/api/world/events", headers=auth(owner), json={"kind": "loot", "amount": 2, "starts_at": now, "hours": 2})
+check("  (Double Loot on every monster, set now)", res.status_code == 201, res.get_json())
+res = client.post("/api/world/events", headers=auth(owner), json={"kind": "xp", "amount": 3, "starts_at": now + HOUR, "hours": 2})
+check("Triple XP set over it: a 409 that says why - and nothing written, nobody told",
+      res.status_code == 409 and res.get_json()["message"].startswith("Too much at once for the stirring land's monsters")
+      and len(sql("SELECT id FROM world_events")) == 1 and sql("SELECT id FROM broadcasts WHERE kind = 'event'") == [],
+      res.get_json())
+stir_land = next(iter(BY_LAND))
+client.post("/api/server/world/stir", headers=auth(owner), json={"element": stir_land})
+client.post("/api/server/world", headers=auth(owner), json={"bags_times": 3.0})
+captured.clear()
+gamedata.roll_kill_rewards = spy
+try:
+    kill(BY_LAND[stir_land])
+finally:
+    gamedata.roll_kill_rewards = real_roll
+check("the stirring lands' loot raised to 3x after Double Loot was set: a kill is still paid 3x loot, not 6x",
+      captured and captured[0][0] == 3.0, captured)
+client.post("/api/server/world", headers=auth(owner), json={"bags_times": 1.5})
+res = client.post("/api/world/events", headers=auth(owner), json={"kind": "stir", "land": 6, "starts_at": now + 9 * HOUR,
+                                                                  "hours": 1})
+check("a stir event set with the lands on and nothing over it: no warnings",
+      res.status_code == 201 and res.get_json()["warnings"] == [], res.get_json())
+client.post("/api/server/world", headers=auth(owner), json={"on": False})
+res = client.post("/api/world/events", headers=auth(owner), json={"kind": "stir", "land": 3, "starts_at": now + 20 * HOUR,
+                                                                  "hours": 1})
+client.post("/api/server/world", headers=auth(owner), json={"on": True})
+check("  with the lands switched off: set, and the answer says it will stir nothing until they are on",
+      res.status_code == 201 and res.get_json()["warnings"]
+      == ["The stirring lands are switched off, so this will stir nothing until they are on (World tab)."], res.get_json())
+
+# =============================================================================
+section("E-6  the dry run - what it would do, before it is set")
+views = app_module.app.view_functions
+for label, token in (("a player gets the same bare 404 from the dry run and the report", player),
+                     ("a dev gets the same bare 404 from the dry run and the report", devtok)):
+    codes = [client.post("/api/world/events/preview", headers=auth(token),
+                         json={"kind": "xp", "amount": 2, "starts_at": now, "hours": 1}).status_code,
+             client.get("/api/world/events/report", headers=auth(token)).status_code]
+    check(label, codes == [404, 404], codes)
+check("  and neither asks for the password again - they only read",
+      not getattr(views["preview_event"], "_elusion_fresh_password", False)
+      and not getattr(views["read_event_report"], "_elusion_fresh_password", False)
+      and getattr(views["preview_event"], "_elusion_min_role", None) == "coowner"
+      and getattr(views["read_event_report"], "_elusion_min_role", None) == "coowner")
+sql("DELETE FROM world_events")
+sql("DELETE FROM kill_reports")
+sql("DELETE FROM gold_ledger WHERE reason IN ('loot', 'shop_sell')")
+lands_seen = sorted(BY_LAND)[:2]
+first_hour = now // HOUR - 60
+for i in range(12):
+    hour = first_hour + i
+    sql("INSERT INTO kill_reports (user_id, slot, enemy_id, xp, attack_xp, level_at, at) VALUES (?, 0, ?, ?, 0, 1, ?)",
+        (player_id, BY_LAND[lands_seen[0 if i < 6 else 1]], 100 * (i + 1), hour * HOUR + 60))
+    sql("INSERT INTO gold_ledger (at, user_id, slot, delta, reason, detail) VALUES (?, ?, 0, ?, 'loot', 'seed')",
+        (hour * HOUR + 120, player_id, 10 * (i + 1)))
+# AN HOUR WHEN AN EVENT WAS ON is not the usual, and is left out.
+busy_hour = first_hour + 20
+sql("INSERT INTO kill_reports (user_id, slot, enemy_id, xp, attack_xp, level_at, at) VALUES (?, 0, ?, 99999, 0, 1, ?)",
+    (player_id, BY_LAND[lands_seen[0]], busy_hour * HOUR + 60))
+sql("INSERT INTO world_events (name, kind, amount, land, starts_at, ends_at, created_at) VALUES ('Past XP', 'xp', 2, 0, ?, ?, ?)",
+    (busy_hour * HOUR, busy_hour * HOUR + HOUR, busy_hour * HOUR - 100))
+plan = {"kind": "xp", "amount": 2, "land": 0, "starts_at": now + 86400, "hours": 3, "players": 20}
+res = client.post("/api/world/events/preview", headers=auth(owner), json=plan)
+body = res.get_json() or {}
+cast = body.get("forecast", {})
+check("Double XP for 3 hours, 20 players: allowed, each land's most, and the event as it would be",
+      res.status_code == 200 and body["allowed"] is True and body["why"] == "" and len(body["worst"]) == 7
+      and body["event"]["name"] == "Double XP" and body["event"]["id"] is None, body)
+check("  the forecast: the middle half of 12 player-hours (400 to 900 XP an hour) x 20 players x 3 hours, and twice that",
+      cast.get("player_hours") == 12 and cast.get("enough") is True
+      and cast["xp"] == {"usual": [24000, 54000], "with": [48000, 108000]}
+      and cast["gold"] == {"usual": [2400, 5400], "with": [2400, 5400]}, cast)
+check("  the hour an event was on (99,999 XP) is not in the usual", cast.get("per_player_hour", {}).get("xp") == [400, 700, 900],
+      cast.get("per_player_hour"))
+plan = {"kind": "loot", "amount": 2, "land": lands_seen[0], "starts_at": now + 86400, "hours": 3, "players": 20}
+cast = client.post("/api/world/events/preview", headers=auth(owner), json=plan).get_json()["forecast"]
+check("  one land's Double Loot: half the kills were that land's, so gold 1.5x, XP as usual",
+      cast["share"] == 0.5 and cast["gold"]["with"] == [3600, 8100] and cast["xp"]["with"] == cast["xp"]["usual"], cast)
+sql("INSERT INTO world_events (name, kind, amount, land, starts_at, ends_at, created_at) VALUES ('Double Loot', 'loot', 2, 0, ?, ?, ?)",
+    (now + 86400, now + 86400 + 4 * HOUR, now))
+sql("DELETE FROM broadcasts")
+before_count = len(sql("SELECT id FROM world_events"))
+res = client.post("/api/world/events/preview", headers=auth(owner),
+                  json={"kind": "xp", "amount": 3, "land": 0, "starts_at": now + 86400 + HOUR, "hours": 2})
+body = res.get_json() or {}
+check("Triple XP over it, dry run: not allowed, and why - and nothing written, nobody told",
+      res.status_code == 200 and body["allowed"] is False and body["why"].startswith("Too much at once")
+      and body["with"] == ["Double Loot"] and len(sql("SELECT id FROM world_events")) == before_count
+      and sql("SELECT id FROM broadcasts") == [], body)
+bad = [client.post("/api/world/events/preview", headers=auth(owner), json=dict(plan, players=p)).status_code
+       for p in (0, 501, "20", True)]
+check("  players is 1 to 500: 0, 501, a word and a yes are each a 400", bad == [400, 400, 400, 400], bad)
+few = services.forecast(ev(None, "xp", 2.0), 5, services.baseline([(1, 1, 100)], [], [], lambda _e: 0, []), LANDS, True)
+check("  from fewer than %d player-hours, the forecast says it is a guess" % services.FEW_PLAYER_HOURS,
+      few["enough"] is False and few["player_hours"] == 1)
+
+# =============================================================================
+section("E-7  the event report - before, during, after, and who was online")
+sql("DELETE FROM online_samples")
+sql("DELETE FROM world_events")
+sql("DELETE FROM kill_reports")
+sql("DELETE FROM gold_ledger WHERE reason IN ('loot', 'shop_sell')")
+api = app_module.world_events
+T = (int(time.time()) // HOUR - 30) * HOUR
+sql("UPDATE sessions SET last_seen_at = ?", (T,))
+with app_module.app.app_context():
+    db = app_module.get_db()
+    api._counted_minute = None
+    api.sample(db, T)
+    db.commit()
+    first_row = [tuple(r) for r in sql("SELECT bucket, everyone, players FROM online_samples")]
+    sql("UPDATE sessions SET last_seen_at = 0 WHERE user_id = ?", (player_id,))
+    api.sample(db, T + 10)
+    api.sample(db, T + 60)
+    db.commit()
+kept_row = [tuple(r) for r in sql("SELECT bucket, everyone, players FROM online_samples")]
+check("who is online, counted: three, one a player - the owner and the dev are not players",
+      first_row == [(T // 300, 3, 1)], first_row)
+check("  at most once a minute, and the five minutes keep the most they were told", kept_row == [(T // 300, 3, 1)], kept_row)
+api._counted_minute = None
+poll(player)
+mine = sql("SELECT players FROM online_samples WHERE bucket = ?", (int(time.time()) // 300,))
+check("  the poll counts: this five minutes has a row, with the player in it", mine and mine[0]["players"] >= 1,
+      [dict(r) for r in mine])
+S = T + 4 * HOUR
+# Online for its first hour only: a five minutes with no row is nobody.
+for bucket in range(S // 300, (S + HOUR) // 300):
+    sql("INSERT INTO online_samples (bucket, at, everyone, players) VALUES (?, ?, 3, 2)", (bucket, bucket * 300))
+for bucket in range((S + 2 * HOUR) // 300, (S + 4 * HOUR) // 300):
+    sql("INSERT INTO online_samples (bucket, at, everyone, players) VALUES (?, ?, 2, 1)", (bucket, bucket * 300))
+for i in range(4):
+    sql("INSERT INTO kill_reports (user_id, slot, enemy_id, xp, attack_xp, level_at, at) VALUES (?, 0, ?, 250, 0, 1, ?)",
+        (player_id, BY_LAND[lands_seen[0]], S + 600 + i))
+sql("INSERT INTO kill_reports (user_id, slot, enemy_id, xp, attack_xp, level_at, at) VALUES (?, 0, ?, 100, 0, 1, ?)",
+    (player_id, BY_LAND[lands_seen[0]], S - 600))
+sql("INSERT INTO gold_ledger (at, user_id, slot, delta, reason, detail) VALUES (?, ?, 0, 300, 'loot', 'seed')", (S + 900, player_id))
+# Not earned by play: a grant, and gold spent.
+sql("INSERT INTO gold_ledger (at, user_id, slot, delta, reason, detail) VALUES (?, ?, 0, 1000, 'staff_gold', 'seed')",
+    (S + 950, player_id))
+sql("INSERT INTO gold_ledger (at, user_id, slot, delta, reason, detail) VALUES (?, ?, 0, -500, 'shop_buy', 'seed')",
+    (S + 960, player_id))
+newbie = register("eventsnewbie")
+sql("UPDATE users SET created_at = ? WHERE username = 'eventsnewbie'", (S + 600,))
+
+
+def seed_event(name, kind, start, length, cancelled=0, land=0):
+    sql("INSERT INTO world_events (name, kind, amount, land, starts_at, ends_at, created_at, cancelled_at)"
+        " VALUES (?, ?, 2, ?, ?, ?, ?, ?)", (name, kind, land, start, start + length, start - 1000, cancelled))
+
+
+seed_event("Double XP", "xp", S, 2 * HOUR)
+seed_event("Early Loot", "loot", T - 3 * HOUR, HOUR)
+seed_event("The Fire Lands Stir", "stir", S + 6 * HOUR, 3 * HOUR, cancelled=S + 7 * HOUR, land=6)
+seed_event("Old Loot", "loot", int(time.time()) - 20 * 86400, HOUR)
+seed_event("On Now", "xp", int(time.time()) - 1800, 2 * HOUR)
+seed_event("Too Old", "xp", int(time.time()) - 31 * 86400, HOUR)
+res = client.get("/api/world/events/report", headers=auth(owner))
+report = res.get_json() or {}
+by_name = {e["name"]: e for e in report.get("events", [])}
+xp_event = by_name.get("Double XP", {})
+spans = xp_event.get("windows", {})
+check("the report: every event begun in the last 30 days, newest first - not one older",
+      res.status_code == 200 and [e["name"] for e in report["events"]]
+      == ["On Now", "The Fire Lands Stir", "Double XP", "Early Loot", "Old Loot"], [e["name"] for e in report.get("events", [])])
+check("Double XP: online 0 before, 1 during on average (2 at most, its first hour), 1 after - it brought players",
+      spans["before"]["online"] == {"players": 0.0, "peak": 0, "everyone": 0.0}
+      and spans["during"]["online"] == {"players": 1.0, "peak": 2, "everyone": 1.5}
+      and spans["after"]["online"]["players"] == 1.0 and xp_event["lift"] == 1.0
+      and xp_event["verdict"] == "Brought players: 1 more online on average (0 before, 1 during).", xp_event)
+check("  XP and gold an hour before and during it (gold earned by play, not granted or spent), the kills, who played, who signed up",
+      spans["before"]["xp_per_hour"] == 50 and spans["during"]["xp_per_hour"] == 500
+      and spans["during"]["kills_per_hour"] == 2 and spans["during"]["gold_per_hour"] == 150
+      and spans["during"]["played"] == 1 and spans["during"]["new_players"] == 1 and spans["after"]["xp_per_hour"] == 0,
+      spans)
+check("one from before the counting began: not counted, and said so",
+      by_name["Early Loot"]["windows"]["before"]["online"] is None and by_name["Early Loot"]["lift"] is None
+      and by_name["Early Loot"]["verdict"] == "Online not counted for it - the counting began later.")
+stirred = by_name["The Fire Lands Stir"]
+check("one called off an hour in: it ended then, and its windows are an hour each",
+      stirred["state"] == "cancelled" and stirred["ended_at"] == S + 7 * HOUR
+      and stirred["windows"]["during"]["hours"] == 1.0 and stirred["windows"]["before"]["start"] == S + 5 * HOUR
+      and stirred["verdict"] == "Nobody was online before it or during it.", stirred)
+check("one older than the kill log (two weeks): its XP is not known, not nothing",
+      by_name["Old Loot"]["windows"]["during"]["xp_per_hour"] is None
+      and by_name["Old Loot"]["windows"]["during"]["gold_per_hour"] == 0)
+check("one on now: no after yet", by_name["On Now"]["state"] == "on" and by_name["On Now"]["windows"]["after"] is None)
+check("which kind moves the needle: XP events +1 online across the one finished and counted; the stir +0; loot not counted",
+      report["kinds"] == [{"kind": "xp", "events": 2, "counted": 1, "lift": 1.0},
+                          {"kind": "loot", "events": 2, "counted": 0, "lift": None},
+                          {"kind": "stir", "events": 1, "counted": 1, "lift": 0.0}], report.get("kinds"))
+chart = [p for p in report.get("online", []) if S <= p["at"] < S + 2 * HOUR]
+check("the last 7 days of who was online, for the chart, and when the counting began",
+      len(chart) == 12 and all(p["players"] == 2 and p["everyone"] == 3 for p in chart)
+      and report["sampling_since"] == (T // 300) * 300 and report["sample_seconds"] == 300, len(chart))
 
 print("\n=== %d passed, %d failed ===" % (passed, failed))
 if failures:
