@@ -1978,7 +1978,11 @@ only, `test_stats.py`.
   `require_owner`, `get_db` and the owner's names through `register()`,
   above ENTRY POINT; **the package never imports app.py**, so each layer is
   tested on its own. The next feature built outside app.py follows the same
-  shape. `test_deploy.py` copies the package with the files a server needs,
+  shape. **And it is run that way** (`test_packages.py`, game 0.50.0): all
+  three packages registered on a bare Flask app - stand-in login checks and a
+  throwaway database, app.py never loaded - answer as on the real server, and
+  two bare apps from the same code keep to their own database, announcer and
+  staff log. A new package goes in its PACKAGES list and `bare_app()`. `test_deploy.py` copies the package with the files a server needs,
   and `codemap.py` lists feature packages under their own heading.
 - **Nothing new is recorded.** Every number comes from rows kept for other
   reasons: `users.created_at`; "seen" is the latest of `saves.updated_at`,
@@ -2094,6 +2098,45 @@ area; or a dry-run page". All in `events/`, still three layers.
   `verdict` says it in a sentence; `kinds` averages the lift of each kind's
   finished events - "which events move the needle". `online` is the last 7
   days of rows for the chart.
+
+## The land insights, and the world's pick weighing new players (game 0.50.0)
+
+From a "Behavior Insights" idea the owner brought: for each land, recent
+players and kills, time since its last event, whether it is overfarmed,
+ignored or healthy; a next stir with a reason, weighing new players against
+veterans and when lands are busy; the GM panel to show it and accept or
+override. Built as `insights/` beside app.py (routes, services, data), not as
+a second service: one server, one login, one deploy. `test_insights.py`.
+
+- **GET /api/server/insights** (owner, reads only): one row per land - kills
+  in the last day and week (everyone's), players in the week (the player
+  rank, the owner and co-owners left out), new players there now (under
+  level 10 at the kill, a kill in the last 2 hours), when it last stirred,
+  when an event last covered it (every monster's, its own, a stir of it),
+  its share of the week's kills and its status - "ignored" (none), "quiet"
+  (under half an even share), "busy" (twice or more: overfarmed), else
+  "healthy" - and its busiest hour of the day (UTC, from 14 days of kills).
+  Plus `next` (below), `hours` (players online by UTC hour over 14 days,
+  from online_samples, and how many days that is), `total_week` and `few`
+  (under 30 kills in the week: a rough read).
+- **The world's own pick changed** (`pick_land()` -> `_pick_land_why()` ->
+  `InsightsAPI.choose()` -> `services.choose()`): still the least hunted in
+  the last day and never the land that just stirred, but now of the lands
+  where no new player is learning - a stir makes a land's monsters hit
+  harder and take more killing, which is for players ready for it. If every
+  land has a new player, the least hunted of all. A tie is still the tick's
+  seeded Random. If the insights fail, it is the old rule, logged.
+- **The next stir and why** (`world_next_stir()`): what the world would pick
+  now for when the stir on now ends - or a stir event's land, if one is on
+  then - with a reason in words ("Wind: the least hunted in the last day (2
+  kills) without new players in it - passing over Ice (1 new player), where
+  they are learning."). On GET /api/server/world as `next` (the World tab
+  offers it for "Stir it now" - accepting; picking another land overrides)
+  and in the insights. None while the lands are off.
+- **No model, on purpose.** A few dozen hand stirs a month is nothing to
+  learn from; a rule with its reason said is the right tool at this size.
+  Hand stirs are already recorded with who chose them (world_ticks
+  `chosen_by`, the staff log), if that ever changes.
 
 ## Decided, not built: staff commands
 
