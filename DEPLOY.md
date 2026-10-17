@@ -509,8 +509,11 @@ another had every request blocked. So the site that serves the game also passes
 **Refresh means update.** Nothing in the export is versioned by name, so
 nothing may be cached blind. `Cache-Control: no-cache` makes the browser ask
 about every file on every visit. Unchanged files get a 304, and a new upload is
-picked up on the next visit or refresh. A raised `min_client_build` then tells an
-open tab to refresh, in the game's own words.
+picked up on the next visit or refresh - no Ctrl+F5. A tab left open is told
+too (game 0.50.1): the loader page asks every five minutes for the
+Last-Modified of index.pck and index.wasm, which `file_server` sends, and when
+they change it offers a Reload. A raised `min_client_build` goes further and
+refuses an old build, in the game's own words.
 
 A DNS record `A play -> YOUR_SERVER_IP`, then one site block. Both of these
 were tested unchanged against a real export (apart from the port and the name).

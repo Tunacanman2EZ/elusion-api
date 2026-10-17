@@ -129,7 +129,7 @@ for body, what in [
         ({"kind": "stir", "land": 0, "starts_at": NOW, "hours": 1}, "a stir of no land"),
         ({"kind": "stir", "starts_at": NOW, "hours": 1}, "a stir with no land"),
         ({"kind": "xp", "amount": 2, "starts_at": NOW - 3600, "hours": 1}, "an hour ago"),
-        ({"kind": "xp", "amount": 2, "starts_at": NOW + 61 * 86400, "hours": 1}, "61 days ahead"),
+        ({"kind": "xp", "amount": 2, "starts_at": NOW + 367 * 86400, "hours": 1}, "367 days ahead"),
         ({"kind": "xp", "amount": 2, "starts_at": NOW, "hours": 0}, "0 hours"),
         ({"kind": "xp", "amount": 2, "starts_at": NOW, "hours": 73}, "73 hours"),
         ({"kind": "xp", "amount": 2, "starts_at": NOW, "hours": 2.5}, "2.5 hours"),
@@ -138,6 +138,10 @@ for body, what in [
     if event is not None or not why:
         refused.append(what)
 check("refused, each with a reason: %d ways to be wrong" % 14, refused == [], refused)
+year_on, why = services.validate({"kind": "xp", "amount": 2, "starts_at": NOW + 365 * 86400 + 3600, "hours": 3}, NOW, LANDS,
+                                 clean)
+check("a year ahead is taken (game 0.52.0, the calendar's whole year): the same date next year, an hour in",
+      why is None and year_on["starts_at"] == NOW + 365 * 86400 + 3600, why)
 check("names and words from the numbers",
       services.default_name("loot", 3.0, 0, LANDS) == "Triple Loot"
       and services.default_name("xp", 1.5, 0, LANDS) == "1.5x XP"
@@ -245,7 +249,8 @@ check("a bad one is a 400 that says why", res.status_code == 400 and "amount" in
 listed = client.get("/api/world/events/schedule", headers=auth(owner)).get_json()
 check("the owner's list: the event, coming, with who set it and the limits",
       listed["events"][0]["id"] == coming_id and listed["events"][0]["state"] == "coming"
-      and listed["events"][0]["created_by"] == "eventsowner" and listed["limits"]["hours"] == [1, 72], listed)
+      and listed["events"][0]["created_by"] == "eventsowner" and listed["limits"]["hours"] == [1, 72]
+      and listed["limits"]["days_ahead"] == 366, listed)
 sql("DELETE FROM broadcasts")
 res = client.post("/api/world/events/cancel", headers=auth(owner), json={"id": coming_id})
 said = [r["body"] for r in sql("SELECT body FROM broadcasts WHERE kind = 'event'")]
@@ -411,6 +416,22 @@ check("allowed, but said: a stir event while the lands are off; two stir events 
       == ["The stirring lands are switched off, so this will stir nothing until they are on (World tab)."]
       and services.warnings(ev(None, "stir", 1.0, land=6), [ev(2, "stir", 1.0, land=3, name="The Ice Lands Stir")],
                             STIR, LANDS) == ["It overlaps The Ice Lands Stir: while both are on, the one that began last stirs."])
+TWO_XP = ("It overlaps Double XP: while both are on, a kill gets the bigger XP, never both, and the game "
+          "shows only that one.")
+check("two Double XPs at once (game 0.50.1): allowed, but said - they do not add up, and the game shows one",
+      services.warnings(ev(None, "xp", 2.0), [ev(2, "xp", 2.0, name="Double XP")], STIR, LANDS) == [TWO_XP]
+      and services.warnings(ev(None, "loot", 1.5, land=6), [ev(2, "loot", 2.0, name="Double Loot")], STIR, LANDS)
+      == ["It overlaps Double Loot: while both are on, a kill gets the bigger loot, never both, and the game "
+          "shows only that one."], services.warnings(ev(None, "xp", 2.0), [ev(2, "xp", 2.0, name="Double XP")], STIR, LANDS))
+check("  the stirring land's meets any land's; two named lands, one ending as the other begins, "
+      "one called off, or XP over loot do not",
+      services.warnings(ev(None, "xp", 2.0, land=services.LAND_STIRRING), [ev(2, "xp", 2.0, land=3, name="Double XP")],
+                        STIR, LANDS) == [TWO_XP]
+      and services.warnings(ev(None, "xp", 2.0, land=6), [ev(2, "xp", 2.0, land=3, name="Double XP")], STIR, LANDS) == []
+      and services.warnings(ev(None, "xp", 2.0, starts=NOW + HOUR, ends=NOW + 2 * HOUR),
+                            [ev(2, "xp", 2.0, name="Double XP")], STIR, LANDS) == []
+      and services.warnings(ev(None, "xp", 2.0), [ev(2, "xp", 2.0, cancelled=NOW - 5, name="Double XP")], STIR, LANDS) == []
+      and services.warnings(ev(None, "xp", 2.0), [ev(2, "loot", 2.0, name="Double Loot")], STIR, LANDS) == [])
 sql("DELETE FROM world_events")
 sql("DELETE FROM broadcasts")
 now = int(time.time())
@@ -444,6 +465,11 @@ client.post("/api/server/world", headers=auth(owner), json={"on": True})
 check("  with the lands switched off: set, and the answer says it will stir nothing until they are on",
       res.status_code == 201 and res.get_json()["warnings"]
       == ["The stirring lands are switched off, so this will stir nothing until they are on (World tab)."], res.get_json())
+res = client.post("/api/world/events", headers=auth(owner), json={"kind": "loot", "amount": 1.5, "starts_at": now, "hours": 1})
+check("a second loot event over Double Loot: set, and the answer says a kill gets the bigger, never both",
+      res.status_code == 201 and res.get_json()["warnings"]
+      == ["It overlaps Double Loot: while both are on, a kill gets the bigger loot, never both, and the game "
+          "shows only that one."], res.get_json())
 
 # =============================================================================
 section("E-6  the dry run - what it would do, before it is set")

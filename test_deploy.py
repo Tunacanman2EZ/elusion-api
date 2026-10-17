@@ -243,9 +243,14 @@ CODE = scratch("code", "x")[:-2]
 for name in ("app.py", "envfile.py", "gamedata.py", "wsgi.py"):
     shutil.copy(os.path.join(HERE, name), os.path.join(CODE, name))
 # And the feature packages app.py imports (game 0.47.0, playerstats/ the
-# first; events/ in 0.48.0): the code a server needs is now a folder or two
-# as well as the files.
-for package in ("playerstats", "events"):
+# first; events/ in 0.48.0, insights/ in 0.50.0, killrecord/ the first taken
+# out of app.py): the code a server needs is folders as well as files. FOUND,
+# not listed - codemap.py's rule, a folder app.py imports with a routes.py -
+# so a package added later is copied here without anybody remembering to.
+sys.path.insert(0, HERE)
+import codemap  # noqa: E402
+DEPLOYED_PACKAGES = [name for name, _rows, _layers in codemap.feature_packages()]
+for package in DEPLOYED_PACKAGES:
     shutil.copytree(os.path.join(HERE, package), os.path.join(CODE, package),
                     ignore=shutil.ignore_patterns("__pycache__"))
 DATA_DIR = scratch("var", "x")[:-2]

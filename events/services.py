@@ -27,10 +27,13 @@ LAND_STIRRING = -1
 # What an amount may be (xp and loot): 1.25x to 3x.
 AMOUNT_LOW = 1.25
 AMOUNT_HIGH = 3.0
-# How long one may last, and how far ahead one may be set.
+# How long one may last, and how far ahead one may be set: a year (game
+# 0.52.0, when the GM panel's calendar became a whole one - "a real calendar
+# that updates with the years"; 60 days before). 366 so the same date next
+# year is always in, a leap day between or not.
 SHORTEST = HOUR
 LONGEST = 72 * HOUR
-FURTHEST = 60 * DAY
+FURTHEST = 366 * DAY
 # A start this far in the past still counts as "now": the GM's clock and the
 # server's are not the same clock.
 LATE_START = 5 * 60
@@ -370,7 +373,25 @@ def warnings(candidate, others, stir, lands):
                  and int(e["starts_at"]) < int(candidate["ends_at"]) and int(e["ends_at"]) > int(candidate["starts_at"])]
         if clash:
             said.append("It overlaps %s: while both are on, the one that began last stirs." % " and ".join(clash))
+    else:
+        # TWO OF A KIND DO NOT ADD UP (game 0.50.1): a kill gets the bigger,
+        # never both (kill_scales()), and the game shows only that one - the
+        # owner set Double XP twice in a minute and every player saw it twice.
+        # Said, not refused: a second, longer one is how an event is made to
+        # run on.
+        clash = [e["name"] for e in others if e["kind"] == candidate["kind"] and not e.get("cancelled_at")
+                 and e.get("id") != candidate.get("id") and _share_monsters(e, candidate)
+                 and int(e["starts_at"]) < int(candidate["ends_at"]) and int(e["ends_at"]) > int(candidate["starts_at"])]
+        if clash:
+            said.append("It overlaps %s: while both are on, a kill gets the bigger %s, never both, and the game "
+                        "shows only that one." % (" and ".join(clash), "XP" if candidate["kind"] == "xp" else "loot"))
     return said
+
+
+def _share_monsters(a, b):
+    """Whether two xp or loot events could cover the same monster: yes unless
+    they name two different lands. The stirring land's may be either."""
+    return not (int(a["land"]) > 0 and int(b["land"]) > 0 and int(a["land"]) != int(b["land"]))
 
 
 # =============================================================================

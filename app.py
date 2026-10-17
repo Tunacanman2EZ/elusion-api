@@ -6088,6 +6088,10 @@ def relayed_image_dict(row):
 #
 # ONE ROW PER PAIR, stored in the direction it was asked. See the comment over
 # the friends table in init_db() for why it is one table and not two.
+#
+# THE ROUTES AND THEIR SQL ARE THE friends/ PACKAGE'S (16 Oct; FRIENDS - THE
+# ROUTES, below). What stays here is what other areas share: the limits (this
+# file's tunables), who is online, and how a person is shown.
 
 
 # A list, not an address book. The cap is here so that neither the presence
@@ -6101,16 +6105,6 @@ MAX_FRIENDS = 100
 # everyone they can see, and they cannot ask anybody else until some are
 # answered or withdrawn.
 MAX_PENDING_SENT = 25
-
-
-def _friend_link(db, a_id, b_id):
-    """The row between two accounts, whichever way round it was made."""
-    return db.execute(
-        "SELECT * FROM friends"
-        " WHERE (requester_id = ? AND addressee_id = ?)"
-        "    OR (requester_id = ? AND addressee_id = ?)",
-        (a_id, b_id, b_id, a_id),
-    ).fetchone()
 
 
 def _presence_for(db, user_ids):
@@ -14402,6 +14396,9 @@ WORLD_SWITCHES = ("on", "hit_on", "health_on", "speed_on", "bags_on", "resist_on
 # THE WORLD'S EVENTS (game 0.48.0): the EventsAPI the events/ package hands
 # back, registered near the end of this file. None until then.
 world_events = None
+# THE LAND INSIGHTS (game 0.50.0, insights/): who is learning where, for the
+# world's own pick. None until registered, at the end of the file.
+land_insights = None
 
 
 def world_settings():
@@ -14458,15 +14455,49 @@ def land_hunts(db, now=None):
 
 def pick_land(db, tick, previous, now=None):
     """The land that stirs at `tick`: the least hunted lately, never
-    `previous`; a tie settled by a Random seeded with the tick."""
+    `previous` - and (game 0.50.0, insights/) never one where a new player is
+    learning, while another will do; a tie settled by a Random seeded with
+    the tick."""
+    return _pick_land_why(db, tick, previous, now)[0]
+
+
+def _pick_land_why(db, tick, previous, now=None):
+    """(land, passed over, newcomers, hunts, candidates) - pick_land() and
+    the reasons for it, for the owner's "next stir"."""
     candidates = sorted(e for e in LANDS if e != previous)
     chooser = random.Random(tick * 7919 + 104729)
     try:
         hunts = land_hunts(db, now)
     except sqlite3.Error:
-        return chooser.choice(candidates)
+        return chooser.choice(candidates), [], {}, {}, candidates
+    if land_insights is not None:
+        land, passed, newcomers = land_insights.choose(db, candidates, hunts, chooser, now)
+        return land, passed, newcomers, hunts, candidates
     least = min(hunts[e] for e in candidates)
-    return chooser.choice([e for e in candidates if hunts[e] == least])
+    return chooser.choice([e for e in candidates if hunts[e] == least]), [], {}, hunts, candidates
+
+
+def world_next_stir(db, now=None):
+    """The next stir as things stand (game 0.50.0): {element, name, at,
+    reason} - the land the world would pick when the stir on now ends, or a
+    stir event's - or None while the lands are off or nothing stirs."""
+    now = int(time.time()) if now is None else int(now)
+    settings = world_settings()
+    if not settings["on"]:
+        return None
+    row = current_world_tick(db, settings, now)
+    if row is None:
+        return None
+    at = int(row["ends_at"])
+    forced = world_events.forced_stir(db, at) if world_events is not None else None
+    if forced is not None:
+        land = int(forced["land"])
+        return {"element": land, "name": LANDS.get(land, ""), "at": at,
+                "reason": "%s: %s is on then." % (LANDS.get(land, "").capitalize(), forced["name"])}
+    land, passed, newcomers, hunts, candidates = _pick_land_why(db, int(row["tick"]) + 1, int(row["element"]), now)
+    why = land_insights.reason(land, hunts, newcomers, passed, candidates) if land_insights is not None else \
+        "%s: the least hunted in the last day." % LANDS.get(land, "").capitalize()
+    return {"element": land, "name": LANDS.get(land, ""), "at": at, "reason": why}
 
 
 def stir_text(element, settings, hours):
@@ -14617,11 +14648,19 @@ def _world_owner_payload(db):
         hunts = land_hunts(db)
     except sqlite3.Error:
         hunts = {element: 0 for element in LANDS}
+    try:
+        upcoming = world_next_stir(db)
+    except Exception:  # noqa: BLE001 - the owner's page must outlive a guess
+        app.logger.exception("[WORLD] could not work out the next stir")
+        upcoming = None
     return {
         "settings": settings,
         "state": state,
         "recent": recent,
         "lands": [{"element": e, "name": LANDS[e], "kills": hunts.get(e, 0)} for e in sorted(LANDS)],
+        # THE NEXT STIR AND WHY (game 0.50.0): what the world would pick now
+        # for when this stir ends. The World tab offers it for "Stir it now".
+        "next": upcoming,
         "limits": {k: [low, high] for k, (low, high, _) in WORLD_LIMITS.items()},
         "now": int(time.time()),
     }
@@ -18830,362 +18869,28 @@ def players_nearby():
 
 
 # =============================================================================
-# FRIENDS - THE ROUTES
+# FRIENDS - THE ROUTES - the friends/ package (since 16 Oct)
 # =============================================================================
-#
-# Four of them, and between them they cover the whole life of a friendship:
-# ask, answer, list, end. There is no separate "withdraw" - removing somebody
-# deletes the row whatever state it is in, which is the same action from the
-# requester's side of a pending row.
+# Ask, answer, list, end: GET /api/friends, POST /api/friends/request,
+# /respond and /remove - as they were here, endpoint names and all
+# (routes.lock). The rules above (FRIENDS) stay this file's: the limits, who
+# is online (_presence_for(), which trade and the poll use too) and how a
+# person is shown (friend_entry()).
+import friends as friends_package  # noqa: E402
 
-
-def _friend_counts(db, user_id):
-    """(accepted friends, requests this account has outstanding)."""
-    accepted = db.execute(
-        "SELECT COUNT(*) AS n FROM friends"
-        " WHERE state = 'accepted' AND (requester_id = ? OR addressee_id = ?)",
-        (user_id, user_id),
-    ).fetchone()["n"]
-    pending_sent = db.execute(
-        "SELECT COUNT(*) AS n FROM friends"
-        " WHERE state = 'pending' AND requester_id = ?",
-        (user_id,),
-    ).fetchone()["n"]
-    return int(accepted or 0), int(pending_sent or 0)
-
-
-def _friend_target(payload):
-    """
-    Resolve the account a friends route is aimed at.
-
-    Returns (row, None) or (None, response). Names are matched by the users
-    table's own NOCASE collation, so the caller does not have to know or fix
-    the casing - typing "tunacan" finds Tunacan.
-    """
-    name = str(payload.get("username", "")).strip()
-    if name == "":
-        return None, bad_request("username is required")
-
-    row = _user_by_name(name)
-    if row is None:
-        return None, ({"error": "Not Found", "message": "No such account."}, 404)
-
-    if int(row["id"]) == int(g.user["id"]):
-        return None, bad_request("you cannot add yourself")
-
-    return row, None
-
-
-@app.get("/api/friends")
-@require_auth
-def friends_list():
-    """
-    Your friends, who is online, and any requests waiting
-    ---
-    tags:
-      - Friends
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-    responses:
-      200:
-        description: Friends, incoming requests, outgoing requests, and the server clock
-      401:
-        description: Missing, invalid or expired token
-    """
-    db = get_db()
-    me = int(g.user["id"])
-    now = int(time.time())
-
-    rows = db.execute(
-        "SELECT * FROM friends WHERE requester_id = ? OR addressee_id = ?",
-        (me, me),
-    ).fetchall()
-
-    # THREE LISTS OUT OF ONE READ. Which list a row belongs in is decided by
-    # its state and which end of it this account is on, so asking the database
-    # three separate questions would be three round trips for one answer.
-    buckets = {"friends": [], "incoming": [], "outgoing": []}
-    other_of = {}
-    for row in rows:
-        other = int(row["addressee_id"]) if int(row["requester_id"]) == me \
-            else int(row["requester_id"])
-        other_of[other] = row
-        if row["state"] == "accepted":
-            buckets["friends"].append(other)
-        elif int(row["requester_id"]) == me:
-            buckets["outgoing"].append(other)
-        else:
-            buckets["incoming"].append(other)
-
-    ids = list(other_of.keys())
-    people = {}
-    if ids:
-        marks = ",".join("?" for _ in ids)
-        # NAMED COLUMNS, NOT SELECT *. Nothing that leaves the server should be
-        # able to carry a password hash out with it by accident.
-        for row in db.execute(
-            "SELECT id, username, role, name_hue FROM users WHERE id IN (%s)" % marks,
-            tuple(ids),
-        ).fetchall():
-            people[int(row["id"])] = row
-
-    presence = _presence_for(db, ids)
-
-    out = {}
-    for key, id_list in buckets.items():
-        entries = []
-        for other in id_list:
-            row = people.get(other)
-            if row is None:
-                # The account was deleted between the two reads. ON DELETE
-                # CASCADE will have taken the link too; skip it rather than
-                # showing a nameless row.
-                continue
-            entry = friend_entry(row, presence, now)
-            entry["since"] = int(other_of[other]["decided_at"] or
-                                 other_of[other]["created_at"])
-            entries.append(entry)
-        # Online first, then by name, so the useful half of the list is at the
-        # top without the client having to sort it.
-        entries.sort(key=lambda e: (not e["online"], e["username"].casefold()))
-        out[key] = entries
-
-    accepted, pending_sent = _friend_counts(db, me)
-    out["now"] = now
-    out["limits"] = {
-        "friends": MAX_FRIENDS,
-        "pending_sent": MAX_PENDING_SENT,
-        "friends_used": accepted,
-        "pending_sent_used": pending_sent,
-    }
-    return out, 200
-
-
-@app.post("/api/friends/request")
-@require_auth
-def friends_request():
-    """
-    Ask somebody to be friends
-    ---
-    tags:
-      - Friends
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: target
-        schema:
-          type: object
-          required: [username]
-          properties:
-            username:
-              type: string
-    responses:
-      200:
-        description: Request sent, or accepted if they had already asked you
-      400:
-        description: Missing username, or aimed at yourself
-      404:
-        description: No such account
-      409:
-        description: Already friends, or already asked
-    """
-    payload = request.get_json(silent=True) or {}
-    target, refusal = _friend_target(payload)
-    if refusal is not None:
-        return refusal
-
-    db = get_db()
-    me = int(g.user["id"])
-    them = int(target["id"])
-    now = int(time.time())
-
-    if ignores(db, them, me):
-        return {"error": "Forbidden",
-                "message": "%s is not taking friend requests from you." % target["username"]}, 403
-
-    link = _friend_link(db, me, them)
-    if link is not None:
-        if link["state"] == "accepted":
-            return {"error": "Conflict",
-                    "message": "You are already friends."}, 409
-        if int(link["requester_id"]) == me:
-            return {"error": "Conflict",
-                    "message": "You have already asked them."}, 409
-
-        # THEY ASKED FIRST AND THIS IS THE ANSWER. Two people who add each
-        # other at the same time should end up friends, not deadlocked with a
-        # pending request pointing each way that neither one can see a button
-        # for. Accepting here is what the second person meant anyway.
-        db.execute(
-            "UPDATE friends SET state = 'accepted', decided_at = ?"
-            " WHERE requester_id = ? AND addressee_id = ?",
-            (now, them, me),
-        )
-        db.commit()
-        return {"username": target["username"], "state": "accepted"}, 200
-
-    accepted, pending_sent = _friend_counts(db, me)
-    if accepted >= MAX_FRIENDS:
-        return bad_request("your friends list is full (%d)" % MAX_FRIENDS)
-    if pending_sent >= MAX_PENDING_SENT:
-        return bad_request(
-            "you have %d requests waiting for an answer; that is the limit"
-            % MAX_PENDING_SENT)
-
-    their_accepted, _ = _friend_counts(db, them)
-    if their_accepted >= MAX_FRIENDS:
-        # THEIR limit, said plainly. Refusing without saying whose list is full
-        # reads as the request silently failing.
-        return bad_request("their friends list is full")
-
-    db.execute(
-        "INSERT INTO friends (requester_id, addressee_id, state, created_at)"
-        " VALUES (?, ?, 'pending', ?)",
-        (me, them, now),
-    )
-    db.commit()
-    return {"username": target["username"], "state": "pending"}, 200
-
-
-@app.post("/api/friends/respond")
-@require_auth
-def friends_respond():
-    """
-    Accept or decline a request somebody sent you
-    ---
-    tags:
-      - Friends
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: answer
-        schema:
-          type: object
-          required: [username, accept]
-          properties:
-            username:
-              type: string
-            accept:
-              type: boolean
-    responses:
-      200:
-        description: Accepted, or declined and the request removed
-      400:
-        description: Missing username, or aimed at yourself
-      404:
-        description: No such account, or no request from them
-    """
-    payload = request.get_json(silent=True) or {}
-    target, refusal = _friend_target(payload)
-    if refusal is not None:
-        return refusal
-
-    db = get_db()
-    me = int(g.user["id"])
-    them = int(target["id"])
-    now = int(time.time())
-
-    # ONLY A REQUEST AIMED AT ME. Answering my own outgoing request would be
-    # accepting on the other person's behalf, so the direction is part of the
-    # lookup rather than something checked afterwards.
-    link = db.execute(
-        "SELECT * FROM friends"
-        " WHERE requester_id = ? AND addressee_id = ? AND state = 'pending'",
-        (them, me),
-    ).fetchone()
-    if link is None:
-        return {"error": "Not Found",
-                "message": "No request from that account."}, 404
-
-    if not bool(payload.get("accept", False)):
-        db.execute(
-            "DELETE FROM friends WHERE requester_id = ? AND addressee_id = ?",
-            (them, me),
-        )
-        db.commit()
-        # The requester is not told. A decline that sends a notification is a
-        # decline most people will not send.
-        return {"username": target["username"], "state": "declined"}, 200
-
-    accepted, _ = _friend_counts(db, me)
-    if accepted >= MAX_FRIENDS:
-        return bad_request("your friends list is full (%d)" % MAX_FRIENDS)
-
-    db.execute(
-        "UPDATE friends SET state = 'accepted', decided_at = ?"
-        " WHERE requester_id = ? AND addressee_id = ?",
-        (now, them, me),
-    )
-    db.commit()
-    return {"username": target["username"], "state": "accepted"}, 200
-
-
-@app.post("/api/friends/remove")
-@require_auth
-def friends_remove():
-    """
-    Remove a friend, or withdraw a request you sent
-    ---
-    tags:
-      - Friends
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: target
-        schema:
-          type: object
-          required: [username]
-          properties:
-            username:
-              type: string
-    responses:
-      200:
-        description: The link between the two accounts is gone
-      400:
-        description: Missing username, or aimed at yourself
-      404:
-        description: No such account, or no link to remove
-    """
-    payload = request.get_json(silent=True) or {}
-    target, refusal = _friend_target(payload)
-    if refusal is not None:
-        return refusal
-
-    db = get_db()
-    me = int(g.user["id"])
-    them = int(target["id"])
-
-    link = _friend_link(db, me, them)
-    if link is None:
-        return {"error": "Not Found",
-                "message": "You are not connected to that account."}, 404
-
-    # BOTH DIRECTIONS IN ONE DELETE. The row could have been made either way
-    # round, and after this call neither side should still be holding one.
-    db.execute(
-        "DELETE FROM friends"
-        " WHERE (requester_id = ? AND addressee_id = ?)"
-        "    OR (requester_id = ? AND addressee_id = ?)",
-        (me, them, them, me),
-    )
-    db.commit()
-    return {"username": target["username"], "state": "none"}, 200
+friends_package.register(
+    app,
+    require_auth=require_auth,
+    get_db=get_db,
+    find_user=_user_by_name,
+    bad_request=bad_request,
+    ignores=ignores,
+    presence=_presence_for,
+    person=friend_entry,
+    # Asked each time: MAX_FRIENDS and MAX_PENDING_SENT are this file's
+    # tunables, and test_friends.py turns them down to test the limits.
+    limits=lambda: (MAX_FRIENDS, MAX_PENDING_SENT),
+)
 
 
 # =============================================================================
@@ -22830,18 +22535,15 @@ def _record_kill(db, user_id, slot, enemy_id, rewards, level_at, now):
 
 
 # =============================================================================
-# THE KILL RECORD
+# THE KILL RECORD (game 0.9.0) - the killrecord/ package (since 16 Oct)
 # =============================================================================
-#
-# The owner, 7 Oct: "lets make a button in game that records all players kills
-# with icons of the enemies". The game's Kills window reads these two routes:
-# this character's kills of each kind of monster, and everybody's. The counts
-# are kill_tally's - paid kills only, so a monster that grants nothing (a large
-# slime, which splits instead of dying) is never on it - and both answers carry
-# `since`, the day counting began, so a board that starts at zero says why.
-#
-# READS ONLY. Nothing here changes a count; _record_kill() is the only writer,
-# and a deleted character's rows go with it (character_delete).
+# GET /api/kills and /api/kills/everyone, the game's Kills window: the counts
+# kill_tally holds - paid kills only - and the day counting began. READS ONLY;
+# _record_kill() above, in the kill's own transaction, is the only writer.
+# The first area taken OUT of this file (ARCHITECTURE.md): the routes, their
+# docstrings and endpoint names are as they were (routes.lock).
+import killrecord  # noqa: E402
+
 
 def _kill_tally_since():
     raw = get_server_setting(KILL_TALLY_SINCE_KEY, None)
@@ -22851,100 +22553,15 @@ def _kill_tally_since():
         return 0
 
 
-@app.get("/api/kills")
-@require_auth
-def kills_mine():
-    """
-    Your character's kill record: how many of each monster, first and last
-    ---
-    tags:
-      - Combat
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: query
-        name: slot
-        type: integer
-        required: true
-        description: Which character
-    responses:
-      200:
-        description: "{slot, since, total, kinds, kills: [{enemy_id, kills, first_at, last_at}]} most killed first"
-      400:
-        description: Bad slot
-      401:
-        description: Missing, invalid or expired token
-    """
-    slot = parse_slot(request.args.get("slot"))
-    if slot is None:
-        return {"error": "Bad Request", "message": "slot must be 0-%d" % MAX_SLOT}, 400
-    rows = get_db().execute(
-        "SELECT enemy_id, kills, first_at, last_at FROM kill_tally"
-        " WHERE user_id = ? AND slot = ? AND kills > 0"
-        " ORDER BY kills DESC, enemy_id",
-        (g.user["id"], slot),
-    ).fetchall()
-    kills = [{"enemy_id": r["enemy_id"], "kills": int(r["kills"]),
-              "first_at": int(r["first_at"]), "last_at": int(r["last_at"])} for r in rows]
-    return {"slot": slot, "since": _kill_tally_since(),
-            "total": sum(k["kills"] for k in kills), "kinds": len(kills),
-            "kills": kills}, 200
+killrecord.register(app, require_auth=require_auth, get_db=get_db, parse_slot=parse_slot,
+                    max_slot=MAX_SLOT, since=_kill_tally_since)
 
 
-@app.get("/api/kills/everyone")
-@require_auth
-def kills_everyone():
-    """
-    Everybody's kill record: each monster's total, how many players, and who has killed the most
-    ---
-    tags:
-      - Combat
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-    responses:
-      200:
-        description: "{since, total, players, kills: [{enemy_id, kills, players, top, top_kills, yours}]} most killed first"
-      401:
-        description: Missing, invalid or expired token
-    """
-    db = get_db()
-    me = g.user["id"]
-    # PER ACCOUNT, not per character: "who has killed the most" is a player,
-    # and four characters of one account are one person. Ties go to whoever
-    # started first (first_at), so the name on a monster does not flicker
-    # between two players level on kills.
-    rows = db.execute(
-        "WITH per AS ("
-        "  SELECT enemy_id, user_id, SUM(kills) AS k, MIN(first_at) AS f"
-        "    FROM kill_tally WHERE kills > 0 GROUP BY enemy_id, user_id),"
-        " ranked AS ("
-        "  SELECT enemy_id, user_id, k,"
-        "         ROW_NUMBER() OVER (PARTITION BY enemy_id ORDER BY k DESC, f ASC, user_id) AS n,"
-        "         SUM(k) OVER (PARTITION BY enemy_id) AS total,"
-        "         COUNT(*) OVER (PARTITION BY enemy_id) AS players"
-        "    FROM per)"
-        " SELECT r.enemy_id, r.total, r.players, r.k AS top_kills, u.username AS top,"
-        "        COALESCE((SELECT k FROM per WHERE per.enemy_id = r.enemy_id AND per.user_id = ?), 0) AS yours"
-        "   FROM ranked r JOIN users u ON u.id = r.user_id"
-        "  WHERE r.n = 1"
-        "  ORDER BY r.total DESC, r.enemy_id",
-        (me,),
-    ).fetchall()
-    kills = [{"enemy_id": r["enemy_id"], "kills": int(r["total"]), "players": int(r["players"]),
-              "top": r["top"], "top_kills": int(r["top_kills"]), "yours": int(r["yours"])}
-             for r in rows]
-    players = db.execute(
-        "SELECT COUNT(DISTINCT user_id) FROM kill_tally WHERE kills > 0").fetchone()[0]
-    return {"since": _kill_tally_since(), "total": sum(k["kills"] for k in kills),
-            "players": int(players or 0), "kills": kills}, 200
-
+# =============================================================================
+# THE SERVER'S GRANTS - a skill's XP, and items into the backpack
+# =============================================================================
+# What fishing, cooking and the loot bag below pay with. They sat under THE
+# KILL RECORD's banner until it moved out (16 Oct); they never were it.
 
 def _grant_skill_xp(user_id, slot, skill_id, gained):
     """
@@ -23718,6 +23335,29 @@ world_events = events_package.register(
     element_of=lambda enemy_id: int((gamedata.ENEMIES.get(enemy_id) or {}).get("element", 0) or 0),
     online_window=ONLINE_WINDOW_SECONDS,
     kills_kept=KILL_LOG_RETENTION_SECONDS,
+)
+
+
+# =============================================================================
+# THE LAND INSIGHTS (game 0.50.0) - the insights/ package
+# =============================================================================
+# The owner's "Behavior Insights": for each land, kills, players, new players
+# there now, when it last stirred and had an event, whether it is busy, quiet
+# or ignored, its busiest hour; who is online by hour; and the next stir with
+# a reason. GET /api/server/insights, owner only. And the world's own pick
+# (pick_land()) asks InsightsAPI.choose(): the least hunted land, never one a
+# new player is learning in while another will do.
+import insights as insights_package  # noqa: E402
+
+land_insights = insights_package.register(
+    app,
+    require_auth=require_auth,
+    require_owner=require_owner,
+    get_db=get_db,
+    lands=LANDS,
+    element_of=lambda enemy_id: int((gamedata.ENEMIES.get(enemy_id) or {}).get("element", 0) or 0),
+    left_out_names=lambda: (OWNER_USERNAME,) + tuple(CO_OWNER_USERNAMES),
+    next_stir=world_next_stir,
 )
 
 

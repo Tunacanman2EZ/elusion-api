@@ -1,6 +1,7 @@
 """The feature packages stand on their own (game 0.50.0).
 
-playerstats/, events/ and insights/ are built the BE105 way: each has a
+Every feature package (ARCHITECTURE.md) - playerstats/, events/, insights/,
+and killrecord/ and friends/, taken out of app.py - is built the BE105 way: each has a
 register(app, ...) that is HANDED the app, its login checks and its database,
 and never imports app.py. The source of each is checked for that elsewhere
 (test_stats.py); this RUNS them without it - the "application factory"
@@ -15,6 +16,9 @@ lesson's "two app instances from the same code", where it pays off here:
   P-3  two bare apps from the same code, each with its own database: an event
        set on one is on that one alone, and only that one's announcer and
        staff log hear of it
+  P-4  EVERY PACKAGE IS HERE: the list is the code map's (a folder app.py
+       imports, with a routes.py), not one kept by hand - a package added
+       without a bare-app run of its own fails this file
 
 Run: python test_packages.py
 """
@@ -30,11 +34,17 @@ sys.path.insert(0, HERE)
 
 from flask import Flask, g, request  # noqa: E402
 
+import codemap  # noqa: E402
 import events  # noqa: E402
+import friends  # noqa: E402
 import insights  # noqa: E402
+import killrecord  # noqa: E402
 import playerstats  # noqa: E402
 
-PACKAGES = ("playerstats", "events", "insights")
+# Found, not listed: what app.py imports that has a routes.py (codemap.py).
+PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
+# The ones this file registers on its bare apps, below.
+RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -101,12 +111,18 @@ def bare_app(name):
         os.remove(path)
     conn = sqlite3.connect(path)
     conn.executescript(
-        "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, role TEXT, created_at INTEGER);"
-        "CREATE TABLE saves (user_id INTEGER, slot INTEGER, class_id TEXT, level INTEGER, area TEXT, updated_at INTEGER);")
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, role TEXT, created_at INTEGER, name_hue INTEGER);"
+        "CREATE TABLE saves (user_id INTEGER, slot INTEGER, class_id TEXT, level INTEGER, area TEXT, updated_at INTEGER);"
+        "CREATE TABLE kill_tally (user_id INTEGER, slot INTEGER, enemy_id TEXT, kills INTEGER, first_at INTEGER,"
+        " last_at INTEGER);"
+        "CREATE TABLE friends (requester_id INTEGER, addressee_id INTEGER, state TEXT DEFAULT 'pending',"
+        " created_at INTEGER, decided_at INTEGER);")
     now = int(time.time())
     for user in USERS.values():
-        conn.execute("INSERT INTO users VALUES (?, ?, ?, ?)", (user["id"], user["username"], user["role"], now - 3600))
+        conn.execute("INSERT INTO users VALUES (?, ?, ?, ?, NULL)", (user["id"], user["username"], user["role"], now - 3600))
     conn.execute("INSERT INTO saves VALUES (2, 0, 'warrior', 4, 'field', ?)", (now,))
+    for user_id, slot, enemy, kills in ((2, 0, "slime", 5), (2, 1, "slime", 2), (3, 0, "slime", 6), (2, 0, "bat", 1)):
+        conn.execute("INSERT INTO kill_tally VALUES (?, ?, ?, ?, ?, ?)", (user_id, slot, enemy, kills, now - 600, now))
     conn.commit()
     conn.close()
 
@@ -136,6 +152,20 @@ def bare_app(name):
     insights.register(app, require_auth=require_auth, require_owner=require_owner, get_db=get_db, lands=LANDS,
                       element_of=lambda _enemy: 0, left_out_names=lambda: (OWNER,),
                       next_stir=lambda _db: {"element": 3, "name": "ice", "at": 0, "reason": "Ice: handed in."})
+    killrecord.register(app, require_auth=require_auth, get_db=get_db,
+                        parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None,
+                        max_slot=3, since=lambda: 1234)
+
+    def find_user(name):
+        return next((u for u in USERS.values() if u["username"].casefold() == name.casefold()), None)
+
+    friends.register(app, require_auth=require_auth, get_db=get_db, find_user=find_user,
+                     bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+                     # bo ignores ann.
+                     ignores=lambda _db, a, b: (a, b) == (3, 2),
+                     presence=lambda _db, ids: {2: int(time.time())} if 2 in ids else {},
+                     person=lambda row, seen, now: {"username": row["username"], "online": 2 in seen and row["id"] == 2},
+                     limits=lambda: (100, 1))
     return app, said, logged, path
 
 
@@ -161,7 +191,8 @@ rules = sorted(r.rule for r in app_a.url_map.iter_rules() if r.rule.startswith("
 check("a bare app has the packages' routes and nothing else",
       rules == sorted(["/api/server/stats", "/api/world/events/active", "/api/world/events/schedule", "/api/world/events",
                        "/api/world/events/cancel", "/api/world/events/preview", "/api/world/events/report",
-                       "/api/server/insights"]), rules)
+                       "/api/server/insights", "/api/kills", "/api/kills/everyone", "/api/friends",
+                       "/api/friends/request", "/api/friends/respond", "/api/friends/remove"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -180,9 +211,41 @@ check("events: any player reads what is on", res.status_code == 200 and res.get_
 hidden = [client_a.get(path, headers=who("ann")).status_code
           for path in ("/api/server/stats", "/api/server/insights", "/api/world/events/schedule", "/api/world/events/report")]
 check("a player gets the same bare 404 from every owner's route", hidden == [404, 404, 404, 404], hidden)
+res = client_a.get("/api/kills?slot=0", headers=who("ann"))
+body = res.get_json() or {}
+check("killrecord: a character's record - its own slot's kills, most first, and the day counting began",
+      res.status_code == 200 and [(k["enemy_id"], k["kills"]) for k in body["kills"]] == [("slime", 5), ("bat", 1)]
+      and body["total"] == 6 and body["kinds"] == 2 and body["since"] == 1234 and body["slot"] == 0, body)
+res = client_a.get("/api/kills/everyone", headers=who("ann"))
+body = res.get_json() or {}
+slime = next((k for k in body.get("kills", []) if k["enemy_id"] == "slime"), {})
+check("  everyone's - an account's characters added together (ann's 7 beats bo's 6), and ann's own share beside it",
+      res.status_code == 200 and slime.get("kills") == 13 and slime.get("top") == "ann" and slime.get("top_kills") == 7
+      and slime.get("yours") == 7 and body["players"] == 2, body)
+check("  and a bad slot is the 400 it was, in its words",
+      client_a.get("/api/kills?slot=9", headers=who("ann")).get_json() == {"error": "Bad Request", "message": "slot must be 0-3"})
+res = client_a.post("/api/friends/request", headers=who("boss"), json={"username": "ANN"})
+check("friends: boss asks ann - by her name in any case - and it waits",
+      res.status_code == 200 and res.get_json() == {"username": "ann", "state": "pending"}, res.get_json())
+check("  a second ask is past the one-outstanding limit handed in",
+      client_a.post("/api/friends/request", headers=who("boss"), json={"username": "bo"}).get_json()
+      == {"error": "Bad Request", "message": "you have 1 requests waiting for an answer; that is the limit"})
+res = client_a.post("/api/friends/respond", headers=who("ann"), json={"username": "boss", "accept": True})
+listed = client_a.get("/api/friends", headers=who("boss")).get_json() or {}
+check("  ann says yes: on boss's list, online by the presence handed in, the limits his",
+      res.get_json() == {"username": "boss", "state": "accepted"}
+      and [(f["username"], f["online"]) for f in listed.get("friends", [])] == [("ann", True)]
+      and listed.get("limits") == {"friends": 100, "pending_sent": 1, "friends_used": 1, "pending_sent_used": 0}, listed)
+check("  bo ignores ann, so she cannot ask him - the ignore list handed in",
+      client_a.post("/api/friends/request", headers=who("ann"), json={"username": "bo"}).status_code == 403)
+check("  and removed, the link is gone both ways",
+      client_a.post("/api/friends/remove", headers=who("ann"), json={"username": "boss"}).get_json()
+      == {"username": "boss", "state": "none"}
+      and client_a.get("/api/friends", headers=who("boss")).get_json()["friends"] == [])
 check("  and nobody without a login gets in anywhere",
-      [client_a.get(path).status_code for path in ("/api/server/stats", "/api/world/events/active", "/api/server/insights")]
-      == [401, 401, 401])
+      [client_a.get(path).status_code for path in ("/api/server/stats", "/api/world/events/active", "/api/server/insights",
+                                                  "/api/kills?slot=0", "/api/kills/everyone", "/api/friends")]
+      == [401, 401, 401, 401, 401, 401])
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")
@@ -204,6 +267,13 @@ check("  and what it says - begun, when first asked; one set ahead, coming - is 
 for path in (path_a, path_b):
     if os.path.exists(path):
         os.remove(path)
+
+# =============================================================================
+section("P-4  every package is here")
+check("the code map finds the packages app.py imports: %s" % ", ".join(PACKAGES),
+      set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends"}, PACKAGES)
+check("  and every one of them runs on a bare app in this file", set(PACKAGES) == set(RUN_HERE),
+      sorted(set(PACKAGES) ^ set(RUN_HERE)))
 
 print("\n=== %d passed, %d failed ===" % (passed, failed))
 if failures:

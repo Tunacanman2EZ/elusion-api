@@ -1982,8 +1982,18 @@ only, `test_stats.py`.
   three packages registered on a bare Flask app - stand-in login checks and a
   throwaway database, app.py never loaded - answer as on the real server, and
   two bare apps from the same code keep to their own database, announcer and
-  staff log. A new package goes in its PACKAGES list and `bare_app()`. `test_deploy.py` copies the package with the files a server needs,
-  and `codemap.py` lists feature packages under their own heading.
+  staff log. A new package goes in `bare_app()`; the list of packages is
+  found, not kept (16 Oct): `codemap.feature_packages()` - a folder app.py
+  imports, with a routes.py - and `test_packages.py` fails for one it does
+  not run. `test_deploy.py` copies every package it finds the same way, and
+  `codemap.py` lists them under their own heading.
+- **And the areas already in app.py are moving out** (16 Oct,
+  ARCHITECTURE.md - the road, the contract, the checklist and the order):
+  `killrecord/` and `friends/` first. **`routes.lock`, held by
+  `test_routes.py`,** is the promise that a move changes nothing outside:
+  every route's method, path, endpoint name, login, rank, password-again,
+  write lock and docstring, and a 401 without a token from every route that
+  needs one. A change meant is written with `python test_routes.py --write`.
 - **Nothing new is recorded.** Every number comes from rows kept for other
   reasons: `users.created_at`; "seen" is the latest of `saves.updated_at`,
   `account_ips.last_seen`, `sessions.last_seen_at` and `kill_tally.last_at`;
@@ -2025,9 +2035,10 @@ its SQL). `test_events.py`.
   `event`. No build is needed to run an event.
 - **Kinds.** `xp` and `loot` take `amount` 1.25-3 and `land` 0 (every
   monster), -1 (whichever land is stirring at the kill) or 1-7. `stir` takes
-  a land 1-7. 1-72 hours, at most 60 days ahead; a start up to 5 minutes in
-  the past is "now" (two clocks). A name is optional - "Double XP", "1.5x
-  Loot", "The Fire Lands Stir" - and cleaned like chat.
+  a land 1-7. 1-72 hours, at most a year ahead (366 days since game 0.52.0,
+  60 before); a start up to 5 minutes in the past is "now" (two clocks). A
+  name is optional - "Double XP", "1.5x Loot", "The Fire Lands Stir" - and
+  cleaned like chat.
 - **Two of a kind take the bigger, never the product.** Events multiply with
   the stirring lands' own XP and loot (`world_stir_for()`): a stir is the
   world, an event is an event.
@@ -2069,8 +2080,12 @@ area; or a dry-run page". All in `events/`, still three layers.
   whole scale held to the same ceilings, loot giving way first - the World
   tab can be raised after an event was set.
 - **Warnings, not refusals**: a stir event while the lands are off, a "the
-  stirring land's" event while they are off, two stir events at once. On the
-  201 as `warnings`, and in the dry run.
+  stirring land's" event while they are off, two stir events at once, and
+  (game 0.50.1) two XP or two loot events at once that could meet on one
+  monster (`_share_monsters()`: unless they name two different lands) - "a
+  kill gets the bigger, never both, and the game shows only that one", after
+  the owner set Double XP twice in a minute and every player saw it twice.
+  On the 201 as `warnings`, and in the dry run.
 - **The dry run**, POST /api/world/events/preview (owner, reads only, no
   password again): the same payload as scheduling plus `players` (1-500, 20
   if not sent). Answers `allowed`, `why`, `warnings`, `worst` (each land),

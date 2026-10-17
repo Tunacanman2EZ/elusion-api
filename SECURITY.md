@@ -363,6 +363,24 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     numbers - everyone, and players - never names.
     → Held by: `test_events.py` — "Triple XP over Double Loot: refused, saying whose monsters, with what, and the ceilings", "Triple XP set over it: a 409 that says why - and nothing written, nobody told", "the stirring lands' loot raised to 3x after Double Loot was set: a kill is still paid 3x loot, not 6x", "a kill's whole pay is held to the ceilings, loot giving way first", "a player gets the same bare 404 from the dry run and the report", "a dev gets the same bare 404 from the dry run and the report", "  and neither asks for the password again - they only read"
     → and in the game: `src/tools/testrunner.gd` — `_test_event_report()`
+38. **The land insights only read, only the owner reads them, and they name
+    nobody** (0.50.0, the insights/ package). `GET /api/server/insights` is
+    require_owner - the same bare 404 to a player or a dev as no route - and
+    its SQL layer holds no write at all. It says counts per land: kills,
+    players (the player rank; the owner, co-owners and staff left out), new
+    players there now, when it last stirred or had an event, its busiest
+    hour; and who is online by hour. No username, address or character name.
+    → Held by: `test_insights.py` — "a player and a dev get the same bare 404 as no route", "data.py only reads: no INSERT, UPDATE, DELETE, REPLACE, DROP, CREATE, ALTER or commit", "  it only reads, so it asks for no password again", "  kills today and this week, and who played - players only, the owner and staff left out"
+    → and in the game: `src/tools/testrunner.gd` — `_test_land_report()`
+39. **Moving code opens no door** (16 Oct, ARCHITECTURE.md). As app.py's
+    areas move into packages of their own, every route keeps its path,
+    method and endpoint name, its login, the lowest rank it lets in, its ask
+    for the password again and its write lock: `routes.lock` pins each, line
+    by line, and a route the lock says needs a token is asked without one
+    and must answer 401 - a package handed a decorator that only tags passes
+    nothing. A change that is meant is written with `--write`, and the lock's
+    diff is in the commit for anyone to read.
+    → Held by: `test_routes.py` — "every one of the %d routes that needs a token answers 401 without one", "  and no path answers one method twice - the second rule would never be reached"
 
 ---
 
