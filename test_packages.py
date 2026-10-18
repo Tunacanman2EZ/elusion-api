@@ -2,8 +2,8 @@
 
 Every feature package (ARCHITECTURE.md) - playerstats/, events/, insights/,
 and killrecord/, friends/, gathering/, loot/, guilds/, parties/, chat/, trade/, kingdom/, world/, moderation/,
-staffdesk/, equipment/, consuming/, death/, bank/, carry/, skills/, saves/, status/ and shop/, taken out of
-app.py - is built the
+staffdesk/, equipment/, consuming/, death/, bank/, carry/, skills/, saves/, status/, shop/, players/ and
+switches/, taken out of app.py - is built the
 BE105 way: each has a
 register(app, ...) that is HANDED the app, its login checks and its database,
 and never imports app.py. The source of each is checked for that elsewhere
@@ -30,7 +30,6 @@ import os
 import re
 import sqlite3
 import sys
-import tempfile
 import time
 import types
 
@@ -58,11 +57,13 @@ import insights  # noqa: E402
 import killrecord  # noqa: E402
 import kingdom  # noqa: E402
 import playerstats  # noqa: E402
+import players as players_package  # noqa: E402
 import saves as saves_package  # noqa: E402
 import shop as shop_package  # noqa: E402
 import skills as skills_package  # noqa: E402
 import staffdesk  # noqa: E402
 import status as status_package  # noqa: E402
+import switches as switches_package  # noqa: E402
 import trade  # noqa: E402
 import world  # noqa: E402
 
@@ -71,7 +72,7 @@ PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
 # The ones this file registers on its bare apps, below.
 RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds", "parties",
             "chat", "trade", "kingdom", "world", "moderation", "staffdesk", "equipment", "consuming",
-            "death", "bank", "carry", "skills", "saves", "status", "shop")
+            "death", "bank", "carry", "skills", "saves", "status", "shop", "players", "switches")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -221,7 +222,11 @@ def bare_app(name):
         "CREATE TABLE world_ticks (tick INTEGER PRIMARY KEY, element INTEGER NOT NULL, started_at INTEGER NOT NULL,"
         " ends_at INTEGER NOT NULL, chosen_by TEXT NOT NULL DEFAULT '');"
         "CREATE TABLE kill_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, slot INTEGER, enemy_id TEXT,"
-        " xp INTEGER NOT NULL DEFAULT 0, at INTEGER);")
+        " xp INTEGER NOT NULL DEFAULT 0, at INTEGER);"
+        "CREATE TABLE presence_tickets (token_hash TEXT PRIMARY KEY, session_hash TEXT NOT NULL, user_id INTEGER NOT NULL,"
+        " slot INTEGER NOT NULL, identity TEXT NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);"
+        "CREATE TABLE server_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_by TEXT NOT NULL DEFAULT '',"
+        " updated_at INTEGER NOT NULL DEFAULT 0);")
     now = int(time.time())
     for user in USERS.values():
         conn.execute("INSERT INTO users (id, username, role, created_at) VALUES (?, ?, ?, ?)",
@@ -783,6 +788,104 @@ def bare_app(name):
         parse_grid_cell=grid_cell, carry_cells=GATHER_CELLS + 2, grid_cells=carry.grid_cells,
         grid_rewrite=carry.grid_rewrite, resync=carry.resync)
 
+    # players/: who is around. The character an account plays is its lowest
+    # slot, as for trade and the staff desk, and its area that save's; a rank
+    # is the column, and an account with none is a "wanderer", so the default
+    # is seen to be the one handed in; a guild's tag is its name in capitals;
+    # PvP is app.config's, asked on every call. A token's hash is "h:" and the
+    # token, and the bearer token is named for its account. The socket's
+    # settings are handed in as app.py hands them, read once.
+    app.config["pvp"] = False
+
+    def area_played(db, user_id):
+        slot = playing_slot(db, user_id)
+        if slot is None:
+            return ""
+        return db.execute("SELECT area FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone()[0] or ""
+
+    def guild_of_account(db, user_id):
+        row = db.execute("SELECT gl.name FROM guild_members m JOIN guilds gl ON gl.id = m.guild_id"
+                         " WHERE m.user_id = ?", (user_id,)).fetchone()
+        return {"guild": row[0] if row else "", "guild_tag": row[0].upper() if row else ""}
+
+    players_package.register(
+        app, require_auth=require_auth, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+        parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None, max_slot=3,
+        catalogue=PlayersCatalogue, playing_area=area_played,
+        playing_slot_sql="(SELECT MIN(slot) FROM saves s2 WHERE s2.user_id = {user} AND ? < ?)",
+        online_window=45, role_for=lambda row: row["role"], default_role="wanderer",
+        name_hue_of=lambda row: row["name_hue"], guild_tag=lambda name: name.upper(),
+        pvp_enabled=lambda: app.config["pvp"], own_guild=guild_of_account, token_hash=lambda raw: "h:" + raw,
+        bearer_token=lambda: "bearer-" + g.user["username"], presence_url="", presence_port=5099, proxy_hops=0)
+
+    # switches/: each switch is a row in server_settings, written with who and
+    # when as app.py's are, and read back by stand-ins for app.py's readers; a
+    # broadcast is a list on the app, each line kept to sixty characters. The
+    # owner's check lets in the carry's owners (so a check can make ann a
+    # co-owner), the owner's alone is the boss only, and the password asked
+    # again is a header, so a check can leave it off. Who the co-owners' switch
+    # lets in is app.config's, so a check can empty it; signing everybody out
+    # spares the boss; the open trades are trade/'s own count.
+    def setting(key):
+        row = get_db().execute("SELECT value FROM server_settings WHERE key = ?", (key,)).fetchone()
+        return None if row is None else row[0]
+
+    def put_setting(key, value, by=""):
+        get_db().execute("INSERT OR REPLACE INTO server_settings VALUES (?, ?, ?, ?)", (key, value, by, int(time.time())))
+
+    def switch_on(key, default=False):
+        raw = setting(key)
+        return default if raw is None else bool(json.loads(raw).get("on"))
+
+    def closed():
+        stored = json.loads(setting("maintenance") or "{}")
+        on = bool(stored.get("on"))
+        return {"on": on, "message": stored.get("message", "") if on else "", "back_at": stored.get("back_at"),
+                "kick_at": int(stored.get("kick_at") or 0)}
+
+    def asks_again(view):
+        def wrapped(*args, **kwargs):
+            if request.headers.get("X-Test-Again") != "yes":
+                return {"error": "Forbidden", "message": "Asked again."}, 403
+            return view(*args, **kwargs)
+        wrapped.__name__ = view.__name__
+        return wrapped
+
+    def owner_or_co(view):
+        def wrapped(*args, **kwargs):
+            if g.user["username"] not in owners:
+                return {"error": "Not Found", "message": "The requested URL was not found on the server."}, 404
+            return view(*args, **kwargs)
+        wrapped.__name__ = view.__name__
+        return wrapped
+
+    told = app.config.setdefault("told", [])
+    app.config["co_names"] = ("AllMind",)
+    app.config["co_changed"] = 0
+
+    def co_changed():
+        app.config["co_changed"] += 1
+
+    switches_package.register(
+        app, require_auth=require_auth, require_owner=owner_or_co, require_the_owner=require_owner,
+        require_fresh_password=asks_again, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400), catalogue=SwitchCatalogue,
+        get_setting=setting, set_setting=put_setting, maintenance_key="maintenance", min_build_key="min_client_build",
+        pvp_key="pvp", trade_key="trade", co_owners_key="coowners", maintenance_state=closed,
+        seconds_left=lambda state: max(0, state["kick_at"] - int(time.time())) if state["on"] else 0,
+        default_message="Closed for a bit.", pvp_enabled=lambda: switch_on("pvp"),
+        trades_enabled=lambda: switch_on("trade", True),
+        min_client_build=lambda: int(json.loads(setting("min_client_build") or "{}").get("build", 0)),
+        current_build=6, co_owners_on=lambda: switch_on("coowners"), co_owners_changed=co_changed,
+        co_owner_names=lambda: app.config["co_names"],
+        post_broadcast=lambda body, kind="system", by="": told.append((kind, body[:60], by)) or len(told),
+        broadcast_limit=60,
+        log_staff_action=lambda user, action, target, target_id=None, detail="": staff_log.append(
+            "%s %s %s: %s" % (user["username"], action, target, detail)),
+        online_window=45, end_player_sessions=lambda db: db.execute("DELETE FROM sessions WHERE user_id != 1").rowcount,
+        open_trades=lambda db: trade.data.open_count(db, int(time.time())))
+
     # bank/: a four-cell bank, handed the grid steps the carry hands back -
     # as app.py hands them - and the bank's own catalogue.
     app.config["bank_api"] = bank_package.register(
@@ -857,6 +960,30 @@ class ShopCatalogue:
     @staticmethod
     def roll_quality(item_id):
         return item_id + "~d104" if item_id == "ironsword" else item_id
+
+
+class SwitchCatalogue:
+    """What switches/ asks of gamedata, for /api/status: its schema version,
+    and its items and monsters, to be counted."""
+    EXPECTED_SCHEMA = 9
+    ITEMS = {"smallhealthpotion": {}, "ironsword": {}}
+    ENEMIES = {"slime": {}}
+
+
+class PlayersCatalogue:
+    """What players/ asks of gamedata, for a ticket: which items are pets (a
+    mage and a fire pet), and which can be worn (a crown, and an iron sword
+    however it rolled). A pebble is neither; "ghost" is no item at all."""
+    ITEMS = {"petmage": {"type_name": "PET"}, "petfire": {"type_name": "PET"}, "crownhelm": {"type_name": "ARMOR"},
+             "pebble": {"type_name": "MATERIAL"}}
+
+    @staticmethod
+    def item_row(item_id):
+        return PlayersCatalogue.ITEMS.get(item_id) or ({"type_name": "WEAPON"} if item_id.startswith("ironsword") else None)
+
+    @staticmethod
+    def equip_slot_for(item_id):
+        return "head" if item_id == "crownhelm" else "weapon" if item_id.startswith("ironsword") else ""
 
 
 class StatusCatalogue:
@@ -1016,7 +1143,10 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/character/inventory/discard", "/api/character/inventory/cash",
                        "/api/character/skills", "/api/skill/train", "/api/save", "/api/save",
                        "/api/character", "/api/character/delete", "/api/player/status",
-                       "/api/player/status", "/api/shop/buy", "/api/shop/sell", "/api/shop/<shop_id>"]), rules)
+                       "/api/player/status", "/api/shop/buy", "/api/shop/sell", "/api/shop/<shop_id>",
+                       "/api/players/online", "/api/presence/ticket", "/api/players/nearby", "/api/status",
+                       "/api/server/maintenance", "/api/server/minbuild", "/api/server/pvp", "/api/server/trade",
+                       "/api/server/coowners", "/api/server/coowners", "/api/server/broadcast"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -2433,6 +2563,237 @@ check("  more than the cell holds, or a cell that does not hold it, is the carry
 check("  and what the till does not buy is the 400 it was",
       till("/api/shop/sell", {"shop_id": "stall", "position": 2, "item_id": "smallhealthpotion"})
       == (400, {"error": "Bad Request", "message": "The shop does not buy that."}))
+def around(sql, rows=()):
+    conn = sqlite3.connect(path_a)
+    conn.executemany(sql, rows) if rows else conn.executescript(sql)
+    conn.commit()
+    conn.close()
+
+
+# Who is around, written out: ann and bo in the field, bo with a second
+# character parked there too; the boss in the crypt; eve in the field and
+# higher; cy in the field with a token that has run out; dee in the field and
+# not heard from for a hundred seconds. bo is in the Moths, and has no rank.
+now = int(time.time())
+around("DELETE FROM sessions; DELETE FROM guild_members WHERE user_id IN (2, 3);"
+       " DELETE FROM saves WHERE user_id IN (2, 3) AND slot > 0; UPDATE users SET name_hue = 200 WHERE id = 2;"
+       " UPDATE users SET role = NULL WHERE id = 3; INSERT OR REPLACE INTO guilds (id, name, folded) VALUES (900, 'Moths', 'moths-around');"
+       " INSERT INTO guild_members (user_id, guild_id, rank) VALUES (3, 900, 'member');"
+       " UPDATE saves SET name = 'Ann', area = 'field', equipment = '{\"weapon\": \"ironsword~d104\", \"head\": \"\"}'"
+       " WHERE user_id = 2 AND slot = 0;"
+       " DELETE FROM carry_items WHERE user_id = 2 AND slot = 0; DELETE FROM bank_items WHERE user_id = 2;"
+       " DELETE FROM skills WHERE user_id = 2 AND slot = 0; DELETE FROM presence_tickets;")
+around("INSERT OR REPLACE INTO users (id, username, role, created_at) VALUES (?, ?, 'player', 0)",
+       [(40, "cy"), (41, "dee"), (42, "eve")])
+around("INSERT OR REPLACE INTO saves (user_id, slot, class_id, level, area, updated_at, name) VALUES (?, ?, 'mage', ?, ?, ?, ?)",
+       [(3, 0, 7, "field", now, "Bo"), (3, 1, 30, "field", now, "BoAlt"), (1, 0, 50, "crypt", now, "Boss"),
+        (40, 0, 8, "field", now, "Cy"), (41, 0, 8, "field", now, "Dee"), (42, 0, 9, "field", now, "Eve")])
+around("INSERT INTO sessions (user_id, last_seen_at, expires_at) VALUES (?, ?, ?)",
+       [(2, now, now + 3600), (3, now - 5, now + 3600), (3, now - 30, now + 3600), (1, now, now + 3600),
+        (40, now, now - 1), (41, now - 100, now + 3600), (42, now, now + 3600)])
+around("INSERT INTO carry_items VALUES (2, 0, ?, ?, ?)", [(0, "petmage", 1), (1, "crownhelm", 1), (2, "pebble", 3),
+                                                         (3, "ghost", 1)])
+around("INSERT INTO bank_items VALUES (2, ?, ?, ?)", [(0, "petfire", 1), (1, "petmage", 1), (2, "pebble", 2)])
+around("INSERT INTO skills VALUES (2, 0, ?, ?, 0)", [("attack", 5), ("magic", 2), ("fishing", 9)])
+around("INSERT INTO presence_tickets VALUES (?, ?, ?, 0, '{}', ?, ?)",
+       [("h:dead", "h:old", 3, now - 200, now - 1), ("h:live", "h:old", 3, now - 60, now + 60)])
+# On the stand-in login too, as the real one carries the users row.
+USERS["ann"]["name_hue"] = 200
+USERS["bo"]["name_hue"] = None
+
+res = client_a.get("/api/players/online", headers=who("ann"))
+online = res.get_json() or {}
+check("players: who is online - heard inside the window AND a token still good, one each, by name",
+      res.status_code == 200 and [p["username"] for p in online.get("players", [])] == ["ann", "bo", "boss", "eve"]
+      and online.get("online") == 4 and online.get("area") == "field" and online.get("precision") == "area", online)
+check("  each by the character they are PLAYING, with their guild, rank and colour, and who is here with you",
+      online["players"][1] == {"username": "bo", "role": "wanderer", "name_hue": None, "name": "Bo", "level": 7,
+                               "area": "field", "guild": "Moths", "guild_tag": "MOTHS", "with_you": True}
+      and online["players"][0]["name_hue"] == 200 and online["players"][0]["guild_tag"] == ""
+      and online["players"][0]["role"] == "player"
+      and [p["with_you"] for p in online["players"]] == [True, True, False, True], online)
+app_a.config["pvp"] = True
+check("  and the world's PvP rule rides along, asked on every call",
+      online.get("pvp") is False and client_a.get("/api/players/online", headers=who("ann")).get_json()["pvp"] is True)
+app_a.config["pvp"] = False
+res = client_a.get("/api/players/nearby?slot=0", headers=who("ann"))
+near = res.get_json() or {}
+check("the nearby list: the others in your area, online and still allowed, by the character played, highest first",
+      res.status_code == 200 and near.get("area") == "field" and near.get("precision") == "area"
+      and near.get("players") == [
+          {"username": "eve", "slot": 0, "name": "Eve", "level": 9, "role": "player", "name_hue": None},
+          {"username": "bo", "slot": 0, "name": "Bo", "level": 7, "role": None, "name_hue": None}], near)
+check("  and the 400 and the 404 it had",
+      client_a.get("/api/players/nearby?slot=9", headers=who("ann")).get_json()
+      == {"error": "Bad Request", "message": "slot must be an integer 0-3"}
+      and client_a.get("/api/players/nearby?slot=3", headers=who("ann")).get_json()
+      == {"error": "Not Found", "message": "No character in slot 3."})
+check("  the caps are the ones app.py had", (players_package.NEARBY_LIMIT, players_package.ONLINE_LIST_LIMIT) == (20, 60))
+
+res = client_a.post("/api/presence/ticket", headers=who("ann"), json={"slot": 0})
+ticket = res.get_json() or {}
+issued = ann_says("SELECT token_hash, session_hash, user_id, slot, identity, issued_at, expires_at FROM presence_tickets"
+                  " WHERE user_id = 2")
+check("the presence ticket: issued, stored by its hash beside the session's, two minutes long",
+      res.status_code == 200 and len(ticket.get("ticket", "")) == 43 and ticket.get("expires_in") == 120
+      and len(issued) == 1 and issued[0][:4] == ("h:" + ticket.get("ticket", ""), "h:bearer-ann", 2, 0)
+      and issued[0][6] - issued[0][5] == 120, (ticket, issued))
+check("  and the socket's address from the settings handed in: here, the presence port on the host asked",
+      ticket.get("socket_url") == "ws://localhost:5099/ws/presence", ticket)
+identity = json.loads(issued[0][4]) if issued else {}
+check("  who ann is on screen is the server's rows: name, character, class, level, rank, colour, guild",
+      {k: identity.get(k) for k in ("name", "character", "cls", "lvl", "role", "hue", "guild")}
+      == {"name": "ann", "character": "Ann", "cls": "warrior", "lvl": 4, "role": "player", "hue": 200, "guild": ""},
+      identity)
+check("  the pets she may be seen with: held in her bag or the bank, each once - not the pebble, not a ghost",
+      identity.get("pets") == ["petfire", "petmage"], identity.get("pets"))
+check("  the gear the books hold her to: worn and carried, what can be worn only; the skills, the three that fight",
+      identity.get("gear") == ["crownhelm", "ironsword~d104"] and identity.get("skills") == {"attack": 5, "magic": 2},
+      identity)
+check("  the dead tickets are pruned as it is issued, a live one of somebody else's is not",
+      [r[0] for r in ann_says("SELECT token_hash FROM presence_tickets WHERE user_id = 3")] == ["h:live"])
+res = client_a.post("/api/presence/ticket", headers=who("bo"), json={"slot": 0})
+bo_ticket = json.loads((ann_says("SELECT identity FROM presence_tickets WHERE token_hash = ?",
+                                 ("h:" + (res.get_json() or {}).get("ticket", ""),)) or [("{}",)])[0][0])
+check("  bo's says his guild, by its tag, and the character he plays in the slot he names",
+      res.status_code == 200 and bo_ticket.get("guild") == "MOTHS" and bo_ticket.get("character") == "Bo"
+      and bo_ticket.get("pets") == [] and bo_ticket.get("skills") == {}, bo_ticket)
+check("  and the 400 and the 404 it had",
+      client_a.post("/api/presence/ticket", headers=who("ann"), json={"slot": "x"}).get_json()
+      == {"error": "Bad Request", "message": "slot must be an integer 0-3"}
+      and client_a.post("/api/presence/ticket", headers=who("ann"), json={"slot": 3}).get_json()
+      == {"error": "Not Found", "message": "No character in slot 3."})
+url = players_package.services.socket_url
+check("where the socket is: the named address wins; behind the proxy, this host under the path, wss for https",
+      url("wss://there.example/ws", 1, 5001, "https", "api.example") == "wss://there.example/ws"
+      and url("", 1, 5001, "https", "api.example") == "wss://api.example/ws/presence"
+      and url("", 2, 5001, "http", "api.example:8080") == "ws://api.example:8080/ws/presence")
+check("  and run locally, the presence port on the host the game asked, IPv6 or none at all",
+      url("", 0, 5001, "http", "192.168.1.5:5000") == "ws://192.168.1.5:5001/ws/presence"
+      and url("", 0, 5001, "https", "[::1]:5000") == "ws://[::1]:5001/ws/presence"
+      and url("", 0, 5001, "http", "") == "ws://127.0.0.1:5001/ws/presence")
+USERS["ann"].pop("name_hue")
+USERS["bo"].pop("name_hue")
+around("UPDATE users SET role = 'player' WHERE id = 3")
+def switch(path, body, as_who="boss", again=True):
+    headers = dict(who(as_who), **({"X-Test-Again": "yes"} if again else {}))
+    res = client_a.post(path, headers=headers, json=body)
+    return res.status_code, res.get_json() or {}
+
+
+def stood():
+    return client_a.get("/api/status").get_json() or {}
+
+
+told = app_a.config["told"]
+log = app_a.config["staff_log"]
+st = stood()
+check("switches: /api/status answers with no login at all - the catalogue's counts and every switch as it stands",
+      st == {"online": True, "gamedata_schema": 9, "items": 2, "enemies": 1, "maintenance": False, "message": "",
+             "back_at": None, "seconds_left": 0, "pvp": False, "trade": True, "min_client_build": 0,
+             "current_client_build": 6}, st)
+check("  a switch is the owner's - a player is told it does not exist - and one that changes the world asks for",
+      switch("/api/server/pvp", {"on": True}, "ann")[0] == 404
+      and switch("/api/server/pvp", {"on": True}, again=False)[0] == 403 and stood()["pvp"] is False)
+said = len(told)
+code, body = switch("/api/server/pvp", {"on": True})
+check("PvP on: the row written with who threw it, said in the world in its own voice, logged, on /api/status",
+      (code, body) == (200, {"pvp": True, "damage_implemented": False}) and stood()["pvp"] is True
+      and ann_says("SELECT updated_by FROM server_settings WHERE key = 'pvp'") == [("boss",)]
+      and told[said:] == [("system", "boss has gone hostile.", "boss")] and log[-1] == "boss pvp server: on",
+      (body, told[said:], log[-1:]))
+code, body = switch("/api/server/pvp", {"on": False})
+check("  off again, said so, and no switch named is the 400 it was",
+      body.get("pvp") is False and told[-1][1] == "boss has cooled off - no longer hostile."
+      and switch("/api/server/pvp", {})[1].get("message") == 'send {"on": true} or {"on": false}')
+now = int(time.time())
+around("DELETE FROM trades; INSERT INTO trades (trade_id, state, updated_at) VALUES ('t-new', 'open', %d),"
+       " ('t-old', 'open', %d), ('t-done', 'done', %d)" % (now - 10, now - 700, now))
+code, body = switch("/api/server/trade", {"on": False})
+check("trading stopped: the trades still open and not run out counted (trade/'s own count), the world told",
+      (code, body) == (200, {"trade": False, "open_trades": 1}) and stood()["trade"] is False
+      and told[-1][1] == "Trading is paused for now. A trade already open can still finish."[:60]
+      and log[-1] == "boss trade server: off", (body, told[-1:]))
+check("  a switch that is not true or false is the 400 it was, and on again is said too",
+      switch("/api/server/trade", {"on": "yes"})[0] == 400
+      and switch("/api/server/trade", {"on": True})[1] == {"trade": True, "open_trades": 1}
+      and told[-1][1] == "Trading is open again.")
+said = len(told)
+check("the oldest build: newer than any there is is refused - nobody locked out - nor below 0, nor a word",
+      "build 7 is newer than any client that exists (current is 6)"
+      in switch("/api/server/minbuild", {"build": 7})[1].get("message", "")
+      and switch("/api/server/minbuild", {"build": -1})[1].get("message") == "build cannot be negative"
+      and switch("/api/server/minbuild", {"build": "x"})[1].get("message") == "build must be a whole number"
+      and switch("/api/server/minbuild", {})[0] == 400)
+code, body = switch("/api/server/minbuild", {"build": 4})
+check("  4 arms the gate, on /api/status - and is not announced: those it refuses cannot hear the world",
+      (code, body) == (200, {"min_client_build": 4, "current_client_build": 6, "armed": True})
+      and stood()["min_client_build"] == 4 and len(told) == said
+      and log[-1] == "boss minbuild server: min client build set to 4", body)
+switch("/api/server/minbuild", {"build": 0})
+now = int(time.time())
+around("DELETE FROM sessions")
+around("INSERT INTO sessions (user_id, last_seen_at, expires_at) VALUES (?, ?, ?)",
+       [(1, now, now + 3600), (2, now, now + 3600), (3, now - 5, now + 3600), (41, now - 100, now + 3600)])
+words = "The server is closing for the great migration of every slime"
+code, body = switch("/api/server/maintenance", {"on": True, "message": words, "back_at": "soon", "grace_seconds": 99999})
+check("closing: the grace held to an hour, the clients heard lately counted, nobody signed out yet",
+      code == 200 and body.get("grace_seconds") == 3600 and body.get("online_now") == 3
+      and body.get("sessions_ended") == 0 and body.get("message") == words and body.get("back_at") == "soon"
+      and body.get("disconnect_at", 0) - now in (3600, 3601), body)
+check("  the world told in sixty characters: the countdown kept whole, the message what gives way",
+      told[-1][1] == "The ser... (closing in 3600s - your progress is being saved)", told[-1])
+st = stood()
+check("  and /api/status says so to anybody: closed, what the owner said, the time left",
+      st["maintenance"] is True and st["message"] == words and st["back_at"] == "soon"
+      and 3590 <= st["seconds_left"] <= 3600, st)
+check("  a grace that is not a number is the 400 it was; an empty message is the default one",
+      switch("/api/server/maintenance", {"on": True, "grace_seconds": "soon"})[1].get("message")
+      == "grace_seconds must be a whole number of seconds"
+      and switch("/api/server/maintenance", {"on": True, "message": "  ", "grace_seconds": 30})[1].get("message")
+      == "Closed for a bit." and switch("/api/server/maintenance", {})[0] == 400)
+code, body = switch("/api/server/maintenance", {"on": True, "grace_seconds": 0})
+check("  no grace at all: everyone but the owner signed out now, the world told it is closing now",
+      body.get("sessions_ended") == 3 and told[-1][1] == "Closed for a bit. (closing now)"
+      and ann_says("SELECT user_id FROM sessions") == [(1,)] and log[-1].endswith(", 3 signed out now"),
+      (body, told[-1:], log[-1:]))
+code, body = switch("/api/server/maintenance", {"on": False})
+check("  and open again: said, logged, and off on /api/status",
+      (code, body) == (200, {"maintenance": False, "message": "", "back_at": None, "seconds_left": 0,
+                             "sessions_ended": 0})
+      and told[-1][1] == "The server is open again." and log[-1] == "boss maintenance server: reopened"
+      and stood()["maintenance"] is False, body)
+co = client_a.get("/api/server/coowners", headers=who("boss")).get_json() or {}
+check("the co-owners: out, who the switch would let in, never thrown",
+      co == {"on": False, "names": ["AllMind"], "by": "", "at": 0, "stored_on": False}, co)
+code, body = switch("/api/server/coowners", {"on": True}, again=False)
+check("  let in by the owner, no password asked again: read afresh, with the row's who and when",
+      code == 200 and body.get("on") is True and body.get("stored_on") is True and body.get("by") == "boss"
+      and abs(body.get("at", 0) - int(time.time())) <= 2 and app_a.config["co_changed"] == 1
+      and log[-1] == "boss coowners server: on: AllMind", body)
+app_a.config["owners"].add("ann")
+check("  a co-owner may look, and may not throw it: the owner's alone",
+      client_a.get("/api/server/coowners", headers=who("ann")).status_code == 200
+      and switch("/api/server/coowners", {"on": False}, "ann")[0] == 404)
+app_a.config["owners"].discard("ann")
+app_a.config["co_names"] = ()
+check("  nobody named is the 409 it was, asked when the switch is thrown; not true or false, the 400",
+      switch("/api/server/coowners", {"on": True})
+      == (409, {"error": "Conflict", "message": "Nobody is named to be a co-owner. Put ELUSION_CO_OWNERS=<name> in"
+                " the server's .env and restart it, then switch this on."})
+      and switch("/api/server/coowners", {"on": 1})[0] == 400)
+app_a.config["co_names"] = ("AllMind",)
+switch("/api/server/coowners", {"on": False})
+code, body = switch("/api/server/broadcast", {"body": "  Mind the slimes  ", "kind": "Shout"}, again=False)
+check("the owner's voice: said in the world as sent, trimmed, its kind in lower case, its id handed back",
+      (code, body) == (200, {"id": len(told), "kind": "shout", "body": "Mind the slimes", "by": "boss"})
+      and told[-1] == ("shout", "Mind the slimes", "boss"), body)
+check("  the answer keeps the line to its length; empty, or a kind that is not one, is the 400 it was",
+      len(switch("/api/server/broadcast", {"body": "x" * 90})[1].get("body", "")) == 60
+      and switch("/api/server/broadcast", {"body": "   "})[1].get("message") == "body must be a non-empty message"
+      and switch("/api/server/broadcast", {"body": "hi", "kind": "whisper"})[1].get("message")
+      == "kind must be 'system' or 'shout'"
+      and switch("/api/server/broadcast", {"body": "hi"}, "ann")[0] == 404)
 check("and nobody without a login gets in anywhere",
       [client_a.get(path).status_code for path in ("/api/server/stats", "/api/world/events/active", "/api/server/insights",
                                                   "/api/kills?slot=0", "/api/kills/everyone", "/api/friends",
@@ -2442,7 +2803,9 @@ check("and nobody without a login gets in anywhere",
                                                   "/api/economy/kingdom", "/api/server/world", "/api/staff/reports",
                                                   "/api/staff/users", "/api/staff/actions", "/api/staff/user/ann",
                                                   "/api/account", "/api/save", "/api/character?slot=0",
-                                                  "/api/player/status?slot=0", "/api/shop/stall")]
+                                                  "/api/player/status?slot=0", "/api/shop/stall",
+                                                  "/api/players/online", "/api/players/nearby?slot=0",
+                                                  "/api/server/coowners")]
       + [client_a.post(path, json={"slot": 0}).status_code for path in ("/api/fishing/catch", "/api/cooking/cook",
                                                                          "/api/loot/take", "/api/guild/create",
                                                                          "/api/staff/guild", "/api/party/invite",
@@ -2467,12 +2830,17 @@ check("and nobody without a login gets in anywhere",
                                                                          "/api/character/inventory/cash",
                                                                          "/api/skill/train",
                                                                          "/api/character/delete",
-                                                                         "/api/shop/buy", "/api/shop/sell")]
+                                                                         "/api/shop/buy", "/api/shop/sell",
+                                                                         "/api/presence/ticket",
+                                                                         "/api/server/maintenance",
+                                                                         "/api/server/minbuild", "/api/server/pvp",
+                                                                         "/api/server/trade", "/api/server/coowners",
+                                                                         "/api/server/broadcast")]
       + [client_a.put(path, json={}).status_code for path in ("/api/staff/role", "/api/account/bank",
                                                               "/api/account/lusions", "/api/character/inventory",
                                                               "/api/character/skills", "/api/save",
                                                               "/api/player/status")]
-      == [401] * 73)
+      == [401] * 83)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")
@@ -2506,7 +2874,7 @@ check("the code map finds the packages app.py imports: %s" % ", ".join(PACKAGES)
       set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds",
                         "parties", "chat", "trade", "kingdom", "world", "moderation", "staffdesk",
                         "equipment", "consuming", "death", "bank", "carry", "skills", "saves", "status",
-                        "shop"},
+                        "shop", "players", "switches"},
       PACKAGES)
 check("  and every one of them runs on a bare app in this file", set(PACKAGES) == set(RUN_HERE),
       sorted(set(PACKAGES) ^ set(RUN_HERE)))

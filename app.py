@@ -16,7 +16,6 @@ from werkzeug.exceptions import HTTPException
 
 import gamedata
 import json
-import logging
 import collections
 import sqlite3
 import secrets
@@ -4032,6 +4031,12 @@ def co_owners_on():
     return on
 
 
+def _co_owners_changed():
+    """Forget this request's answer, so the next co_owners_on() reads the row
+    again - the co-owners' switch, once it has moved it (switches/)."""
+    g.pop("_co_owners_on", None)
+
+
 def is_co_owner(username):
     """True for an account ELUSION_CO_OWNERS names, while the owner's switch is
     on. Case-insensitive, like is_owner(). Never the owner."""
@@ -4371,15 +4376,8 @@ CURRENT_CLIENT_BUILD = 6
 
 MAINTENANCE_DEFAULT_MESSAGE = "Update in progress - please come back later."
 
-# Long enough that every client actually in the world gets at least one
-# heartbeat inside the window, which is what makes "everyone saved" true rather
-# than hopeful. ONLINE_WINDOW_SECONDS is the yardstick for "is anyone there".
-MAINTENANCE_DEFAULT_GRACE_SECONDS = 60
-
-# A grace window is a promise to wait, and an hour is the longest promise this
-# endpoint will make. Past that the owner wants a scheduled restart, not a
-# switch someone will forget is on.
-MAINTENANCE_MAX_GRACE_SECONDS = 3600
+# The grace window's default and its longest (MAINTENANCE_DEFAULT_GRACE_SECONDS,
+# MAINTENANCE_MAX_GRACE_SECONDS) are the close route's, in switches/services.py.
 
 MAINTENANCE_OFF = {
     "on": False, "message": "", "back_at": None, "kick_at": 0, "by": "", "at": 0,
@@ -10172,414 +10170,61 @@ STAFF_NOTE_MAX = staffdesk_package.STAFF_NOTE_MAX
 STAFF_ONLINE_COUNT_SQL = staffdesk_package.STAFF_ONLINE_COUNT_SQL
 
 
-@app.get("/api/status")
-def server_status():
-    """
-    Server health and maintenance window
-    ---
-    tags:
-      - Status
-    responses:
-      200:
-        description: The server is up; message and back_at describe any planned downtime
-    """
-    # NO @require_auth, deliberately. The login screen needs to be able to ask
-    # "are you there?" before anyone has logged in, and a 401 is not an answer
-    # to that question.
-    #
-    # WHY THIS EXISTS: the client currently infers the difference between "your
-    # internet is down" and "the host's server is down" from an HTTP failure
-    # code, and that inference is unreliable - a dead port on localhost reports
-    # a timeout rather than a refused connection, and a timeout looks identical
-    # either way. It cannot be inferred. It has to be told.
-    #
-    # A reachable /api/status also means a scheduled restart can ANNOUNCE
-    # itself rather than surfacing as an error. Downtime the player was warned
-    # about is maintenance; the same downtime unannounced is a broken game.
-    # NO LONGER SET BY HAND. The owner throws the switch from the HUD and it
-    # lives in server_settings, so a closed server announces itself to every
-    # client that asks - including one sitting on the login screen that has
-    # never logged in and has no token to ask with.
-    state = maintenance_state()
-    return {
-        "online": True,
-        "gamedata_schema": gamedata.EXPECTED_SCHEMA,
-        "items": len(gamedata.ITEMS),
-        "enemies": len(gamedata.ENEMIES),
-        "maintenance": state["on"],
-        "message": state["message"] if state["on"] else "",
-        "back_at": state["back_at"],
-        "seconds_left": maintenance_seconds_left(state),
-        # ON THE UNAUTHENTICATED ROUTE, on purpose. "Is PvP on" is a fact about
-        # the world, not about an account, and the login screen is exactly where
-        # somebody wants to know before they walk in.
-        "pvp": pvp_enabled(),
-        # Whether players may open a trade. The trade window asks before it
-        # offers anything, and a player on the login screen can know too.
-        "trade": trades_enabled(),
-        # THE BUILD GATE, ON THE ONE ROUTE IT DOES NOT GATE. An outdated client
-        # is refused everywhere else, so this is where it finds out what it
-        # needs - and a client that is merely BEHIND, with the gate still
-        # disarmed, can say so without being refused at all. That is what makes
-        # shipping it at 0 useful rather than inert: the notice works from day
-        # one, the refusal waits until it is wanted.
-        "min_client_build": min_client_build(),
-        "current_client_build": CURRENT_CLIENT_BUILD,
-    }, 200
+# =============================================================================
+# THE SERVER'S SWITCHES - the switches/ package (since 18 Oct)
+# =============================================================================
+# GET /api/status, the owner's five switches (maintenance, the minimum build,
+# PvP, trading, the co-owners - read and set) and the owner's announcement, as
+# they were here: endpoint names, docstrings, ranks, the password asked again
+# and every message (routes.lock). switches/__init__.py says what each does and
+# which are announced. What every switch READS as stays above, with its key -
+# the gates that ask run on every request - and is handed in; so are the
+# broadcast line, the moderation log and the sign-out for a close with no
+# grace. The broadcast poll stays below: it is the heartbeat, and reads every
+# area.
+import switches as switches_package  # noqa: E402
 
+switches_package.register(
+    app,
+    require_auth=require_auth,
+    require_owner=require_owner,
+    require_the_owner=require_the_owner,
+    require_fresh_password=require_fresh_password,
+    get_db=get_db,
+    bad_request=bad_request,
+    catalogue=gamedata,
+    get_setting=get_server_setting,
+    set_setting=set_server_setting,
+    maintenance_key=MAINTENANCE_KEY,
+    min_build_key=MIN_BUILD_KEY,
+    pvp_key=PVP_KEY,
+    trade_key=TRADE_KEY,
+    co_owners_key=CO_OWNERS_KEY,
+    maintenance_state=maintenance_state,
+    seconds_left=maintenance_seconds_left,
+    default_message=MAINTENANCE_DEFAULT_MESSAGE,
+    pvp_enabled=pvp_enabled,
+    trades_enabled=trades_enabled,
+    min_client_build=min_client_build,
+    current_build=CURRENT_CLIENT_BUILD,
+    co_owners_on=co_owners_on,
+    co_owners_changed=_co_owners_changed,
+    # ASKED ON EVERY CALL: test_coowner.py empties it to see the switch refuse.
+    co_owner_names=lambda: CO_OWNER_USERNAMES,
+    post_broadcast=post_broadcast,
+    broadcast_limit=MAX_BROADCAST_LENGTH,
+    log_staff_action=log_staff_action,
+    online_window=ONLINE_WINDOW_SECONDS,
+    end_player_sessions=_end_all_player_sessions,
+    # trade/'s count, registered further down, so asked for when it is wanted.
+    open_trades=lambda db: trade_package.open_count(db, int(time.time())),
+)
 
-@app.post("/api/server/maintenance")
-@require_auth
-@require_owner
-@require_fresh_password
-def set_maintenance():
-    """
-    Close or reopen the server (owner only)
-    ---
-    tags:
-      - Status
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [on]
-          properties:
-            "on":          {type: boolean, description: "true closes the server"}
-            message:       {type: string,  description: "what players are told"}
-            back_at:       {type: string,  description: "RFC3339, or null"}
-            grace_seconds: {type: integer, description: "seconds players get to save before being signed out"}
-    responses:
-      200:
-        description: The switch as it now stands
-      400:
-        description: Malformed body
-      404:
-        description: Not the owner (the same 404 every owner route gives)
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-    if "on" not in payload:
-        return bad_request('send {"on": true} to close the server, or {"on": false} to reopen it')
+# Named here as well, for the suites that read them off this module;
+# switches/services.py is where they are set.
+MAINTENANCE_DEFAULT_GRACE_SECONDS = switches_package.MAINTENANCE_DEFAULT_GRACE_SECONDS
+MAINTENANCE_MAX_GRACE_SECONDS = switches_package.MAINTENANCE_MAX_GRACE_SECONDS
 
-    db = get_db()
-    now = int(time.time())
-
-    # ------------------------------------------------------------------ open
-    if not bool(payload.get("on")):
-        # Written as an explicit {"on": false} rather than deleting the row, so
-        # server_settings keeps a record of who reopened it and when.
-        set_server_setting(MAINTENANCE_KEY, json.dumps({"on": False}), g.user["username"])
-        post_broadcast("The server is open again.", "system", g.user["username"])
-        log_staff_action(g.user, "maintenance", "server", None, "reopened")
-        db.commit()
-        return {
-            "maintenance": False, "message": "", "back_at": None,
-            "seconds_left": 0, "sessions_ended": 0,
-        }, 200
-
-    # ----------------------------------------------------------------- close
-    message = str(payload.get("message", "")).strip()[:200] or MAINTENANCE_DEFAULT_MESSAGE
-
-    back_at = payload.get("back_at")
-    if back_at is not None:
-        back_at = str(back_at).strip()[:64] or None
-
-    grace = payload.get("grace_seconds", MAINTENANCE_DEFAULT_GRACE_SECONDS)
-    try:
-        grace = int(grace)
-    except (TypeError, ValueError):
-        return bad_request("grace_seconds must be a whole number of seconds")
-    grace = max(0, min(grace, MAINTENANCE_MAX_GRACE_SECONDS))
-
-    set_server_setting(MAINTENANCE_KEY, json.dumps({
-        "on": True,
-        "message": message,
-        "back_at": back_at,
-        # THE ONE NUMBER THAT MATTERS. Stored as an absolute time, not a
-        # duration, because every later request has to answer "is the window
-        # spent" without knowing when the switch was thrown.
-        "kick_at": now + grace,
-        "by": g.user["username"],
-        "at": now,
-    }), g.user["username"])
-
-    # WHO IS ACTUALLY IN THE WORLD, not who holds a session - a token lasts
-    # thirty days, so counting sessions would report a crowd that went home
-    # weeks ago. This is the number the owner is really asking for: how many
-    # people is the grace window for.
-    online = int(db.execute(
-        "SELECT COUNT(*) AS n FROM sessions WHERE last_seen_at > ?",
-        (now - ONLINE_WINDOW_SECONDS,),
-    ).fetchone()["n"] or 0)
-
-    # NO GRACE MEANS NO SAVE, and it is spelled out here rather than hidden
-    # behind a default. Asking for zero is asking to drop whatever the clients
-    # had not sent yet; every other value lets the heartbeat carry the notice
-    # and the clients flush first.
-    # SAID OUT LOUD, IN THE WORLD. The login screen only reaches people who
-    # are not playing yet; this is the half that reaches the ones who are.
-    # Posted before the sessions are ended so it is already in the table when
-    # the last poll before disconnection asks for it.
-    #
-    # THE COUNTDOWN IS NEVER THE PART CUT. post_broadcast() trims the whole line
-    # to MAX_BROADCAST_LENGTH, and the owner's message may already be 200 - so
-    # a long message used to push "(closing in 60s - ...)" off the end, and the
-    # players lost the one thing in the notice they had to act on. The message
-    # is what gives way now, with an ellipsis to say so.
-    tail = (" (closing in %ds - your progress is being saved)" % grace) if grace > 0 \
-        else " (closing now)"
-    room = MAX_BROADCAST_LENGTH - len(tail)
-    said = message if len(message) <= room else message[:room - 3].rstrip() + "..."
-    post_broadcast(said + tail, "system", g.user["username"])
-
-    ended = _end_all_player_sessions(db) if grace == 0 else 0
-
-    log_staff_action(
-        g.user, "maintenance", "server", None,
-        "closed, %ds grace, %d online%s" % (
-            grace, online, ", %d signed out now" % ended if ended else ""),
-    )
-    db.commit()
-
-    return {
-        "maintenance": True,
-        "message": message,
-        "back_at": back_at,
-        "grace_seconds": grace,
-        "disconnect_at": now + grace,
-        "seconds_left": grace,
-        "online_now": online,
-        "sessions_ended": ended,
-    }, 200
-
-
-
-@app.post("/api/server/minbuild")
-@require_auth
-@require_owner
-@require_fresh_password
-def set_min_build():
-    """
-    Set the oldest client build allowed to connect (owner only)
-    ---
-    tags:
-      - Status
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [build]
-          properties:
-            build: {type: integer, description: "oldest build allowed; 0 disarms the gate"}
-    responses:
-      200:
-        description: The gate as it now stands
-      400:
-        description: Malformed body
-      404:
-        description: Not the owner (the same 404 every owner route gives)
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-    if "build" not in payload:
-        return bad_request('send {"build": 3} to require build 3 or newer, '
-                           'or {"build": 0} to let every client in')
-
-    try:
-        wanted = int(payload.get("build"))
-    except (TypeError, ValueError):
-        return bad_request("build must be a whole number")
-    if wanted < 0:
-        return bad_request("build cannot be negative")
-
-    # A MINIMUM ABOVE THE BUILD THAT EXISTS LOCKS EVERYONE OUT INCLUDING YOU,
-    # and unlike the maintenance switch there is no owner exemption to climb
-    # back in through - the gate runs before authentication, because refusing a
-    # protocol mismatch cannot depend on parsing a token that build may not
-    # know how to send. So the one typo that would need a shell on the server to
-    # undo is refused here instead.
-    if wanted > CURRENT_CLIENT_BUILD:
-        return bad_request(
-            "build %d is newer than any client that exists (current is %d). "
-            "That would refuse every player including you, and this gate runs "
-            "before authentication - there would be no way back in from the game."
-            % (wanted, CURRENT_CLIENT_BUILD))
-
-    db = get_db()
-    # Written even when unchanged, like the two switches beside it, so
-    # server_settings keeps who set it and when.
-    set_server_setting(MIN_BUILD_KEY, json.dumps({"build": wanted}),
-                       g.user["username"])
-
-    # NOT ANNOUNCED IN CHAT, and that is the difference from the PvP switch.
-    # The people this affects are the ones who cannot connect, so a broadcast
-    # reaches everybody except its audience. The client reads it off
-    # /api/status - the one route the gate never refuses - which is where a
-    # player who cannot get in is already looking.
-    log_staff_action(g.user, "minbuild", "server", None,
-                     "min client build set to %d" % wanted)
-    db.commit()
-
-    return {
-        "min_client_build": wanted,
-        "current_client_build": CURRENT_CLIENT_BUILD,
-        "armed": wanted > 0,
-    }, 200
-
-
-@app.post("/api/server/pvp")
-@require_auth
-@require_owner
-@require_fresh_password
-def set_pvp():
-    """
-    Turn player-versus-player on or off (owner only)
-    ---
-    tags:
-      - Status
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: switch
-        schema:
-          type: object
-          required: [on]
-          properties:
-            "on": {type: boolean}
-    responses:
-      200:
-        description: The switch, as it now stands
-      400:
-        description: No 'on' field
-      401:
-        description: Missing, invalid or expired token
-      404:
-        description: Not the owner
-    """
-    # OWNER, LIKE THE MAINTENANCE SWITCH ABOVE IT, and for the same reason: this
-    # is a statement about the whole world rather than an action on one account.
-    # require_owner answers with a 404 rather than a 403 - see the refusal rule
-    # in SECURITY.md; a 403 would confirm the route exists to somebody who has
-    # no business knowing it does.
-    payload = request.get_json(silent=True) or {}
-    if "on" not in payload:
-        return bad_request('send {"on": true} or {"on": false}')
-
-    wanted = bool(payload.get("on"))
-    db = get_db()
-
-    # WRITTEN EVEN WHEN IT DOES NOT CHANGE, like the maintenance row, so
-    # server_settings keeps a record of who set it and when. An explicit
-    # {"on": false} rather than a deleted row, for the same reason.
-    set_server_setting(PVP_KEY, json.dumps({"on": wanted}), g.user["username"])
-
-    # ANNOUNCED, because a rule about whether other players may hurt you is not
-    # something to discover by being hurt. post_broadcast reaches everyone who
-    # is online; /api/status carries it for everyone who is not yet.
-    #
-    # NAMED, AND IN THE WORLD'S OWN VOICE. "PvP is now ON" is a settings screen
-    # talking; a world boss is a thing that HAPPENS to a world, and the line
-    # people should see is the one that reads like an event. The name is
-    # g.user["username"] - the server's own spelling of it, the same authority
-    # the login screen greets somebody by, so it matches the crown over the
-    # owner's head rather than whatever case was typed at a keyboard.
-    post_broadcast(
-        ("%s has gone hostile." % g.user["username"]) if wanted
-        else ("%s has cooled off - no longer hostile." % g.user["username"]),
-        "system", g.user["username"])
-    log_staff_action(g.user, "pvp", "server", None, "on" if wanted else "off")
-    db.commit()
-
-    return {
-        "pvp": wanted,
-        # SAID OUT LOUD ON EVERY ANSWER, so a panel written against this route
-        # cannot imply more than the switch does. Nothing can damage another
-        # player yet - there are no positions on the server and no remote bodies
-        # in the client. The flag is the authority the damage path will ask when
-        # it exists; today it is a flag and an announcement, and the button that
-        # sets it says so too.
-        "damage_implemented": False,
-    }, 200
-
-
-@app.post("/api/server/trade")
-@require_auth
-@require_owner
-@require_fresh_password
-def set_trade():
-    """
-    Let players open trades, or stop them (owner only)
-    ---
-    tags:
-      - Status
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: switch
-        schema:
-          type: object
-          required: [on]
-          properties:
-            "on": {type: boolean, description: "false stops new trades; open ones may finish"}
-    responses:
-      200:
-        description: The switch, as it now stands, and how many trades are still open
-      400:
-        description: No 'on' field
-      401:
-        description: Missing, invalid or expired token
-      404:
-        description: Not the owner
-    """
-    # OWNER, like maintenance and PvP: a rule about the whole world. See
-    # TRADE_KEY for what off does and does not do.
-    payload = request.get_json(silent=True) or {}
-    if "on" not in payload or not isinstance(payload.get("on"), bool):
-        return bad_request('send {"on": true} or {"on": false}')
-
-    wanted = payload["on"]
-    db = get_db()
-    set_server_setting(TRADE_KEY, json.dumps({"on": wanted}), g.user["username"])
-
-    # ANNOUNCED, so a player whose offer is refused already knows why. The
-    # trade window says so too; this reaches the people who are not in it.
-    post_broadcast(
-        "Trading is open again." if wanted
-        else "Trading is paused for now. A trade already open can still finish.",
-        "system", g.user["username"])
-    log_staff_action(g.user, "trade", "server", None, "on" if wanted else "off")
-    db.commit()
-
-    # HOW MANY ARE STILL OPEN, so the owner knows what "may finish" covers.
-    cutoff = int(time.time()) - TRADE_EXPIRY_SECONDS
-    still_open = db.execute(
-        "SELECT COUNT(*) FROM trades WHERE state = 'open' AND updated_at >= ?", (cutoff,)
-    ).fetchone()[0]
-    return {"trade": wanted, "open_trades": int(still_open)}, 200
 
 # =============================================================================
 # THE STIRRING LANDS (game 0.46.0)
@@ -10633,162 +10278,6 @@ world_stir_for = _WORLD.stir_for
 # their mark for asking the password again.
 set_world = app.view_functions["set_world"]
 stir_world = app.view_functions["stir_world"]
-
-
-def _co_owners_payload():
-    raw = get_server_setting(CO_OWNERS_KEY)
-    try:
-        stored = json.loads(raw) if raw else {}
-    except (TypeError, ValueError):
-        stored = {}
-    row = get_db().execute("SELECT updated_by, updated_at FROM server_settings WHERE key = ?",
-                           (CO_OWNERS_KEY,)).fetchone()
-    return {
-        "on": co_owners_on(),
-        # Who the switch lets in: ELUSION_CO_OWNERS, as the .env names them.
-        "names": list(CO_OWNER_USERNAMES),
-        "by": row["updated_by"] if row is not None else "",
-        "at": int(row["updated_at"] or 0) if row is not None else 0,
-        "stored_on": bool(stored.get("on")) if isinstance(stored, dict) else False,
-    }
-
-
-@app.get("/api/server/coowners")
-@require_auth
-@require_owner
-def read_co_owners():
-    """
-    Whether the co-owners are in, and who they are (owner only)
-    ---
-    tags:
-      - Status
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-    responses:
-      200:
-        description: The switch, and the names ELUSION_CO_OWNERS gives it
-      401:
-        description: Missing, invalid or expired token
-      404:
-        description: Not the owner or a co-owner
-    """
-    return _co_owners_payload(), 200
-
-
-@app.post("/api/server/coowners")
-@require_auth
-@require_the_owner
-def set_co_owners():
-    """
-    Let the co-owners in, or take them out (the owner alone)
-    ---
-    tags:
-      - Status
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: switch
-        schema:
-          type: object
-          required: [on]
-          properties:
-            "on": {type: boolean, description: "true gives the accounts ELUSION_CO_OWNERS names the owner's powers"}
-    responses:
-      200:
-        description: The switch as it now stands, and who it lets in
-      400:
-        description: No 'on' field
-      401:
-        description: Missing, invalid or expired token
-      404:
-        description: Not the owner - a co-owner included
-      409:
-        description: On, with nobody named in the server's ELUSION_CO_OWNERS
-    """
-    # THE OWNER'S ALONE (require_the_owner): a co-owner who could throw it
-    # could keep it on. Off takes effect on their next request - role_for()
-    # asks the switch every time - so there is nothing to sign out.
-    payload = request.get_json(silent=True) or {}
-    if "on" not in payload or not isinstance(payload.get("on"), bool):
-        return bad_request('send {"on": true} or {"on": false}')
-    wanted = payload["on"]
-    if wanted and not CO_OWNER_USERNAMES:
-        return {
-            "error": "Conflict",
-            "message": "Nobody is named to be a co-owner. Put ELUSION_CO_OWNERS=<name> in the"
-                       " server's .env and restart it, then switch this on.",
-        }, 409
-    db = get_db()
-    set_server_setting(CO_OWNERS_KEY, json.dumps({"on": wanted}), g.user["username"])
-    log_staff_action(g.user, "coowners", "server", None,
-                     ("on: " + ", ".join(CO_OWNER_USERNAMES)) if wanted else "off")
-    db.commit()
-    # Asked again, not the answer cached before the switch moved.
-    g.pop("_co_owners_on", None)
-    return _co_owners_payload(), 200
-
-
-@app.post("/api/server/broadcast")
-@require_auth
-@require_owner
-def send_broadcast():
-    """
-    Say something to everyone playing (owner only)
-    ---
-    tags:
-      - Status
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [body]
-          properties:
-            body: {type: string, description: "the announcement, max 200 chars"}
-            kind: {type: string, description: "system (default) or shout"}
-    responses:
-      200:
-        description: The announcement as stored
-      400:
-        description: Empty or missing body
-      404:
-        description: Not the owner
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-    text = str(payload.get("body", "")).strip()
-    if text == "":
-        return bad_request("body must be a non-empty message")
-
-    kind = str(payload.get("kind", "system")).strip().lower() or "system"
-    if kind not in ("system", "shout"):
-        return bad_request("kind must be 'system' or 'shout'")
-
-    db = get_db()
-    new_id = post_broadcast(text, kind, g.user["username"])
-    db.commit()
-
-    return {
-        "id": new_id,
-        "kind": kind,
-        "body": text[:MAX_BROADCAST_LENGTH],
-        "by": g.user["username"],
-    }, 200
 
 
 @app.get("/api/server/broadcasts")
@@ -11587,415 +11076,56 @@ trade_package.register(
     catalogue=gamedata,
 )
 
-# The most names the nearby list will return. A cap rather than paging: this
-# feeds a panel you glance at to find somebody to trade with, and a list longer
-# than this is one nobody reads to the end of anyway.
-NEARBY_LIMIT = 20
-
-# The most the who-is-online menu returns. A cap rather than paging, like
-# NEARBY_LIMIT above: a list nobody can scroll to the end of has stopped being a
-# list, and at fifty concurrent players - the size this server is provisioned
-# for - it is not reached. If it ever is, that is a good problem and the fix is
-# paging rather than a bigger number.
-ONLINE_LIST_LIMIT = 60
-
-
-@app.get("/api/players/online")
-@require_auth
-def players_online():
-    """
-    Everyone playing right now, and where
-    ---
-    tags:
-      - Players
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-    responses:
-      200:
-        description: Who is online, their area, and which of them are with you
-      401:
-        description: Missing, invalid or expired token
-    """
-    # ANY LOGGED-IN PLAYER, no rank. This is the "who else is here" list every
-    # game has, and it is the honest version of presence available today: the
-    # server knows which AREA a character is in and nothing finer, which
-    # /api/players/nearby says in its own comment. When real positions arrive
-    # this route gains a distance and the client does not change shape.
-    #
-    # WHAT IT DISCLOSES, said plainly because it is a choice and not an
-    # oversight: every online player's account name, character name, level and
-    # area, to every other player. That is what a who-is-online list IS, and
-    # the friends panel already shows the same thing for friends. It does not
-    # disclose anything the game does not already put over a character's head.
-    user_id = g.user["id"]
-    now = int(time.time())
-    db = get_db()
-
-    # WHERE THE CALLER IS, so the list can be grouped into "here with you" and
-    # "elsewhere" without the client having to ask a second route for its own
-    # area. From the character being PLAYED - see _playing_slot(); a player has
-    # up to four and "saved last" is wrong for the minute after a switch.
-    my_area = _playing_area(db, user_id)
-
-    # BOTH CONDITIONS. last_seen_at says a client was there in the last 45
-    # seconds; expires_at says the session is still allowed to be. Either one
-    # alone is wrong in a different direction - see the longer note in
-    # players_nearby, which had exactly that bug for one test run.
-    rows = db.execute(
-        """
-        SELECT users.username                AS username,
-               users.role                    AS role,
-               users.name_hue                AS name_hue,
-               MAX(sessions.last_seen_at)    AS seen,
-               saves.name                    AS name,
-               saves.level                   AS level,
-               saves.area                    AS area,
-               saves.updated_at              AS updated_at,
-               guilds.name                   AS guild
-          FROM sessions
-          JOIN users ON users.id = sessions.user_id
-          -- THE CHARACTER THEY ARE PLAYING, and only that one, by the rule the
-          -- trade window and the guild roster use (PLAYING_SLOT_SQL). It used
-          -- to join every save and keep whichever was saved last.
-          LEFT JOIN saves ON saves.user_id = sessions.user_id
-                         AND saves.slot = %s
-          -- THE GUILD RIDES THE JOIN THAT IS ALREADY HERE. Two LEFT JOINs on
-          -- indexed keys, against a list already capped at ONLINE_LIST_LIMIT
-          -- rows - not a second query, and not a lookup per player in Python.
-          LEFT JOIN guild_members ON guild_members.user_id = users.id
-          LEFT JOIN guilds ON guilds.id = guild_members.guild_id
-         WHERE sessions.last_seen_at > ?
-           AND sessions.expires_at > ?
-      GROUP BY users.id
-      ORDER BY users.username ASC
-         LIMIT ?
-        """ % PLAYING_SLOT_SQL.format(user="users.id"),
-        # PLAYING_SLOT_SQL's two first - it sits in the JOIN, above the WHERE.
-        (now - ONLINE_WINDOW_SECONDS, now,
-         now - ONLINE_WINDOW_SECONDS, now, ONLINE_LIST_LIMIT),
-    ).fetchall()
-
-    # ONE ENTRY PER ACCOUNT. The join now picks one character each and the
-    # GROUP BY folds an account's several sessions into one row, so this is a
-    # guard rather than the mechanism - kept because a list that shows somebody
-    # twice is the bug a future join would bring back.
-    seen_accounts = set()
-    players = []
-    for row in rows:
-        name = row["username"]
-        if name in seen_accounts:
-            continue
-        seen_accounts.add(name)
-        players.append({
-            "username": name,
-            # THE RANK IS SHOWN, because the game already draws it over their
-            # head - see the nameplate colours in api.gd. A list that hid what
-            # the world shows would just be a worse list.
-            "role": role_for(row) if row["role"] is not None else DEFAULT_ROLE,
-            "name_hue": name_hue_of(row),
-            "name": row["name"] or "",
-            "level": int(row["level"] or 1),
-            "area": row["area"] or "",
-            # WHO THEY RUN WITH. Empty for somebody in no guild, so the client
-            # has one thing to test rather than a null to remember.
-            "guild": row["guild"] or "",
-            "guild_tag": guild_tag(row["guild"]) if row["guild"] else "",
-            "with_you": bool(row["area"] and row["area"] == my_area),
-        })
-        if len(players) >= ONLINE_LIST_LIMIT:
-            break
-
-    return {
-        "area": my_area,
-        "precision": "area",
-        "online": len(players),
-        "players": players,
-        # SO THE MENU CAN SAY SO. One list, one answer about the world's rules.
-        "pvp": pvp_enabled(),
-    }, 200
-
-
 # =============================================================================
-# PRESENCE: SEEING EACH OTHER
+# WHO IS AROUND - the players/ package (since 18 Oct)
 # =============================================================================
-# Players are drawn in each other's worlds by presence.py, a WebSocket process
-# beside this one (it says why it is a process of its own). This route is its
-# front door: a game with a login asks here for a ticket, then hands the ticket
-# to the socket. So bans, a session ended elsewhere and a stale token are
-# decided here, by require_auth, exactly as for every other route - and the
-# socket only has to find a ticket row and its login.
+# GET /api/players/online and /nearby, and POST /api/presence/ticket - the
+# front door of presence.py, the socket that draws players in each other's
+# worlds - as they were here: endpoint names, docstrings and every message
+# (routes.lock). players/__init__.py says what each list discloses and why the
+# identity on a ticket is the server's. What stays here is what other areas ask
+# too: which character an account is playing (PLAYING_SLOT_SQL, _playing_slot()
+# and _playing_area(), above), the online window, how a person is shown, the
+# caller's guild and the token hashing.
 #
-# THE IDENTITY IS OURS. What other players see over somebody's head - name,
-# crown or badge, colour, guild tag, class and level - and which pets they may
-# be seen with are read from this server's rows, never taken from the game.
-# The game only tells the socket where it is standing and how it is moving.
-PRESENCE_TICKET_SECONDS = 120
+# THE PRESENCE SOCKET'S SETTINGS are read here with every other setting:
+# ELUSION_PRESENCE_URL names the socket outright; without it the address is
+# worked out per request (players/services.py, socket_url()).
 PRESENCE_PORT = int(os.environ.get("ELUSION_PRESENCE_PORT", "5001") or 5001)
 PRESENCE_URL = os.environ.get("ELUSION_PRESENCE_URL", "").strip()
-PRESENCE_PATH = "/ws/presence"
 
+import players as players_package  # noqa: E402
 
-def _presence_url():
-    """
-    Where the game should open its socket.
+players_package.register(
+    app,
+    require_auth=require_auth,
+    get_db=get_db,
+    bad_request=bad_request,
+    parse_slot=parse_slot,
+    max_slot=MAX_SLOT,
+    catalogue=gamedata,
+    playing_area=_playing_area,
+    playing_slot_sql=PLAYING_SLOT_SQL,
+    online_window=ONLINE_WINDOW_SECONDS,
+    role_for=role_for,
+    default_role=DEFAULT_ROLE,
+    name_hue_of=name_hue_of,
+    guild_tag=guild_tag,
+    pvp_enabled=pvp_enabled,
+    own_guild=_own_guild,
+    token_hash=_token_hash,
+    bearer_token=bearer_token,
+    presence_url=PRESENCE_URL,
+    presence_port=PRESENCE_PORT,
+    proxy_hops=TRUSTED_PROXY_HOPS,
+)
 
-    ELUSION_PRESENCE_URL when it is set. Otherwise, BEHIND THE PROXY (Caddy,
-    ELUSION_TRUSTED_PROXIES above 0) it is this same host under /ws/presence,
-    wss:// when the page came over https - one address for the game, the API and
-    the socket, as the browser needs. Run locally, it is the presence process's
-    own port on the host the game reached the API by.
-    """
-    if PRESENCE_URL:
-        return PRESENCE_URL
-    if TRUSTED_PROXY_HOPS > 0:
-        # request.scheme is already the proxy's (ProxyFix, x_proto, above),
-        # and Caddy passes the page's Host through unchanged.
-        return "%s://%s%s" % ("wss" if request.scheme == "https" else "ws", request.host, PRESENCE_PATH)
-    host = request.host or "127.0.0.1"
-    if host.startswith("["):
-        host = host[:host.index("]") + 1]
-    else:
-        host = host.split(":")[0]
-    return "ws://%s:%d%s" % (host, PRESENCE_PORT, PRESENCE_PATH)
-
-
-@app.post("/api/presence/ticket")
-@require_auth
-def presence_ticket():
-    """
-    A ticket to be seen by other players
-    ---
-    tags:
-      - Players
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [slot]
-          properties:
-            slot: {type: integer, example: 0}
-    responses:
-      200:
-        description: "{ticket, expires_in, socket_url}: hand the ticket to the socket at socket_url"
-      400:
-        description: Bad slot
-      404:
-        description: No character in that slot
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-
-    db = get_db()
-    save = db.execute(
-        "SELECT name, class_id, level, equipment FROM saves WHERE user_id = ? AND slot = ?",
-        (user_id, slot),
-    ).fetchone()
-    if save is None:
-        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
-
-    # THE PETS THIS CHARACTER MAY BE SEEN WITH: the ones the account holds,
-    # in this character's bag or the shared bank - the rule /api/save uses for
-    # active_pet_id (_owns_item). The socket draws a claimed pet only when it is
-    # on this list, so a modified game cannot parade one it never won.
-    held = db.execute(
-        "SELECT item_id FROM carry_items WHERE user_id = ? AND slot = ?"
-        " UNION SELECT item_id FROM bank_items WHERE user_id = ?",
-        (user_id, slot, user_id),
-    ).fetchall()
-    pets = sorted({r["item_id"] for r in held
-                   if (gamedata.item_row(r["item_id"]) or {}).get("type_name") == "PET"})
-
-    # WHAT THE BOOKS HOLD THIS CHARACTER TO (presence.py, combatbook.py): the
-    # gear it wears and carries and its three fighting skills, from which
-    # gamedata.combat_bounds() works out the biggest hit it can land, its
-    # damage a second and how fast it walks. Carried as well as worn, so a
-    # sword swapped in mid-fight was always within its bounds. Never shown to
-    # another player - presence.py's join entry names what it shares.
-    try:
-        worn = json.loads(save["equipment"] or "{}")
-    except (TypeError, ValueError):
-        worn = {}
-    gear = {str(v) for v in (worn.values() if isinstance(worn, dict) else []) if isinstance(v, str) and v}
-    gear |= {r["item_id"] for r in db.execute(
-        "SELECT DISTINCT item_id FROM carry_items WHERE user_id = ? AND slot = ?", (user_id, slot))
-        if gamedata.equip_slot_for(r["item_id"])}
-    skills = {r["skill_id"]: int(r["level"]) for r in db.execute(
-        "SELECT skill_id, level FROM skills WHERE user_id = ? AND slot = ?"
-        " AND skill_id IN ('attack', 'magic', 'agility')", (user_id, slot))}
-
-    identity = {
-        "name": g.user["username"],
-        "character": save["name"] or "",
-        "cls": save["class_id"] or "",
-        "lvl": int(save["level"] or 1),
-        "role": role_for(g.user),
-        "hue": g.user["name_hue"],
-        "guild": _own_guild(db, user_id)["guild_tag"],
-        "pets": pets,
-        "gear": sorted(gear),
-        "skills": skills,
-    }
-
-    now = int(time.time())
-    raw = secrets.token_urlsafe(32)
-    # Pruned as they are issued, like chat: a ticket lives two minutes, so the
-    # table is never more than two minutes of renewals deep.
-    db.execute("DELETE FROM presence_tickets WHERE expires_at <= ?", (now,))
-    db.execute(
-        "INSERT INTO presence_tickets (token_hash, session_hash, user_id, slot, identity,"
-        " issued_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (_token_hash(raw), _token_hash(bearer_token()), user_id, slot,
-         json.dumps(identity, separators=(",", ":")), now, now + PRESENCE_TICKET_SECONDS),
-    )
-    db.commit()
-    return {
-        "ticket": raw,
-        "expires_in": PRESENCE_TICKET_SECONDS,
-        "socket_url": _presence_url(),
-    }, 200
-
-
-@app.get("/api/players/nearby")
-@require_auth
-def players_nearby():
-    """
-    Other players in your area, right now
-    ---
-    tags:
-      - Players
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: query
-        name: slot
-        type: integer
-        required: true
-        description: Which of your characters is asking
-    responses:
-      200:
-        description: Who else is here
-      400:
-        description: Bad slot
-      404:
-        description: No character in that slot
-    """
-    # AREA, NOT DISTANCE, AND THE NAME OF THIS ROUTE OVERSTATES IT.
-    #
-    # The server stores which AREA a character is in (saves.area, written by
-    # PUT /api/save) and nothing finer. There is no position on the server and
-    # no heartbeat carrying one, so "nearby" here means "in the same area and
-    # online" - which is the honest maximum today and is genuinely what a trade
-    # panel needs, because you cannot see another player at all yet.
-    #
-    # WHEN PRESENCE ARRIVES, this is the seam: the query gains a distance test
-    # and the response gains a position, and the client does not change shape.
-    user_id = g.user["id"]
-
-    slot = parse_slot(request.args.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-
-    db = get_db()
-    me = db.execute(
-        "SELECT area FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)
-    ).fetchone()
-    if me is None:
-        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
-
-    area = me["area"]
-
-    # ONLINE IS A LIVE SESSION, not a recent save. A save happens on a timer
-    # and on scene changes, so "saved recently" lists somebody who alt-tabbed
-    # away an hour ago; an unexpired token is the closest thing the server has
-    # to "that client is still there". DISTINCT because one account may hold
-    # several valid tokens - two machines, or a login that did not log out.
-    rows = db.execute(
-        """
-        SELECT DISTINCT users.username AS username,
-               users.role     AS role,
-               users.name_hue AS name_hue,
-               saves.slot   AS slot,
-               saves.name   AS name,
-               saves.level  AS level
-          FROM saves
-          JOIN users    ON users.id = saves.user_id
-          JOIN sessions ON sessions.user_id = saves.user_id
-         WHERE saves.area = ?
-           AND saves.user_id != ?
-           AND sessions.last_seen_at > ?
-           AND sessions.expires_at > ?
-           -- ONLY THE CHARACTER THEY ARE PLAYING. An account has up to four,
-           -- and without this every one of them parked in this area was
-           -- listed - so "Trade" beside somebody's old alt opened a trade
-           -- with a character nobody was playing.
-           AND saves.slot = %s
-      ORDER BY saves.level DESC, users.username ASC
-         LIMIT ?
-        """ % PLAYING_SLOT_SQL.format(user="saves.user_id"),
-        # LAST SEEN **AND** STILL VALID. Both, and the first version of this fix
-        # had only one of them, which test_economy.py caught in one line.
-        #
-        # This filtered on sessions.expires_at > now, which is true for anybody
-        # holding an unexpired token - and a token lasts TOKEN_TTL, thirty days,
-        # surviving the game being closed. So "in this area with you" listed
-        # everyone who had logged in since last month and happened to save here.
-        #
-        # ONLINE_WINDOW_SECONDS is this file's own answer to "is anyone there",
-        # and its comment warns about exactly this mistake in exactly these
-        # words: "NOT 'has a live session'... a kick list sorted by it put last
-        # week's visitors at the top." The heartbeat stamps last_seen_at every
-        # 15 seconds, so 45 is three missed beats.
-        #
-        # AND THE EXPIRY STILL MATTERS. A beat within the window says the client
-        # was there; an unexpired token says it is still allowed to be. Dropping
-        # the second one meant a session that had been revoked or had run out
-        # went on being listed for its last 45 seconds - which is exactly what
-        # "an offline player is not listed as nearby" in test_economy.py exists
-        # to catch, and did.
-        (area, user_id, int(time.time()) - ONLINE_WINDOW_SECONDS, int(time.time()),
-         # PLAYING_SLOT_SQL's own two, in its order: cutoff, then now.
-         int(time.time()) - ONLINE_WINDOW_SECONDS, int(time.time()),
-         NEARBY_LIMIT),
-    ).fetchall()
-
-    return {
-        "area": area,
-        # Said out loud so the client never has to guess how precise this is,
-        # and so a panel written against it can show the right wording.
-        "precision": "area",
-        "players": [
-            {
-                "username": r["username"],
-                "slot": int(r["slot"]),
-                "name": r["name"],
-                "level": int(r["level"]),
-                # DRAWN LIKE EVERY OTHER LIST: in the colour its owner chose,
-                # with the rank as a badge. See nametag.gd.
-                "role": r["role"],
-                "name_hue": name_hue_of(r),
-            }
-            for r in rows
-        ],
-    }, 200
+# Named here as well, for anything that reads them off this module;
+# players/services.py is where they are set.
+NEARBY_LIMIT = players_package.NEARBY_LIMIT
+ONLINE_LIST_LIMIT = players_package.ONLINE_LIST_LIMIT
+PRESENCE_TICKET_SECONDS = players_package.PRESENCE_TICKET_SECONDS
+PRESENCE_PATH = players_package.PRESENCE_PATH
 
 
 # =============================================================================

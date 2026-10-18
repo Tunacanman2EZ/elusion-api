@@ -25,9 +25,7 @@ Exits 0 if everything passes, 1 if anything fails.
 import importlib.util
 import io
 import os
-import socket
 import sys
-import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer

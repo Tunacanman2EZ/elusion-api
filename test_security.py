@@ -2125,8 +2125,6 @@ print("\n=== E-4b  THE DEPLOY PREFLIGHT ACTUALLY REFUSES ===\n")
 # running interpreter. A child process can be asked the question twice with
 # different environments, which is the whole point.
 
-import subprocess
-
 
 def preflight(env_overrides, gamedata_dir=None):
     """Import wsgi.py in a child and report (exit_code, stderr)."""

@@ -28,7 +28,7 @@ much did i inflate my server". THE GIFTS LEDGER in app.py.
   GL-8  giftwatch.py ON THE SERVER: the same answer from the database, read
         only, and a plain sentence when the table is not there yet.
 """
-import importlib.util, os, sqlite3, subprocess, sys, tempfile
+import importlib.util, os, sqlite3, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import testdir  # noqa: E402  (a private folder per run - testdir.py)

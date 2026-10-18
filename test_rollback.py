@@ -37,7 +37,7 @@ player's bag. SAVE SNAPSHOTS AND ROLLBACK in app.py.
         as "give", about the player.
   GV-6  A TRADE'S RESULT WINS THE FLAG, and the gift list is short.
 """
-import importlib.util, json, os, sqlite3, sys, tempfile
+import importlib.util, json, os, sqlite3, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import testdir  # noqa: E402  (a private folder per run - testdir.py)

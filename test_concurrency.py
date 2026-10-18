@@ -34,7 +34,7 @@ request reads the same old row inside that wait. With it, the second request
 cannot start reading until the first has committed, so the wait changes nothing.
 Sabotage-checked: take the lock out of get_db() and CC-1 to CC-4 all fail.
 """
-import importlib.util, json, os, sqlite3, sys, tempfile, threading, time
+import importlib.util, json, os, sqlite3, sys, threading, time
 import urllib.error, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))

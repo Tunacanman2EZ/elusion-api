@@ -21,7 +21,7 @@ move or destroy the wrong thing. Most checks are about what must NOT happen.
 
 Runs against a throwaway database in the temp folder, never elusion.db.
 """
-import gc, importlib.util, os, sqlite3, sys, tempfile
+import gc, importlib.util, os, sqlite3, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 

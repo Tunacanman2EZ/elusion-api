@@ -92,3 +92,36 @@ still described parsing equipment there are corrected.
   carried for a long time; it now says what it does carry.
 - **`REVIVE_EXPLAINS_EVERYTHING`** was defined and read by nothing (the check
   names the refill grants directly). Removed.
+
+### Found and fixed with the who-is-around move, 18 Oct
+
+- **Unused imports, 60 of them.** `logging` in app.py; `tempfile` in 50
+  suites, which item 2 left behind when they moved to testdir.py (that one was
+  this work's own leftover); and nine more in the suites and tooltip_sim.py,
+  plus a second `import subprocess` in test_security.py. Each removal was only
+  the import, and every suite passes as before. Keeping it that way is item 8.
+- **The nearby list read the clock four times** for one query (the online
+  cutoff and "now", twice each). It reads it once now, so the two halves of
+  the online test can never straddle a second.
+
+### Found and fixed with the switches move, 18 Oct
+
+- **The trade switch counted open trades with its own query** into trade/'s
+  table, the one place outside trade/ that still read it that way. trade/
+  answers it now (`open_count()`), and the bare-app check runs that count.
+- **The co-owners' switch cleared another function's cache by its private
+  name** (`g._co_owners_on`, co_owners_on()'s). app.py has
+  `_co_owners_changed()` beside co_owners_on() for that now, and the switch
+  calls it.
+
+### 8. Nothing checked for unused imports - fixed 18 Oct
+
+The 60 cleared with the who-is-around move had built up because an unused
+import breaks nothing. The API's CI workflow (.github/workflows/tests.yml) now
+has a second job, `imports`: flake8's pyflakes checks alone (`--select=F` -
+unused imports, names that do not exist, a name defined twice; no style
+rules), pinned to flake8 7.1.1. It honours the `# noqa` marks the packages'
+`__init__.py` files and wsgi.py carry where an import is the export. Run here
+on the whole API with that version: no findings; a planted unused import and
+an undefined name each fail it. A job of its own, so it never hides how the
+suites went. Its first run on GitHub is the first push after this one.

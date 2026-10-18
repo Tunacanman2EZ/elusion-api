@@ -1396,8 +1396,9 @@ every rule.
 - **It never sees a login.** `POST /api/presence/ticket` (behind
   `require_auth`, `{"slot"}`) writes a ticket to `presence_tickets` - stored
   hashed, tied to the session that asked, two minutes long - and answers
-  `{ticket, expires_in, socket_url}`. The socket takes the ticket. Every rule
-  about who may sign in stays here in app.py: a ban, a logout, a login
+  `{ticket, expires_in, socket_url}` (the route is players/ since 18 Oct).
+  The socket takes the ticket. Every rule about who may sign in stays here in
+  app.py: a ban, a logout, a login
   elsewhere or a password change deletes the session, and presence.py drops
   the connection within `SWEEP_SECONDS` without app.py knowing it exists.
 - **Who somebody is comes from the ticket**, written from this file's own
@@ -2063,7 +2064,18 @@ only, `test_stats.py`.
   reasons written beside it, so the one place it is flipped must stay the one
   place it is read). And `shop/` (18 Oct: buying, selling and the shelf; it
   writes no table of its own - the carry's grant and cells, the ledger and
-  trade's hold are handed in).
+  trade's hold are handed in). And `players/` (18 Oct: who is online, who is
+  nearby, and the presence ticket - the one table it writes; which character
+  an account is playing, the online window and how a person is shown stay in
+  app.py, and the presence socket's settings are still read there, with
+  every other setting, and handed in).
+  And `switches/` (18 Oct: `/api/status`, the owner's five switches and the
+  owner's announcement - eight routes. **What a switch reads as stays in
+  app.py**, keys and readers and the way each fails, because the gates that
+  ask run on every request; they are handed in. The co-owner names are
+  handed as a lookup, since test_coowner empties them. **The broadcast poll
+  stays in app.py**: it is the heartbeat and gathers every area's news, like
+  `/api/staff/powers`.)
   **Something noticed along the way that needs upgrading goes in
   UPGRADES.md** (the owner asked to be kept told): checked first, then where
   it is, why it matters, how big the fix is.

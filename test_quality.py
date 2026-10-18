@@ -23,7 +23,7 @@ of the id: "jadechest~a104h96r605" resists fire by 5%. Never a weapon.
 
 Runs against a throwaway database in the temp folder, never elusion.db.
 """
-import collections, importlib.util, os, random, re, sqlite3, sys, tempfile
+import collections, importlib.util, os, random, re, sqlite3, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 

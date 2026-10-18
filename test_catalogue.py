@@ -49,7 +49,6 @@ the last four times.
 
 import json
 import os
-import sys
 
 # THE REAL FILE, NOT A FIXTURE. Cleared explicitly rather than merely left
 # unset, because the other suites set this and a developer running the whole

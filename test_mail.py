@@ -23,7 +23,6 @@ import smtplib
 import socket
 import ssl
 import sys
-import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 

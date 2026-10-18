@@ -38,7 +38,6 @@ import sys
 # were shortened rather than the cap being argued with. "  Spaced Out  "
 # is deliberately still long: it is testing that the name is stripped
 # before it is measured.
-import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import testdir  # noqa: E402  (a private folder per run - testdir.py)

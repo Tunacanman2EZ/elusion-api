@@ -13,7 +13,7 @@ NOW: the kill applies proficient_amount() - the same function the train route
 uses - and answers with where the skill stands (level, xp, xp_to_next), which
 the client copies onto its bar instead of adding up its own.
 """
-import importlib.util, os, sqlite3, sys, tempfile
+import importlib.util, os, sqlite3, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import testdir  # noqa: E402  (a private folder per run - testdir.py)

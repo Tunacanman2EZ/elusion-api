@@ -24,7 +24,7 @@ game".
   CO-8  NOTHING STORES THE RANK: not the role route, not the column, not
         set_role.py, and a row reading 'coowner' is a player.
 """
-import importlib.util, json, os, sqlite3, subprocess, sys, tempfile
+import importlib.util, json, os, sqlite3, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import testdir  # noqa: E402  (a private folder per run - testdir.py)

@@ -22,7 +22,7 @@ character and nothing of the account's.
   CD-7  NO CHARACTER ROUTE ANSWERS A BAD SLOT WITH A 500. /api/character/
         respawn did: it named a constant that does not exist.
 """
-import importlib.util, json, os, sqlite3, sys, tempfile
+import importlib.util, json, os, sqlite3, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import testdir  # noqa: E402  (a private folder per run - testdir.py)

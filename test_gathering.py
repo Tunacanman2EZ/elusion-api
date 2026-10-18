@@ -20,7 +20,6 @@ import os
 import sys
 import json
 import sqlite3
-import tempfile
 
 import testdir  # noqa: E402  (a private folder per run - testdir.py)
 DB_PATH = os.path.join(testdir.PATH, "elusion_gathering_test.db")

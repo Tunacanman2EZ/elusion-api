@@ -11,7 +11,7 @@ that derives a maximum reads what the character is wearing.
 The amulet families follow their colour: green is health (Vitality), blue is
 mana (Arcana), crimson is damage (Fury), purple is armour (Ward).
 """
-import importlib.util, json, os, re, sqlite3, sys, tempfile
+import importlib.util, json, os, re, sqlite3, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 

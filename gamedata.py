@@ -1049,7 +1049,7 @@ def equip_check(item_id, slot_name, class_id, character_level):
 # in play changes.
 #
 # FROM WHAT THE CHARACTER HOLDS, NOT ONLY WHAT IT WEARS. The ticket the socket
-# reads (app.py, presence_ticket) names every piece worn and every piece of
+# reads (players/, presence_ticket) names every piece worn and every piece of
 # gear in the character's bag. A character that swaps to a better sword in the
 # middle of a fight could always hit that hard - it was carrying the sword - so
 # the weapon is the best one held and each slot's damage bonus the best held

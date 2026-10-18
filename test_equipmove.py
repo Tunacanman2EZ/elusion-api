@@ -9,7 +9,7 @@ check, and the client never asserts the result.
 
 The checks below are mostly about what must NOT be possible.
 """
-import gc, importlib.util, json, os, sqlite3, sys, tempfile
+import gc, importlib.util, os, sqlite3, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 

@@ -50,7 +50,6 @@ Runs against a THROWAWAY database in the temp folder, exactly like
 test_revocation.py, so it never touches elusion.db. Run: python test_ownership.py
 """
 
-import base64
 import hashlib
 import importlib.util
 import io
@@ -58,7 +57,6 @@ import os
 import re
 import sqlite3
 import sys
-import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))

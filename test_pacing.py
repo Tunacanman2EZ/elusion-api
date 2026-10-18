@@ -28,7 +28,7 @@ cost about four times a potion for every point either healed. So a set is now
 and a potion costs about what the cooked fish of its tier does per point
 healed.
 """
-import importlib.util, os, sqlite3, sys, tempfile
+import importlib.util, os, sqlite3, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import testdir  # noqa: E402  (a private folder per run - testdir.py)

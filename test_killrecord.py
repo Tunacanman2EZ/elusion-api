@@ -22,7 +22,7 @@ kind of monster, for good; GET /api/kills is one character's, GET
         nothing.
   KR-6  DELETING A CHARACTER DELETES ITS RECORD, and only its record.
 """
-import importlib.util, os, sqlite3, sys, tempfile, time
+import importlib.util, os, sqlite3, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import testdir  # noqa: E402  (a private folder per run - testdir.py)

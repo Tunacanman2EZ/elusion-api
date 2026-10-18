@@ -24,7 +24,6 @@ Exits 0 if everything passes, 1 if anything fails.
 import importlib.util
 import os
 import sys
-import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))

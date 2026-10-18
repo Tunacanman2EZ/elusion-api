@@ -13,7 +13,7 @@ Run: python3 test_chatsafety.py
 
 Throwaway database in the temp folder. Never touches elusion.db.
 """
-import importlib.util, os, sqlite3, sys, tempfile, time
+import importlib.util, os, sqlite3, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import testdir  # noqa: E402  (a private folder per run - testdir.py)

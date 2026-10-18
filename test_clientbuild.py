@@ -30,7 +30,6 @@ Exits 0 if everything passes, 1 if anything fails.
 import importlib.util
 import os
 import sys
-import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import testdir  # noqa: E402  (a private folder per run - testdir.py)

@@ -5,7 +5,6 @@ and then the whole round trip against the real server.
 Run with:  python3 test_equipment.py
 """
 
-import json
 import os
 import sys
 import tempfile

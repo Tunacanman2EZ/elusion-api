@@ -35,7 +35,7 @@ A change to the table that is meant - a new route, a route moved on purpose -
 is written with --write, and the diff of routes.lock in the commit says what
 changed for the game.
 """
-import importlib.util, os, re, sys, tempfile
+import importlib.util, os, re, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOCK = os.path.join(HERE, "routes.lock")

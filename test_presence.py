@@ -17,7 +17,7 @@ out - takes the player off everybody's screen within seconds.
 It runs the real presence server in this process, on a free port, against a
 throwaway database in the temp folder - never elusion.db.
 """
-import asyncio, importlib.util, json, math, os, sqlite3, sys, tempfile, time
+import asyncio, importlib.util, json, math, os, sqlite3, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import testdir  # noqa: E402  (a private folder per run - testdir.py)

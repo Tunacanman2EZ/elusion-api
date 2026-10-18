@@ -28,7 +28,6 @@ import os
 import re
 import sqlite3
 import sys
-import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))

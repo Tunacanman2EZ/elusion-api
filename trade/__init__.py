@@ -29,13 +29,13 @@ Built like guilds/ and chat/ (ARCHITECTURE.md): routes.py (the edge),
 services.py (the rules, pure), data.py (the SQL). It never imports app.py;
 register() is handed what it needs. WHAT STAYS IN app.py: the backpack grants
 the execution pays with (_take_from_backpack(), _add_to_backpack() - the carry
-is step 10), the gold ledger (gold_delta()), the owner's trade switch, which
-character an account is playing (_playing_slot(), shared with the nearby list
-and parties), and the resync flag (_mark_resync(), _take_resync()), which owner
-gifts ride too.
+is step 10), the gold ledger (gold_delta()), what the owner's trade switch
+reads as (trades_enabled(); switches/ throws it), which character an account
+is playing (_playing_slot(), shared with the nearby list and parties), and the
+resync flag (_mark_resync(), _take_resync()), which owner gifts ride too.
 """
-from .data import (find_open, find_page, find_recent, hold_refusal, place_hold,  # noqa: F401
-                   record, summary)
+from .data import (find_open, find_page, find_recent, hold_refusal, open_count,  # noqa: F401
+                   place_hold, record, summary)
 from .routes import register  # noqa: F401
 from .services import (STAFF_TRADE_STATES, TRADE_CANCELLED_KEPT_SECONDS,  # noqa: F401
                        TRADE_EXPIRY_SECONDS, TRADE_HISTORY_SHOWN, TRADE_HOLD_SECONDS,

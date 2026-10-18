@@ -19,7 +19,7 @@ section below holds one of them:
        new player for a recovery address, answered "check that inbox", and sent
        nothing - and the login screen does not let anyone past that prompt.
 """
-import importlib.util, os, sqlite3, sys, tempfile, time
+import importlib.util, os, sqlite3, sys, time
 import hashlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))

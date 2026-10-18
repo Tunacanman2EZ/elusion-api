@@ -7,7 +7,6 @@ read here rather than by hovering 123 items in the editor.
 
 If a row is wrong here it is wrong there.
 """
-import json
 import sim_client as C
 
 RESTORE = ["NONE", "HP", "MANA", "STAMINA"]

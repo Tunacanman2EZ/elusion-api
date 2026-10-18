@@ -8,7 +8,7 @@ it follows the same road.
 ## Where it stands
 
 `app.py` was about 20,000 lines when this was written (16 Oct), and is about
-12,700 with the carry out (18 Oct): the shared core (config, the database and
+11,900 with the carry, who-is-around and the switches out (18 Oct): the shared core (config, the database and
 its write lock, sessions and tokens, the auth decorators, rate limiting,
 request timing) and the areas not yet moved, one after another. It works, and every
 area is covered by its own suite, but one file that size has a cost that grows:
@@ -43,6 +43,8 @@ Beside it, **feature packages**: a folder per area, each in three layers.
 | `saves/` | 18 Oct | **moved out** of app.py: a character's slot, its read, deleting it |
 | `status/` | 18 Oct | **moved out** of app.py: the live stats and the healing check |
 | `shop/` | 18 Oct | **moved out** of app.py: buying, selling, the shelf |
+| `players/` | 18 Oct | **moved out** of app.py: who is online and nearby, the presence ticket |
+| `switches/` | 18 Oct | **moved out** of app.py: the server's switches, `/api/status`, the owner's announcement |
 
 ## Where it is going
 
@@ -270,16 +272,35 @@ areas that hold money and items:
 
 11. what is left beside the core, in moves, the smallest first (written here
     18 Oct, when the carry finished and the list was counted - 39 routes):
-    - who is around: the online list, the nearby list, the presence ticket (3)
-    - the server's switches: maintenance, the minimum build, PvP, trading,
-      co-owners, the broadcasts, and `/api/status` (9)
+    - ~~who is around: the online list, the nearby list, the presence ticket
+      (3)~~ (18 Oct, `players/`): the one table it writes is
+      `presence_tickets`. Which character an account is playing stays here
+      (the broadcast poll, trades and the guild roster ask it too) and is
+      handed in, as the rule and as SQL; so are the presence socket's
+      settings, read with every other setting - the address itself is worked
+      out in the package.
+    - ~~the server's switches: maintenance, the minimum build, PvP, trading,
+      co-owners, the owner's announcement, and `/api/status` (8)~~ (18 Oct,
+      `switches/`). **What a switch READS as stays in app.py** - the keys,
+      the readers and the way each fails when its row is missing or broken -
+      because the gates that ask run on every request (the maintenance window
+      inside require_auth, the build gate before it, the co-owners inside
+      role_for()); the package is handed them, and writes through
+      set_server_setting(). The open trades it counts are trade/'s own count
+      now (`trade.open_count()`), not a query into trade's table. **The
+      broadcast poll stays** (below).
     - the kill: `/api/combat/kill` - the XP, the level, the loot roll and the
       kill's record, in one transaction (1)
     - the owner's tools: gold, level, skill, grant, the gifts ledger, the save
       history and rollback, teleport and its acknowledgement (9)
     - the account's settings: e-mail and its check, the name colour (4)
     What stays in app.py on purpose: `/api/staff/powers` (it reads every route
-    and quotes every area's limits - the composition root's own page),
+    and quotes every area's limits - the composition root's own page), the
+    broadcast poll `GET /api/server/broadcasts` (the heartbeat: it stamps
+    presence and gathers every area's news - the world, events, a teleport,
+    the guild, the party, a trade, chat, what waits on an answer, reports -
+    so it is the composition root's too; moved, it would be a package that
+    owns nothing and is handed seventeen things from a dozen areas),
     `/api/metrics` and `/api/economy/supply` (the request timing and the
     ledger audit, both the core's).
 12. then the core itself (sessions, tokens, auth - the other 10 routes) into a

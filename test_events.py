@@ -25,11 +25,9 @@ Runs against a THROWAWAY database in the temp folder, like every other suite.
 Run: python test_events.py
 """
 import importlib.util
-import json
 import os
 import sqlite3
 import sys
-import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))

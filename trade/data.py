@@ -1,7 +1,8 @@
 """trade/data.py - the SQL. trades, trade_items and trade_holds are app.py's
-tables (init_db()). Every write to them is here; the only other readers are
-app.py's - the owner's trade switch counts the open ones, and a rollback and a
-character delete each refuse a character with one open. A trade also writes
+tables (init_db()). Every write to them is here, and so is what other areas
+ask of them: the owner's trade switch (switches/) counts the open ones with
+open_count(), and a rollback and a character delete each refuse a character
+with one open (find_open()). A trade also writes
 the saves it moves gold between and the carry it moves items between, but
 through app.py's own grants (handed in), and the gold through gold_delta()
 only for the tax. No commits: the routes make them."""
@@ -58,6 +59,17 @@ def hold_refusal(db, catalogue, user_id, items, now=None):
             row = catalogue.item_row(item_id) or {}
             return services.hold_words(row.get("display_name", item_id), holds["first"], now)
     return None
+
+
+# -- how many are open: the owner's switch asks --------------------------------
+
+def open_count(db, now):
+    """How many trades are open and not yet run out at `now` - what "a trade
+    already open can still finish" covers when the owner stops trading."""
+    return int(db.execute(
+        "SELECT COUNT(*) FROM trades WHERE state = 'open' AND updated_at >= ?",
+        (int(now) - services.TRADE_EXPIRY_SECONDS,),
+    ).fetchone()[0])
 
 
 # -- finding a trade: ALWAYS FROM THE CALLER ------------------------------------

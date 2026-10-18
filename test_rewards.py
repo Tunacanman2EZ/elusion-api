@@ -8,7 +8,7 @@ has to count every one of them or a save clamps them away. And the loot roll is
 the server's: legendary (ember) gear is about one an hour in the dark band, 1 in
 4 from the fire boss and the Crowned, and never from the other five bosses.
 """
-import importlib.util, os, random, sys, tempfile
+import importlib.util, os, random, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import testdir  # noqa: E402  (a private folder per run - testdir.py)

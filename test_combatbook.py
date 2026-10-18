@@ -42,7 +42,7 @@ wiring is test_presence.py P-8.
         its first hit arrives in the same world as that hit, and the hit
         counts - without reading a split's smalls ahead of its death.
 """
-import json, math, os, random, sys
+import math, os, random, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.pop("ELUSION_GAMEDATA", None)
