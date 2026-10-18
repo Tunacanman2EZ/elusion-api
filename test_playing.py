@@ -240,6 +240,19 @@ for m in re.finditer(r'FROM saves[^"\n]*(?:"\s*\n\s*"[^"\n]*)*', source):
     owner = re.findall(r"\n(?:def (\w+)|(PLAYING_SLOT_SQL) = )", before)
     name = [a or b for a, b in owner][-1] if owner else "?"
     found.append(name)
+# AND IN EVERY FEATURE PACKAGE, where the guild roster's read went (18 Oct)
+# and where new areas are built: none of them may pick a save by recency at
+# all - the rule is app.py's PLAYING_SLOT_SQL, handed in.
+import codemap  # noqa: E402
+
+for package, _rows, _layers in codemap.feature_packages():
+    for name in sorted(os.listdir(os.path.join(HERE, package))):
+        if not name.endswith(".py"):
+            continue
+        text = open(os.path.join(HERE, package, name), encoding="utf-8").read()
+        for m in re.finditer(r'FROM saves[^"\n]*(?:"\s*\n\s*"[^"\n]*)*', text):
+            if re.search(r"updated_at DESC|MAX\(updated_at\)|LIMIT 1", m.group(0)):
+                found.append("%s/%s" % (package, name))
 check("the scan finds the two sanctioned reads", {"PLAYING_SLOT_SQL", "_take_resync"} <= set(found), found)
 check("and nothing else picks a save by recency or at random",
       [f for f in found if f not in ALLOWED] == [], [f for f in found if f not in ALLOWED])

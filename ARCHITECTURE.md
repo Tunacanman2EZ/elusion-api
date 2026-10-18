@@ -7,7 +7,7 @@ it follows the same road.
 
 ## Where it stands
 
-`app.py` is about 22,900 lines: the shared core (config, the database and its
+`app.py` is about 21,900 lines: the shared core (config, the database and its
 write lock, sessions and tokens, the auth decorators, rate limiting, request
 timing) and most of the game's areas, one after another. It works, and every
 area is covered by its own suite, but one file that size has a cost that grows:
@@ -25,6 +25,7 @@ Beside it, **feature packages**: a folder per area, each in three layers.
 | `friends/` | 16 Oct | **moved out** of app.py |
 | `gathering/` | 18 Oct | **moved out** of app.py: fishing and cooking |
 | `loot/` | 18 Oct | **moved out** of app.py: the loot bag |
+| `guilds/` | 18 Oct | **moved out** of app.py: guilds, staff's two guild routes too |
 
 ## Where it is going
 
@@ -73,7 +74,11 @@ checked, not hoped:
 ## Moving an area out - the checklist
 
 1. Read the area and everything that calls into it (`grep` its functions and
-   its tables across app.py and the suites).
+   its tables across app.py and the suites). **Look for suites that read
+   app.py's SOURCE** for a rule (every kind logged is a listed kind, nothing
+   picks a save by recency): code moved out of app.py is code they stop
+   seeing. Each must read the packages too - found the code map's way - and
+   a sabotage in the package must fail it. Guilds needed three (18 Oct).
 2. Make the package: `__init__.py` (what it is, its routes), `routes.py`,
    `services.py`, `data.py`.
 3. Move the routes **as they are** - docstrings, messages, status codes - and
@@ -102,7 +107,13 @@ areas that hold money and items:
    (`_create_loot_bag()`, with the package's `stamped()` and `store_bag()`),
    because it is the kill's commit, as `_record_kill()` is. The money and the
    backpack the take pays into are handed in.
-4. guilds
+4. ~~guilds~~ (18 Oct): all ten routes - `/api/staff/guild` and
+   `/api/guild/list` with them, since they write and read nothing but guilds -
+   and every write to the four tables. Other areas still READ the tables in
+   app.py (a chat line's guild, the poll's invitations, the players list, the
+   kingdom board), and ask through `guild_membership()` and `guild_tag()`,
+   which are the package's `membership()` and `guild_tag()` under their old
+   names. Guild chat stays with chat (6).
 5. parties and party voice
 6. chat: world chat, channels, pictures, the ignore list's routes
 7. trade and the kingdom tax

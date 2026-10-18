@@ -618,12 +618,23 @@ check("and every one of those actually answered", unanswered == [], unanswered)
 section("M-8 every logged action is a kind the log knows")
 # =============================================================================
 
-with open(os.path.join(HERE, "app.py"), encoding="utf-8") as fh:
-    tree = ast.parse(fh.read())
+# APP.PY AND EVERY FEATURE PACKAGE: guilds/ writes the two guild actions since
+# 18 Oct, handed log_staff_action by name. The packages are found the code
+# map's way (codemap.py), so one added later is read without a change here.
+import codemap  # noqa: E402
+
+sources = [os.path.join(HERE, "app.py")]
+for package, _rows, _layers in codemap.feature_packages():
+    sources += sorted(os.path.join(HERE, package, name)
+                      for name in os.listdir(os.path.join(HERE, package)) if name.endswith(".py"))
+trees = []
+for source in sources:
+    with open(source, encoding="utf-8") as fh:
+        trees.append(ast.parse(fh.read()))
 
 literal_kinds = set()
 computed = []
-for fn in ast.walk(tree):
+for fn in (node for tree in trees for node in ast.walk(tree)):
     if not isinstance(fn, ast.FunctionDef):
         continue
     for node in ast.walk(fn):

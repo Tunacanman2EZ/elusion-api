@@ -1069,10 +1069,10 @@ can choose - so a player who picks the owner's gold is still visibly a player.
 **Guilds keep their own history** in `guild_events`: founded, invited, joined,
 promoted, demoted, handed on, removed, left, renamed - one line per real change,
 in the same transaction, bounded per guild (`GUILD_EVENTS_KEPT`), gone with the
-guild, and sent to members only (the newest `GUILD_ACTIVITY_SHOWN` ride on
-`guild_dict`). A staff rename is recorded **without the staff member's name**:
-members need to know it happened, not whom to be angry at; `staff_actions` keeps
-who. The roster also carries each member's latest character, class, level and
+guild, and sent to members only (the newest `GUILD_ACTIVITY_SHOWN` ride on the
+guild answer, `guild_dict()` in guilds/routes.py). A staff rename is recorded
+**without the staff member's name**: members need to know it happened, not whom
+to be angry at; `staff_actions` keeps who. The roster also carries each member's latest character, class, level and
 area. `test_guildlife.py`.
 
 ## Trades
@@ -1990,8 +1990,11 @@ only, `test_stats.py`.
 - **And the areas already in app.py are moving out** (16 Oct,
   ARCHITECTURE.md - the road, the contract, the checklist and the order):
   `killrecord/` and `friends/` first, then `gathering/` (18 Oct: fishing and
-  cooking, handed the grants they pay with) and `loot/` (18 Oct: the bag's
-  two routes and its SQL; a new bag is still made in the kill's commit).
+  cooking, handed the grants they pay with), `loot/` (18 Oct: the bag's
+  two routes and its SQL; a new bag is still made in the kill's commit) and
+  `guilds/` (18 Oct: all ten routes, staff's two included, and every write to
+  the four guild tables; `guild_membership()` and `guild_tag()` stay callable
+  in app.py for chat, the poll and the boards).
   **`routes.lock`, held by
   `test_routes.py`,** is the promise that a move changes nothing outside:
   every route's method, path, endpoint name, login, rank, password-again,

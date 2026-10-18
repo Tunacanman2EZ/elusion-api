@@ -1,7 +1,7 @@
 """The feature packages stand on their own (game 0.50.0).
 
 Every feature package (ARCHITECTURE.md) - playerstats/, events/, insights/,
-and killrecord/, friends/, gathering/ and loot/, taken out of app.py - is built the BE105 way: each has a
+and killrecord/, friends/, gathering/, loot/ and guilds/, taken out of app.py - is built the BE105 way: each has a
 register(app, ...) that is HANDED the app, its login checks and its database,
 and never imports app.py. The source of each is checked for that elsewhere
 (test_stats.py); this RUNS them without it - the "application factory"
@@ -38,6 +38,7 @@ import codemap  # noqa: E402
 import events  # noqa: E402
 import friends  # noqa: E402
 import gathering  # noqa: E402
+import guilds  # noqa: E402
 import loot  # noqa: E402
 import insights  # noqa: E402
 import killrecord  # noqa: E402
@@ -46,7 +47,7 @@ import playerstats  # noqa: E402
 # Found, not listed: what app.py imports that has a routes.py (codemap.py).
 PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
 # The ones this file registers on its bare apps, below.
-RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot")
+RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -115,7 +116,15 @@ def bare_app(name):
     conn.executescript(
         "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, role TEXT, created_at INTEGER, name_hue INTEGER);"
         "CREATE TABLE saves (user_id INTEGER, slot INTEGER, class_id TEXT, level INTEGER, area TEXT, updated_at INTEGER,"
-        " last_cast_at INTEGER NOT NULL DEFAULT 0, cast_tokens REAL NOT NULL DEFAULT 6.0);"
+        " last_cast_at INTEGER NOT NULL DEFAULT 0, cast_tokens REAL NOT NULL DEFAULT 6.0,"
+        " gold INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL DEFAULT '');"
+        "CREATE TABLE sessions (user_id INTEGER, last_seen_at INTEGER);"
+        "CREATE TABLE guilds (id INTEGER PRIMARY KEY, name TEXT, folded TEXT UNIQUE, founded_by TEXT, created_at INTEGER);"
+        "CREATE TABLE guild_members (user_id INTEGER PRIMARY KEY, guild_id INTEGER, rank TEXT, joined_at INTEGER);"
+        "CREATE TABLE guild_invites (guild_id INTEGER, user_id INTEGER, invited_by TEXT, created_at INTEGER,"
+        " UNIQUE (guild_id, user_id));"
+        "CREATE TABLE guild_events (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER, at INTEGER, kind TEXT,"
+        " actor TEXT, target TEXT, detail TEXT);"
         "CREATE TABLE carry_items (user_id INTEGER, slot INTEGER, position INTEGER, item_id TEXT, quantity INTEGER);"
         "CREATE TABLE skills (user_id INTEGER, slot INTEGER, skill_id TEXT, level INTEGER, xp INTEGER);"
         "CREATE TABLE loot_bags (bag_id TEXT PRIMARY KEY, user_id INTEGER, slot INTEGER, enemy_id TEXT, created_at INTEGER);"
@@ -267,6 +276,54 @@ def bare_app(name):
                   inventory_of=lambda user_id, slot: [{"position": p, "item_id": i, "quantity": q}
                                                       for p, (i, q) in sorted(carried(user_id, slot).items())],
                   bag_cells=GATHER_CELLS)
+
+    # guilds/: the purse and the bank are a column and a dict here, through
+    # ledgers that list what was burned and why; the moderation log is a list
+    # of its own; staff are the owner alone.
+    bank = app.config.setdefault("bank", {})
+    staff_log = app.config.setdefault("staff_log", [])
+
+    class Short(Exception):
+        pass
+
+    def purse_delta(db, user_id, slot, delta, reason, _detail=""):
+        have = db.execute("SELECT gold FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone()[0]
+        if have + delta < 0:
+            raise Short()
+        db.execute("UPDATE saves SET gold = ? WHERE user_id = ? AND slot = ?", (have + delta, user_id, slot))
+        minted["gold"].append((user_id, slot, delta, reason))
+        return have + delta
+
+    def bank_delta(_db, user_id, delta, reason, _detail=""):
+        if bank.get(user_id, 0) + delta < 0:
+            raise Short()
+        bank[user_id] = bank.get(user_id, 0) + delta
+        minted["gold"].append((user_id, "bank", delta, reason))
+        return bank[user_id]
+
+    def owner_only(_minimum):
+        def decorator(view):
+            def wrapped(*args, **kwargs):
+                if g.user["username"] != OWNER:
+                    return {"error": "Not Found", "message": "The requested URL was not found on the server."}, 404
+                return view(*args, **kwargs)
+            wrapped.__name__ = view.__name__
+            return wrapped
+        return decorator
+
+    guilds.register(app, require_auth=require_auth, require_role=owner_only, get_db=get_db,
+                    bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+                    parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None,
+                    find_user=find_user, ensure_account=lambda user_id: {"bank_gold": bank.get(user_id, 0)},
+                    gold_delta=purse_delta, bank_gold_delta=bank_delta, insufficient_gold=Short,
+                    log_staff_action=lambda user, action, target, detail="": staff_log.append(
+                        "%s %s %s: %s" % (user["username"], action, target, detail)),
+                    has_owner_powers=lambda name: name == OWNER,
+                    role_for=lambda row: row["role"], name_hue_of=lambda row: row["name_hue"],
+                    # The character an account plays: its lowest slot, for any
+                    # account seen within the window - the two ? are app.py's.
+                    playing_slot_sql="(SELECT MIN(slot) FROM saves s2 WHERE s2.user_id = {user} AND ? < ?)",
+                    online_window=45)
     return app, said, logged, path
 
 
@@ -298,7 +355,10 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/world/events/cancel", "/api/world/events/preview", "/api/world/events/report",
                        "/api/server/insights", "/api/kills", "/api/kills/everyone", "/api/friends",
                        "/api/friends/request", "/api/friends/respond", "/api/friends/remove",
-                       "/api/fishing/catch", "/api/cooking/cook", "/api/loot/take", "/api/loot/bag"]), rules)
+                       "/api/fishing/catch", "/api/cooking/cook", "/api/loot/take", "/api/loot/bag",
+                       "/api/guild", "/api/guild/create", "/api/guild/invite", "/api/guild/respond", "/api/guild/leave",
+                       "/api/guild/kick", "/api/guild/rank", "/api/guild/disband", "/api/staff/guild",
+                       "/api/guild/list"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -502,13 +562,86 @@ body = take(last_bag, 0).get_json() or {}
 check("  the last thing out empties the bag, and the bag goes with it",
       body.get("bag_empty") is True and body.get("gold_amount") == 100
       and client_a.get("/api/loot/bag?bag_id=%s" % last_bag, headers=who("bo")).status_code == 404, body)
+
+
+def guild_post(as_who, path, body):
+    res = client_a.post(path, headers=who(as_who), json=body)
+    return res.status_code, res.get_json() or {}
+
+
+def guild_of(as_who):
+    return client_a.get("/api/guild", headers=who(as_who)).get_json() or {}
+
+
+conn = sqlite3.connect(path_a)
+conn.execute("UPDATE saves SET gold = 3000, name = 'Ann' WHERE user_id = 2 AND slot = 0")
+conn.execute("INSERT INTO sessions VALUES (2, ?)", (int(time.time()),))
+conn.commit()
+conn.close()
+app_a.config["bank"][2] = 4000
+gold_before = len(minted["gold"])
+code, body = guild_post("ann", "/api/guild/create", {"name": "The Crowned", "slot": 0})
+check("guilds: ann founds one - %d gold, the carried 3000 first, then 2000 from the bank, both burned"
+      % guilds.GUILD_FOUND_COST,
+      code == 200 and body.get("rank") == "leader" and body.get("from_carried") == 3000 and body.get("from_bank") == 2000
+      and body.get("carried_gold") == 0 and body.get("bank_gold") == 2000
+      and minted["gold"][gold_before:] == [(2, 0, -3000, "guild_found"), (2, "bank", -2000, "guild_found")], body)
+crowned = body.get("guild", {})
+check("  the guild as every route returns it: tagged, on the roster as she plays, online by the window handed in",
+      crowned.get("tag") == "THE CROWNED" and crowned.get("capacity") == 50
+      and [(m["username"], m["rank"], m["online"], m["character"]) for m in crowned.get("members", [])]
+      == [("ann", "leader", True, "Ann")], crowned)
+check("  a second founding is the 409 it was, a bad name the 400",
+      guild_post("ann", "/api/guild/create", {"name": "Another", "slot": 0})[0] == 409
+      and guild_post("bo", "/api/guild/create", {"name": "x", "slot": 0})[1].get("message", "").startswith(
+          "a guild name is 3 to 12 characters"))
+check("  and an empty slot pays nothing: the 404 it was",
+      guild_post("bo", "/api/guild/create", {"name": "Bo's Lot", "slot": 0})
+      == (404, {"error": "Not Found", "message": "That slot is empty."}))
+guild_post("ann", "/api/guild/invite", {"username": "bo"})
+check("  invited, bo sees it waiting",
+      [i["guild"] for i in guild_of("bo").get("invites", [])] == ["The Crowned"], guild_of("bo"))
+code, body = guild_post("bo", "/api/guild/respond", {"guild": "the crowned", "accept": True})
+check("  accepted - by the name in any case - he is a member",
+      code == 200 and body.get("state") == "joined" and body.get("guild", {}).get("size") == 2, body)
+code, body = guild_post("ann", "/api/guild/rank", {"username": "bo", "rank": "officer"})
+check("  the leader makes him an officer", code == 200 and body.get("rank") == "officer", body)
+check("  an officer cannot remove the leader: the same 404 as no such member",
+      guild_post("bo", "/api/guild/kick", {"username": "ann"}) == (404, {"error": "Not Found", "message": "Not found."}))
+check("  and the leader cannot walk out on him",
+      guild_post("ann", "/api/guild/leave", {})[1].get("message")
+      == "make somebody else the leader first, or disband the guild")
+check("  its history, newest first",
+      [e["kind"] for e in guild_of("ann").get("guild", {}).get("activity", [])]
+      == ["promoted", "joined", "invited", "founded"], guild_of("ann"))
+code, body = guild_post("boss", "/api/staff/guild", {"guild": "The Crowned", "action": "rename", "name": "The First",
+                                                     "reason": "a test"})
+check("staff: renamed, on the moderation log handed in, and in the guild's history without who did it",
+      code == 200 and body == {"guild": "The First", "was": "The Crowned", "state": "renamed"}
+      and app_a.config["staff_log"] == ["boss guild_rename The Crowned: -> The First: a test"]
+      and guild_of("bo").get("guild", {}).get("activity", [{}])[0] == {
+          "at": guild_of("bo")["guild"]["activity"][0]["at"], "kind": "renamed", "actor": "", "target": "The First",
+          "detail": "The Crowned"}, (body, app_a.config["staff_log"]))
+check("  and the old name no longer finds it",
+      guild_post("boss", "/api/staff/guild", {"guild": "The Crowned", "action": "disband", "reason": "x"})[0] == 404)
+listed = client_a.get("/api/guild/list", headers=who("boss")).get_json() or {}
+check("  the staff list: one guild, its size and leader, and the owner may take it down",
+      [(r["name"], r["size"], r["leader"]) for r in listed.get("guilds", [])] == [("The First", 2, "ann")]
+      and listed.get("may_disband") is True, listed)
+check("  and nobody else is shown the list",
+      client_a.get("/api/guild/list", headers=who("ann")).status_code == 404)
+code, body = guild_post("ann", "/api/guild/disband", {})
+check("the leader takes it down: both out, and the guild gone",
+      code == 200 and body.get("members_removed") == 2 and guild_of("bo").get("in_guild") is False
+      and client_a.get("/api/guild/list", headers=who("boss")).get_json()["guilds"] == [], body)
 check("  and nobody without a login gets in anywhere",
       [client_a.get(path).status_code for path in ("/api/server/stats", "/api/world/events/active", "/api/server/insights",
                                                   "/api/kills?slot=0", "/api/kills/everyone", "/api/friends",
-                                                  "/api/loot/bag?bag_id=%s" % bag)]
+                                                  "/api/loot/bag?bag_id=%s" % bag, "/api/guild", "/api/guild/list")]
       + [client_a.post(path, json={"slot": 0}).status_code for path in ("/api/fishing/catch", "/api/cooking/cook",
-                                                                         "/api/loot/take")]
-      == [401] * 10)
+                                                                         "/api/loot/take", "/api/guild/create",
+                                                                         "/api/staff/guild")]
+      == [401] * 14)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")
@@ -534,7 +667,8 @@ for path in (path_a, path_b):
 # =============================================================================
 section("P-4  every package is here")
 check("the code map finds the packages app.py imports: %s" % ", ".join(PACKAGES),
-      set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot"}, PACKAGES)
+      set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds"},
+      PACKAGES)
 check("  and every one of them runs on a bare app in this file", set(PACKAGES) == set(RUN_HERE),
       sorted(set(PACKAGES) ^ set(RUN_HERE)))
 

@@ -288,11 +288,18 @@ check("so does the history of a guild whose last member walked out",
 # =============================================================================
 print("\n--- L-6 every kind written is a kind the panel knows ---")
 # =============================================================================
-with open(os.path.join(HERE, "app.py"), encoding="utf-8") as fh:
-    tree = ast.parse(fh.read())
+# THE CALLS ARE IN THE guilds/ PACKAGE since 18 Oct, and app.py is read too in
+# case one is ever written there again.
+sources = [os.path.join(HERE, "app.py")] + sorted(
+    os.path.join(HERE, "guilds", name) for name in os.listdir(os.path.join(HERE, "guilds"))
+    if name.endswith(".py"))
+trees = []
+for source in sources:
+    with open(source, encoding="utf-8") as fh:
+        trees.append(ast.parse(fh.read()))
 written = set()
 calls = 0
-for node in ast.walk(tree):
+for node in (node for tree in trees for node in ast.walk(tree)):
     if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
             and node.func.id == "log_guild_event" and len(node.args) >= 3):
         calls += 1
