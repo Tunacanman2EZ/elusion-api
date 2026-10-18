@@ -37,9 +37,10 @@ called them by.
 
 WHAT STAYS IN app.py: the broadcasts (the server's own voice, which cannot be
 muted or ignored), clean_player_text() (every name and line a player types),
-reporting and muting (moderation's), the friends table's read of who accepted
-whom, and the one call out to fetch a linked picture (_fetch_image_bytes(),
-every hop checked against the server's own network). The tunables a suite
+how a mute reads (chat_mute_state() - muting itself, and reporting, are
+moderation/'s), the friends table's read of who accepted whom, and the one
+call out to fetch a linked picture (_fetch_image_bytes(), every hop checked
+against the server's own network). The tunables a suite
 turns down - CHAT_KEEP_PER_CHANNEL and IGNORE_LIMIT - stay there too, asked for
 on every use.
 """

@@ -862,20 +862,26 @@ holds all three.
   `REPORTS_PER_HOUR` per reporter. `chat_delete` closes a line's reports as
   `deleted`. A mod cannot close a report about another mod - the same
   `can_act_on()` as every sanction.
+- **Reports, mutes and the four sanctions are the moderation/ package** (18
+  Oct): ban, kick, unban, a rank, mute, unmute, both reports and the Reports
+  tab. The rank ladder, `_moderation_target()`, `log_staff_action()`,
+  `ban_state()` and `chat_mute_state()` stay in app.py, shared; so do the
+  three tunables a suite turns down (`REPORTS_PER_HOUR`,
+  `REPORT_LINES_PER_PLAYER`, `MUTE_MAX_MINUTES_MOD`), asked for on every use.
 - **Staff see a card per reported PLAYER** (day 1: the tab would flood).
   `GET /api/staff/reports` answers `players` - who, `line_count`, `people`,
   `reasons`, `reporters` and their newest `REPORT_LINES_PER_PLAYER` lines -
-  counted in SQL over every open report (`_report_players()`), worst first:
+  counted in SQL over every open report (moderation/'s `report_players()`), worst first:
   the most different people reporting them, then the newest. Ten people about
   one line outrank one person about ten. The per-line `reports` list stays
   for older builds. `resolve` takes `username` as well as `message_id` and
   closes everything open about that player with ONE line in the log.
 - **Acting on somebody closes their reports.** A mute, kick or ban calls
-  `_close_reports_about()` (outcome `actioned`), says so in the sanction's
+  moderation/'s `close_reports_about()` (outcome `actioned`), says so in the sanction's
   log line ("closed 5 reported lines") and answers `reports_closed`. Nobody
   has to come back and tidy the tab.
 - **Closed reports are kept 90 days** (`REPORT_KEEP_SECONDS`), pruned on the
-  next report filed or closed (`_prune_reports()`), like chat. What staff
+  next report filed or closed (moderation/'s `prune()`), like chat. What staff
   decided stays in `staff_actions` for good. An open report is never pruned.
 - `open_reports` (lines) and `open_report_players` ride the broadcast poll for
   mod and up (0 for everyone else); the Staff button counts players.
@@ -2014,7 +2020,9 @@ only, `test_stats.py`.
   and `world/` (18 Oct: the stirring lands - the owner's three routes, the
   settings and the stir itself; register() hands back what the kill route,
   the poll, the events and the insights ask, and is handed the events and
-  insights as lookups, since they are registered after it).
+  insights as lookups, since they are registered after it). And `moderation/`
+  (18 Oct: the sanctions, the reports and the mutes - ten routes; it hands
+  back the two open-report counts the poll shows staff).
   **trade/ is handed gamedata whole, as `catalogue`**, so a rule checked by
   searching for `gamedata.` reads `catalogue.` too (test_quality Q-7).
   **A name a suite replaces on app.py**

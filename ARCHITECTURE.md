@@ -31,6 +31,7 @@ Beside it, **feature packages**: a folder per area, each in three layers.
 | `trade/` | 18 Oct | **moved out** of app.py: player trade and the kingdom tax |
 | `kingdom/` | 18 Oct | **moved out** of app.py: the Kingdom Tax board |
 | `world/` | 18 Oct | **moved out** of app.py: the stirring lands |
+| `moderation/` | 18 Oct | **moved out** of app.py: sanctions, reports, mutes |
 
 ## Where it is going
 
@@ -177,7 +178,18 @@ areas that hold money and items:
    hands one in after the world is registered and checks it is heard. What
    stays in app.py: the server_settings store, the broadcasts, the kill
    route and the poll themselves.
-9. moderation and the staff list
+9. moderation and the staff list, in two moves.
+   ~~The sanctions, the reports and the mutes (`moderation/`)~~ (18 Oct): ten
+   routes - ban, kick, unban, a rank, mute, unmute, both reports and the
+   Reports tab - and every write to `chat_reports`. **What every staff area
+   shares stays in app.py and is handed in**: the rank ladder
+   (`can_act_on()`, `role_for()`), `_moderation_target()` and the moderation
+   log's writer, `log_staff_action()` - which test_moderation's M-8 finds in
+   the package by that name, so it is handed in under it. So do the three
+   tunables a suite turns down (`REPORTS_PER_HOUR`, `REPORT_LINES_PER_PLAYER`,
+   `MUTE_MAX_MINUTES_MOD`, which the staff powers page quotes too). Next: the
+   staff list and the moderation record - `/api/staff/users`, `actions`,
+   `note` and `user/<username>`.
 10. the carry: saves, character, bank, equipment, consuming, reviving
 11. then the core itself (sessions, tokens, auth) into a package of its own,
     and each table's `CREATE` into its area - and app.py is the composition

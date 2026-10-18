@@ -1,8 +1,8 @@
 """The feature packages stand on their own (game 0.50.0).
 
 Every feature package (ARCHITECTURE.md) - playerstats/, events/, insights/,
-and killrecord/, friends/, gathering/, loot/, guilds/, parties/, chat/, trade/, kingdom/ and world/, taken out of
-app.py - is built the BE105 way: each has a
+and killrecord/, friends/, gathering/, loot/, guilds/, parties/, chat/, trade/, kingdom/, world/ and moderation/,
+taken out of app.py - is built the BE105 way: each has a
 register(app, ...) that is HANDED the app, its login checks and its database,
 and never imports app.py. The source of each is checked for that elsewhere
 (test_stats.py); this RUNS them without it - the "application factory"
@@ -44,6 +44,7 @@ import guilds  # noqa: E402
 import parties  # noqa: E402
 import chat  # noqa: E402
 import loot  # noqa: E402
+import moderation  # noqa: E402
 import insights  # noqa: E402
 import killrecord  # noqa: E402
 import kingdom  # noqa: E402
@@ -55,7 +56,7 @@ import world  # noqa: E402
 PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
 # The ones this file registers on its bare apps, below.
 RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds", "parties",
-            "chat", "trade", "kingdom", "world")
+            "chat", "trade", "kingdom", "world", "moderation")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -85,6 +86,7 @@ USERS = {"boss": {"id": 1, "username": "boss", "role": "player"},
          "ann": {"id": 2, "username": "ann", "role": "player"},
          "bo": {"id": 3, "username": "bo", "role": "player"}}
 OWNER = "boss"
+RANKS = ("player", "mod", "dev", "coowner", "owner")
 
 
 def require_auth(view):
@@ -123,7 +125,10 @@ def bare_app(name):
     conn = sqlite3.connect(path)
     conn.executescript(
         "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT COLLATE NOCASE, role TEXT, created_at INTEGER, name_hue INTEGER,"
-        " deaths INTEGER NOT NULL DEFAULT 0,"
+        " deaths INTEGER NOT NULL DEFAULT 0, is_banned INTEGER NOT NULL DEFAULT 0, ban_expires_at INTEGER,"
+        " ban_reason TEXT NOT NULL DEFAULT '', banned_by TEXT NOT NULL DEFAULT '', banned_at INTEGER NOT NULL DEFAULT 0,"
+        " chat_muted_until INTEGER NOT NULL DEFAULT 0, chat_mute_reason TEXT NOT NULL DEFAULT '',"
+        " chat_muted_by TEXT NOT NULL DEFAULT '',"
         " chat_tokens REAL NOT NULL DEFAULT 8.0, last_chat_at INTEGER NOT NULL DEFAULT 0,"
         " last_image_at INTEGER NOT NULL DEFAULT 0, last_world_image_at INTEGER NOT NULL DEFAULT 0);"
         "CREATE TABLE chat_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, role TEXT,"
@@ -136,8 +141,12 @@ def bare_app(name):
         "CREATE TABLE chat_image_holders (image_id TEXT, user_id INTEGER, created_at INTEGER,"
         " PRIMARY KEY (image_id, user_id));"
         "CREATE TABLE ignores (user_id INTEGER, ignored_id INTEGER, created_at INTEGER);"
-        "CREATE TABLE chat_reports (message_id INTEGER, image_id TEXT, reported_id INTEGER, resolved_at INTEGER,"
-        " resolved_by TEXT, outcome TEXT);"
+        "CREATE TABLE chat_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER NOT NULL,"
+        " reporter_id INTEGER NOT NULL, reporter_name TEXT NOT NULL, reported_id INTEGER NOT NULL,"
+        " reported_name TEXT NOT NULL, channel TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',"
+        " image_id TEXT NOT NULL DEFAULT '', said_at INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL,"
+        " created_at INTEGER NOT NULL, resolved_at INTEGER NOT NULL DEFAULT 0, resolved_by TEXT NOT NULL DEFAULT '',"
+        " outcome TEXT NOT NULL DEFAULT '', UNIQUE (message_id, reporter_id));"
         "CREATE TABLE saves (user_id INTEGER, slot INTEGER, class_id TEXT, level INTEGER, area TEXT, updated_at INTEGER,"
         " last_cast_at INTEGER NOT NULL DEFAULT 0, cast_tokens REAL NOT NULL DEFAULT 6.0,"
         " gold INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL DEFAULT '', hp INTEGER NOT NULL DEFAULT 0,"
@@ -146,7 +155,7 @@ def bare_app(name):
         "CREATE TABLE party_members (user_id INTEGER PRIMARY KEY, party_id INTEGER, is_leader INTEGER DEFAULT 0,"
         " joined_at INTEGER);"
         "CREATE TABLE party_invites (user_id INTEGER, from_id INTEGER, created_at INTEGER, PRIMARY KEY (user_id, from_id));"
-        "CREATE TABLE sessions (user_id INTEGER, last_seen_at INTEGER);"
+        "CREATE TABLE sessions (user_id INTEGER, last_seen_at INTEGER, expires_at INTEGER NOT NULL DEFAULT 0);"
         "CREATE TABLE guilds (id INTEGER PRIMARY KEY, name TEXT, folded TEXT UNIQUE, founded_by TEXT, created_at INTEGER);"
         "CREATE TABLE guild_members (user_id INTEGER PRIMARY KEY, guild_id INTEGER, rank TEXT, joined_at INTEGER);"
         "CREATE TABLE guild_invites (guild_id INTEGER, user_id INTEGER, invited_by TEXT, created_at INTEGER,"
@@ -508,6 +517,44 @@ def bare_app(name):
             "%s %s %s: %s" % (user["username"], action, target, detail)),
         element_of=lambda enemy_id: int(enemy_id[1:]) if re.fullmatch(r"e[1-7]", enemy_id) else 0,
         events=lambda: app.config["world_events"], insights=lambda: app.config["world_insights"])
+
+    # moderation/: the accounts are the database's rows; boss is staff, and how
+    # far up is app.config's ("boss_rank"), so a check can make him a mod. Who
+    # may read a line is chat/'s own answer, handed back above. The three
+    # tunables are app.config's, asked on every use.
+    app.config["boss_rank"] = "owner"
+    limits = app.config.setdefault("report_limits", {"per_hour": 20, "per_card": 10, "mod_mute": 24 * 60})
+
+    def account(name):
+        return get_db().execute("SELECT * FROM users WHERE username = ?", (name,)).fetchone()
+
+    def rank_of(row):
+        return app.config["boss_rank"] if row["username"] == OWNER else row["role"]
+
+    def outranks(actor, target):
+        return RANKS.index(rank_of(actor)) > RANKS.index(rank_of(target))
+
+    def within_reach(payload):
+        name = str(payload.get("username", "")).strip()
+        if not name:
+            return None, ({"error": "Bad Request", "message": "username is required"}, 400)
+        row = account(name)
+        if row is None or not outranks(g.user, row):
+            return None, ({"error": "Not Found", "message": "No such account."}, 404)
+        return row, None
+
+    moderation.register(
+        app, require_auth=require_auth, require_role=owner_only, require_fresh_password=require_fresh_password,
+        get_db=get_db, bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+        parse_stat=parse_stat, moderation_target=within_reach, find_user=account, can_act_on=outranks,
+        role_for=rank_of, role_at_least=lambda row, rank: RANKS.index(rank_of(row)) >= RANKS.index(rank),
+        roles=RANKS, settable_roles=("player", "mod", "dev"),
+        log_staff_action=lambda user, action, target, target_id=0, detail="": staff_log.append(
+            "%s %s %s: %s" % (user["username"], action, target, detail)),
+        can_read_row=lambda db, user_id, row: app.config["chat"].can_read_row(db, user_id, row),
+        wait_words=lambda seconds: "%d minutes" % (seconds // 60), default_channel="world",
+        reports_per_hour=lambda: limits["per_hour"], report_lines_per_player=lambda: limits["per_card"],
+        mute_max_minutes_mod=lambda: limits["mod_mute"])
     return app, said, logged, path
 
 
@@ -578,7 +625,9 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/ignores/remove", "/api/trade/offer", "/api/trade", "/api/trade/update",
                        "/api/trade/confirm", "/api/trade/cancel", "/api/staff/trades", "/api/trade/history",
                        "/api/economy/kingdom", "/api/server/world", "/api/server/world",
-                       "/api/server/world/stir"]), rules)
+                       "/api/server/world/stir", "/api/staff/ban", "/api/staff/kick", "/api/staff/unban",
+                       "/api/staff/role", "/api/chat/report", "/api/report/player", "/api/staff/reports",
+                       "/api/staff/reports/resolve", "/api/staff/mute", "/api/staff/unmute"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -795,7 +844,7 @@ def guild_of(as_who):
 
 conn = sqlite3.connect(path_a)
 conn.execute("UPDATE saves SET gold = 3000, name = 'Ann' WHERE user_id = 2 AND slot = 0")
-conn.execute("INSERT INTO sessions VALUES (2, ?)", (int(time.time()),))
+conn.execute("INSERT INTO sessions (user_id, last_seen_at) VALUES (2, ?)", (int(time.time()),))
 conn.commit()
 conn.close()
 app_a.config["bank"][2] = 4000
@@ -1222,21 +1271,133 @@ check("  a stir event handed in wins: its land stirs until it ends, and a kill i
       and stir_for("e2") == (3.0, 1.25) and stir_for("e1") == (2.0, 1.0), (view.get("state"), stir_for("e2")))
 app_a.config["world_events"] = None
 app_a.config["world_insights"] = None
+def staff_post(path, body, as_who="boss", method="post"):
+    res = getattr(client_a, method)(path, headers=who(as_who), json=body)
+    return res.status_code, res.get_json() or {}
+
+
+def column(user_id, name):
+    conn = sqlite3.connect(path_a)
+    value = conn.execute("SELECT %s FROM users WHERE id = ?" % name, (user_id,)).fetchone()[0]
+    conn.close()
+    return value
+
+
+def sessions_of(user_id, live=0):
+    conn = sqlite3.connect(path_a)
+    if live:
+        conn.executemany("INSERT INTO sessions (user_id, last_seen_at, expires_at) VALUES (?, ?, ?)",
+                         [(user_id, int(time.time()), int(time.time()) + 3600)] * live)
+        conn.commit()
+    n = conn.execute("SELECT COUNT(*) FROM sessions WHERE user_id = ?", (user_id,)).fetchone()[0]
+    conn.close()
+    return int(n)
+
+
+limits = app_a.config["report_limits"]
+staff_log = app_a.config["staff_log"]
+ann_lines = [m["id"] for m in heard("bo").get("messages", []) if m["by"] == "ann" and m["body"].startswith("line")]
+code, body = staff_post("/api/chat/report", {"id": ann_lines[0], "reason": "spam"}, as_who="bo")
+check("moderation: bo reports a line of ann's he was shown - chat's own answer, handed in",
+      len(ann_lines) >= 2 and (code, body) == (200, {"id": ann_lines[0], "reported": True}), (ann_lines, code, body))
+check("  the same line again is not a second report, and a reason that is not one is the 400 it was",
+      staff_post("/api/chat/report", {"id": ann_lines[0], "reason": "spam"}, as_who="bo")[1].get("already") is True
+      and staff_post("/api/chat/report", {"id": ann_lines[1], "reason": "rude"}, as_who="bo")[0] == 400)
+check("  and a line nobody has is the same 404 as one you were not shown",
+      staff_post("/api/chat/report", {"id": 99999, "reason": "spam"}, as_who="bo")
+      == (404, {"error": "Not Found", "message": "No such message."}))
+code, body = staff_post("/api/report/player", {"username": "ANN", "reason": "harassment", "area": "dark_forest"},
+                        as_who="bo")
+check("  bo reports ann herself, by her name in any case, from where he saw her",
+      (code, body) == (200, {"username": "ann", "reported": True}), body)
+limits["per_hour"] = 2
+check("  the hourly ceiling is the tunable handed in, asked each time",
+      staff_post("/api/chat/report", {"id": ann_lines[1], "reason": "spam"}, as_who="bo")[0] == 429)
+limits["per_hour"] = 20
+res = client_a.get("/api/staff/reports", headers=who("boss"))
+tab = res.get_json() or {}
+card = (tab.get("players") or [{}])[0]
+check("staff: the Reports tab - one card for ann, her line and the report about her, and the counts",
+      res.status_code == 200 and card.get("reported") == "ann" and card.get("line_count") == 2
+      and card.get("people") == 1 and card.get("reasons") == {"harassment": 1, "spam": 1}
+      and card.get("actionable") is True and (tab.get("open"), tab.get("open_players")) == (2, 1)
+      and sorted(r["channel"] for r in tab.get("reports", [])) == ["player", "world"]
+      and any(r["body"] == "Reported in dark forest" for r in tab["reports"]), tab)
+limits["per_card"] = 1
+check("  a card shows the newest few lines - the tunable handed in - and says how many there are",
+      len(client_a.get("/api/staff/reports", headers=who("boss")).get_json()["players"][0]["lines"]) == 1)
+limits["per_card"] = 10
+check("  and nobody else is shown the tab", client_a.get("/api/staff/reports", headers=who("ann")).status_code == 404)
+app_a.config["boss_rank"] = "mod"
+limits["mod_mute"] = 60
+check("a mod's longest mute is the tunable handed in",
+      staff_post("/api/staff/mute", {"username": "ann", "minutes": 120, "reason": "spam"})
+      == (403, {"error": "Forbidden", "message": "A mod may mute for at most 60 minutes."}))
+code, body = staff_post("/api/staff/mute", {"username": "ann", "minutes": 10, "reason": "spamming world"})
+check("  muted for ten minutes: stored, logged, and her two reported lines closed with it",
+      code == 200 and body.get("muted") is True and body.get("reports_closed") == 2
+      and column(2, "chat_muted_until") > int(time.time()) and column(2, "chat_muted_by") == "boss"
+      and staff_log[-1] == "boss mute ann: 10 minutes: spamming world - closed 2 reported lines"
+      and client_a.get("/api/staff/reports", headers=who("boss")).get_json()["open"] == 0, (body, staff_log[-1:]))
+check("  and unmuted", staff_post("/api/staff/unmute", {"username": "ann"}) == (200, {"username": "ann", "muted": False})
+      and column(2, "chat_muted_until") == 0)
+check("a mod may not ban for good, nor for longer than %d days" % moderation.MAX_MOD_BAN_DAYS,
+      staff_post("/api/staff/ban", {"username": "bo", "reason": "griefing"})[0] == 403
+      and staff_post("/api/staff/ban", {"username": "bo", "reason": "griefing", "days": 31})[1].get("message")
+      == "A mod may ban for at most 30 days.")
+sessions_of(3, live=2)
+code, body = staff_post("/api/staff/ban", {"username": "bo", "reason": "griefing", "days": 3})
+check("  three days: stored, every session of his ended, and logged",
+      code == 200 and body.get("permanent") is False and column(3, "is_banned") == 1
+      and abs(body["expires_at"] - (int(time.time()) + 3 * 86400)) < 5 and sessions_of(3) == 0
+      and staff_log[-1] == "boss ban bo: 3 days: griefing", (body, staff_log[-1:]))
+check("  and lifted", staff_post("/api/staff/unban", {"username": "bo"}) == (200, {"username": "bo", "banned": False})
+      and column(3, "is_banned") == 0)
+sessions_of(2, live=2)
+code, body = staff_post("/api/staff/kick", {"username": "ann", "reason": "stuck client"})
+check("a kick signs her out everywhere and says from how many places",
+      code == 200 and body.get("sessions_ended") == 2 and sessions_of(2) == 0
+      and staff_log[-1] == "boss kick ann: 2 session(s): stuck client", (body, staff_log[-1:]))
+check("  somebody out of reach - himself, at his own rank - is the same 404 as nobody",
+      staff_post("/api/staff/kick", {"username": "boss"}) == staff_post("/api/staff/kick", {"username": "nobody"})
+      == (404, {"error": "Not Found", "message": "No such account."}))
+app_a.config["boss_rank"] = "owner"
+check("ranks: the owner makes bo a mod, the ladder handed in",
+      staff_post("/api/staff/role", {"username": "bo", "role": "mod"}, method="put")
+      == (200, {"username": "bo", "role": "mod", "was": "player"}))
+app_a.config["boss_rank"] = "dev"
+check("  a dev cannot make a dev, and nobody can make an owner",
+      staff_post("/api/staff/role", {"username": "bo", "role": "dev"}, method="put")[0] == 403
+      and staff_post("/api/staff/role", {"username": "bo", "role": "owner"}, method="put")[0] == 400)
+staff_post("/api/staff/role", {"username": "bo", "role": "player"}, method="put")
+app_a.config["boss_rank"] = "owner"
+staff_post("/api/chat/report", {"id": ann_lines[1], "reason": "hate"}, as_who="bo")
+code, body = staff_post("/api/staff/reports/resolve", {"message_id": ann_lines[1], "outcome": "dismissed"})
+check("closing a line's reports: closed, logged, and nothing left to close",
+      (code, body) == (200, {"message_id": ann_lines[1], "outcome": "dismissed", "closed": 1})
+      and staff_log[-1].startswith("boss report ann: dismissed: line")
+      and staff_post("/api/staff/reports/resolve", {"username": "ann", "outcome": "dismissed"})[0] == 404, body)
 check("and nobody without a login gets in anywhere",
       [client_a.get(path).status_code for path in ("/api/server/stats", "/api/world/events/active", "/api/server/insights",
                                                   "/api/kills?slot=0", "/api/kills/everyone", "/api/friends",
                                                   "/api/loot/bag?bag_id=%s" % bag, "/api/guild", "/api/guild/list",
                                                   "/api/party", "/api/party/voice", "/api/chat", "/api/ignores",
                                                   "/api/trade", "/api/trade/history", "/api/staff/trades",
-                                                  "/api/economy/kingdom", "/api/server/world")]
+                                                  "/api/economy/kingdom", "/api/server/world", "/api/staff/reports")]
       + [client_a.post(path, json={"slot": 0}).status_code for path in ("/api/fishing/catch", "/api/cooking/cook",
                                                                          "/api/loot/take", "/api/guild/create",
                                                                          "/api/staff/guild", "/api/party/invite",
                                                                          "/api/chat/send", "/api/chat/image",
                                                                          "/api/trade/offer", "/api/trade/update",
                                                                          "/api/trade/confirm", "/api/trade/cancel",
-                                                                         "/api/server/world", "/api/server/world/stir")]
-      == [401] * 32)
+                                                                         "/api/server/world", "/api/server/world/stir",
+                                                                         "/api/staff/ban", "/api/staff/kick",
+                                                                         "/api/staff/unban", "/api/staff/mute",
+                                                                         "/api/staff/unmute", "/api/chat/report",
+                                                                         "/api/report/player",
+                                                                         "/api/staff/reports/resolve")]
+      + [client_a.put("/api/staff/role", json={}).status_code]
+      == [401] * 42)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")
@@ -1266,7 +1427,7 @@ for path in (path_a, path_b):
 section("P-4  every package is here")
 check("the code map finds the packages app.py imports: %s" % ", ".join(PACKAGES),
       set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds",
-                        "parties", "chat", "trade", "kingdom", "world"},
+                        "parties", "chat", "trade", "kingdom", "world", "moderation"},
       PACKAGES)
 check("  and every one of them runs on a bare app in this file", set(PACKAGES) == set(RUN_HERE),
       sorted(set(PACKAGES) ^ set(RUN_HERE)))
