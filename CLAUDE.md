@@ -2034,7 +2034,9 @@ only, `test_stats.py`.
   hands back the two query builders whose plans test_moderation checks). And
   `equipment/` and `consuming/` (18 Oct: equip, unequip, consume - the first
   of the carry, ARCHITECTURE's step 10; the backpack grants, `_derived_stats()`
-  and the skills stay in app.py and are handed in).
+  and the skills stay in app.py and are handed in). And `death/` (18 Oct:
+  revive and respawn; the three ledgers, the account row, `_derived_stats()`
+  and the grant ids the healing reconciler reads stay in app.py).
   **trade/ is handed gamedata whole, as `catalogue`**, so a rule checked by
   searching for `gamedata.` reads `catalogue.` too (test_quality Q-7).
   **A name a suite replaces on app.py**

@@ -35,6 +35,7 @@ Beside it, **feature packages**: a folder per area, each in three layers.
 | `staffdesk/` | 18 Oct | **moved out** of app.py: the staff list and the record |
 | `equipment/` | 18 Oct | **moved out** of app.py: wearing gear |
 | `consuming/` | 18 Oct | **moved out** of app.py: using a consumable |
+| `death/` | 18 Oct | **moved out** of app.py: reviving and respawning |
 
 ## Where it is going
 
@@ -209,7 +210,11 @@ areas that hold money and items:
     as lambdas (they are further down the file). `_derived_stats()` - the one
     way to ask a character's maxima - stays and is handed in, and
     test_gearbonus now reads the packages for a bare `max_stats_for(`, by
-    either name. Next: reviving and respawning; then the bank; then the carry
+    either name.
+    ~~Reviving and respawning (`death/`)~~ (18 Oct): the death screen's two
+    exits. Every coin and lusion they cost goes through app.py's ledgers,
+    handed in; the account row is handed in as a lookup, because
+    test_concurrency slows `_ensure_account()`. Next: the bank; then the carry
     itself, the grants with it; then saves and the status write.
 11. then the core itself (sessions, tokens, auth) into a package of its own,
     and each table's `CREATE` into its area - and app.py is the composition

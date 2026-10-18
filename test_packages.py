@@ -2,7 +2,7 @@
 
 Every feature package (ARCHITECTURE.md) - playerstats/, events/, insights/,
 and killrecord/, friends/, gathering/, loot/, guilds/, parties/, chat/, trade/, kingdom/, world/, moderation/,
-staffdesk/, equipment/ and consuming/, taken out of app.py - is built the BE105 way: each has a
+staffdesk/, equipment/, consuming/ and death/, taken out of app.py - is built the BE105 way: each has a
 register(app, ...) that is HANDED the app, its login checks and its database,
 and never imports app.py. The source of each is checked for that elsewhere
 (test_stats.py); this RUNS them without it - the "application factory"
@@ -45,6 +45,7 @@ import guilds  # noqa: E402
 import parties  # noqa: E402
 import chat  # noqa: E402
 import consuming  # noqa: E402
+import death  # noqa: E402
 import equipment  # noqa: E402
 import loot  # noqa: E402
 import moderation  # noqa: E402
@@ -60,7 +61,8 @@ import world  # noqa: E402
 PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
 # The ones this file registers on its bare apps, below.
 RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds", "parties",
-            "chat", "trade", "kingdom", "world", "moderation", "staffdesk", "equipment", "consuming")
+            "chat", "trade", "kingdom", "world", "moderation", "staffdesk", "equipment", "consuming",
+            "death")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -155,7 +157,8 @@ def bare_app(name):
         " last_cast_at INTEGER NOT NULL DEFAULT 0, cast_tokens REAL NOT NULL DEFAULT 6.0,"
         " gold INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL DEFAULT '', hp INTEGER NOT NULL DEFAULT 0,"
         " max_hp INTEGER NOT NULL DEFAULT 0, mana INTEGER NOT NULL DEFAULT 0, max_mana INTEGER NOT NULL DEFAULT 0,"
-        " equipment TEXT NOT NULL DEFAULT '{}');"
+        " equipment TEXT NOT NULL DEFAULT '{}', stamina INTEGER NOT NULL DEFAULT 0,"
+        " max_stamina INTEGER NOT NULL DEFAULT 0, pools_at INTEGER NOT NULL DEFAULT 0);"
         "CREATE TABLE consume_grants (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, slot INTEGER, item_id TEXT,"
         " target TEXT NOT NULL DEFAULT '', amount INTEGER NOT NULL DEFAULT 0, at INTEGER);"
         "CREATE TABLE parties (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER);"
@@ -193,7 +196,8 @@ def bare_app(name):
         "CREATE TABLE staff_actions (id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id INTEGER, actor_name TEXT,"
         " action TEXT, target_id INTEGER, target_name TEXT, detail TEXT, created_at INTEGER);"
         "CREATE TABLE login_attempts (username TEXT, ok INTEGER, reason TEXT, ip TEXT, at INTEGER);"
-        "CREATE TABLE accounts (user_id INTEGER PRIMARY KEY, lusions INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE accounts (user_id INTEGER PRIMARY KEY, lusions INTEGER NOT NULL DEFAULT 0,"
+        " bank_gold INTEGER NOT NULL DEFAULT 0, score INTEGER NOT NULL DEFAULT 0);"
         "CREATE TABLE world_ticks (tick INTEGER PRIMARY KEY, element INTEGER NOT NULL, started_at INTEGER NOT NULL,"
         " ends_at INTEGER NOT NULL, chosen_by TEXT NOT NULL DEFAULT '');"
         "CREATE TABLE kill_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, slot INTEGER, enemy_id TEXT,"
@@ -600,7 +604,7 @@ def bare_app(name):
 
     def maxima(row):
         worn = row["equipment"]
-        return {"max_hp": 120 if "cobaltrobe" in worn else 100, "max_mana": 50}
+        return {"max_hp": 120 if "cobaltrobe" in worn else 100, "max_mana": 50, "max_stamina": 30}
 
     cell = lambda payload, capacity: (payload.get("position"), None)  # noqa: E731
     equipment.register(
@@ -620,11 +624,52 @@ def bare_app(name):
         take_from_backpack=take_from,
         inventory_of=lambda user_id, slot: [{"position": p, "item_id": i, "quantity": q}
                                             for p, (i, q) in sorted(carried(user_id, slot).items())])
+
+    # death/: the account row, the bank and the lusions are the accounts
+    # table, and every burn writes its ledger, as app.py's do; the carried gold
+    # goes through the same ledger_delta() trade's tax does.
+    def ensure_account(user_id):
+        get_db().execute("INSERT OR IGNORE INTO accounts (user_id) VALUES (?)", (user_id,))
+        return get_db().execute("SELECT * FROM accounts WHERE user_id = ?", (user_id,)).fetchone()
+
+    def bank_delta_ledger(db, user_id, delta, reason, detail=""):
+        db.execute("UPDATE accounts SET bank_gold = bank_gold + ? WHERE user_id = ?", (delta, user_id))
+        db.execute("INSERT INTO gold_ledger (at, user_id, slot, delta, reason, detail) VALUES (?, ?, NULL, ?, ?, ?)",
+                   (int(time.time()), user_id, delta, reason, detail))
+
+    def lusion_delta_ledger(db, user_id, slot, delta, reason, detail=""):
+        db.execute("UPDATE accounts SET lusions = lusions + ? WHERE user_id = ?", (delta, user_id))
+        db.execute("INSERT INTO lusion_ledger (at, user_id, slot, delta, reason, detail) VALUES (?, ?, ?, ?, ?, ?)",
+                   (int(time.time()), user_id, slot, delta, reason, detail))
+
+    def status_of(user_id, slot):
+        row = get_db().execute("SELECT hp, max_hp, gold FROM saves WHERE user_id = ? AND slot = ?",
+                               (user_id, slot)).fetchone()
+        return {"hp": row["hp"], "max_hp": row["max_hp"], "gold": row["gold"]}
+
+    death.register(
+        app, require_auth=require_auth, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+        parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None, max_slot=3,
+        ensure_account=ensure_account, catalogue=DeathCatalogue, derived_stats=maxima,
+        gold_delta=ledger_delta, bank_gold_delta=bank_delta_ledger, lusion_delta=lusion_delta_ledger,
+        lusion_gold_value=1000, revive_grant_id="__revive__", respawn_grant_id="__respawn__",
+        status_of=status_of)
     return app, said, logged, path
 
 
 # A four-cell bag for gathering/'s stand-ins.
 GATHER_CELLS = 4
+
+
+class DeathCatalogue:
+    """What death/ asks of gamedata: the gold a revive costs - eight tenths of
+    what you hold, at least 100 - and the lusions."""
+    CONSTANTS = {"revive_cost": 20}
+
+    @staticmethod
+    def revive_gold_cost(held):
+        return 0 if held <= 0 else max(100, held * 8 // 10)
 
 
 class GearCatalogue:
@@ -730,7 +775,8 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/staff/reports/resolve", "/api/staff/mute", "/api/staff/unmute",
                        "/api/staff/users", "/api/staff/actions", "/api/staff/note",
                        "/api/staff/user/<username>", "/api/character/equip", "/api/character/unequip",
-                       "/api/character/consume"]), rules)
+                       "/api/character/consume", "/api/character/revive",
+                       "/api/character/respawn"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -1494,7 +1540,7 @@ conn.executemany("INSERT INTO staff_actions (actor_id, actor_name, action, targe
                   ("guild_rename", None, "The Crowned", "-> The First", start + 2)])
 conn.executemany("INSERT INTO login_attempts VALUES ('ann', ?, ?, ?, ?)",
                  [(1, "ok", "203.0.113.7", start), (0, "password", "203.0.113.9", start + 5)])
-conn.execute("INSERT INTO accounts VALUES (2, 7)")
+conn.execute("INSERT INTO accounts (user_id, lusions) VALUES (2, 7)")
 conn.execute("INSERT INTO sessions (user_id, last_seen_at, expires_at) VALUES (2, ?, ?)",
              (int(time.time()), int(time.time()) + 3600))
 conn.commit()
@@ -1637,6 +1683,73 @@ check("  and what she does not carry is the 404 before anything else, what is no
       gear("/api/character/consume", {"item_id": "smallmanapotion"})[0] == 404
       and gear("/api/character/consume", {"item_id": "cobaltrobe"})
       == (409, {"error": "Conflict", "message": "That cannot be used."}))
+def died(gold=None, bank=None, lusions=None):
+    conn = sqlite3.connect(path_a)
+    conn.execute("UPDATE saves SET hp = 0 WHERE user_id = 2 AND slot = 0")
+    if gold is not None:
+        conn.execute("UPDATE saves SET gold = ? WHERE user_id = 2 AND slot = 0", (gold,))
+    conn.execute("INSERT OR IGNORE INTO accounts (user_id) VALUES (2)")
+    if bank is not None:
+        conn.execute("UPDATE accounts SET bank_gold = ? WHERE user_id = 2", (bank,))
+    if lusions is not None:
+        conn.execute("UPDATE accounts SET lusions = ? WHERE user_id = 2", (lusions,))
+    conn.commit()
+    conn.close()
+
+
+def ann_says(sql, args=()):
+    conn = sqlite3.connect(path_a)
+    rows = conn.execute(sql, args).fetchall()
+    conn.close()
+    return rows
+
+
+check("death: the living are not revived, and a currency that is not one is the 400 it was",
+      gear("/api/character/revive", {}) == (409, {"error": "Conflict", "message": "That character is not dead."})
+      and gear("/api/character/revive", {"pay": "beans"})[0] == 400)
+died(lusions=5)
+check("  dead, with 5 lusions: the 402 it was, with both numbers",
+      gear("/api/character/revive", {}) == (402, {"error": "Payment Required",
+                                                  "message": "Reviving costs 20 lusions; you have 5.",
+                                                  "cost": 20, "lusions": 5}))
+died(lusions=25)
+score_before = ann_says("SELECT score FROM accounts WHERE user_id = 2")[0][0]
+code, body = gear("/api/character/revive", {})
+check("  with 25: back at the maxima handed in, 20 lusions through the ledger handed in, a grant, and the score in gold",
+      code == 200 and body.get("paid_with") == "lusions" and body.get("lusions") == 5
+      and body.get("status", {}).get("hp") == 100
+      and ann_says("SELECT delta, reason FROM lusion_ledger WHERE user_id = 2") == [(-20, "revive")]
+      and ann_says("SELECT item_id FROM consume_grants WHERE user_id = 2 AND item_id LIKE '\\_\\_%' ESCAPE '\\'")
+      == [("__revive__",)]
+      and ann_says("SELECT score FROM accounts WHERE user_id = 2")[0][0] == score_before + 20 * 1000, body)
+died(gold=280, bank=1000)
+code, body = gear("/api/character/revive", {"pay": "gold"})
+check("  paid in gold: eight tenths of everything, the carry first and then the bank, each burned in its ledger",
+      code == 200 and body.get("cost") == 1024 and body.get("bank_gold") == 256
+      and ann_says("SELECT gold FROM saves WHERE user_id = 2 AND slot = 0") == [(0,)]
+      and ann_says("SELECT slot, delta FROM gold_ledger WHERE user_id = 2 AND reason = 'revive'") == [(0, -280), (None, -744)],
+      body)
+died(gold=0, bank=0)
+check("  with no gold at all, the 402 it was",
+      gear("/api/character/revive", {"pay": "gold"})[1].get("message") == "You have no gold to pay with.")
+died(gold=40)
+check("  and with less than the floor, the 402 that says the floor",
+      gear("/api/character/revive", {"pay": "gold"})[1].get("message") == "Reviving costs at least 100 gold; you have 40.")
+conn = sqlite3.connect(path_a)
+conn.execute("UPDATE saves SET equipment = ? WHERE user_id = 2 AND slot = 0", (json.dumps({"chest": "cobaltrobe"}),))
+conn.commit()
+conn.close()
+code, body = gear("/api/character/respawn", {})
+check("respawn: the carried gold through the ledger, the bag and every worn piece gone, the bare maxima, and a grant",
+      code == 200 and body.get("gold_lost") == 40 and body.get("gear_lost") == ["cobaltrobe"]
+      and body.get("equipment") == {} and body.get("status", {}).get("max_hp") == 100
+      and ann_says("SELECT COUNT(*) FROM carry_items WHERE user_id = 2 AND slot = 0") == [(0,)]
+      and ann_says("SELECT equipment FROM saves WHERE user_id = 2 AND slot = 0") == [("{}",)]
+      and ann_says("SELECT delta, reason FROM gold_ledger WHERE user_id = 2 AND reason = 'death'") == [(-40, "death")]
+      and ("__respawn__",) in ann_says("SELECT item_id FROM consume_grants WHERE user_id = 2"), body)
+check("  and the living, or nobody, are the 409 and 404 they were",
+      gear("/api/character/respawn", {})[0] == 409
+      and gear("/api/character/respawn", {"slot": 1}) == (404, {"error": "Not Found", "message": "No character in slot 1."}))
 check("and nobody without a login gets in anywhere",
       [client_a.get(path).status_code for path in ("/api/server/stats", "/api/world/events/active", "/api/server/insights",
                                                   "/api/kills?slot=0", "/api/kills/everyone", "/api/friends",
@@ -1659,9 +1772,11 @@ check("and nobody without a login gets in anywhere",
                                                                          "/api/staff/reports/resolve",
                                                                          "/api/staff/note", "/api/character/equip",
                                                                          "/api/character/unequip",
-                                                                         "/api/character/consume")]
+                                                                         "/api/character/consume",
+                                                                         "/api/character/revive",
+                                                                         "/api/character/respawn")]
       + [client_a.put("/api/staff/role", json={}).status_code]
-      == [401] * 49)
+      == [401] * 51)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")
@@ -1692,7 +1807,7 @@ section("P-4  every package is here")
 check("the code map finds the packages app.py imports: %s" % ", ".join(PACKAGES),
       set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds",
                         "parties", "chat", "trade", "kingdom", "world", "moderation", "staffdesk",
-                        "equipment", "consuming"},
+                        "equipment", "consuming", "death"},
       PACKAGES)
 check("  and every one of them runs on a bare app in this file", set(PACKAGES) == set(RUN_HERE),
       sorted(set(PACKAGES) ^ set(RUN_HERE)))
