@@ -708,8 +708,21 @@ SWEEPS_ALLOWED = [
     ("party_invites", "from_id =", "the invitations you sent, as you leave"),
 ]
 
+# THE PACKAGES' WRITES TOO. The tables are app.py's (the schema above), but
+# since 16 Oct the areas moving out of app.py take their writes with them -
+# loot's, guilds', parties' - and a scan of app.py alone stopped seeing them.
+# Found the code map's way, so a package added later is read without a change
+# here.
+import codemap  # noqa: E402
+
+written_src = source
+for package, _rows, _layers in codemap.feature_packages():
+    for name in sorted(os.listdir(os.path.join(HERE, package))):
+        if name.endswith(".py"):
+            written_src += "\n" + open(os.path.join(HERE, package, name), encoding="utf-8").read()
+
 unscoped = []
-for text in sql_statements(source):
+for text in sql_statements(written_src):
     table = re.match(r'(?:UPDATE|DELETE FROM)\s+(\w+)', text).group(1)
     if table not in OWNED_TABLES:
         continue
@@ -730,7 +743,7 @@ for text in sql_statements(source):
 check("every write to a per-user table names the owner, or is on the allowlist",
       unscoped == [], "\n        ".join(unscoped))
 check("the scanner actually found statements to look at",
-      len(sql_statements(source)) > 60, len(sql_statements(source)))
+      len(sql_statements(written_src)) > 60, len(sql_statements(written_src)))
 print("  %d allowlisted writes, each one a deliberate reach past the caller:"
       % len(SWEEPS_ALLOWED))
 for (t, frag, why) in SWEEPS_ALLOWED:

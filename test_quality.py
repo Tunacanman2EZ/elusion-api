@@ -524,11 +524,20 @@ section("Q-7 NOTHING ASKS ITEMS WHAT AN ID IS")
 # it in. Every question about an id goes through item_row() / has_item().
 # Iterating ITEMS (the shelf, the loot pool) is fine and stays.
 app_src = open(os.path.join(HERE, "app.py"), encoding="utf-8").read()
+# AND EVERY FEATURE PACKAGE, where the areas moving out of app.py go: the rule
+# is the server's, not one file's. Found the code map's way.
+import codemap  # noqa: E402
+
+for _package, _rows, _layers in codemap.feature_packages():
+    for _name in sorted(os.listdir(os.path.join(HERE, _package))):
+        if _name.endswith(".py"):
+            app_src += "\n" + open(os.path.join(HERE, _package, _name), encoding="utf-8").read()
 FINE = re.compile(r"for\s+\w+\s+in\s+gamedata\.ITEMS\s*:|gamedata\.ITEMS\.(?:values|items)\(\)|len\(gamedata\.ITEMS\)")
 by_id = [line.strip() for line in app_src.splitlines()
          if "gamedata.ITEMS" in line and not line.lstrip().startswith("#")
          and len(re.findall(r"gamedata\.ITEMS", line)) != len(FINE.findall(line))]
-check("app.py looks nothing up in gamedata.ITEMS by id (it walks it, and counts it)", not by_id, by_id)
+check("app.py and its packages look nothing up in gamedata.ITEMS by id (they walk it, and count it)",
+      not by_id, by_id)
 gd_src = open(os.path.join(HERE, "gamedata.py"), encoding="utf-8").read()
 allowed = ("def split_variant", "def item_row", "def roll_quality", "def perfect_id")
 offenders = []

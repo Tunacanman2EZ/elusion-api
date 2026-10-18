@@ -4949,111 +4949,39 @@ def guild_membership(user_id):
 
 
 # =============================================================================
-# PARTIES (game 0.42.0)
+# PARTIES (game 0.42.0) - the parties/ package (since 18 Oct)
 # =============================================================================
-# The owner: "we need to be able to start parties so we need a tab for
-# parties", and of what a party should do: its members in the Party window,
-# "Party chat", "Party on the map". Two to MAX_PARTY_MEMBERS players; the
-# leader invites, removes and hands it on; anybody leaves; down to one, it is
-# gone. Asked, never put in: an invitation waits PARTY_INVITE_SECONDS for an
-# answer, like a guild's but short - a party is made for what you are doing
-# now.
-MAX_PARTY_MEMBERS = 4
-PARTY_INVITE_SECONDS = 120
-# How many invitations one player may have waiting at once.
-MAX_PARTY_INVITES = 8
+# The seven routes, voice's included, the rules (how big, how long an
+# invitation waits) and every write to the three party tables are in parties/;
+# its __init__.py tells what a party is. The routes register at PARTY ROUTES
+# below.
+#
+# WHAT OTHER AREAS ASK STAYS ASKABLE HERE, under the names this file has always
+# called it by: who is in which party (party_membership() - party chat asks),
+# who is in a party (party_member_rows()), the invitations waiting on somebody
+# (_party_invites_to() - the poll asks). All three are the package's own.
+import parties  # noqa: E402
 
 # WHAT PARTY CHAT SAYS TO SOMEBODY WITH NO PARTY, read or written - one
-# sentence, as GUILD_CHAT_NO_GUILD is, saying where to go.
+# sentence, as GUILD_CHAT_NO_GUILD is, saying where to go. Chat's, not the
+# package's: it is a chat refusal.
 PARTY_CHAT_NO_PARTY = "You are not in a party. Open Party to invite somebody, or answer an invite."
 
 
 def party_membership(db, user_id):
     """The caller's party_members row, or None."""
-    return db.execute("SELECT * FROM party_members WHERE user_id = ?",
-                      (int(user_id),)).fetchone()
+    return parties.membership(db, user_id)
 
 
 def party_member_rows(db, party_id):
     """A party's members, the leader first, then by when they joined."""
-    return db.execute(
-        "SELECT m.user_id, m.is_leader, m.joined_at, u.username"
-        "  FROM party_members m JOIN users u ON u.id = m.user_id"
-        " WHERE m.party_id = ? ORDER BY m.is_leader DESC, m.joined_at, m.user_id",
-        (int(party_id),)).fetchall()
-
-
-def party_fix(db, party_id):
-    """After somebody left, was removed or deleted their account: a party of
-    one is no party - it goes - and two or more always have exactly one
-    leader, the longest there. Returns True if the party is gone."""
-    rows = db.execute("SELECT user_id, is_leader FROM party_members WHERE party_id = ?"
-                      " ORDER BY joined_at, user_id", (int(party_id),)).fetchall()
-    if len(rows) <= 1:
-        db.execute("DELETE FROM party_members WHERE party_id = ?", (int(party_id),))
-        db.execute("DELETE FROM parties WHERE id = ?", (int(party_id),))
-        return True
-    leaders = [r for r in rows if int(r["is_leader"] or 0)]
-    if len(leaders) != 1:
-        db.execute("UPDATE party_members SET is_leader = 0 WHERE party_id = ?", (int(party_id),))
-        db.execute("UPDATE party_members SET is_leader = 1 WHERE user_id = ?",
-                   (int(rows[0]["user_id"]),))
-    return False
+    return parties.member_rows(db, party_id)
 
 
 def _party_invites_to(db, user_id, now=None):
-    """Invitations waiting on this player's answer, newest first. A READ, on
-    the poll every ten seconds: the ones run out are skipped here and pruned by
-    the invite route, never deleted from a GET."""
-    now = int(time.time()) if now is None else now
-    return db.execute(
-        "SELECT u.username, i.created_at FROM party_invites i JOIN users u ON u.id = i.from_id"
-        " WHERE i.user_id = ? AND i.created_at > ? ORDER BY i.created_at DESC, i.rowid DESC",
-        (int(user_id), now - PARTY_INVITE_SECONDS)).fetchall()
-
-
-def party_dict(db, party_id, now=None):
-    """A party as the Party window draws it: who is in it and the character
-    each is playing - class, level, area and health, from their save - and
-    whether they are on."""
-    now = int(time.time()) if now is None else now
-    rows = party_member_rows(db, party_id)
-    ids = [int(r["user_id"]) for r in rows]
-    playing = {}
-    seen = {}
-    if ids:
-        marks = ",".join("?" * len(ids))
-        for save in db.execute(
-            "SELECT user_id, name, class_id, level, area, hp, max_hp FROM saves"
-            " WHERE user_id IN (%s) AND slot = %s"
-            % (marks, PLAYING_SLOT_SQL.format(user="saves.user_id")),
-            ids + [now - ONLINE_WINDOW_SECONDS, now],
-        ).fetchall():
-            playing[int(save["user_id"])] = save
-        for row in db.execute(
-            "SELECT user_id, MAX(last_seen_at) AS seen FROM sessions"
-            " WHERE user_id IN (%s) GROUP BY user_id" % marks, ids).fetchall():
-            seen[int(row["user_id"])] = int(row["seen"] or 0)
-    members = []
-    leader = ""
-    for row in rows:
-        save = playing.get(int(row["user_id"]))
-        last = seen.get(int(row["user_id"]), 0)
-        if int(row["is_leader"] or 0):
-            leader = row["username"]
-        members.append({
-            "username": row["username"],
-            "leader": bool(int(row["is_leader"] or 0)),
-            "online": bool(last and now - last <= ONLINE_WINDOW_SECONDS),
-            "character": save["name"] if save is not None else "",
-            "class_id": save["class_id"] if save is not None else "",
-            "level": int(save["level"] or 1) if save is not None else 0,
-            "area": save["area"] if save is not None else "",
-            "hp": int(save["hp"] or 0) if save is not None else 0,
-            "max_hp": int(save["max_hp"] or 0) if save is not None else 0,
-        })
-    return {"id": int(party_id), "leader": leader, "members": members,
-            "size": len(members), "capacity": MAX_PARTY_MEMBERS}
+    """Invitations waiting on this player's answer, newest first - the ones run
+    out skipped. A read, on the poll every ten seconds."""
+    return parties.invites_to(db, user_id, int(time.time()) if now is None else now)
 
 
 def _own_party(db, user_id):
@@ -18710,331 +18638,11 @@ guilds.register(
 
 
 # =============================================================================
-# PARTY ROUTES (game 0.42.0) - see PARTIES
+# PARTY ROUTES (game 0.42.0) - the parties/ package (see PARTIES)
 # =============================================================================
-
-def _party_body(db, user_id, now=None):
-    """GET /api/party's answer, which every party route returns too: your
-    party (or None) and the invitations waiting on you."""
-    now = int(time.time()) if now is None else now
-    seat = party_membership(db, user_id)
-    party = None
-    if seat is not None:
-        # A LEADER WHO DELETED THEIR ACCOUNT took their row with them: the
-        # read puts things right before it answers.
-        if party_fix(db, int(seat["party_id"])):
-            db.commit()
-        elif party_membership(db, user_id) is not None:
-            party = party_dict(db, int(seat["party_id"]), now)
-    invites = [{"from": r["username"], "at": int(r["created_at"] or 0)}
-               for r in _party_invites_to(db, user_id, now)]
-    return {"party": party, "invites": invites,
-            "capacity": MAX_PARTY_MEMBERS, "invite_seconds": PARTY_INVITE_SECONDS}
-
-
-@app.get("/api/party")
-@require_auth
-def party_read():
-    """
-    Your party and the invitations waiting on you
-    ---
-    tags:
-      - Parties
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-    responses:
-      200:
-        description: Your party (null for none), each member's character, and your invitations
-      401:
-        description: Missing, invalid or expired token
-    """
-    db = get_db()
-    body = _party_body(db, int(g.user["id"]))
-    db.commit()
-    return body, 200
-
-
-@app.post("/api/party/invite")
-@require_auth
-def party_invite():
-    """
-    Ask somebody to join your party - or to start one with you
-    ---
-    tags:
-      - Parties
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: who
-        schema:
-          type: object
-          required: [username]
-          properties:
-            username: {type: string}
-    responses:
-      200:
-        description: The invitation is waiting for them
-      400:
-        description: Yourself, already in a party, your party is full, too many waiting, or you are not its leader
-      401:
-        description: Missing, invalid or expired token
-      403:
-        description: They are not taking invitations from you
-      404:
-        description: No such account
-    """
-    payload = request.get_json(silent=True) or {}
-    who = str(payload.get("username", "")).strip()
-    if who == "":
-        return bad_request("username is required")
-    db = get_db()
-    me = int(g.user["id"])
-    target = _user_by_name(who)
-    if target is None:
-        return {"error": "Not Found", "message": "No such account."}, 404
-    if int(target["id"]) == me:
-        return bad_request("you cannot invite yourself")
-    seat = party_membership(db, me)
-    if seat is not None:
-        if not int(seat["is_leader"] or 0):
-            return bad_request("only the party's leader can invite")
-        if len(party_member_rows(db, int(seat["party_id"]))) >= MAX_PARTY_MEMBERS:
-            return bad_request("a party holds %d" % MAX_PARTY_MEMBERS)
-    if party_membership(db, int(target["id"])) is not None:
-        return bad_request("%s is already in a party" % target["username"])
-    if ignores(db, int(target["id"]), me):
-        return {"error": "Forbidden",
-                "message": "%s is not taking party invites from you." % target["username"]}, 403
-    now = int(time.time())
-    db.execute("DELETE FROM party_invites WHERE created_at <= ?", (now - PARTY_INVITE_SECONDS,))
-    waiting = db.execute("SELECT COUNT(*) AS n FROM party_invites WHERE from_id = ? AND user_id != ?",
-                         (me, int(target["id"]))).fetchone()["n"]
-    if int(waiting or 0) >= MAX_PARTY_INVITES:
-        return bad_request("you already have %d invitations waiting" % MAX_PARTY_INVITES)
-    # ASKED AGAIN, ASKED FRESH: a second press restarts the clock rather than
-    # making a second invitation.
-    db.execute("INSERT OR REPLACE INTO party_invites (user_id, from_id, created_at) VALUES (?, ?, ?)",
-               (int(target["id"]), me, now))
-    db.commit()
-    return {"username": target["username"], "state": "invited",
-            "expires_in": PARTY_INVITE_SECONDS}, 200
-
-
-@app.post("/api/party/respond")
-@require_auth
-def party_respond():
-    """
-    Accept or turn down a party invitation
-    ---
-    tags:
-      - Parties
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: answer
-        schema:
-          type: object
-          required: [from, accept]
-          properties:
-            from:   {type: string}
-            accept: {type: boolean}
-    responses:
-      200:
-        description: Joined (or started) their party, or the invitation is gone
-      400:
-        description: You are already in a party, or theirs is full
-      401:
-        description: Missing, invalid or expired token
-      404:
-        description: No invitation from them, or it ran out
-    """
-    payload = request.get_json(silent=True) or {}
-    wanted = str(payload.get("from", "")).strip()
-    accept = bool(payload.get("accept", False))
-    if wanted == "":
-        return bad_request("from is required")
-    db = get_db()
-    me = int(g.user["id"])
-    now = int(time.time())
-    asker = _user_by_name(wanted)
-    invite = None
-    if asker is not None:
-        invite = db.execute(
-            "SELECT * FROM party_invites WHERE user_id = ? AND from_id = ? AND created_at > ?",
-            (me, int(asker["id"]), now - PARTY_INVITE_SECONDS)).fetchone()
-    if invite is None:
-        return {"error": "Not Found", "message": "No invitation from them - it may have run out."}, 404
-    if not accept:
-        # TURNED DOWN SILENTLY, as a guild's or a friend's is.
-        db.execute("DELETE FROM party_invites WHERE user_id = ? AND from_id = ?", (me, int(asker["id"])))
-        db.commit()
-        return {"from": asker["username"], "state": "declined"}, 200
-    if party_membership(db, me) is not None:
-        return bad_request("leave your party first")
-    theirs = party_membership(db, int(asker["id"]))
-    if theirs is None:
-        # THE PARTY IS MADE NOW, with the one who asked leading it.
-        party_id = int(db.execute("INSERT INTO parties (created_at) VALUES (?)", (now,)).lastrowid)
-        db.execute("INSERT INTO party_members (user_id, party_id, is_leader, joined_at) VALUES (?, ?, 1, ?)",
-                   (int(asker["id"]), party_id, now))
-    else:
-        party_id = int(theirs["party_id"])
-        if len(party_member_rows(db, party_id)) >= MAX_PARTY_MEMBERS:
-            return bad_request("that party is full")
-    # IN THE ORDER THEY CAME, to the second and past it: two joining in one
-    # second still have an order, which the leader's hand-on reads.
-    last = db.execute("SELECT MAX(joined_at) AS n FROM party_members WHERE party_id = ?",
-                      (party_id,)).fetchone()["n"]
-    db.execute("INSERT INTO party_members (user_id, party_id, is_leader, joined_at) VALUES (?, ?, 0, ?)",
-               (me, party_id, max(now, int(last or 0) + 1)))
-    # EVERY OTHER INVITATION GOES TOO: they are in a party now.
-    db.execute("DELETE FROM party_invites WHERE user_id = ?", (me,))
-    db.commit()
-    return dict(_party_body(db, me, now), state="joined"), 200
-
-
-@app.post("/api/party/leave")
-@require_auth
-def party_leave():
-    """
-    Leave your party
-    ---
-    tags:
-      - Parties
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-    responses:
-      200:
-        description: You are out - and the party is gone if one was left
-      401:
-        description: Missing, invalid or expired token
-      404:
-        description: You are not in a party
-    """
-    db = get_db()
-    me = int(g.user["id"])
-    seat = party_membership(db, me)
-    if seat is None:
-        return {"error": "Not Found", "message": "You are not in a party."}, 404
-    db.execute("DELETE FROM party_members WHERE user_id = ?", (me,))
-    db.execute("DELETE FROM party_invites WHERE from_id = ?", (me,))
-    # A LEADER LEAVING HANDS IT ON to the longest there; the last but one
-    # leaving takes it down.
-    gone = party_fix(db, int(seat["party_id"]))
-    db.commit()
-    return dict(_party_body(db, me), state="left", disbanded=gone), 200
-
-
-@app.post("/api/party/kick")
-@require_auth
-def party_kick():
-    """
-    Remove somebody from your party (its leader only)
-    ---
-    tags:
-      - Parties
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: who
-        schema:
-          type: object
-          required: [username]
-          properties:
-            username: {type: string}
-    responses:
-      200:
-        description: They are out
-      400:
-        description: Yourself - leave instead
-      401:
-        description: Missing, invalid or expired token
-      404:
-        description: You lead no party, or they are not in it
-    """
-    payload = request.get_json(silent=True) or {}
-    who = str(payload.get("username", "")).strip()
-    db = get_db()
-    me = int(g.user["id"])
-    seat = party_membership(db, me)
-    if seat is None or not int(seat["is_leader"] or 0):
-        return {"error": "Not Found", "message": "You are not leading a party."}, 404
-    target = _user_by_name(who) if who else None
-    theirs = party_membership(db, int(target["id"])) if target is not None else None
-    if theirs is None or int(theirs["party_id"]) != int(seat["party_id"]):
-        return {"error": "Not Found", "message": "They are not in your party."}, 404
-    if int(target["id"]) == me:
-        return bad_request("leave the party instead")
-    db.execute("DELETE FROM party_members WHERE user_id = ?", (int(target["id"]),))
-    gone = party_fix(db, int(seat["party_id"]))
-    db.commit()
-    return dict(_party_body(db, me), state="removed", disbanded=gone), 200
-
-
-@app.post("/api/party/lead")
-@require_auth
-def party_lead():
-    """
-    Hand your party on to somebody in it (its leader only)
-    ---
-    tags:
-      - Parties
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: who
-        schema:
-          type: object
-          required: [username]
-          properties:
-            username: {type: string}
-    responses:
-      200:
-        description: They lead it now
-      401:
-        description: Missing, invalid or expired token
-      404:
-        description: You lead no party, or they are not in it
-    """
-    payload = request.get_json(silent=True) or {}
-    who = str(payload.get("username", "")).strip()
-    db = get_db()
-    me = int(g.user["id"])
-    seat = party_membership(db, me)
-    if seat is None or not int(seat["is_leader"] or 0):
-        return {"error": "Not Found", "message": "You are not leading a party."}, 404
-    target = _user_by_name(who) if who else None
-    theirs = party_membership(db, int(target["id"])) if target is not None else None
-    if theirs is None or int(theirs["party_id"]) != int(seat["party_id"]):
-        return {"error": "Not Found", "message": "They are not in your party."}, 404
-    db.execute("UPDATE party_members SET is_leader = 0 WHERE party_id = ?", (int(seat["party_id"]),))
-    db.execute("UPDATE party_members SET is_leader = 1 WHERE user_id = ?", (int(target["id"]),))
-    db.commit()
-    return dict(_party_body(db, me), state="handed"), 200
+# /api/party and its five actions, and /api/party/voice, as they were here -
+# endpoint names, docstrings and every message (routes.lock). Registered below
+# PARTY VOICE, which hands them the relay.
 
 
 # =============================================================================
@@ -19057,12 +18665,16 @@ def party_lead():
 #
 # ELUSION_VOICE_DIRECT=on is for a test on one computer: no relay, every
 # address allowed. Never on a public server.
+#
+# THE ROUTE AND ITS RULES ARE parties/'s (GET /api/party/voice, how long a
+# player's credentials are reused, how often the relay may be asked). WHAT
+# STAYS HERE is the server's side of it: the TURN key, read from the settings
+# (voice_settings()), and the one call out to Cloudflare that uses it
+# (_turn_fetch()) - handed to the package, which passes the key straight from
+# one to the other and keeps nothing - and the credentials handed out, kept
+# per process in the two dicts below.
 VOICE_TURN_URL = "https://rtc.live.cloudflare.com/v1/turn/keys/%s/credentials/generate-ice-servers"
-VOICE_TURN_TTL = 24 * 3600
-# A player's credentials are handed out again while they have this long left.
-VOICE_TURN_REUSE_SECONDS = 12 * 3600
 VOICE_TURN_TIMEOUT = 6
-VOICE_FETCHES_PER_HOUR = 30
 VOICE_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 # user_id -> (expires_at, ice_servers); and user_id -> [times it asked the relay].
 _voice_issued = {}
@@ -19103,95 +18715,30 @@ def _turn_fetch(key_id, token, ttl):
     return data.get("iceServers") if isinstance(data, dict) else None
 
 
-def clean_ice_servers(servers):
-    """Only what a browser needs from the relay's answer, checked: STUN and
-    TURN addresses (none on port 53, which browsers block - Cloudflare's
-    advice), with the username and password the TURN ones need."""
-    if isinstance(servers, dict):
-        servers = [servers]
-    if not isinstance(servers, list):
-        return []
-    out = []
-    for entry in servers[:8]:
-        if not isinstance(entry, dict):
-            continue
-        urls = entry.get("urls")
-        urls = [urls] if isinstance(urls, str) else urls
-        if not isinstance(urls, list):
-            continue
-        kept = [u for u in urls[:12] if isinstance(u, str) and len(u) <= 200
-                and re.match(r"^(stun|turn|turns):[A-Za-z0-9.:-]+(\?transport=(udp|tcp))?$", u)
-                and not re.search(r":53(\?|$)", u)]
-        if not kept:
-            continue
-        item = {"urls": kept}
-        if any(u.startswith("turn") for u in kept):
-            user, cred = entry.get("username"), entry.get("credential")
-            if not isinstance(user, str) or not isinstance(cred, str) or not user or not cred \
-                    or len(user) > 512 or len(cred) > 512:
-                continue
-            item["username"], item["credential"] = user, cred
-        out.append(item)
-    return out
+# Named here as well, for test_voice.py and anything else that reads them off
+# this module; parties/services.py is where they are set.
+VOICE_TURN_TTL = parties.VOICE_TURN_TTL
+VOICE_TURN_REUSE_SECONDS = parties.VOICE_TURN_REUSE_SECONDS
+VOICE_FETCHES_PER_HOUR = parties.VOICE_FETCHES_PER_HOUR
+clean_ice_servers = parties.clean_ice_servers
 
-
-@app.get("/api/party/voice")
-@require_auth
-def party_voice():
-    """
-    The relay a party's voice call goes through - for somebody in a party
-    ---
-    tags:
-      - Parties
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-    responses:
-      200:
-        description: '{"ice_servers": [...], "policy": "relay", "expires_at": t}'
-      401:
-        description: Missing, invalid or expired token
-      409:
-        description: You are in no party
-      429:
-        description: Asked for too many relays this hour
-      502:
-        description: The relay did not answer
-      503:
-        description: Voice is not set up on this server
-    """
-    db = get_db()
-    me = int(g.user["id"])
-    if party_membership(db, me) is None:
-        return {"error": "Conflict", "message": "Voice is for parties: invite somebody first."}, 409
-    mode, key_id, token = voice_settings()
-    if mode == "direct":
-        return {"ice_servers": [], "policy": "all", "expires_at": 0}, 200
-    if mode != "relay":
-        return {"error": "Service Unavailable",
-                "message": "Voice is not set up on this server yet."}, 503
-    now = int(time.time())
-    with _voice_lock:
-        issued = _voice_issued.get(me)
-        if issued is not None and issued[0] - now >= VOICE_TURN_REUSE_SECONDS:
-            return {"ice_servers": issued[1], "policy": "relay", "expires_at": issued[0]}, 200
-        asks = [t for t in _voice_asks.get(me, []) if t > now - 3600]
-        if len(asks) >= VOICE_FETCHES_PER_HOUR:
-            _voice_asks[me] = asks
-            return {"error": "Too Many Requests",
-                    "message": "Voice was switched on a lot this hour. Try again later."}, 429
-        asks.append(now)
-        _voice_asks[me] = asks
-    servers = clean_ice_servers(_turn_fetch(key_id, token, VOICE_TURN_TTL))
-    if not any("username" in s for s in servers):
-        return {"error": "Bad Gateway", "message": "The voice relay did not answer. Try again in a minute."}, 502
-    expires = now + VOICE_TURN_TTL
-    with _voice_lock:
-        _voice_issued[me] = (expires, servers)
-    return {"ice_servers": servers, "policy": "relay", "expires_at": expires}, 200
+parties.register(
+    app,
+    require_auth=require_auth,
+    get_db=get_db,
+    bad_request=bad_request,
+    find_user=_user_by_name,
+    ignores=ignores,
+    playing_slot_sql=PLAYING_SLOT_SQL,
+    online_window=ONLINE_WINDOW_SECONDS,
+    voice_settings=voice_settings,
+    # LOOKED UP ON EACH CALL, so test_voice.py's stand-in for the relay is the
+    # one asked: it replaces this module's _turn_fetch.
+    turn_fetch=lambda key_id, token, ttl: _turn_fetch(key_id, token, ttl),
+    voice_issued=_voice_issued,
+    voice_asks=_voice_asks,
+    voice_lock=_voice_lock,
+)
 
 
 @app.get("/api/economy/kingdom")
@@ -21613,7 +21160,10 @@ loot.register(
     lusions_item_id=LUSIONS_ITEM_ID,
     # Asked on each take: the catalogue's constant.
     dupe_pet_lusions=lambda: int(gamedata.CONSTANTS.get("dupe_pet_lusions", 20)),
-    gold_item_value=gold_item_value,
+    # LOOKED UP ON EACH TAKE: test_concurrency.py holds this module's
+    # gold_item_value open to widen the race the write lock closes, and a
+    # function handed in once would be the one it never slowed.
+    gold_item_value=lambda item_id: gold_item_value(item_id),
     gold_delta=gold_delta,
     lusion_delta=lusion_delta,
     ensure_account=_ensure_account,

@@ -753,14 +753,14 @@ with "Party chat" and "Party on the map".
   (120) and is pruned on read; `MAX_PARTY_INVITES` (8) waiting from one player;
   only the leader asks once there is a party; nobody in a party can be asked
   into another; somebody who ignores you refuses your invitations (403).
-  `party_fix()` after every leave, removal or deleted account: one left and the
-  party is gone; two or more always have exactly one leader, the longest there
-  (`joined_at` kept strictly increasing within a second).
+  `fix()` (parties/data.py) after every leave, removal or deleted account: one
+  left and the party is gone; two or more always have exactly one leader, the
+  longest there (`joined_at` kept strictly increasing within a second).
 - **Routes**: `GET /api/party` (your party - each member's playing character:
   class, level, area, hp, max_hp, online - and invitations waiting on you),
   `POST /api/party/invite {username}`, `respond {from, accept}`, `leave`,
   `kick {username}` and `lead {username}` (leader only). Every route answers
-  with the whole party again (`_party_body()`).
+  with the whole party again (`party_body()` in parties/routes.py).
 - **The broadcast poll** carries `party` (`_own_party()`: id, leader, member
   names) and `asks.party` (count, newest asker, at); `chat_news.party` is the
   newest party line somebody else said.
@@ -780,13 +780,14 @@ browser's own calling through Cloudflare's TURN relay.
 - **The sound never comes here.** Each game in a party calls each other one
   (WebRTC, a mesh of at most four) through the TURN relay, told to use the
   relay and nothing else (`iceTransportPolicy: "relay"`), so nobody learns an
-  address. `GET /api/party/voice` (`party_voice()`, PARTY VOICE) hands a party
+  address. `GET /api/party/voice` (parties/, `party_voice()`) hands a party
   member the relay's short-lived credentials, made from the server's TURN key
   (`ELUSION_TURN_KEY_ID`, `ELUSION_TURN_KEY_TOKEN`) by asking Cloudflare
   (`_turn_fetch()`, a seam). A day's credentials, handed out again while 12
   hours are left; at most `VOICE_FETCHES_PER_HOUR` asks of the relay per
-  player. What the relay answers is checked (`clean_ice_servers()`: STUN and
-  TURN addresses only, none on port 53, TURN ones only with their password).
+  player. What the relay answers is checked (parties/services.py
+  `clean_ice_servers()`: STUN and TURN addresses only, none on port 53, TURN
+  ones only with their password).
   No key: 503, "not set up". `ELUSION_VOICE_DIRECT=on` - a test on one
   computer - hands out no relay and allows direct calls; never live.
 - **Who may pass a call's setup to whom** is presence.py's (PARTY VOICE): `vs`
@@ -1994,7 +1995,11 @@ only, `test_stats.py`.
   two routes and its SQL; a new bag is still made in the kill's commit) and
   `guilds/` (18 Oct: all ten routes, staff's two included, and every write to
   the four guild tables; `guild_membership()` and `guild_tag()` stay callable
-  in app.py for chat, the poll and the boards).
+  in app.py for chat, the poll and the boards) and `parties/` (18 Oct: the
+  seven routes, voice's included; the TURN key and the call to Cloudflare stay
+  in app.py and are handed in). **A name a suite replaces on app.py**
+  (`_turn_fetch`, `gold_item_value`) **is handed in as a lambda that looks it
+  up**, or the suite's stand-in is never asked.
   **`routes.lock`, held by
   `test_routes.py`,** is the promise that a move changes nothing outside:
   every route's method, path, endpoint name, login, rank, password-again,

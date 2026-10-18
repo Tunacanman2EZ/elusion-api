@@ -7,7 +7,7 @@ it follows the same road.
 
 ## Where it stands
 
-`app.py` is about 21,900 lines: the shared core (config, the database and its
+`app.py` is about 21,400 lines: the shared core (config, the database and its
 write lock, sessions and tokens, the auth decorators, rate limiting, request
 timing) and most of the game's areas, one after another. It works, and every
 area is covered by its own suite, but one file that size has a cost that grows:
@@ -26,6 +26,7 @@ Beside it, **feature packages**: a folder per area, each in three layers.
 | `gathering/` | 18 Oct | **moved out** of app.py: fishing and cooking |
 | `loot/` | 18 Oct | **moved out** of app.py: the loot bag |
 | `guilds/` | 18 Oct | **moved out** of app.py: guilds, staff's two guild routes too |
+| `parties/` | 18 Oct | **moved out** of app.py: parties and party voice |
 
 ## Where it is going
 
@@ -44,6 +45,12 @@ area, handing each package what it needs. Every area in a package of its own.
   (`_presence_for()`), how a person is shown (`friend_entry()`), the limits
   that are this file's tunables (asked through a callable, so a suite can turn
   them down).
+- **A seam a suite replaces is handed as a lookup.** Where a suite swaps or
+  slows one of app.py's names (`_turn_fetch`, `gold_item_value`), the package
+  is handed `lambda ...: name(...)`, so the swap is heard on every call. A
+  function handed in once is one the suite never touches - which is how
+  test_concurrency's hold stopped reaching the loot take, still passing, until
+  it was found on 18 Oct.
 - **A moved route keeps its endpoint name** (`add_url_rule(..., endpoint=...)`)
   - rate limiting, request timing and `/api/staff/powers` key on it - **and its
   docstring**, which is its page in `/apidocs`.
@@ -78,7 +85,11 @@ checked, not hoped:
    app.py's SOURCE** for a rule (every kind logged is a listed kind, nothing
    picks a save by recency): code moved out of app.py is code they stop
    seeing. Each must read the packages too - found the code map's way - and
-   a sabotage in the package must fail it. Guilds needed three (18 Oct).
+   a sabotage in the package must fail it. Guilds needed three; two more -
+   the per-user write scan (test_ownership) and the item-lookup rule
+   (test_quality) - were found a move late, with parties (18 Oct). **And
+   look for suites that replace one of app.py's names** (`app_module.x = `,
+   `held_open(app_module, ...)`): see the seam rule above.
 2. Make the package: `__init__.py` (what it is, its routes), `routes.py`,
    `services.py`, `data.py`.
 3. Move the routes **as they are** - docstrings, messages, status codes - and
@@ -114,7 +125,12 @@ areas that hold money and items:
    kingdom board), and ask through `guild_membership()` and `guild_tag()`,
    which are the package's `membership()` and `guild_tag()` under their old
    names. Guild chat stays with chat (6).
-5. parties and party voice
+5. ~~parties and party voice~~ (18 Oct): all seven routes and every write to
+   the three party tables. The TURN key (`voice_settings()`) and the call to
+   Cloudflare (`_turn_fetch()`) stay in app.py and are handed in - a server
+   setting and the server's one outside call, which test_voice replaces - and
+   so do the credentials handed out, kept per process. Party chat stays with
+   chat (6), the poll's view of a party (`_own_party()`) with the poll.
 6. chat: world chat, channels, pictures, the ignore list's routes
 7. trade and the kingdom tax
 8. the stirring lands (`world/`) - combat asks it what a kill pays

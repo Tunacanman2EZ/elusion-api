@@ -1,7 +1,7 @@
 """The feature packages stand on their own (game 0.50.0).
 
 Every feature package (ARCHITECTURE.md) - playerstats/, events/, insights/,
-and killrecord/, friends/, gathering/, loot/ and guilds/, taken out of app.py - is built the BE105 way: each has a
+and killrecord/, friends/, gathering/, loot/, guilds/ and parties/, taken out of app.py - is built the BE105 way: each has a
 register(app, ...) that is HANDED the app, its login checks and its database,
 and never imports app.py. The source of each is checked for that elsewhere
 (test_stats.py); this RUNS them without it - the "application factory"
@@ -39,6 +39,7 @@ import events  # noqa: E402
 import friends  # noqa: E402
 import gathering  # noqa: E402
 import guilds  # noqa: E402
+import parties  # noqa: E402
 import loot  # noqa: E402
 import insights  # noqa: E402
 import killrecord  # noqa: E402
@@ -47,7 +48,7 @@ import playerstats  # noqa: E402
 # Found, not listed: what app.py imports that has a routes.py (codemap.py).
 PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
 # The ones this file registers on its bare apps, below.
-RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds")
+RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds", "parties")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -117,7 +118,12 @@ def bare_app(name):
         "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, role TEXT, created_at INTEGER, name_hue INTEGER);"
         "CREATE TABLE saves (user_id INTEGER, slot INTEGER, class_id TEXT, level INTEGER, area TEXT, updated_at INTEGER,"
         " last_cast_at INTEGER NOT NULL DEFAULT 0, cast_tokens REAL NOT NULL DEFAULT 6.0,"
-        " gold INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL DEFAULT '');"
+        " gold INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL DEFAULT '', hp INTEGER NOT NULL DEFAULT 0,"
+        " max_hp INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE parties (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER);"
+        "CREATE TABLE party_members (user_id INTEGER PRIMARY KEY, party_id INTEGER, is_leader INTEGER DEFAULT 0,"
+        " joined_at INTEGER);"
+        "CREATE TABLE party_invites (user_id INTEGER, from_id INTEGER, created_at INTEGER, PRIMARY KEY (user_id, from_id));"
         "CREATE TABLE sessions (user_id INTEGER, last_seen_at INTEGER);"
         "CREATE TABLE guilds (id INTEGER PRIMARY KEY, name TEXT, folded TEXT UNIQUE, founded_by TEXT, created_at INTEGER);"
         "CREATE TABLE guild_members (user_id INTEGER PRIMARY KEY, guild_id INTEGER, rank TEXT, joined_at INTEGER);"
@@ -324,6 +330,27 @@ def bare_app(name):
                     # account seen within the window - the two ? are app.py's.
                     playing_slot_sql="(SELECT MIN(slot) FROM saves s2 WHERE s2.user_id = {user} AND ? < ?)",
                     online_window=45)
+
+    # parties/: the relay is a stand-in that counts how often it is asked; the
+    # TURN key comes from app.config, so a check can take it away.
+    relay = app.config.setdefault("relay", {"mode": "relay", "asked": 0})
+
+    def turn_fetch(_key_id, _token, ttl):
+        relay["asked"] += 1
+        relay["ttl"] = ttl
+        return [{"urls": ["stun:stun.example.com:3478", "stun:stun.example.com:53"]},
+                {"urls": ["turn:turn.example.com:3478?transport=udp"], "username": "u", "credential": "c"}]
+
+    import threading
+    parties.register(app, require_auth=require_auth, get_db=get_db,
+                     bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+                     find_user=find_user,
+                     # bo ignores ann, as for friends.
+                     ignores=lambda _db, a, b: (a, b) == (3, 2),
+                     playing_slot_sql="(SELECT MIN(slot) FROM saves s2 WHERE s2.user_id = {user} AND ? < ?)",
+                     online_window=45,
+                     voice_settings=lambda: (relay["mode"], "keyid", "token") if relay["mode"] else ("", "", ""),
+                     turn_fetch=turn_fetch, voice_issued={}, voice_asks={}, voice_lock=threading.Lock())
     return app, said, logged, path
 
 
@@ -358,7 +385,8 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/fishing/catch", "/api/cooking/cook", "/api/loot/take", "/api/loot/bag",
                        "/api/guild", "/api/guild/create", "/api/guild/invite", "/api/guild/respond", "/api/guild/leave",
                        "/api/guild/kick", "/api/guild/rank", "/api/guild/disband", "/api/staff/guild",
-                       "/api/guild/list"]), rules)
+                       "/api/guild/list", "/api/party", "/api/party/invite", "/api/party/respond",
+                       "/api/party/leave", "/api/party/kick", "/api/party/lead", "/api/party/voice"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -634,14 +662,73 @@ code, body = guild_post("ann", "/api/guild/disband", {})
 check("the leader takes it down: both out, and the guild gone",
       code == 200 and body.get("members_removed") == 2 and guild_of("bo").get("in_guild") is False
       and client_a.get("/api/guild/list", headers=who("boss")).get_json()["guilds"] == [], body)
+
+
+def party_post(as_who, path, body):
+    res = client_a.post(path, headers=who(as_who), json=body)
+    return res.status_code, res.get_json() or {}
+
+
+def party_of(as_who):
+    return client_a.get("/api/party", headers=who(as_who)).get_json() or {}
+
+
+check("parties: bo ignores ann, so her invitation is the 403 it was - the ignore list handed in",
+      party_post("ann", "/api/party/invite", {"username": "bo"})
+      == (403, {"error": "Forbidden", "message": "bo is not taking party invites from you."}))
+code, body = party_post("boss", "/api/party/invite", {"username": "ann"})
+check("  boss asks ann, and she sees it waiting",
+      code == 200 and body.get("expires_in") == parties.services.PARTY_INVITE_SECONDS
+      and [i["from"] for i in party_of("ann").get("invites", [])] == ["boss"], body)
+code, body = party_post("ann", "/api/party/respond", {"from": "boss", "accept": True})
+members = (body.get("party") or {}).get("members", [])
+check("  she says yes: the party is made with boss leading, and her on it as she plays, online",
+      code == 200 and body.get("state") == "joined"
+      and [(m["username"], m["leader"], m["online"], m["character"]) for m in members]
+      == [("boss", True, False, ""), ("ann", False, True, "Ann")], body)
+check("  only the leader invites",
+      party_post("ann", "/api/party/invite", {"username": "bo"})
+      == (400, {"error": "Bad Request", "message": "only the party's leader can invite"}))
+code, body = party_post("boss", "/api/party/lead", {"username": "ann"})
+check("  boss hands it on to ann", code == 200 and body.get("party", {}).get("leader") == "ann", body)
+check("  and no longer leading, he cannot remove anybody",
+      party_post("boss", "/api/party/kick", {"username": "ann"})
+      == (404, {"error": "Not Found", "message": "You are not leading a party."}))
+code, body = party_post("ann", "/api/party/kick", {"username": "boss"})
+check("  ann removes him: down to one, the party is gone",
+      code == 200 and body.get("disbanded") is True and body.get("party") is None
+      and party_of("boss").get("party") is None, body)
+check("  and an answer to nobody's invitation is the 404 it was",
+      party_post("ann", "/api/party/respond", {"from": "bo", "accept": True})
+      == (404, {"error": "Not Found", "message": "No invitation from them - it may have run out."}))
+check("party voice: in no party, the 409 it was",
+      client_a.get("/api/party/voice", headers=who("ann")).get_json()
+      == {"error": "Conflict", "message": "Voice is for parties: invite somebody first."})
+party_post("boss", "/api/party/invite", {"username": "ann"})
+party_post("ann", "/api/party/respond", {"from": "boss", "accept": True})
+relay = app_a.config["relay"]
+body = client_a.get("/api/party/voice", headers=who("ann")).get_json() or {}
+urls = [u for server in body.get("ice_servers", []) for u in server["urls"]]
+check("  in one: the relay handed in is asked once, for a day, and port 53 is dropped from its answer",
+      body.get("policy") == "relay" and relay["asked"] == 1 and relay["ttl"] == parties.VOICE_TURN_TTL
+      and "stun:stun.example.com:53" not in urls and "turn:turn.example.com:3478?transport=udp" in urls
+      and body.get("expires_at", 0) - time.time() > 23 * 3600, (body, relay))
+again = client_a.get("/api/party/voice", headers=who("ann")).get_json() or {}
+check("  asked again, the same credentials, and the relay is not asked twice",
+      again.get("ice_servers") == body.get("ice_servers") and relay["asked"] == 1, relay)
+relay["mode"] = ""
+check("  and with no TURN key in the settings handed in, the 503 it was",
+      client_a.get("/api/party/voice", headers=who("boss")).get_json()
+      == {"error": "Service Unavailable", "message": "Voice is not set up on this server yet."})
 check("  and nobody without a login gets in anywhere",
       [client_a.get(path).status_code for path in ("/api/server/stats", "/api/world/events/active", "/api/server/insights",
                                                   "/api/kills?slot=0", "/api/kills/everyone", "/api/friends",
-                                                  "/api/loot/bag?bag_id=%s" % bag, "/api/guild", "/api/guild/list")]
+                                                  "/api/loot/bag?bag_id=%s" % bag, "/api/guild", "/api/guild/list",
+                                                  "/api/party", "/api/party/voice")]
       + [client_a.post(path, json={"slot": 0}).status_code for path in ("/api/fishing/catch", "/api/cooking/cook",
                                                                          "/api/loot/take", "/api/guild/create",
-                                                                         "/api/staff/guild")]
-      == [401] * 14)
+                                                                         "/api/staff/guild", "/api/party/invite")]
+      == [401] * 17)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")
@@ -667,7 +754,8 @@ for path in (path_a, path_b):
 # =============================================================================
 section("P-4  every package is here")
 check("the code map finds the packages app.py imports: %s" % ", ".join(PACKAGES),
-      set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds"},
+      set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds",
+                        "parties"},
       PACKAGES)
 check("  and every one of them runs on a bare app in this file", set(PACKAGES) == set(RUN_HERE),
       sorted(set(PACKAGES) ^ set(RUN_HERE)))
