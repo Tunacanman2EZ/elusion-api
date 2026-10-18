@@ -1,8 +1,8 @@
 """The feature packages stand on their own (game 0.50.0).
 
 Every feature package (ARCHITECTURE.md) - playerstats/, events/, insights/,
-and killrecord/, friends/, gathering/, loot/, guilds/, parties/, chat/, trade/, kingdom/, world/, moderation/ and
-staffdesk/, taken out of app.py - is built the BE105 way: each has a
+and killrecord/, friends/, gathering/, loot/, guilds/, parties/, chat/, trade/, kingdom/, world/, moderation/,
+staffdesk/, equipment/ and consuming/, taken out of app.py - is built the BE105 way: each has a
 register(app, ...) that is HANDED the app, its login checks and its database,
 and never imports app.py. The source of each is checked for that elsewhere
 (test_stats.py); this RUNS them without it - the "application factory"
@@ -23,6 +23,7 @@ lesson's "two app instances from the same code", where it pays off here:
 
 Run: python test_packages.py
 """
+import json
 import os
 import re
 import sqlite3
@@ -43,6 +44,8 @@ import gathering  # noqa: E402
 import guilds  # noqa: E402
 import parties  # noqa: E402
 import chat  # noqa: E402
+import consuming  # noqa: E402
+import equipment  # noqa: E402
 import loot  # noqa: E402
 import moderation  # noqa: E402
 import insights  # noqa: E402
@@ -57,7 +60,7 @@ import world  # noqa: E402
 PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
 # The ones this file registers on its bare apps, below.
 RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds", "parties",
-            "chat", "trade", "kingdom", "world", "moderation", "staffdesk")
+            "chat", "trade", "kingdom", "world", "moderation", "staffdesk", "equipment", "consuming")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -151,7 +154,10 @@ def bare_app(name):
         "CREATE TABLE saves (user_id INTEGER, slot INTEGER, class_id TEXT, level INTEGER, area TEXT, updated_at INTEGER,"
         " last_cast_at INTEGER NOT NULL DEFAULT 0, cast_tokens REAL NOT NULL DEFAULT 6.0,"
         " gold INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL DEFAULT '', hp INTEGER NOT NULL DEFAULT 0,"
-        " max_hp INTEGER NOT NULL DEFAULT 0);"
+        " max_hp INTEGER NOT NULL DEFAULT 0, mana INTEGER NOT NULL DEFAULT 0, max_mana INTEGER NOT NULL DEFAULT 0,"
+        " equipment TEXT NOT NULL DEFAULT '{}');"
+        "CREATE TABLE consume_grants (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, slot INTEGER, item_id TEXT,"
+        " target TEXT NOT NULL DEFAULT '', amount INTEGER NOT NULL DEFAULT 0, at INTEGER);"
         "CREATE TABLE parties (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER);"
         "CREATE TABLE party_members (user_id INTEGER PRIMARY KEY, party_id INTEGER, is_leader INTEGER DEFAULT 0,"
         " joined_at INTEGER);"
@@ -584,11 +590,76 @@ def bare_app(name):
         log_staff_action=write_log, online_window=45, playing_slot=playing_slot,
         linked_accounts=lambda _db, user_id: ([{"username": "bo", "strength": "strong"}], False),
         crowded_at=6, row_int=lambda row, column: int(row[column] or 0) if column in row.keys() else 0)
+
+    # equipment/ and consuming/: the bag is the same four cells; the catalogue
+    # is a stand-in that knows a robe, a sword, a crown that needs level 9, and
+    # the potions; a character's maxima are 100 hp, and 20 more in the robe.
+    def take_from(user_id, slot, item_id, quantity, prefer=None):
+        app.config.setdefault("preferred", []).append(prefer)
+        return take(user_id, slot, item_id, quantity)
+
+    def maxima(row):
+        worn = row["equipment"]
+        return {"max_hp": 120 if "cobaltrobe" in worn else 100, "max_mana": 50}
+
+    cell = lambda payload, capacity: (payload.get("position"), None)  # noqa: E731
+    equipment.register(
+        app, require_auth=require_auth, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+        parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None, max_slot=3,
+        parse_cell=cell, carry_capacity=GATHER_CELLS, equip_slots=("chest", "head", "weapon"),
+        catalogue=GearCatalogue, derived_stats=maxima, take_from_backpack=take_from, add_to_backpack=add,
+        inventory_of=lambda user_id, slot: [{"position": p, "item_id": i, "quantity": q}
+                                            for p, (i, q) in sorted(carried(user_id, slot).items())])
+    consuming.register(
+        app, require_auth=require_auth, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+        parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None, max_slot=3,
+        parse_cell=cell, carry_capacity=GATHER_CELLS, catalogue=GearCatalogue,
+        skills_of=lambda user_id, slot: {"cooking": {"level": 2, "xp": 0}}, valid_skills={"cooking"},
+        take_from_backpack=take_from,
+        inventory_of=lambda user_id, slot: [{"position": p, "item_id": i, "quantity": q}
+                                            for p, (i, q) in sorted(carried(user_id, slot).items())])
     return app, said, logged, path
 
 
 # A four-cell bag for gathering/'s stand-ins.
 GATHER_CELLS = 4
+
+
+class GearCatalogue:
+    """What equipment/ and consuming/ ask of gamedata: where a piece goes,
+    whether this character may wear it, whether they may use a consumable,
+    and what it restores."""
+    SLOTS = {"cobaltrobe": "chest", "ironsword": "weapon", "crownhelm": "head"}
+    NEEDS = {"crownhelm": 9}
+    KNOWN = set(SLOTS) | {"pebble", "smallhealthpotion", "elixir", "chefsoup"}
+
+    @staticmethod
+    def equip_slot_for(item_id):
+        return GearCatalogue.SLOTS.get(item_id, "")
+
+    @staticmethod
+    def has_item(item_id):
+        return item_id in GearCatalogue.KNOWN
+
+    @staticmethod
+    def equip_check(item_id, target, class_id, level):
+        if level < GearCatalogue.NEEDS.get(item_id, 0):
+            return {"ok": False, "reason": "level", "needs": GearCatalogue.NEEDS[item_id]}
+        return {"ok": True}
+
+    @staticmethod
+    def consume_check(item_id, level, levels, known_skills=None):
+        if item_id == "elixir":
+            return {"ok": False, "reason": "level", "needs": 30}
+        if item_id == "chefsoup":
+            return {"ok": levels.get("cooking", 1) >= 5, "reason": "skill", "skill": "cooking", "needs": 5}
+        return {"ok": item_id == "smallhealthpotion", "reason": "nottype"}
+
+    @staticmethod
+    def restore_for(item_id):
+        return "hp", 25
 
 
 class TradeCatalogue:
@@ -658,7 +729,8 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/staff/role", "/api/chat/report", "/api/report/player", "/api/staff/reports",
                        "/api/staff/reports/resolve", "/api/staff/mute", "/api/staff/unmute",
                        "/api/staff/users", "/api/staff/actions", "/api/staff/note",
-                       "/api/staff/user/<username>"]), rules)
+                       "/api/staff/user/<username>", "/api/character/equip", "/api/character/unequip",
+                       "/api/character/consume"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -1489,6 +1561,82 @@ conn = sqlite3.connect(path_a)
 conn.execute("UPDATE users SET role = 'player' WHERE id = 3")
 conn.commit()
 conn.close()
+def gear(path, body):
+    res = client_a.post(path, headers=who("ann"), json=dict({"slot": 0}, **body))
+    return res.status_code, res.get_json() or {}
+
+
+def ann_row(column):
+    conn = sqlite3.connect(path_a)
+    value = conn.execute("SELECT %s FROM saves WHERE user_id = 2 AND slot = 0" % column).fetchone()[0]
+    conn.close()
+    return value
+
+
+conn = sqlite3.connect(path_a)
+conn.execute("DELETE FROM carry_items WHERE user_id = 2")
+conn.executemany("INSERT INTO carry_items VALUES (2, 0, ?, ?, ?)",
+                 [(0, "cobaltrobe", 1), (1, "smallhealthpotion", 2), (2, "crownhelm", 1)])
+conn.execute("UPDATE saves SET hp = 150, max_hp = 150, mana = 40, max_mana = 50, equipment = '{}'"
+             " WHERE user_id = 2 AND slot = 0")
+conn.commit()
+conn.close()
+code, body = gear("/api/character/equip", {"item_id": "cobaltrobe", "position": 0})
+check("equipment: ann puts on the robe - taken from the cell she used, through the grant handed in",
+      code == 200 and body.get("equip_slot") == "chest" and body.get("equipment") == {"chest": "cobaltrobe"}
+      and body.get("unequipped") == "" and "cobaltrobe" not in [c["item_id"] for c in body.get("inventory", [])]
+      and json.loads(ann_row("equipment")) == {"chest": "cobaltrobe"} and app_a.config["preferred"][-1] == 0, body)
+check("  her ceilings are what is now worn - by the maxima handed in - and her hp is brought down to them",
+      body.get("stats") == {"hp": 120, "max_hp": 120, "mana": 40, "max_mana": 50}, body.get("stats"))
+check("  the catalogue's no is the 403 it was: too low a level, and something that is not gear",
+      gear("/api/character/equip", {"item_id": "crownhelm"})
+      == (403, {"error": "Forbidden", "message": "That needs level 9.", "needs": 9})
+      and gear("/api/character/equip", {"item_id": "pebble"}) == (403, {"error": "Forbidden",
+                                                                      "message": "That is not equipment."}))
+check("  and what she does not carry, or nothing at all, the 404 and 400 they were",
+      gear("/api/character/equip", {"item_id": "ironsword"})
+      == (404, {"error": "Not Found", "message": "You are not carrying that."})
+      and gear("/api/character/equip", {"item_id": "nothing"})
+      == (400, {"error": "Bad Request", "message": "No such item 'nothing'."}))
+conn = sqlite3.connect(path_a)
+conn.execute("INSERT INTO carry_items VALUES (2, 0, 0, 'pebble', 1)")
+conn.execute("INSERT INTO carry_items VALUES (2, 0, 3, 'pebble', 1)")
+conn.commit()
+conn.close()
+check("  a full bag keeps the robe on: the 409 it was, and nothing moved",
+      gear("/api/character/unequip", {"equip_slot": "chest"}) == (409, {"error": "Conflict", "message": "Your bag is full."})
+      and json.loads(ann_row("equipment")) == {"chest": "cobaltrobe"})
+conn = sqlite3.connect(path_a)
+conn.execute("DELETE FROM carry_items WHERE user_id = 2 AND item_id = 'pebble'")
+conn.commit()
+conn.close()
+code, body = gear("/api/character/unequip", {"equip_slot": "chest"})
+check("  taken off: back in the bag, nothing worn, and the ceiling down again",
+      code == 200 and body.get("unequipped") == "cobaltrobe" and body.get("equipment") == {}
+      and "cobaltrobe" in [c["item_id"] for c in body.get("inventory", [])] and body["stats"]["max_hp"] == 100, body)
+check("  twice is the 404 it was, and a place gear does not go the 400",
+      gear("/api/character/unequip", {"equip_slot": "chest"}) == (404, {"error": "Not Found",
+                                                                      "message": "Nothing is worn there."})
+      and gear("/api/character/unequip", {"equip_slot": "hat"})[0] == 400)
+code, body = gear("/api/character/consume", {"item_id": "smallhealthpotion", "position": 1})
+conn = sqlite3.connect(path_a)
+grants = conn.execute("SELECT item_id, target, amount FROM consume_grants WHERE user_id = 2").fetchall()
+conn.close()
+check("consuming: ann drinks one - taken by the grant handed in, and what it restores written down from the catalogue",
+      code == 200 and body.get("remaining") == 1 and body.get("restores") == {"target": "hp", "amount": 25}
+      and grants == [("smallhealthpotion", "hp", 25)] and app_a.config["preferred"][-1] == 1, (body, grants))
+conn = sqlite3.connect(path_a)
+conn.executemany("INSERT INTO carry_items VALUES (2, 0, ?, ?, 1)", [(0, "elixir"), (3, "chefsoup")])
+conn.commit()
+conn.close()
+check("  the catalogue's no is the 403 it was - her level, and a skill from the levels handed in",
+      gear("/api/character/consume", {"item_id": "elixir"}) == (403, {"error": "Forbidden", "message": "You need level 30."})
+      and gear("/api/character/consume", {"item_id": "chefsoup"})
+      == (403, {"error": "Forbidden", "message": "You need Cooking level 5."}))
+check("  and what she does not carry is the 404 before anything else, what is not a drink the 409",
+      gear("/api/character/consume", {"item_id": "smallmanapotion"})[0] == 404
+      and gear("/api/character/consume", {"item_id": "cobaltrobe"})
+      == (409, {"error": "Conflict", "message": "That cannot be used."}))
 check("and nobody without a login gets in anywhere",
       [client_a.get(path).status_code for path in ("/api/server/stats", "/api/world/events/active", "/api/server/insights",
                                                   "/api/kills?slot=0", "/api/kills/everyone", "/api/friends",
@@ -1509,9 +1657,11 @@ check("and nobody without a login gets in anywhere",
                                                                          "/api/staff/unmute", "/api/chat/report",
                                                                          "/api/report/player",
                                                                          "/api/staff/reports/resolve",
-                                                                         "/api/staff/note")]
+                                                                         "/api/staff/note", "/api/character/equip",
+                                                                         "/api/character/unequip",
+                                                                         "/api/character/consume")]
       + [client_a.put("/api/staff/role", json={}).status_code]
-      == [401] * 46)
+      == [401] * 49)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")
@@ -1541,7 +1691,8 @@ for path in (path_a, path_b):
 section("P-4  every package is here")
 check("the code map finds the packages app.py imports: %s" % ", ".join(PACKAGES),
       set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds",
-                        "parties", "chat", "trade", "kingdom", "world", "moderation", "staffdesk"},
+                        "parties", "chat", "trade", "kingdom", "world", "moderation", "staffdesk",
+                        "equipment", "consuming"},
       PACKAGES)
 check("  and every one of them runs on a bare app in this file", set(PACKAGES) == set(RUN_HERE),
       sorted(set(PACKAGES) ^ set(RUN_HERE)))

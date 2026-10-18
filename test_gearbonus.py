@@ -401,8 +401,25 @@ helper_end = src.find("\ndef ", helper_at + 1)
 check("app.py calls max_stats_for exactly once", len(calls) == 1, len(calls))
 check("  and that once is inside _derived_stats()",
       all(helper_at < c < helper_end for c in calls), calls)
-check("every _derived_stats caller exists (at least six routes use it)",
-      src.count("_derived_stats(") >= 7, src.count("_derived_stats("))
+
+# AND EVERY FEATURE PACKAGE. The routes that wear and take off gear moved into
+# equipment/ (18 Oct), handed _derived_stats() as `derived_stats`, and a
+# package is handed gamedata whole as `catalogue` - so a bare maximum asked
+# there reads catalogue.max_stats_for(), which a search for "gamedata." walks
+# past. Found the code map's way, so the next area to move is read too.
+import codemap  # noqa: E402
+
+package_src = ""
+for _package, _rows, _layers in codemap.feature_packages():
+    for _name in sorted(os.listdir(os.path.join(HERE, _package))):
+        if _name.endswith(".py"):
+            package_src += "\n" + open(os.path.join(HERE, _package, _name), encoding="utf-8").read()
+bare = re.findall(r"(?:gamedata|catalogue)\.max_stats_for\((?!\))", package_src)
+check("  and no package calls it at all - each is handed _derived_stats()", bare == [], bare)
+# The definition and its callers, in app.py and the packages alike: a call
+# passes it something, prose names it with "()".
+uses = len(re.findall(r"\b_?derived_stats\((?!\))", src + package_src))
+check("every _derived_stats caller exists (at least six routes use it)", uses >= 7, uses)
 
 
 print("\n%d passed, %d failed" % (passed, failed))

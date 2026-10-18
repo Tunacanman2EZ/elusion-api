@@ -14938,453 +14938,54 @@ def train_skills():
 
 
 # =============================================================================
-# CONSUMING AN ITEM
+# CONSUMING AN ITEM, AND EQUIPMENT
 # =============================================================================
-#
-# WHY THIS ENDPOINT EXISTS AT ALL, when the client could simply drop the item
-# from its next inventory sync and be done with it.
-#
-# ItemData has carried `required_level` and `required_skill` for a while, and
-# inventoryscreen.gd checked both before letting a use through. That check runs
-# on the player's machine, which made it a courtesy rather than a rule - and its
-# own comment said so, and named the day it would stop being good enough:
-#
-#     "It becomes load-bearing the day trade exists."
-#
-# Trade exists. Before it, the only person the gate protected against was an
-# honest player using something they had not earned, because an item you hold is
-# an item you found. Now a level 1 character can be HANDED a level 22 potion by
-# a friend, and the only thing between them is a check they control.
-#
-# WHAT THIS CLOSES AND WHAT IT DOES NOT. It makes the requirement real and the
-# destruction real: the item leaves the bag because the server took it, not
-# because the client announced it. It does NOT stop a determined cheat, because
-# PUT /api/player/status still accepts any hp up to the server's derived maximum
-# - a patched client heals without drinking anything. That is a separate and
-# larger finding, and this endpoint is what makes it addressable: once healing
-# has an authorised source, an unexplained rise becomes a question the server
-# can ask. See consume_grants in init_db().
-#
-# THE EFFECT IS STILL THE CLIENT'S. The server does not know what a potion
-# restores - `restore_target` and `restore_amount` are not in gamedata.json - so
-# it authorises and destroys, and the client applies. That is deliberately where
-# the line sits today rather than a pretence that it sits further along.
+# The consuming/ and equipment/ packages since 18 Oct: using a consumable, and
+# putting gear on and taking it off. Both are the same shape - the client
+# asks, the server moves the item through the backpack grants, the client
+# renders the answer - and why each had to be a server route is in its
+# __init__.py. What stays here: the grants (the carry's, further down this
+# file, so asked for when a route runs), _derived_stats() - the one way to ask
+# a character's maxima, which reads what is worn - and the catalogue, handed
+# in whole so a suite's stand-in for one of its functions is heard.
+import consuming as consuming_package  # noqa: E402
+import equipment as equipment_package  # noqa: E402
 
-# =============================================================================
-# EQUIPMENT IS A MOVE, NOT A REFERENCE
-# =============================================================================
-# WHAT THIS REPLACES, and why it had to become an endpoint rather than a
-# client gesture.
-#
-# Equipping used to be a POINTER: `equipment` named an item that was also
-# sitting in the backpack, and characterdata.gd's prune_equipment() cleared
-# any slot naming something the bag did not contain. The bag was the record of
-# ownership and the doll was a view onto it - which is why an equipped chest
-# piece showed up twice on screen, once in each panel.
-#
-# That arrangement carried the ownership check for free: the bag is reconciled
-# against what the server granted (E-1), so gear pointing into it was
-# reconciled too. The moment equipping MOVES the item out of the bag, both of
-# those stop applying, and `equipment` becomes a client-written field that
-# nothing reconciles - in the column combat reads to decide what a hit is
-# worth. That is E-1 again, one column over, and it is the reason this is a
-# server endpoint instead of two lines in the UI.
-#
-# SO THE SERVER MOVES IT. Taking from the bag IS the ownership check: you
-# cannot equip what _take_from_backpack() cannot find. Nothing needs
-# reconciling afterwards because the client never gets to assert the result.
-# Same shape as /api/character/consume, for the same reason - the client asks,
-# the server moves, the client renders the answer.
+consuming_package.register(
+    app,
+    require_auth=require_auth,
+    get_db=get_db,
+    bad_request=bad_request,
+    parse_slot=parse_slot,
+    max_slot=MAX_SLOT,
+    parse_cell=parse_cell,
+    carry_capacity=CARRY_CAPACITY,
+    catalogue=gamedata,
+    skills_of=skills_payload,
+    valid_skills=VALID_SKILLS,
+    take_from_backpack=lambda user_id, slot, item_id, quantity, prefer=None:
+        _take_from_backpack(user_id, slot, item_id, quantity, prefer=prefer),
+    inventory_of=inventory_payload,
+)
 
-def _equipment_of(row):
-    """The stored map, parsed. Always a dict, even for a row that predates it."""
-    return _stored_json(row["equipment"], {})
-
-
-def _equip_row(user_id, slot):
-    return get_db().execute(
-        "SELECT class_id, level, equipment FROM saves WHERE user_id = ? AND slot = ?",
-        (user_id, slot),
-    ).fetchone()
-
-
-def _apply_worn_maxima(db, user_id, slot):
-    """
-    Re-derive the maxima from what is NOW worn, in the caller's transaction,
-    and bring hp and mana down to them if they sit above. Returns the four
-    numbers for the response.
-
-    WHY THE EQUIP ROUTES DO THIS AND NOT ONLY THE NEXT SAVE: taking off a
-    Vitality amulet lowers max_hp this instant. Left for the next status write,
-    the stored row would say 492/432 for however long that took, and anything
-    reading it meanwhile - the character sheet, the healing reconciler's
-    "before" - would be reading a character over their own ceiling.
-
-    NEVER RAISES THE POOLS. Putting one on lifts the ceiling, not the health;
-    regeneration fills the gap at the rate the new maximum allows.
-    """
-    derived = _derived_stats(_equip_row(user_id, slot))
-    if derived is None:
-        return {}
-    db.execute(
-        "UPDATE saves SET max_hp = ?, max_mana = ?, hp = MIN(hp, ?), mana = MIN(mana, ?) "
-        "WHERE user_id = ? AND slot = ?",
-        (derived["max_hp"], derived["max_mana"], derived["max_hp"], derived["max_mana"],
-         user_id, slot),
-    )
-    pools = db.execute(
-        "SELECT hp, max_hp, mana, max_mana FROM saves WHERE user_id = ? AND slot = ?",
-        (user_id, slot),
-    ).fetchone()
-    return {"hp": int(pools["hp"]), "max_hp": int(pools["max_hp"]),
-            "mana": int(pools["mana"]), "max_mana": int(pools["max_mana"])}
-
-
-@app.post("/api/character/equip")
-@require_auth
-def equip_item():
-    """
-    Move one item from the backpack onto the character
-    ---
-    tags: [Character]
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [slot, item_id]
-          properties:
-            slot:     {type: integer, example: 0}
-            item_id:  {type: string,  example: cobaltrobe}
-            position: {type: integer, example: 4, description: "The carried cell it came from (0-19 bag, 20-29 hotbar). Taken from first when it holds the item."}
-    responses:
-      200: {description: "Equipped. Returns the new equipment map, the bag layout, and stats: the hp/mana ceilings what is now worn implies"}
-      400: {description: Bad slot or item_id}
-      403: {description: Wrong slot for this item, wrong class, or too low a level}
-      404: {description: No character in that slot, or you are not carrying that}
-      409: {description: The piece coming off has nowhere to go}
-    """
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-
-    item_id = str(payload.get("item_id", "")).strip()
-    if not item_id or len(item_id) > 64:
-        return bad_request("item_id must be 1-64 characters")
-
-    position, error = parse_cell(payload, CARRY_CAPACITY)
-    if error is not None:
-        return error
-
-    row = _equip_row(user_id, slot)
-    if row is None:
-        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
-
-    # THE SLOT IS DERIVED FROM THE ITEM, never taken from the request. There is
-    # then nothing for the two to disagree about, and equipmentpanel.gd already
-    # works this way - "the square's name is ignored on purpose".
-    target = gamedata.equip_slot_for(item_id)
-    if not target:
-        if not gamedata.has_item(item_id):
-            return bad_request("No such item '%s'." % item_id)
-        return {"error": "Forbidden", "message": "That is not equipment."}, 403
-
-    # THE SERVER'S OWN LEVEL AND CLASS, never the body's. Same reason
-    # parse_equipment() takes them as arguments rather than reading a payload:
-    # a client that could name its own level could wear anything.
-    verdict = gamedata.equip_check(item_id, target, str(row["class_id"]), int(row["level"]))
-    if not verdict.get("ok", False):
-        reason = verdict.get("reason", "")
-        if reason == "unknown":
-            return bad_request("No such item '%s'." % item_id)
-        if reason == "notgear":
-            return {"error": "Forbidden", "message": "That is not equipment."}, 403
-        if reason == "class":
-            return {"error": "Forbidden",
-                    "message": "Your class cannot wear that.",
-                    "allowed": verdict.get("allowed", [])}, 403
-        if reason == "level":
-            return {"error": "Forbidden",
-                    "message": "That needs level %d." % int(verdict.get("needs", 0)),
-                    "needs": int(verdict.get("needs", 0))}, 403
-        return {"error": "Forbidden", "message": "That cannot be equipped."}, 403
-
-    worn = _equipment_of(row)
-    coming_off = str(worn.get(target, ""))
-
-    # ---- everything above this line is validation; everything below commits --
-
-    db = get_db()
-
-    # TAKE FIRST, THEN PUT BACK, and the order is load-bearing rather than
-    # tidy. Taking the new item may free the cell the old one needs - swapping
-    # your only chest piece for another should always work, and it only does
-    # if the bag is measured after the incoming item has left it.
-    if not _take_from_backpack(user_id, slot, item_id, 1, prefer=position):
-        return {"error": "Not Found", "message": "You are not carrying that."}, 404
-
-    if coming_off:
-        if _add_to_backpack(user_id, slot, coming_off, 1) is None:
-            # ALL OR NOTHING. The take above is undone rather than left
-            # standing - an item that left the bag and reached neither the
-            # doll nor the floor is the worst outcome available here.
-            _add_to_backpack(user_id, slot, item_id, 1)
-            return {"error": "Conflict",
-                    "message": "Your bag is full - nowhere to put what you are wearing."}, 409
-
-    worn[target] = item_id
-    db.execute(
-        "UPDATE saves SET equipment = ?, updated_at = ? WHERE user_id = ? AND slot = ?",
-        (json.dumps(worn), int(time.time()), user_id, slot),
-    )
-    pools = _apply_worn_maxima(db, user_id, slot)
-    db.commit()
-
-    return {
-        "slot": slot,
-        "equipped": item_id,
-        "equip_slot": target,
-        "unequipped": coming_off,
-        "equipment": worn,
-        # THE CEILINGS THE SERVER NOW HOLDS, so a client can see its own
-        # recompute agrees rather than finding out on the next save.
-        "stats": pools,
-        # THE AUTHORITATIVE LAYOUT, handed back so the client renders what the
-        # server did rather than guessing at it. /api/loot/take does the same.
-        "inventory": inventory_payload(user_id, slot),
-    }
-
-
-@app.post("/api/character/unequip")
-@require_auth
-def unequip_item():
-    """
-    Move one item off the character and back into the backpack
-    ---
-    tags: [Character]
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [slot, equip_slot]
-          properties:
-            slot:       {type: integer, example: 0}
-            equip_slot: {type: string,  example: chest}
-    responses:
-      200: {description: "Unequipped. Returns the new equipment map, the bag layout, and stats: the hp/mana ceilings what is now worn implies"}
-      400: {description: Bad slot or equip_slot}
-      404: {description: No character in that slot, or nothing worn there}
-      409: {description: The bag is full}
-    """
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-
-    target = str(payload.get("equip_slot", "")).strip().lower()
-    if target not in EQUIP_SLOTS:
-        return bad_request("equip_slot must be one of: %s" % ", ".join(EQUIP_SLOTS))
-
-    row = _equip_row(user_id, slot)
-    if row is None:
-        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
-
-    worn = _equipment_of(row)
-    item_id = str(worn.get(target, ""))
-    if not item_id:
-        # 404 RATHER THAN A CHEERFUL 200. Taking off a slot that is already
-        # empty means the client and the server disagree about what is worn,
-        # and answering "done" would let that disagreement persist silently.
-        return {"error": "Not Found", "message": "Nothing is worn there."}, 404
-
-    # ---- everything above this line is validation; everything below commits --
-
-    if _add_to_backpack(user_id, slot, item_id, 1) is None:
-        return {"error": "Conflict",
-                "message": "Your bag is full."}, 409
-
-    worn.pop(target, None)
-    db = get_db()
-    db.execute(
-        "UPDATE saves SET equipment = ?, updated_at = ? WHERE user_id = ? AND slot = ?",
-        (json.dumps(worn), int(time.time()), user_id, slot),
-    )
-    pools = _apply_worn_maxima(db, user_id, slot)
-    db.commit()
-
-    return {
-        "slot": slot,
-        "unequipped": item_id,
-        "equip_slot": target,
-        "equipment": worn,
-        "stats": pools,
-        "inventory": inventory_payload(user_id, slot),
-    }
-
-
-@app.post("/api/character/consume")
-@require_auth
-def character_consume():
-    """
-    Use one consumable from the backpack
-    ---
-    tags:
-      - Character
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [slot, item_id]
-          properties:
-            slot:     {type: integer, example: 0}
-            item_id:  {type: string,  example: smallhealthpotion}
-            position: {type: integer, example: 21, description: "The carried cell used (0-19 bag, 20-29 hotbar). Spent first when it holds the item."}
-    responses:
-      200:
-        description: The item was destroyed; apply its effect
-      400:
-        description: Bad slot or item_id
-      403:
-        description: Character level or skill level too low
-      404:
-        description: That slot is empty, or you are not carrying that item
-      409:
-        description: That item is not something you can consume
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-
-    item_id = str(payload.get("item_id", "")).strip()
-    if not item_id or len(item_id) > 64:
-        return bad_request("item_id must be 1-64 characters")
-
-    position, error = parse_cell(payload, CARRY_CAPACITY)
-    if error is not None:
-        return error
-
-    db = get_db()
-    row = db.execute(
-        "SELECT level FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)
-    ).fetchone()
-    if row is None:
-        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
-
-    # WHAT YOU HOLD IS CHECKED BEFORE WHETHER YOU MAY USE IT, and the order is
-    # not arbitrary. "You are not carrying that" is true regardless of level,
-    # and answering 403 first would tell a client which items it does NOT hold
-    # are gated and at what level - the same shape as the 404-not-403 decision
-    # in require_role(), for the same reason.
-    held = db.execute(
-        "SELECT COALESCE(SUM(quantity), 0) FROM carry_items "
-        "WHERE user_id = ? AND slot = ? AND item_id = ?",
-        (user_id, slot, item_id),
-    ).fetchone()[0]
-    if int(held) <= 0:
-        return {"error": "Not Found", "message": "You are not carrying that."}, 404
-
-    levels = {
-        skill: int(value["level"])
-        for skill, value in skills_payload(user_id, slot).items()
-    }
-
-    # VALID_SKILLS IS PASSED IN, and it is the whole difference between a gate
-    # and a bypass. Skill rows are written when a skill is first trained, so a
-    # new character has none at all - and without this set, "cooking is missing
-    # from your levels" reads as "cooking is not a skill" and every fresh
-    # account walks through every skill gate in the game. See consume_check().
-    verdict = gamedata.consume_check(
-        item_id, int(row["level"]), levels, known_skills=VALID_SKILLS)
-
-    if verdict.get("unknown_skill"):
-        # Loud and permissive, exactly as the client is. A skill name the game
-        # does not have is a typo in the .tres, and refusing would take a
-        # working item away from every player over an editor slip. Logged,
-        # because a gate that has quietly stopped gating is the outcome worth
-        # avoiding.
-        app.logger.error(
-            "consume: '%s' requires unknown skill '%s' - check its .tres",
-            item_id, verdict["unknown_skill"],
-        )
-
-    if not verdict["ok"]:
-        reason = verdict["reason"]
-        if reason == "level":
-            return {
-                "error": "Forbidden",
-                "message": "You need level %d." % verdict["needs"],
-            }, 403
-        if reason == "skill":
-            return {
-                "error": "Forbidden",
-                "message": "You need %s level %d." % (
-                    verdict["skill"].capitalize(), verdict["needs"]),
-            }, 403
-        # "unknown" and "nottype" are both "the server will not destroy this",
-        # and neither answer tells the caller anything it did not itself send.
-        return {"error": "Conflict", "message": "That cannot be used."}, 409
-
-    # ---- everything above this line is validation; everything below commits --
-
-    if not _take_from_backpack(user_id, slot, item_id, 1, prefer=position):
-        # Only reachable if the stack vanished between the count above and here.
-        # All-or-nothing, so nothing is written.
-        return {"error": "Not Found", "message": "You are not carrying that."}, 404
-
-    # WHAT THIS AUTHORISED, not merely that it happened. The healing reconciler
-    # reads these rows, and with only a timestamp to go on the cheapest potion
-    # in the game explained a rise of any size in any pool. The amount comes
-    # from the server's own catalogue, never from the request.
-    target, amount = gamedata.restore_for(item_id)
-    db.execute(
-        "INSERT INTO consume_grants (user_id, slot, item_id, target, amount, at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (user_id, slot, item_id, target, int(amount), int(time.time())),
-    )
-    db.commit()
-
-    return {
-        "slot": slot,
-        "item_id": item_id,
-        "consumed": 1,
-        "remaining": int(held) - 1,
-        # Returned so the client applies the server's number rather than its
-        # own copy. It still owns the effect - hp is client-written, see E-9 -
-        # but there is no reason for the two to disagree about the size of it.
-        "restores": {"target": target, "amount": int(amount)},
-        # THE BAG AFTERWARDS, like every other route that changes it. The game
-        # used to take one off its own copy and save the whole bag; the bag is
-        # the server's now, so it adopts this instead.
-        "inventory": inventory_payload(user_id, slot),
-    }, 200
+equipment_package.register(
+    app,
+    require_auth=require_auth,
+    get_db=get_db,
+    bad_request=bad_request,
+    parse_slot=parse_slot,
+    max_slot=MAX_SLOT,
+    parse_cell=parse_cell,
+    carry_capacity=CARRY_CAPACITY,
+    equip_slots=EQUIP_SLOTS,
+    catalogue=gamedata,
+    derived_stats=_derived_stats,
+    take_from_backpack=lambda user_id, slot, item_id, quantity, prefer=None:
+        _take_from_backpack(user_id, slot, item_id, quantity, prefer=prefer),
+    add_to_backpack=lambda user_id, slot, item_id, quantity:
+        _add_to_backpack(user_id, slot, item_id, quantity),
+    inventory_of=inventory_payload,
+)
 
 
 # =============================================================================

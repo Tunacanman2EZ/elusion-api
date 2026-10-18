@@ -1676,10 +1676,11 @@ and the status route clamps hp to them.
 - **app.py derives maxima only through `_derived_stats(row)`**, which reads the
   row's own `equipment` with `row["equipment"]` - a SELECT that forgot the
   column fails loudly rather than deriving a bare maximum. Save, status, kill,
-  revive, respawn and both equip routes use it; `test_gearbonus.py` fails if
-  `gamedata.max_stats_for(` is called anywhere else.
+  revive, respawn and both equip routes use it (equipment/ is handed it as
+  `derived_stats`); `test_gearbonus.py` fails if `max_stats_for(` is called
+  anywhere else - app.py or a package, as `gamedata.` or `catalogue.`.
 - **The equip routes move the maxima in the same transaction**
-  (`_apply_worn_maxima`) and bring hp/mana DOWN to them, never up. Taking off a
+  (equipment/'s `apply_worn_maxima()`) and bring hp/mana DOWN to them, never up. Taking off a
   Vitality amulet at full health leaves you at the lower full. The response
   carries `stats` so the client can see it agrees. The save route clamps the
   same way when it rewrites the maxima.
@@ -2030,7 +2031,10 @@ only, `test_stats.py`.
   (18 Oct: the sanctions, the reports and the mutes - ten routes; it hands
   back the two open-report counts the poll shows staff). And `staffdesk/` (18
   Oct: the staff list, the moderation log, notes and one account's page; it
-  hands back the two query builders whose plans test_moderation checks).
+  hands back the two query builders whose plans test_moderation checks). And
+  `equipment/` and `consuming/` (18 Oct: equip, unequip, consume - the first
+  of the carry, ARCHITECTURE's step 10; the backpack grants, `_derived_stats()`
+  and the skills stay in app.py and are handed in).
   **trade/ is handed gamedata whole, as `catalogue`**, so a rule checked by
   searching for `gamedata.` reads `catalogue.` too (test_quality Q-7).
   **A name a suite replaces on app.py**

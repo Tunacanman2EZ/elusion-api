@@ -33,6 +33,8 @@ Beside it, **feature packages**: a folder per area, each in three layers.
 | `world/` | 18 Oct | **moved out** of app.py: the stirring lands |
 | `moderation/` | 18 Oct | **moved out** of app.py: sanctions, reports, mutes |
 | `staffdesk/` | 18 Oct | **moved out** of app.py: the staff list and the record |
+| `equipment/` | 18 Oct | **moved out** of app.py: wearing gear |
+| `consuming/` | 18 Oct | **moved out** of app.py: using a consumable |
 
 ## Where it is going
 
@@ -199,7 +201,16 @@ areas that hold money and items:
    register(), and the note route's computed kind came back twice.
    `/api/staff/powers` stays in app.py: it reads every route on the server and
    quotes limits from every area, so it is the composition root's own page.
-10. the carry: saves, character, bank, equipment, consuming, reviving
+10. the carry: saves, character, bank, equipment, consuming, reviving - in
+    several moves, the smallest first.
+    ~~Equipment and consuming (`equipment/`, `consuming/`)~~ (18 Oct): equip,
+    unequip and consume, and every write to `consume_grants`. Both move the
+    item through the backpack grants, which stay in app.py for now, handed in
+    as lambdas (they are further down the file). `_derived_stats()` - the one
+    way to ask a character's maxima - stays and is handed in, and
+    test_gearbonus now reads the packages for a bare `max_stats_for(`, by
+    either name. Next: reviving and respawning; then the bank; then the carry
+    itself, the grants with it; then saves and the status write.
 11. then the core itself (sessions, tokens, auth) into a package of its own,
     and each table's `CREATE` into its area - and app.py is the composition
     root it was meant to be.
