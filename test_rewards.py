@@ -11,7 +11,8 @@ the server's: legendary (ember) gear is about one an hour in the dark band, 1 in
 import importlib.util, os, random, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_rewards_test.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+DB_PATH = os.path.join(testdir.PATH, "elusion_rewards_test.db")
 os.environ["ELUSION_DB"] = DB_PATH
 os.environ["ELUSION_OWNER"] = "NOT_A_TEST_ACCOUNT"
 os.environ.pop("ELUSION_GAMEDATA", None)

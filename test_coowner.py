@@ -27,7 +27,8 @@ game".
 import importlib.util, json, os, sqlite3, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_coowner_test.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+DB_PATH = os.path.join(testdir.PATH, "elusion_coowner_test.db")
 os.environ["ELUSION_DB"] = DB_PATH
 os.environ["ELUSION_OWNER"] = "boss"
 # The owner's own name in the list is dropped; the spaces are trimmed.

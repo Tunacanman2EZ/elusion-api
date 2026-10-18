@@ -29,7 +29,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Same guard every suite here uses: app.py calls init_db() at import time and
 # must not be allowed anywhere near the real database.
-os.environ["ELUSION_DB"] = os.path.join(tempfile.gettempdir(), "elusion_mailcheck.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+os.environ["ELUSION_DB"] = os.path.join(testdir.PATH, "elusion_mailcheck.db")
 
 sys.path.insert(0, HERE)
 spec = importlib.util.spec_from_file_location("elusion_app", os.path.join(HERE, "app.py"))

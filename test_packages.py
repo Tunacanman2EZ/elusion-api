@@ -2,7 +2,8 @@
 
 Every feature package (ARCHITECTURE.md) - playerstats/, events/, insights/,
 and killrecord/, friends/, gathering/, loot/, guilds/, parties/, chat/, trade/, kingdom/, world/, moderation/,
-staffdesk/, equipment/, consuming/, death/, bank/, carry/, skills/ and saves/, taken out of app.py - is built the
+staffdesk/, equipment/, consuming/, death/, bank/, carry/, skills/, saves/, status/ and shop/, taken out of
+app.py - is built the
 BE105 way: each has a
 register(app, ...) that is HANDED the app, its login checks and its database,
 and never imports app.py. The source of each is checked for that elsewhere
@@ -39,6 +40,7 @@ sys.path.insert(0, HERE)
 from flask import Flask, g, request  # noqa: E402
 
 import codemap  # noqa: E402
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
 import events  # noqa: E402
 import friends  # noqa: E402
 import gathering  # noqa: E402
@@ -57,8 +59,10 @@ import killrecord  # noqa: E402
 import kingdom  # noqa: E402
 import playerstats  # noqa: E402
 import saves as saves_package  # noqa: E402
+import shop as shop_package  # noqa: E402
 import skills as skills_package  # noqa: E402
 import staffdesk  # noqa: E402
+import status as status_package  # noqa: E402
 import trade  # noqa: E402
 import world  # noqa: E402
 
@@ -67,7 +71,7 @@ PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
 # The ones this file registers on its bare apps, below.
 RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds", "parties",
             "chat", "trade", "kingdom", "world", "moderation", "staffdesk", "equipment", "consuming",
-            "death", "bank", "carry", "skills", "saves")
+            "death", "bank", "carry", "skills", "saves", "status", "shop")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -130,7 +134,7 @@ def bare_app(name):
     """A Flask app with nothing on it, a database of its own, and all three
     packages registered. Hands back (app, what was announced, what was logged,
     the database's path)."""
-    path = os.path.join(tempfile.gettempdir(), "elusion_packages_%s.db" % name)
+    path = os.path.join(testdir.PATH, "elusion_packages_%s.db" % name)
     if os.path.exists(path):
         os.remove(path)
     conn = sqlite3.connect(path)
@@ -743,6 +747,42 @@ def bare_app(name):
         find_open_trade=trade.data.find_open, gold_delta=ledger_delta, deletions_kept=2,
         delete_reason="character-deleted")
 
+    # status/: a pool regenerates one point a second whatever its size; the
+    # maxima are the ones equipment/ was handed; the healing tunables are
+    # app.config's, asked on every check, so a check can turn the clamp off.
+    heal = app.config.setdefault("heal", {"margin": 1.25, "clamp": 3.0, "enforced": True, "minimum": 2.0,
+                                          "window": 30})
+    app.config["status"] = status_package.register(
+        app, require_auth=require_auth, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+        parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None, max_slot=3,
+        parse_stat=parse_stat, stat_ceiling=1000, derived_stats=lambda row, class_id=None, level=None: maxima(row),
+        catalogue=StatusCatalogue, heal_margin=lambda: heal["margin"], clamp_margin=lambda: heal["clamp"],
+        clamp_enforced=lambda: heal["enforced"], minimum_elapsed=lambda: heal["minimum"],
+        explain_window=lambda: heal["window"], refill_grants=("__revive__", "__respawn__", "__levelup__"))
+
+    # shop/: one stall - potions at 10, a sword at 100 that rolls at the till;
+    # it buys swords back at 50 and pebbles at 1. The bag and its cells are the
+    # carry's own, as app.py hands them; the gold goes through the same ledger
+    # as the rest and answers with the new balance, as app.py's does; a hold
+    # is minted["holds"], as for loot.
+    def till_delta(db, user_id, slot, delta, reason, detail=""):
+        ledger_delta(db, user_id, slot, delta, reason, detail)
+        return db.execute("SELECT gold FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone()[0]
+
+    shop_package.register(
+        app, require_auth=require_auth, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+        parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None, max_slot=3,
+        slot_exists=lambda user_id, slot: get_db().execute(
+            "SELECT 1 FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone() is not None,
+        catalogue=ShopCatalogue, stack_limit=carry.stack_limit, add_to_backpack=carry.add_to_backpack,
+        bag_cells=GATHER_CELLS,
+        place_trade_hold=lambda _db, user_id, item_id, quantity: minted["holds"].append((user_id, item_id, quantity)),
+        gold_delta=till_delta, inventory_of=carry.inventory_of, carry_request=carry.carry_request,
+        parse_grid_cell=grid_cell, carry_cells=GATHER_CELLS + 2, grid_cells=carry.grid_cells,
+        grid_rewrite=carry.grid_rewrite, resync=carry.resync)
+
     # bank/: a four-cell bank, handed the grid steps the carry hands back -
     # as app.py hands them - and the bank's own catalogue.
     app.config["bank_api"] = bank_package.register(
@@ -789,6 +829,42 @@ class CarryCatalogue:
         if item_id in ("goldpile", "lusions"):
             return {"stackable": True, "max_stack": 99}
         return {"stackable": False} if item_id in ("pebble", "cobaltrobe", "ironsword", "crownhelm") else None
+
+
+class ShopCatalogue:
+    """What shop/ asks of gamedata: one stall, what it stocks and charges and
+    pays, the items, and the roll at the till - a sword is handed over rolled,
+    anything else as it is. "ghost" is stocked and is no item at all, so the
+    shelf leaves it out."""
+    SHOPS = {"stall": {"shop_id": "stall", "display_name": "Stall", "sell_multiplier": 0.5,
+                       "stock": ["smallhealthpotion", "ironsword", "ghost"]}}
+    ITEMS = {"smallhealthpotion": {"display_name": "Small Health Potion", "max_stack": 5},
+             "ironsword": {"display_name": "Iron Sword", "required_classes": ["warrior"], "damage": 12},
+             "pebble": {"display_name": "Pebble"}}
+
+    @staticmethod
+    def item_row(item_id):
+        return ShopCatalogue.ITEMS.get(item_id)
+
+    @staticmethod
+    def shop_price(shop_id, item_id):
+        return {"smallhealthpotion": 10, "ironsword": 100}.get(item_id) if shop_id == "stall" else None
+
+    @staticmethod
+    def shop_sell_price(shop_id, item_id):
+        return {"ironsword": 50, "pebble": 1}.get(item_id) if shop_id == "stall" else None
+
+    @staticmethod
+    def roll_quality(item_id):
+        return item_id + "~d104" if item_id == "ironsword" else item_id
+
+
+class StatusCatalogue:
+    """What status/ asks of gamedata: how fast a pool regenerates - one point
+    a second, whatever its size."""
+    @staticmethod
+    def regen_rate_for(_ceiling):
+        return 1.0
 
 
 class SavesCatalogue:
@@ -939,7 +1015,8 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/character/inventory", "/api/character/inventory/move",
                        "/api/character/inventory/discard", "/api/character/inventory/cash",
                        "/api/character/skills", "/api/skill/train", "/api/save", "/api/save",
-                       "/api/character", "/api/character/delete"]), rules)
+                       "/api/character", "/api/character/delete", "/api/player/status",
+                       "/api/player/status", "/api/shop/buy", "/api/shop/sell", "/api/shop/<shop_id>"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -2227,6 +2304,135 @@ for again in range(2):
     bo_saves("POST", "/api/character/delete", {"slot": 1, "confirm": "again"})
 check("  and an account keeps only the deleted characters it is handed to keep, the newest",
       ann_says("SELECT name FROM character_deletions WHERE user_id = 3 ORDER BY id") == [("Again",), ("Again",)])
+def pools(hp, grants=()):
+    """ann's slot 0 at `hp` of 100, its pools written this instant, and only
+    the grants named in the window."""
+    conn = sqlite3.connect(path_a)
+    conn.execute("UPDATE saves SET hp = ?, max_hp = 100, mana = 50, max_mana = 50, stamina = 30, max_stamina = 30,"
+                 " pools_at = ?, equipment = '{}' WHERE user_id = 2 AND slot = 0", (hp, int(time.time())))
+    conn.execute("DELETE FROM consume_grants WHERE user_id = 2")
+    for item_id, target, amount in grants:
+        conn.execute("INSERT INTO consume_grants (user_id, slot, item_id, target, amount, at) VALUES (2, 0, ?, ?, ?, ?)",
+                     (item_id, target, amount, int(time.time())))
+    conn.commit()
+    conn.close()
+
+
+def report(body):
+    res = client_a.put("/api/player/status", headers=who("ann"), json=dict({"slot": 0}, **body))
+    return res.status_code, res.get_json() or {}
+
+
+pools(10)
+code, body = report({"hp": 12, "level": 99, "gold": 10 ** 6, "max_hp": 999})
+check("status: the server's own fields and the derived maxima are ignored, and said so; a small rise is regen",
+      code == 200 and body.get("ignored") == ["level", "gold", "max_hp"] and body.get("hp") == 12
+      and body.get("max_hp") == 100 and ann_row("level") == 4, body)
+pools(10)
+check("  a rise regen cannot explain, past the loose line handed in, is trimmed to what was explained",
+      report({"hp": 100})[1].get("hp") == 12 and ann_row("hp") == 12)
+pools(10)
+check("  between the two lines it is kept - logged, never trimmed",
+      report({"hp": 15})[1].get("hp") == 15)
+pools(10, [("smallhealthpotion", "hp", 50)])
+check("  a potion's grant explains the pool it fills, up to what it gives",
+      report({"hp": 60})[1].get("hp") == 60)
+pools(10, [("__revive__", "mana", 1)])
+check("  and a refill grant, by the ids handed in, explains any rise in any pool, whatever it names",
+      report({"hp": 100})[1].get("hp") == 100)
+app_a.config["heal"]["enforced"] = False
+pools(10)
+unclamped = report({"hp": 100})[1].get("hp")
+app_a.config["heal"]["enforced"] = True
+check("  the clamp switch is the one handed in, asked on every check: off, nothing is trimmed",
+      unclamped == 100, unclamped)
+pools(50)
+deaths = ann_says("SELECT deaths FROM users WHERE id = 2")[0][0]
+report({"hp": 0})
+report({"hp": 0})
+check("  a death is counted once: the write that takes a living character to zero, not every write at zero",
+      ann_says("SELECT deaths FROM users WHERE id = 2")[0][0] == deaths + 1)
+check("  and the 400s and the 404 they were",
+      report({"hp": -1}) == (400, {"error": "Bad Request",
+                                   "message": "hp must be a non-negative integer no greater than 1000"})
+      and report({}) == (400, {"error": "Bad Request", "message": "no writable fields supplied"})
+      and report({"slot": 1, "hp": 5})[0] == 404)
+res = client_a.get("/api/player/status?slot=0", headers=who("ann"))
+with app_a.app_context():
+    handed = app_a.config["status"].status_of(2, 0)
+check("  the read, and the status_of() handed back, say the same",
+      res.status_code == 200 and res.get_json() == handed and handed["hp"] == 0 and handed["max_mana"] == 50,
+      (res.get_json(), handed))
+def till(path, body):
+    res = client_a.post(path, headers=who("ann"), json=dict({"slot": 0}, **body))
+    return res.status_code, res.get_json() or {}
+
+
+def purse(gold=None, cells=()):
+    conn = sqlite3.connect(path_a)
+    if gold is not None:
+        conn.execute("UPDATE saves SET gold = ? WHERE user_id = 2 AND slot = 0", (gold,))
+        conn.execute("DELETE FROM carry_items WHERE user_id = 2 AND slot = 0")
+        conn.executemany("INSERT INTO carry_items VALUES (2, 0, ?, ?, ?)", cells)
+    conn.commit()
+    conn.close()
+
+
+res = client_a.get("/api/shop/stall", headers=who("ann"))
+shelf = res.get_json() or {}
+check("shop: the shelf - what is stocked and is an item, at the catalogue's prices, and what the till pays",
+      res.status_code == 200 and [(r["item_id"], r["price"]) for r in shelf.get("stock", [])]
+      == [("smallhealthpotion", 10), ("ironsword", 100)]
+      and shelf["stock"][1]["required_classes"] == ["warrior"] and shelf["stock"][1]["damage"] == 12
+      and shelf.get("sell_prices") == {"ironsword": 50, "pebble": 1} and shelf.get("sell_multiplier") == 0.5,
+      shelf)
+check("  and a stall that does not exist is the 404 it was",
+      client_a.get("/api/shop/nowhere", headers=who("ann")).get_json()
+      == {"error": "Not Found", "message": "No shop 'nowhere'."})
+purse(300)
+burned = len(ann_says("SELECT id FROM gold_ledger WHERE user_id = 2 AND reason = 'shop_buy'"))
+code, body = till("/api/shop/buy", {"shop_id": "stall", "item_id": "smallhealthpotion", "quantity": 3})
+check("  three potions bought: priced by the catalogue, the gold burned through the ledger, into the bag",
+      code == 200 and body.get("total_paid") == 30 and body.get("gold") == 270 == ann_row("gold")
+      and ann_says("SELECT delta FROM gold_ledger WHERE user_id = 2 AND reason = 'shop_buy'")[burned:] == [(-30,)]
+      and cells_of(body)[0] == ("smallhealthpotion", 3), body)
+code, body = till("/api/shop/buy", {"shop_id": "stall", "item_id": "ironsword"})
+check("  a sword is rolled at the till - the piece that arrives, the shelf's id beside it - and held from trade",
+      code == 200 and body.get("item_id") == "ironsword~d104" and body.get("stock_id") == "ironsword"
+      and app_a.config["minted"]["holds"][-1] == (2, "ironsword~d104", 1) and cells_of(body)[1] == ("ironsword~d104", 1),
+      body)
+purse(30)
+check("  the 400s it had: past the stack, past the purse, a stall that is not one, a thing not stocked",
+      till("/api/shop/buy", {"shop_id": "stall", "item_id": "smallhealthpotion", "quantity": 6})[1].get("message")
+      == "quantity is 6, the most smallhealthpotion stacks to is 5"
+      and till("/api/shop/buy", {"shop_id": "stall", "item_id": "ironsword"})[1].get("message")
+      == "That costs 100 gold and you have 30."
+      and till("/api/shop/buy", {"shop_id": "nowhere", "item_id": "pebble"})[1].get("message")
+      == "Unknown shop 'nowhere'. Is gamedata.json current?"
+      and till("/api/shop/buy", {"shop_id": "stall", "item_id": "pebble"})[1].get("message")
+      == "'stall' does not stock 'pebble'.")
+purse(500, [(0, "pebble", 1), (1, "pebble", 1), (2, "pebble", 1), (3, "pebble", 1)])
+before = len(ann_says("SELECT id FROM gold_ledger WHERE user_id = 2"))
+check("  a full bag is the 409 it was, and not a coin taken",
+      till("/api/shop/buy", {"shop_id": "stall", "item_id": "ironsword"})
+      == (409, {"error": "Conflict", "message": "Your backpack is full (4 slots)."})
+      and ann_row("gold") == 500 and len(ann_says("SELECT id FROM gold_ledger WHERE user_id = 2")) == before)
+purse(0, [(0, "ironsword", 1), (2, "pebble", 3)])
+code, body = till("/api/shop/sell", {"shop_id": "stall", "position": 2, "item_id": "pebble", "quantity": 2})
+check("selling: two pebbles from a cell of three, at what the till pays, minted through the ledger, one left",
+      code == 200 and body.get("total_received") == 2 and body.get("gold") == 2 == ann_row("gold")
+      and ann_says("SELECT delta FROM gold_ledger WHERE user_id = 2 AND reason = 'shop_sell'")[-1:] == [(2,)]
+      and cells_of(body)[2] == ("pebble", 1), body)
+code, body = till("/api/shop/sell", {"shop_id": "stall", "position": 0, "item_id": "ironsword"})
+check("  the whole stack when no quantity is named",
+      code == 200 and body.get("quantity") == 1 and body.get("gold") == 52 and cells_of(body)[0] is None, body)
+code, body = till("/api/shop/sell", {"shop_id": "stall", "position": 2, "item_id": "pebble", "quantity": 5})
+check("  more than the cell holds, or a cell that does not hold it, is the carry's 409 - nothing sold",
+      code == 409 and body.get("resync", {}).get("reason") == "stale_save" and ann_row("gold") == 52
+      and till("/api/shop/sell", {"shop_id": "stall", "position": 0, "item_id": "ironsword"})[0] == 409, body)
+check("  and what the till does not buy is the 400 it was",
+      till("/api/shop/sell", {"shop_id": "stall", "position": 2, "item_id": "smallhealthpotion"})
+      == (400, {"error": "Bad Request", "message": "The shop does not buy that."}))
 check("and nobody without a login gets in anywhere",
       [client_a.get(path).status_code for path in ("/api/server/stats", "/api/world/events/active", "/api/server/insights",
                                                   "/api/kills?slot=0", "/api/kills/everyone", "/api/friends",
@@ -2235,7 +2441,8 @@ check("and nobody without a login gets in anywhere",
                                                   "/api/trade", "/api/trade/history", "/api/staff/trades",
                                                   "/api/economy/kingdom", "/api/server/world", "/api/staff/reports",
                                                   "/api/staff/users", "/api/staff/actions", "/api/staff/user/ann",
-                                                  "/api/account", "/api/save", "/api/character?slot=0")]
+                                                  "/api/account", "/api/save", "/api/character?slot=0",
+                                                  "/api/player/status?slot=0", "/api/shop/stall")]
       + [client_a.post(path, json={"slot": 0}).status_code for path in ("/api/fishing/catch", "/api/cooking/cook",
                                                                          "/api/loot/take", "/api/guild/create",
                                                                          "/api/staff/guild", "/api/party/invite",
@@ -2259,11 +2466,13 @@ check("and nobody without a login gets in anywhere",
                                                                          "/api/character/inventory/discard",
                                                                          "/api/character/inventory/cash",
                                                                          "/api/skill/train",
-                                                                         "/api/character/delete")]
+                                                                         "/api/character/delete",
+                                                                         "/api/shop/buy", "/api/shop/sell")]
       + [client_a.put(path, json={}).status_code for path in ("/api/staff/role", "/api/account/bank",
                                                               "/api/account/lusions", "/api/character/inventory",
-                                                              "/api/character/skills", "/api/save")]
-      == [401] * 68)
+                                                              "/api/character/skills", "/api/save",
+                                                              "/api/player/status")]
+      == [401] * 73)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")
@@ -2286,7 +2495,7 @@ board_b = app_b.test_client().get("/api/economy/kingdom", headers=who("ann")).ge
 check("  and the kingdom board's snapshot is its own app's: the second, asked while the first's is fresh, has nothing",
       board_b.get("total") == 0 and board_b.get("top") == [] and fresh.get("total") == 123, board_b)
 check("  and the carry is its own app's: what the first one's grants put in ann's bag is not in the second's",
-      ann_carry(app_b) == [None] * 6 and ann_carry()[0] == ("crownhelm", 1), ann_carry(app_b))
+      ann_carry(app_b) == [None] * 6 and ann_carry() != [None] * 6, ann_carry(app_b))
 for path in (path_a, path_b):
     if os.path.exists(path):
         os.remove(path)
@@ -2296,7 +2505,8 @@ section("P-4  every package is here")
 check("the code map finds the packages app.py imports: %s" % ", ".join(PACKAGES),
       set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds",
                         "parties", "chat", "trade", "kingdom", "world", "moderation", "staffdesk",
-                        "equipment", "consuming", "death", "bank", "carry", "skills", "saves"},
+                        "equipment", "consuming", "death", "bank", "carry", "skills", "saves", "status",
+                        "shop"},
       PACKAGES)
 check("  and every one of them runs on a bare app in this file", set(PACKAGES) == set(RUN_HERE),
       sorted(set(PACKAGES) ^ set(RUN_HERE)))

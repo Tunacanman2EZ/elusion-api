@@ -14,7 +14,8 @@ catalogue, and nothing tested the catalogue.
 So gamedata.json in this repo sat 46 hours behind the Godot export, and four
 protections were failing open the whole time:
 
-    EQUIP_EXPORTED      False   ->  parse_equipment() skipped equip_check(),
+    EQUIP_EXPORTED      False   ->  parse_equipment() (gone since 18 Oct)
+                                    skipped equip_check(),
                                     which is the state that let
                                     {"helm": "embersword"} through
     SPAWNS_EXPORTED     False   ->  the spawn ceiling was disabled entirely
@@ -102,8 +103,9 @@ REQUIRED = [
         probe=lambda: sum(
             1 for i in gamedata.ITEMS.values() if i.get("equip_slot_name")),
         expect=lambda n: n > 0,
-        breaks="equipment saves fall back to the loose slot list, and nothing "
-               "verifies an item belongs in the slot it was sent for",
+        breaks="the catalogue cannot say which slot an item goes in, so every "
+               "equip is refused as not equipment, and the slot names fall back "
+               "to the loose list",
     ),
     dict(
         field="placed_count",

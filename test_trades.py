@@ -36,7 +36,8 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_trades_test.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+DB_PATH = os.path.join(testdir.PATH, "elusion_trades_test.db")
 os.environ["ELUSION_DB"] = DB_PATH
 if os.path.exists(DB_PATH):
     os.remove(DB_PATH)
@@ -674,7 +675,7 @@ check("finding the open trade still uses an index for both sides",
 # An old database, from before any of this: the migration must bring it up and
 # boot. A trades table without revision, sessions without playing_slot, and
 # the two old indexes.
-legacy = os.path.join(tempfile.gettempdir(), "elusion_trades_legacy.db")
+legacy = os.path.join(testdir.PATH, "elusion_trades_legacy.db")
 if os.path.exists(legacy):
     os.remove(legacy)
 conn = sqlite3.connect(legacy)

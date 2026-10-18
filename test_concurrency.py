@@ -38,7 +38,8 @@ import importlib.util, json, os, sqlite3, sys, tempfile, threading, time
 import urllib.error, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_concurrency_test.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+DB_PATH = os.path.join(testdir.PATH, "elusion_concurrency_test.db")
 os.environ["ELUSION_DB"] = DB_PATH
 os.environ["ELUSION_OWNER"] = "NOT_A_TEST_ACCOUNT"
 os.environ.pop("ELUSION_GAMEDATA", None)

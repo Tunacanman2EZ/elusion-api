@@ -7269,67 +7269,11 @@ EQUIP_SLOTS_FALLBACK = (
 EQUIP_SLOTS = (tuple(sorted(gamedata.EQUIP_SLOTS)) if gamedata.EQUIP_EXPORTED
                else EQUIP_SLOTS_FALLBACK)
 
-def parse_equipment(raw, class_id="", character_level=0):
-    """
-    Validate an equipment map from a request body: {slot_name: item_id}.
-
-    Returns a dict, or None when the value cannot be one - so the caller can
-    400 rather than store something the client will later fail to read back.
-
-    WHAT IS CHECKED. The slot names have to be ones the catalogue uses, the ids
-    have to be items it holds, and then gamedata.equip_check() settles the
-    three questions that decide whether wearing it means anything: is this item
-    worn in THAT slot, may this CLASS wear it, and is the character high enough
-    LEVEL.
-
-    WHAT THIS USED TO CHECK, AND WHY THAT WAS DEFENSIBLE UNTIL IT WASN'T. The
-    first version stopped after "the slot exists and the item exists", and said
-    so on purpose: equipping is a reference to a bag item rather than a move of
-    one, so the server was recording a preference and had no business policing
-    it. That argument holds exactly as long as equipment does nothing. It stops
-    the moment an equipped weapon decides what a hit is worth - and in the
-    meantime {"helm": "embersword"} was a legal save, so the column combat is
-    about to read could already contain a sword worn on the head.
-
-    character_level MUST BE THE SERVER'S. /api/save does not take level from
-    the body for exactly this family of reasons; passing the payload's number
-    in here would hand the gate back to the client it is meant to bind.
-
-    class_id IS THE ONE IN THE SAME SAVE, which is self-consistent rather than
-    circular: a client that claims to be a mage to wear a robe is also claiming
-    to be a mage for max_hp, and the save endpoint recomputes the pools from
-    that claim a few lines down. Lying costs more than it buys.
-    """
-    if raw is None:
-        return {}
-    if not isinstance(raw, dict):
-        return None
-
-    out = {}
-    for slot_name, item_id in raw.items():
-        if slot_name not in EQUIP_SLOTS:
-            return None
-        if item_id is None or item_id == "":
-            continue
-        if isinstance(item_id, bool) or not isinstance(item_id, (str, int, float)):
-            return None
-        text = str(item_id).strip()
-        if text == "":
-            continue
-        if len(text) > 64 or not gamedata.has_item(text):
-            return None
-
-        # SKIPPED ENTIRELY on a gamedata.json that predates the equipment
-        # export, because every slot would read as "" there and every honest
-        # save would be refused. A server in that state is warned about at
-        # boot; it is not a server that should stop accepting saves.
-        if gamedata.EQUIP_EXPORTED:
-            verdict = gamedata.equip_check(text, slot_name, class_id, character_level)
-            if not verdict["ok"]:
-                return None
-
-        out[slot_name] = text
-    return out
+# parse_equipment() WAS HERE: it validated a whole equipment map a save sent.
+# Nothing has sent one it stores since equipment became server-owned - the
+# save ignores the field - and the equip routes ask gamedata.equip_check() for
+# one item at a time. Removed on 18 Oct (UPGRADES.md) rather than left looking
+# like a guard that guards nothing.
 
 
 def _stored_json(raw, fallback):
@@ -7374,117 +7318,20 @@ def _derived_stats(row, class_id=None, level=None):
 
 
 # =============================================================================
-# PLAYER STATUS  -  GET /api/player/status
+# PLAYER STATUS - the status/ package (since 18 Oct)
 # =============================================================================
+# GET and PUT /api/player/status, and the check that every rise in a pool was
+# earned (_reconcile_heals()), are status/'s - registered below, after the
+# tunables it is handed. What stays here: the stat ceiling and its parser,
+# what a coin is worth, the healing tunables and the grant ids every refill
+# writes, and the boot check that says which protections are not armed.
 
-@app.get("/api/player/status")
-@require_auth
-def player_status():
-    """
-    Live stat values for the HUD
-    ---
-    tags:
-      - Player
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: query
-        name: slot
-        type: integer
-        required: true
-        description: Character slot, 0-3
-    responses:
-      200:
-        description: Current stats for that slot
-      400:
-        description: Missing or out-of-range slot
-      404:
-        description: That slot is empty
-      401:
-        description: Missing, invalid or expired token
-    """
-    slot = parse_slot(request.args.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-
-    row = get_db().execute(
-        "SELECT * FROM saves WHERE user_id = ? AND slot = ?",
-        (g.user["id"], slot),
-    ).fetchone()
-
-    # 404 is the right answer for an empty slot: the request was valid, the
-    # resource does not exist. The client distinguishes this from a transport
-    # failure and shows "no character here" instead of "server is down".
-    if row is None:
-        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
-
-    return {
-        "slot": row["slot"],
-        "level": row["level"],
-        "hp": row["hp"], "max_hp": row["max_hp"],
-        "mana": row["mana"], "max_mana": row["max_mana"],
-        "stamina": row["stamina"], "max_stamina": row["max_stamina"],
-        "gold": row["gold"],
-        "xp": row["xp"], "xp_to_next": row["xp_to_next"],
-    }, 200
-
-
-# =============================================================================
-# PLAYER STATUS - WRITE
-# =============================================================================
-
-# Every stat the client is allowed to push, and the ceiling each one is
-# checked against. The client proposes; the server decides. A value that
-# cannot legally exist is refused rather than clamped, because clamping
-# hides the bug that produced it.
-STATUS_FIELDS = {
-    "level":       None,        # no paired maximum
-    "hp":          "max_hp",
-    "mana":        "max_mana",
-    "stamina":     "max_stamina",
-    "gold":        None,
-    "xp":          None,
-    "xp_to_next":  None,
-    "max_hp":      None,
-    "max_mana":    None,
-    "max_stamina": None,
-}
-
-# nothing in this game legitimately exceeds these. a number past one of them
-# means a corrupted save, an overflow, or someone editing packets - all three
-# are worth refusing rather than storing.
+# THE CEILING ON ANY STAT A REQUEST NAMES (parse_stat()). Nothing in this game
+# legitimately exceeds it; a number past it means a corrupted save, an
+# overflow, or someone editing packets - all three are worth refusing rather
+# than storing.
 STAT_CEILING = 1_000_000_000
 
-# FIELDS THE SERVER OWNS. A client may send them; the server ignores the values
-# and keeps its own.
-#
-# These three are granted by /api/combat/kill, which applies the level-up loop
-# itself and commits the result. The server therefore already knows what they
-# should be, and an assertion from the client is not evidence of anything.
-#
-# THIS IS THE HALF THAT MAKES THE OTHER HALF MEAN SOMETHING. Moving the loot
-# roll to the server closed the "give myself a pet" hole, but while
-# /api/player/status accepted a level, a modified client could simply declare
-# itself level 60 and skip the game entirely. It could not do that until there
-# was a server-side record to contradict it - which is why this change had to
-# come second, not first.
-#
-# NOT IN THIS LIST, and honestly so:
-#
-#   gold          arrives by picking up a loot bag, and the pickup is still
-#                 client-side. The server rolled what was IN the bag but does
-#                 not know the player walked over it. Closing that needs the
-#                 bag itself to be server-owned - a bag id, and an endpoint
-#                 that transfers from it. That is the next piece.
-#   hp/mana/      the result of combat and regen the server does not simulate.
-#   stamina       Clamped against their maxima below, which is all the server
-#                 can honestly say about them.
-#   hp/mana/      the result of combat and regen the server does not simulate.
-#   stamina       Clamped against their maxima below, which is all the server
-#                 can honestly say about them.
 # The two item ids that resolve into carried gold rather than a backpack cell.
 # Read from gamedata so the authored source stays baseenemy.gd's constants.
 CONSTANTS_GOLD_SMALL = gamedata.CONSTANTS.get("gold_small_id", "smallamountofgold")
@@ -7534,48 +7381,6 @@ def gold_item_value(item_id):
         return max(0, int(record.get("value", 0) or 0))
     except (TypeError, ValueError):
         return 0
-
-# GOLD IS IN THIS LIST AND ITS ABSENCE WAS A HOLE STRAIGHT THROUGH THE ECONOMY.
-#
-# PUT /api/save has always refused a client's gold. PUT /api/player/status never
-# did - `gold` is one of STATUS_FIELDS and was not one of these, so a single
-# request set any balance an authenticated player liked:
-#
-#     PUT /api/player/status  {"slot": 0, "gold": 1000000}   -> 200
-#
-# and the invariant the whole gold_ledger exists to hold up
-#
-#     SUM(gold_ledger.delta) == SUM(saves.gold) + SUM(accounts.bank_gold)
-#
-# broke on that one call: nothing was minted through gold_delta(), so the left
-# side stayed at 0 while the right side went to a million. The vendor sink, the
-# kingdom tax and every trade valuation sit on top of that equation.
-#
-# NOTHING HONEST NEEDS TO PUSH A GOLD FIGURE, which is why this is safe to close
-# rather than shadow-log first. /api/loot/take resolves a CURRENCY drop straight
-# into a balance through gold_delta() and calls itself the only place gold is
-# created; shop purchases, bank moves and trades all write their own rows. The
-# one client path that added gold locally was inventoryscreen.gd's gold-pile
-# handler, and a gold pile cannot reach a backpack in the first place - CURRENCY
-# is in EXCLUDED_FROM_LOOT.
-#
-# Ignored rather than refused, like every other owned field: an honest client
-# sends its whole status block and has no way to know which fields the server
-# has taken over. It is named in `ignored` so the client can see it is being
-# corrected rather than wonder why its gold did not stick.
-SERVER_OWNED_STATS = ("level", "xp", "xp_to_next", "gold")
-
-# DERIVED, not merely owned. These are not stored from a request at all - they
-# are recomputed from the character's class and level every time the status is
-# written, using the same curve the client runs:
-#
-#     max_hp = hp_base + (level - 1) * hp_per_lvl
-#
-# That curve used to be four literals inside warrior.gd's _set_stat_curve(), so
-# the server knew your level AND your class and still could not work out your
-# maximum health. ClassData moved it into data/classes/*.tres and the exporter
-# carries it here - the same route EnemyData took.
-DERIVED_STATS = ("max_hp", "max_mana", "max_stamina")
 
 
 # =============================================================================
@@ -7738,11 +7543,6 @@ RESPAWN_GRANT_ID = "__respawn__"
 # the surest way to make a log nobody reads.
 LEVELUP_GRANT_ID = "__levelup__"
 
-# A revive fills every pool, so it explains any rise in any of them. Recorded
-# with an empty target and a zero amount, and read here rather than stored as
-# three rows of unknown size.
-REVIVE_EXPLAINS_EVERYTHING = True
-
 
 # PROTECTIONS THAT ARE ONLY AS REAL AS THE CATALOGUE THEY READ.
 #
@@ -7770,9 +7570,9 @@ EXPORT_DEPENDENT_PROTECTIONS = (
     (
         "equip_slot_name",
         lambda: gamedata.EQUIP_EXPORTED,
-        "equipment saves fall back to EQUIP_SLOTS_FALLBACK and nothing "
-        "verifies an item belongs in the slot it was sent for - the state "
-        "that let {\"helm\": \"embersword\"} through",
+        "the catalogue cannot say which slot an item goes in, so every equip "
+        "is refused as not equipment, and the slot names fall back to "
+        "EQUIP_SLOTS_FALLBACK",
     ),
     (
         "placed_count",
@@ -7845,188 +7645,6 @@ def _warn_if_protections_unarmed():
 _warn_if_protections_unarmed()
 
 
-def _reconcile_heals(db, user_id, slot, before, after):
-    """
-    Trim any rise in hp/mana/stamina that regeneration and authorised
-    consumables cannot account for. Returns {field: corrected} for the caller
-    to apply, empty when there is nothing to correct.
-
-    RENAMED FROM _report_unexplained_heals, because it no longer only reports.
-    It sat beside _reconcile_bank() and _reconcile_inventory() when it was
-    named, did the same job as those two - compare the claim to the record and
-    correct it - and is named for it. (Those two are gone: the bag and the bank
-    are no longer claimed by the client at all. See ONE CELL AT A TIME.)
-
-    TWO LINES, NOT ONE, AND THAT IS THE WHOLE DESIGN.
-
-        HEAL_ALLOWANCE_MARGIN   1.25x   the TIGHT line: what regen plus
-                                        consumes can honestly produce.
-                                        Logged, never enforced.
-        HEAL_CLAMP_MARGIN       3.00x   the LOOSE line: enforced.
-
-    Enforcing at 1.25x on the evidence available would be the E-2 mistake - a
-    threshold picked from eighteen simulated scenarios rather than from real
-    traffic. Enforcing at 3x cannot plausibly catch an honest player: it is
-    three times more healing than the game can produce, and a rise that large
-    did not come from the game.
-
-    Meanwhile every rise landing BETWEEN the two lines is logged as
-    "tight-clamp would have caught this". That is the evidence for closing the
-    gap later, gathered while a control is already running rather than instead
-    of one. If that band stays empty across real play, 1.25x is safe and the
-    log is what says so. If it fills up with honest players, the band is the
-    proof that shipping the tight clamp would have broken them.
-
-    CLAMPS, DOES NOT REFUSE. A 400 here fails the whole save, and the save
-    carries XP, gold, position and inventory - punishing a suspicious hp figure
-    by discarding a legitimate half-hour of play is a worse bug than the cheat.
-    Trimmed to what the player could have earned, the way the old bag ledger
-    trimmed a bag, and the write proceeds.
-
-    WHAT IT STILL DOES NOT DO. It bounds the RATE of unexplained healing, not
-    its existence: measured against a 180 hp pool, roughly 7 hp per save slips
-    under the tight line and ~14 full heals an hour under it. That is the same
-    shape as the kill bucket, and the reason both are controls rather than
-    proofs is the same - the server does not observe combat. See E-3.
-
-    THE CHECK IS PER-POOL NOW, not per-character. The first version asked "did
-    this character drink anything recently", which meant one cheap stamina
-    potion explained an arbitrary jump in health - a hole exactly as wide as the
-    smallest consumable in the game. It asked that because the server did not
-    know what a potion restored. It does now, so a grant explains a rise in the
-    pool it actually fills, up to the amount it actually gives.
-
-    KNOWN SOURCE OF FALSE POSITIVES, named so whoever reads the log is not
-    misled: **a level-up** raises the derived maximum in the same write. The
-    rise in the CURRENT stat still has to come from somewhere, so this only
-    misfires if the client refills on level-up as well.
-
-    (Revive used to be the big one and no longer is - it goes through
-    /api/character/revive and leaves a grant row of its own.)
-
-    Anything that survives all of that is a client claiming health it did not
-    earn.
-    """
-    # MEASURED FROM WHEN THE POOLS WERE LAST WRITTEN, not from updated_at. A
-    # kill, a loot take, a skill tick or an equip all move updated_at without
-    # touching hp or mana, and measuring from them gave a player who stood still
-    # for fifteen seconds and then killed something two seconds' worth of
-    # regeneration - found on day 1 as "mana +19 vs regen 8" while looting coins.
-    # A row written before pools_at existed reads 0 there and falls back.
-    since = int(before["pools_at"] or 0) if "pools_at" in before.keys() else 0
-    elapsed = max(
-        float(int(time.time()) - (since or int(before["updated_at"] or 0))),
-        HEAL_MINIMUM_ELAPSED_SECONDS,
-    )
-
-    risen = {}
-    for field, cap_field in (("hp", "max_hp"), ("mana", "max_mana"), ("stamina", "max_stamina")):
-        gained = int(after[field]) - int(before[field] or 0)
-        if gained <= 0:
-            continue
-
-        ceiling = max(int(after[cap_field]), 1)
-
-        # Capped at the headroom that existed, because regeneration cannot take
-        # you past your own maximum however long you waited. Without this cap a
-        # client that simply saves rarely is handed an unlimited allowance.
-        #
-        # ELAPSED IS THE WHOLE WINDOW, even though regen only runs after
-        # REGEN_IDLE_THRESHOLD seconds of standing still and any action resets
-        # it. The server cannot see movement, so it assumes the most generous
-        # case. That makes this an upper bound rather than a tight one, which
-        # is the right direction to be wrong in for a check that must never
-        # fire on honest play.
-        allowance = min(
-            elapsed * gamedata.regen_rate_for(ceiling) * HEAL_ALLOWANCE_MARGIN,
-            float(ceiling - int(before[field] or 0)),
-        )
-
-        if gained > allowance:
-            risen[field] = (gained, allowance)
-
-    if not risen:
-        return {}
-
-    # WHAT THE SERVER AUTHORISED IN THE WINDOW, by pool.
-    since = int(time.time()) - HEAL_EXPLAIN_WINDOW_SECONDS
-    granted = {"hp": 0.0, "mana": 0.0, "stamina": 0.0}
-    for row in db.execute(
-        "SELECT item_id, target, amount FROM consume_grants "
-        "WHERE user_id = ? AND slot = ? AND at >= ?",
-        (user_id, slot, since),
-    ):
-        if row["item_id"] in (REVIVE_GRANT_ID, RESPAWN_GRANT_ID, LEVELUP_GRANT_ID):
-            # All three fill every pool to its maximum, so any of them explains
-            # any rise in any of them. They are special cases rather than large
-            # amounts because "as much as you had room for" is not a number the
-            # server can write down in advance.
-            return {}
-        target = str(row["target"] or "").lower()
-        if target in granted:
-            granted[target] += float(row["amount"] or 0)
-        elif row["amount"] == 0 and target == "":
-            # A grant written before the target/amount columns existed, or a
-            # potion from a gamedata.json that predates the export. Unknown
-            # rather than zero: it explains nothing on its own, but it must not
-            # be reported as a cheat either, because the server genuinely does
-            # not know what it did.
-            return {}
-
-    still_unexplained = {
-        field: (gained, allowance)
-        for field, (gained, allowance) in risen.items()
-        if gained > allowance + granted.get(field, 0.0)
-    }
-    if not still_unexplained:
-        return {}
-
-    # THE LINE SAYS WHAT WAS ALLOWED AND WHAT WAS GRANTED, per pool, because
-    # "unexplained heal" on its own is not something anyone can act on. The old
-    # message ended "(no consume in 30s)", which stopped being true the moment
-    # a grant could be partial - a potion may well have been drunk; it just did
-    # not cover the jump.
-    app.logger.warning(
-        "unexplained heal: user=%s slot=%s elapsed=%.1fs  %s  (window %ds)",
-        user_id, slot, elapsed,
-        "  ".join(
-            "%s +%d vs regen %.0f + granted %.0f" % (field, gained, allowance, granted.get(field, 0.0))
-            for field, (gained, allowance) in sorted(still_unexplained.items())
-        ),
-        HEAL_EXPLAIN_WINDOW_SECONDS,
-    )
-
-    # THE ENFORCED LINE. Everything above this point is the 1.25x measurement
-    # and is unchanged; this is the only part that acts.
-    #
-    # The ratio is taken against the TIGHT allowance, so widening the enforced
-    # margin never widens what gets logged. The two numbers stay independent on
-    # purpose: one is the honest estimate, the other is how much benefit of the
-    # doubt is currently being given, and conflating them is how a temporary
-    # margin quietly becomes the definition of honest.
-    if not HEAL_CLAMP_ENFORCED:
-        # Measured and reported above; nothing is corrected. See the constant.
-        return {}
-
-    corrections = {}
-    for field, (gained, allowance) in still_unexplained.items():
-        ceiling = allowance + granted.get(field, 0.0)
-        if gained <= ceiling * (HEAL_CLAMP_MARGIN / HEAL_ALLOWANCE_MARGIN):
-            # Between the lines. Logged above, deliberately not trimmed - this
-            # is the band that decides whether the tight margin is safe.
-            continue
-        corrections[field] = int(before[field] or 0) + int(ceiling)
-
-    if corrections:
-        app.logger.warning(
-            "heal clamped: user=%s slot=%s  %s",
-            user_id, slot,
-            "  ".join("%s %s -> %d" % (field, after[field], value)
-                      for field, value in sorted(corrections.items())),
-        )
-    return corrections
-
-
 def parse_stat(raw):
     """Return a non-negative int, or None if the value isn't one."""
     if isinstance(raw, bool):
@@ -8040,206 +7658,37 @@ def parse_stat(raw):
     return value
 
 
-@app.put("/api/player/status")
-@require_auth
-def write_player_status():
-    """
-    Push current stat values for one character slot
-    ---
-    tags:
-      - Player
-    consumes:
-      - application/json
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [slot]
-          properties:
-            slot:        {type: integer, example: 0}
-            level:       {type: integer, example: 12}
-            hp:          {type: integer, example: 88}
-            max_hp:      {type: integer, example: 120}
-            mana:        {type: integer, example: 30}
-            max_mana:    {type: integer, example: 60}
-            stamina:     {type: integer, example: 45}
-            max_stamina: {type: integer, example: 50}
-            gold:        {type: integer, example: 1450}
-            xp:          {type: integer, example: 15320}
-            xp_to_next:  {type: integer, example: 2100}
-    responses:
-      200:
-        description: The full status after the write
-      400:
-        description: A field was not a non-negative integer, or hp exceeded max_hp
-      404:
-        description: That slot is empty
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
+# THE STATUS ROUTES - the status/ package (see PLAYER STATUS). Handed the
+# healing tunables above as lookups, so the switch stays here, where its
+# history is, and a flip of it is heard on the next check.
+import status as status_package  # noqa: E402
 
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
+_STATUS = status_package.register(
+    app,
+    require_auth=require_auth,
+    get_db=get_db,
+    bad_request=bad_request,
+    parse_slot=parse_slot,
+    max_slot=MAX_SLOT,
+    parse_stat=parse_stat,
+    stat_ceiling=STAT_CEILING,
+    derived_stats=_derived_stats,
+    catalogue=gamedata,
+    heal_margin=lambda: HEAL_ALLOWANCE_MARGIN,
+    clamp_margin=lambda: HEAL_CLAMP_MARGIN,
+    clamp_enforced=lambda: HEAL_CLAMP_ENFORCED,
+    minimum_elapsed=lambda: HEAL_MINIMUM_ELAPSED_SECONDS,
+    explain_window=lambda: HEAL_EXPLAIN_WINDOW_SECONDS,
+    refill_grants=(REVIVE_GRANT_ID, RESPAWN_GRANT_ID, LEVELUP_GRANT_ID),
+)
+status_payload = _STATUS.status_of
+_reconcile_heals = _STATUS.reconcile_heals
 
-    row = get_db().execute(
-        "SELECT * FROM saves WHERE user_id = ? AND slot = ?",
-        (user_id, slot),
-    ).fetchone()
-    if row is None:
-        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
-
-    # PARTIAL UPDATE: only fields actually present are touched. A client that
-    # knows nothing about stamina can still push hp without silently zeroing
-    # everything it didn't mention.
-    # RECOMPUTED BEFORE ANYTHING IS VALIDATED, so that hp is checked against the
-    # maximum the server believes in rather than the one the client sent. A
-    # client declaring max_hp = 999999 alongside hp = 999999 would otherwise pass
-    # the paired check below on its own say-so.
-    derived = _derived_stats(row)
-
-    updates = {}
-    ignored = []
-    for field in STATUS_FIELDS:
-        if field not in payload:
-            continue
-
-        # Derived fields are dropped from the request for the same reason as
-        # owned ones, but they are then written back from the curve - see below.
-        if derived is not None and field in DERIVED_STATS:
-            ignored.append(field)
-            continue
-
-        # IGNORED, NOT REFUSED. A 400 here would break every honest save: the
-        # client sends its whole status block and has no way to know which
-        # fields the server has taken ownership of. Dropping them silently and
-        # reporting which ones were dropped lets an honest client carry on and
-        # gives a dishonest one nothing.
-        if field in SERVER_OWNED_STATS:
-            ignored.append(field)
-            continue
-
-        value = parse_stat(payload[field])
-        if value is None:
-            return bad_request(
-                "%s must be a non-negative integer no greater than %d" % (field, STAT_CEILING)
-            )
-        updates[field] = value
-
-    if not updates and not ignored:
-        return bad_request("no writable fields supplied")
-
-    # Validate against the state AFTER the merge, not against what was sent.
-    # Pushing hp=120 alone is illegal if stored max_hp is 100, but legal in the
-    # same request that raises max_hp to 120 - and order of keys in JSON must
-    # not decide which.
-    merged = {field: row[field] for field in STATUS_FIELDS}
-    merged.update(updates)
-
-    if derived is not None:
-        # The server's own numbers go in AFTER the client's, so they win, and
-        # they are added to `updates` so they are actually written - a character
-        # that levelled up needs its new maximum stored, not just enforced.
-        merged.update(derived)
-        updates.update(derived)
-
-    for field, cap_field in STATUS_FIELDS.items():
-        if cap_field is None:
-            continue
-        if merged[field] > merged[cap_field]:
-            # CLAMPED, not refused, when the ceiling is one the server derived.
-            #
-            # A character at full health who levels DOWN - or whose class curve
-            # is retuned downward between releases - legitimately arrives with
-            # hp above the new max_hp. Refusing would make that character
-            # unsaveable. Clamping is the honest reading: you have as much health
-            # as the curve allows.
-            if cap_field in DERIVED_STATS and derived is not None:
-                merged[field] = merged[cap_field]
-                updates[field] = merged[cap_field]
-                continue
-            return bad_request(
-                "%s (%d) cannot exceed %s (%d)" % (field, merged[field], cap_field, merged[cap_field])
-            )
-
-    db = get_db()
-    if updates:
-        # BEFORE THE WRITE, because it compares the stored row to the merged
-        # one and the stored row is about to stop existing.
-        #
-        # IT CORRECTS RATHER THAN REFUSING, and the corrections go into BOTH
-        # `merged` and `updates`: merged is what the rest of this function
-        # reasons about, updates is what actually reaches the UPDATE statement.
-        # Writing only one of them is how a clamp becomes decorative - the log
-        # would say "clamped" and the client's figure would be stored anyway.
-        healed = _reconcile_heals(db, user_id, slot, row, merged)
-        for field, value in healed.items():
-            merged[field] = value
-            updates[field] = value
-
-        # A DEATH IS A TRANSITION, NOT A STATE, and counting it as a state is
-        # the bug worth not writing. A dead client keeps reporting its status
-        # while the death screen is up, so "hp is 0" is true over and over for
-        # as long as the player sits there deciding whether to pay. Counting
-        # that would let anybody run their death total to a million by leaving
-        # the screen open, and would make the figure meaningless for everybody
-        # who did not.
-        #
-        # So: the STORED row still had hp above zero and the merged one does
-        # not. That happens exactly once per death.
-        #
-        # AFTER _reconcile_heals(), because the reconciler can correct the hp
-        # the client sent, and the corrected figure is the one that gets
-        # stored - reading before it would count a death the save never
-        # recorded.
-        if "hp" in updates and int(row["hp"]) > 0 and int(updates["hp"]) <= 0:
-            db.execute("UPDATE users SET deaths = deaths + 1 WHERE id = ?", (user_id,))
-
-        # pools_at moves only when a pool is written - see the migration.
-        if any(f in updates for f in ("hp", "mana", "stamina")):
-            updates["pools_at"] = int(time.time())
-        assignments = ", ".join("%s = ?" % f for f in updates)
-        values = list(updates.values()) + [int(time.time()), user_id, slot]
-        db.execute(
-            "UPDATE saves SET %s, updated_at = ? WHERE user_id = ? AND slot = ?" % assignments,
-            values,
-        )
-        db.commit()
-
-    result = status_payload(user_id, slot)
-    if ignored:
-        # The server's own values are already in `result`; this just names what
-        # was disregarded, so a client can see it is being corrected rather than
-        # wondering why its level did not stick.
-        result["ignored"] = ignored
-    return result, 200
-
-
-def status_payload(user_id, slot):
-    row = get_db().execute(
-        "SELECT * FROM saves WHERE user_id = ? AND slot = ?",
-        (user_id, slot),
-    ).fetchone()
-    if row is None:
-        return None
-    return {
-        "slot": row["slot"],
-        "level": row["level"],
-        "hp": row["hp"], "max_hp": row["max_hp"],
-        "mana": row["mana"], "max_mana": row["max_mana"],
-        "stamina": row["stamina"], "max_stamina": row["max_stamina"],
-        "gold": row["gold"],
-        "xp": row["xp"], "xp_to_next": row["xp_to_next"],
-    }
+# Named here as well, for anything that reads them off this module;
+# status/services.py is where they are set.
+STATUS_FIELDS = status_package.STATUS_FIELDS
+SERVER_OWNED_STATS = status_package.SERVER_OWNED_STATS
+DERIVED_STATS = status_package.DERIVED_STATS
 
 
 # =============================================================================
@@ -9305,7 +8754,7 @@ def staff_skill():
           required: [slot, skill, level]
           properties:
             slot:  {type: integer, example: 0}
-            skill: {type: string, example: "attack", description: "One skill, or \"all\""}
+            skill: {type: string, example: "attack", description: 'One skill, or "all"'}
             level: {type: integer, example: 50}
     responses:
       200:
@@ -10802,7 +10251,7 @@ def set_maintenance():
           type: object
           required: [on]
           properties:
-            on:            {type: boolean, description: "true closes the server"}
+            "on":          {type: boolean, description: "true closes the server"}
             message:       {type: string,  description: "what players are told"}
             back_at:       {type: string,  description: "RFC3339, or null"}
             grace_seconds: {type: integer, description: "seconds players get to save before being signed out"}
@@ -11016,7 +10465,7 @@ def set_pvp():
           type: object
           required: [on]
           properties:
-            on: {type: boolean}
+            "on": {type: boolean}
     responses:
       200:
         description: The switch, as it now stands
@@ -11095,7 +10544,7 @@ def set_trade():
           type: object
           required: [on]
           properties:
-            on: {type: boolean, description: "false stops new trades; open ones may finish"}
+            "on": {type: boolean, description: "false stops new trades; open ones may finish"}
     responses:
       200:
         description: The switch, as it now stands, and how many trades are still open
@@ -11251,7 +10700,7 @@ def set_co_owners():
           type: object
           required: [on]
           properties:
-            on: {type: boolean, description: "true gives the accounts ELUSION_CO_OWNERS names the owner's powers"}
+            "on": {type: boolean, description: "true gives the accounts ELUSION_CO_OWNERS names the owner's powers"}
     responses:
       200:
         description: The switch as it now stands, and who it lets in
@@ -11894,370 +11343,38 @@ _BANK = bank_package.register(
 account_payload = _BANK.account_of
 
 
+# =============================================================================
+# THE SHOP - the shop/ package (since 18 Oct)
+# =============================================================================
+# POST /api/shop/buy and /sell and GET /api/shop/<shop_id>, as they were here -
+# endpoint names, docstrings and every message (routes.lock). shop/__init__.py
+# tells why a shop has to be the server's. Handed the carry's grant and its
+# one-cell steps (carry/, registered above), the gold ledger, and the trade
+# hold - defined with trade, below, so asked for when a purchase lands.
+import shop as shop_package  # noqa: E402
 
-@app.post("/api/shop/buy")
-@require_auth
-def shop_buy():
-    """
-    ---
-    post:
-      summary: Buy from a vendor
-      description: >
-        Server-authoritative purchase. The server checks the shop stocks the
-        item, prices it from its OWN ItemData copy, takes the gold and grants
-        the item in one transaction. The gold is DESTROYED, not moved - this is
-        the first real sink in the economy.
-      requestBody:
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [slot, shop_id, item_id]
-              properties:
-                slot:     {type: integer, example: 0}
-                shop_id:  {type: string,  example: generalstore}
-                item_id:  {type: string,  example: tinyhealthpotion}
-                quantity: {type: integer, example: 1}
-      responses:
-        200:
-          description: >
-            Bought. Returns the new gold balance and backpack. item_id is the
-            piece that arrived - for gear, rolled on the spot ("jadesword~d104p96");
-            stock_id is the shelf's id it was bought as.
-        400:
-          description: Bad slot, unknown shop, item not stocked, or not enough gold
-        404:
-          description: That slot is empty
-        409:
-          description: Backpack full
-        401:
-          description: Missing, invalid or expired token
-    """
-    # WHY THIS EXISTS AT ALL, rather than the client taking gold and adding an
-    # item locally. The old bag ledger trimmed a client holding MORE of an
-    # item than the server granted - but a client-side shop asserts both halves
-    # of the trade, the item gained AND the gold spent, and the trim only
-    # checks the first. A shop that ran on the client would be an item printer
-    # with a receipt.
-    #
-    # It is also the sink. Every gold that leaves here leaves the economy for
-    # good, which is the whole reason vendors sell rather than buy.
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-    if not _slot_exists(user_id, slot):
-        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
-
-    shop_id = str(payload.get("shop_id", "")).strip()
-    if not shop_id or len(shop_id) > 64:
-        return bad_request("shop_id must be 1-64 characters")
-
-    item_id = str(payload.get("item_id", "")).strip()
-    if not item_id or len(item_id) > 64:
-        return bad_request("item_id must be 1-64 characters")
-
-    raw_quantity = payload.get("quantity", 1)
-    if isinstance(raw_quantity, bool):
-        return bad_request("quantity must be a positive integer")
-    try:
-        quantity = int(raw_quantity)
-    except (TypeError, ValueError):
-        return bad_request("quantity must be a positive integer")
-    if quantity <= 0:
-        return bad_request("quantity must be a positive integer")
-
-    # The same ceiling an ordinary write gets. One cell cannot hold more than
-    # the item stacks to, and a purchase is not a reason to create a row that
-    # breaks that rule everywhere else in the game.
-    limit = _stack_limit(item_id)
-    if quantity > limit:
-        return bad_request(
-            "quantity is %d, the most %s stacks to is %d" % (quantity, item_id, limit)
-        )
-
-    if shop_id not in gamedata.SHOPS:
-        # Named back deliberately, the same way an unknown enemy_id is: this is
-        # the client and the server disagreeing about the world, which almost
-        # always means gamedata.json is stale on one side.
-        return bad_request("Unknown shop '%s'. Is gamedata.json current?" % shop_id)
-
-    # PRICED BY THE SERVER, FROM THE SERVER'S CATALOGUE. The request does not
-    # carry a price and would not be believed if it did.
-    unit_price = gamedata.shop_price(shop_id, item_id)
-    if unit_price is None:
-        return bad_request("'%s' does not stock '%s'." % (shop_id, item_id))
-
-    total = unit_price * quantity
-
-    db = get_db()
-    row = db.execute(
-        "SELECT gold FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)
-    ).fetchone()
-    carried = int(row["gold"]) if row is not None else 0
-    if carried < total:
-        return bad_request(
-            "That costs %d gold and you have %d." % (total, carried)
-        )
-
-    # ---- everything above this line is validation; below it commits --------
-
-    # THE ITEM FIRST, because this is the half that can still fail. It writes
-    # nothing unless the whole quantity fits, so a refusal here leaves the
-    # backpack exactly as it was and the gold untouched.
-    # GEAR IS ROLLED AT THE TILL. The owner, 5 Oct: "item stats say ? and are
-    # revealed upon buying in shop only". The shelf lists the catalogue piece
-    # and its price; what is handed over rolls exactly as a drop does
-    # (gamedata.roll_quality: 85-115% a stat, one in QUALITY_PERFECT_ODDS
-    # Perfect). Same price whatever it rolls, so an average purchase is the
-    # catalogue piece, as it was. A potion, a worm or a rod has nothing to roll
-    # and comes as it is. Gear stacks to one, so quantity is 1 here.
-    bought = gamedata.roll_quality(item_id)
-
-    written = _add_to_backpack(user_id, slot, bought, quantity)
-    if written is None:
-        db.rollback()
-        return {
-            "error": "Conflict",
-            "message": "Your backpack is full (%d slots)." % INVENTORY_CAPACITY,
-        }, 409
-
-    # A PERFECT FROM THE SHOP IS HELD FROM TRADE like one from a bag: gold
-    # from cheated kills buys it as well as anything.
-    place_trade_hold(db, user_id, bought, quantity)
-
-    # THE BURN. Negative delta, through gold_delta() so it lands in the ledger
-    # in the same transaction as the balance - see gold_ledger in init_db().
-    # This is gold leaving the world, not moving to a vendor's pocket: nothing
-    # holds it afterwards, which is what makes it a sink.
-    remaining = gold_delta(
-        db, user_id, slot, -total, "shop_buy",
-        "%s x%d @%d from %s" % (bought, quantity, unit_price, shop_id),
-    )
-
-    db.commit()
-
-    return {
-        "slot": slot,
-        "shop_id": shop_id,
-        "item_id": bought,
-        "stock_id": item_id,
-        "quantity": quantity,
-        "unit_price": unit_price,
-        "total_paid": total,
-        "gold": remaining,
-        "inventory": inventory_payload(user_id, slot),
-    }, 200
-
-
-@app.post("/api/shop/sell")
-@require_auth
-def shop_sell():
-    """
-    Sell what is in one carried cell to a vendor
-    ---
-    tags:
-      - Shop
-    consumes:
-      - application/json
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [slot, shop_id, position, item_id]
-          properties:
-            slot:     {type: integer, example: 0}
-            shop_id:  {type: string,  example: generalstore}
-            position: {type: integer, example: 4, description: "The carried cell"}
-            item_id:  {type: string,  example: jadesword, description: "What the game saw in that cell"}
-            quantity: {type: integer, example: 1, description: "How many from the cell; the whole stack when left out"}
-    responses:
-      200:
-        description: Sold. The carry and the purse afterwards, and what was paid.
-      400:
-        description: Bad slot, cell, item, quantity or shop, or the shop does not buy it
-      404:
-        description: That slot is empty
-      409:
-        description: "The cell does not hold that item, or not that many. Carries resync; nothing was sold."
-      401:
-        description: Missing, invalid or expired token
-    """
-    # THE SHOP BUYS NOW (5 Oct, the owner: "we should be able to sell items to
-    # the shop"). Every piece of a tier was the same piece, so a second jade
-    # sword was worth nothing to its finder; now it is worth something.
-    #
-    # ONE CELL AND THE ITEM THE GAME SAW IN IT, like every carry route (ONE
-    # CELL AT A TIME): a sale names what it sells, the server checks the cell
-    # still holds it, prices it from its own catalogue and pays through
-    # gold_delta() in the same transaction. The request carries no price and
-    # would not be believed if it did.
-    #
-    # IT IS A FAUCET, on purpose and small: the gold is MINTED, reason
-    # shop_sell, so the supply report counts it and the invariant still holds.
-    # sell_multiplier (the game's ShopData, 0.05) keeps an hour's junk worth
-    # less than the hour's coin, and a set five hours away even for a player
-    # who sells everything - test_pacing.py measures both.
-    payload, slot, item_id, error = _carry_request()
-    if error is not None:
-        return error
-    position, error = parse_grid_cell(payload, "position", CARRY_CAPACITY)
-    if error is not None:
-        return error
-
-    shop_id = str(payload.get("shop_id", "")).strip()
-    if not shop_id or len(shop_id) > 64:
-        return bad_request("shop_id must be 1-64 characters")
-    if shop_id not in gamedata.SHOPS:
-        return bad_request("Unknown shop '%s'. Is gamedata.json current?" % shop_id)
-
-    unit_price = gamedata.shop_sell_price(shop_id, item_id)
-    if unit_price is None:
-        return bad_request("The shop does not buy that.")
-
-    raw_quantity = payload.get("quantity")
-    quantity = None
-    if raw_quantity is not None:
-        if isinstance(raw_quantity, bool):
-            return bad_request("quantity must be a positive integer")
-        try:
-            quantity = int(raw_quantity)
-        except (TypeError, ValueError):
-            return bad_request("quantity must be a positive integer")
-        if quantity <= 0 or float(raw_quantity) != quantity:
-            return bad_request("quantity must be a positive integer")
-
-    user_id = g.user["id"]
-    keys = (user_id, slot)
-    held = _grid_cells("carry_items", ("user_id", "slot"), keys, (position,)).get(position)
-    if held is None or held[0] != item_id:
-        return _carry_resync(user_id, slot)
-    if quantity is None:
-        quantity = held[1]
-    if quantity > held[1]:
-        # Asking for more than the cell holds is the game's picture being out
-        # of date, the same as a cell holding something else.
-        return _carry_resync(user_id, slot)
-
-    db = get_db()
-    left = held[1] - quantity
-    _grid_rewrite("carry_items", ("user_id", "slot"), keys, (position,),
-                  {position: (item_id, left)} if left > 0 else {})
-    total = unit_price * quantity
-    remaining = gold_delta(
-        db, user_id, slot, total, "shop_sell",
-        "%s x%d @%d to %s" % (item_id, quantity, unit_price, shop_id),
-    )
-    db.commit()
-
-    return {
-        "slot": slot,
-        "shop_id": shop_id,
-        "position": position,
-        "item_id": item_id,
-        "quantity": quantity,
-        "unit_price": unit_price,
-        "total_received": total,
-        "gold": remaining,
-        "inventory": inventory_payload(user_id, slot),
-    }, 200
-
-
-@app.get("/api/shop/<shop_id>")
-@require_auth
-def shop_catalogue(shop_id):
-    """
-    ---
-    get:
-      summary: What a vendor stocks, with prices
-      description: >
-        The prices the server will actually charge, so the panel cannot show a
-        number the buy endpoint then disagrees with.
-      responses:
-        200:
-          description: The vendor's stock
-        404:
-          description: No such shop
-    """
-    shop = gamedata.SHOPS.get(str(shop_id).strip())
-    if shop is None:
-        return {"error": "Not Found", "message": "No shop '%s'." % shop_id}, 404
-
-    # PRICED HERE RATHER THAN IN THE CLIENT. The panel could multiply
-    # ItemData.value by the shop's multiplier itself and usually get the same
-    # answer - and the day the rounding rule changes, it would quietly get a
-    # different one and show a price the server refuses. One source.
-    stock = []
-    for item_id in shop.get("stock", []):
-        definition = gamedata.item_row(item_id)
-        if definition is None:
-            continue
-        stock.append({
-            "item_id": item_id,
-            "display_name": definition.get("display_name", item_id),
-            "tier": definition.get("tier", 1),
-            "type_name": definition.get("type_name", ""),
-            "required_level": definition.get("required_level", 1),
-
-            # THE OTHER HALF OF THE REQUIREMENT. A cooked fish is gated on
-            # COOKING, not on character level - see itemdata.gd's comment on
-            # required_skill - so a row carrying only required_level would let
-            # the panel print "Needs nothing" for a Reef Clown that needs 70
-            # cooking. Sent from the server's own ItemData copy for the same
-            # reason the price is: one source, and a stale client cannot
-            # disagree with it.
-            "required_skill": definition.get("required_skill", ""),
-            "required_skill_level": definition.get("required_skill_level", 1),
-
-            # THE THIRD HALF, and the one a weapon rack needs most. A sword
-            # and a staff sit side by side at the same price and the same
-            # level, and nothing on the row said which of them a warrior can
-            # actually hold - so the first time you find out is when the
-            # equip endpoint refuses it, after you have paid.
-            #
-            # An empty list means "anyone", which is most of the catalogue, so
-            # the panel prints nothing rather than "Needs: anyone".
-            #
-            # FROM THE SERVER'S OWN COPY, like the price and the level, for
-            # the reason those are: one source, and a stale client cannot
-            # disagree with it.
-            "required_classes": list(definition.get("required_classes") or []),
-
-            # WHAT IT IS, for the same row. A tooltip that says "Ember Staff"
-            # and a price is a tooltip that made you click to learn anything.
-            "equip_slot_name": definition.get("equip_slot_name", ""),
-            "damage": int(definition.get("damage", 0) or 0),
-            "armor_value": int(definition.get("armor_value", 0) or 0),
-
-            "max_stack": definition.get("max_stack", 1),
-            "price": gamedata.shop_price(shop["shop_id"], item_id),
-        })
-
-    # WHAT THE SHOP PAYS, for every item it would buy, from the same function
-    # /api/shop/sell prices with - so the Sell list shows the number the till
-    # pays, not one the panel worked out.
-    sell_prices = {}
-    for item_id in gamedata.ITEMS:
-        price = gamedata.shop_sell_price(shop["shop_id"], item_id)
-        if price is not None:
-            sell_prices[item_id] = price
-
-    return {
-        "shop_id": shop["shop_id"],
-        "display_name": shop.get("display_name", "Shop"),
-        "stock": stock,
-        "sell_multiplier": float(shop.get("sell_multiplier", 0.0) or 0.0),
-        "sell_prices": sell_prices,
-    }, 200
+shop_package.register(
+    app,
+    require_auth=require_auth,
+    get_db=get_db,
+    bad_request=bad_request,
+    parse_slot=parse_slot,
+    max_slot=MAX_SLOT,
+    slot_exists=_slot_exists,
+    catalogue=gamedata,
+    stack_limit=_stack_limit,
+    add_to_backpack=_add_to_backpack,
+    bag_cells=INVENTORY_CAPACITY,
+    place_trade_hold=lambda db, user_id, item_id, quantity: place_trade_hold(db, user_id, item_id, quantity),
+    gold_delta=gold_delta,
+    inventory_of=inventory_payload,
+    carry_request=_carry_request,
+    parse_grid_cell=parse_grid_cell,
+    carry_cells=CARRY_CAPACITY,
+    grid_cells=_grid_cells,
+    grid_rewrite=_grid_rewrite,
+    resync=_carry_resync,
+)
 
 
 # =============================================================================

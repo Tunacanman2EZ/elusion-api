@@ -23,7 +23,8 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_economy_test.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+DB_PATH = os.path.join(testdir.PATH, "elusion_economy_test.db")
 
 # BEFORE the import: app.py reads DB_PATH and OWNER_USERNAME at import time and
 # calls init_db(), and none of that may touch the real database.

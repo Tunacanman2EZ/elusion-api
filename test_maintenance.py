@@ -28,7 +28,8 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_maintenance_test.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+DB_PATH = os.path.join(testdir.PATH, "elusion_maintenance_test.db")
 
 # Point the app at a scratch database BEFORE importing it - app.py calls
 # init_db() at import time and must not touch the real one.

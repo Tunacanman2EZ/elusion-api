@@ -7,9 +7,10 @@ it follows the same road.
 
 ## Where it stands
 
-`app.py` is about 20,000 lines: the shared core (config, the database and its
-write lock, sessions and tokens, the auth decorators, rate limiting, request
-timing) and most of the game's areas, one after another. It works, and every
+`app.py` was about 20,000 lines when this was written (16 Oct), and is about
+12,700 with the carry out (18 Oct): the shared core (config, the database and
+its write lock, sessions and tokens, the auth decorators, rate limiting,
+request timing) and the areas not yet moved, one after another. It works, and every
 area is covered by its own suite, but one file that size has a cost that grows:
 a change to one area means reading around all the others, and nothing stops
 one area reaching into another's tables.
@@ -40,6 +41,8 @@ Beside it, **feature packages**: a folder per area, each in three layers.
 | `carry/` | 18 Oct | **moved out** of app.py: the backpack, and the item grants |
 | `skills/` | 18 Oct | **moved out** of app.py: the skills write, training, the XP grant |
 | `saves/` | 18 Oct | **moved out** of app.py: a character's slot, its read, deleting it |
+| `status/` | 18 Oct | **moved out** of app.py: the live stats and the healing check |
+| `shop/` | 18 Oct | **moved out** of app.py: buying, selling, the shelf |
 
 ## Where it is going
 
@@ -248,14 +251,43 @@ areas that hold money and items:
     than its old banner**, after everything it is handed (the carry, the
     skills, the trade lookup, the save history), so nothing is a lookup.
     What every route shares stays at SAVES: the slot parser, the 400, a cell,
-    the JSON-column reader and `_derived_stats()`. Next: the status read and
-    write, with the healing reconciler; then the shop.
+    the JSON-column reader and `_derived_stats()`.
+    ~~The status read and write (`status/`)~~ (18 Oct): GET and PUT
+    `/api/player/status` and the check that every rise in a pool was earned,
+    with what a status write may name, what the server owns and what it
+    derives. **The healing tunables stay in app.py, handed in as lookups**
+    (`lambda: HEAL_CLAMP_ENFORCED` and the margins): they are switches with
+    their history written beside them, and a copy handed in once would be a
+    second switch the first no longer moves - checked by flipping app.py's on
+    the real app, and app.config's on the bare one. register() hands back
+    `status_of()`, kept as `status_payload()` for every area that answers with
+    the vitals.
+    ~~The shop (`shop/`)~~ (18 Oct): buying, selling and the shelf - three
+    routes. It writes no table of its own: the bag through the carry's grant
+    and one-cell steps, handed in by the names app.py keeps for them, the gold
+    through the ledger, a Perfect's hold through trade/'s (a lookup - it is
+    defined further down). **That finishes the carry.**
+
+11. what is left beside the core, in moves, the smallest first (written here
+    18 Oct, when the carry finished and the list was counted - 39 routes):
+    - who is around: the online list, the nearby list, the presence ticket (3)
+    - the server's switches: maintenance, the minimum build, PvP, trading,
+      co-owners, the broadcasts, and `/api/status` (9)
+    - the kill: `/api/combat/kill` - the XP, the level, the loot roll and the
+      kill's record, in one transaction (1)
+    - the owner's tools: gold, level, skill, grant, the gifts ledger, the save
+      history and rollback, teleport and its acknowledgement (9)
+    - the account's settings: e-mail and its check, the name colour (4)
+    What stays in app.py on purpose: `/api/staff/powers` (it reads every route
+    and quotes every area's limits - the composition root's own page),
+    `/api/metrics` and `/api/economy/supply` (the request timing and the
+    ledger audit, both the core's).
+12. then the core itself (sessions, tokens, auth - the other 10 routes) into a
+    package of its own, and each table's `CREATE` into its area - and app.py
+    is the composition root it was meant to be.
 
 Things noticed along the way that need upgrading, but are not part of a move,
 are kept in UPGRADES.md - checked before they are written there.
-11. then the core itself (sessions, tokens, auth) into a package of its own,
-    and each table's `CREATE` into its area - and app.py is the composition
-    root it was meant to be.
 
 The game has the same kind of work waiting: the 30,000-line test runner into a
 file per area, and the HUD (characterhud.gd) into its parts. Server first:

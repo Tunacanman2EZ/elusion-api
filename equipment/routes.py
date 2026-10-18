@@ -113,9 +113,8 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, pa
                 return bad_request("No such item '%s'." % item_id)
             return {"error": "Forbidden", "message": "That is not equipment."}, 403
 
-        # THE SERVER'S OWN LEVEL AND CLASS, never the body's. Same reason
-        # parse_equipment() takes them as arguments rather than reading a
-        # payload: a client that could name its own level could wear anything.
+        # THE SERVER'S OWN LEVEL AND CLASS, never the body's: a client that
+        # could name its own level could wear anything.
         verdict = catalogue.equip_check(item_id, target, str(row["class_id"]), int(row["level"]))
         if not verdict.get("ok", False):
             if verdict.get("reason", "") == "unknown":

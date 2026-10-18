@@ -26,7 +26,8 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_security_test.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+DB_PATH = os.path.join(testdir.PATH, "elusion_security_test.db")
 
 os.environ["ELUSION_DB"] = DB_PATH
 if os.path.exists(DB_PATH):
@@ -2094,7 +2095,7 @@ def import_app_with(env_overrides, argv=None):
     for key in ("ELUSION_DEBUG", "FLASK_DEBUG", "ELUSION_TRUSTED_PROXIES"):
         env.pop(key, None)
     env.update(env_overrides)
-    env["ELUSION_DB"] = os.path.join(tempfile.gettempdir(), "elusion_debugdoor.db")
+    env["ELUSION_DB"] = os.path.join(testdir.PATH, "elusion_debugdoor.db")
     code = "import sys; sys.argv = %r; import app" % (argv or ["app.py"])
     r = subprocess.run([sys.executable, "-c", code], cwd=HERE, env=env,
                        capture_output=True, text=True, timeout=120)
@@ -2131,7 +2132,7 @@ def preflight(env_overrides, gamedata_dir=None):
     """Import wsgi.py in a child and report (exit_code, stderr)."""
     env = dict(os.environ)
     env.update(env_overrides)
-    env["ELUSION_DB"] = os.path.join(tempfile.gettempdir(), "elusion_preflight.db")
+    env["ELUSION_DB"] = os.path.join(testdir.PATH, "elusion_preflight.db")
     run_in = gamedata_dir or HERE
     r = subprocess.run(
         [sys.executable, "-c", "import wsgi"],

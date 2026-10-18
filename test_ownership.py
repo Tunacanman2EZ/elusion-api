@@ -62,7 +62,8 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_ownership_test.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+DB_PATH = os.path.join(testdir.PATH, "elusion_ownership_test.db")
 
 os.environ["ELUSION_DB"] = DB_PATH
 if os.path.exists(DB_PATH):
@@ -661,7 +662,6 @@ check("the schema names some per-user tables", len(OWNED_TABLES) >= 8,
 # gets switched off. Join them first, the way the interpreter does.
 def sql_statements(text):
     out = []
-    pattern = re.compile(r'"((?:[^"\\]|\\.)*)"(?:\s*\n?\s*"((?:[^"\\]|\\.)*)")*')
     for m in re.finditer(r'((?:"(?:[^"\\]|\\.)*"\s*(?:\n\s*)?)+)', text):
         joined = "".join(re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1)))
         flat = " ".join(joined.split())

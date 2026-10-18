@@ -35,7 +35,11 @@ One suite on its own:
 ```
 
 Every suite builds a throwaway database in your temp folder, so none of them
-ever touches `elusion.db`.
+ever touches `elusion.db` - and in a folder of its own for each run
+(`testdir.PATH`, testdir.py), so two suites, or two copies of one, can run at
+the same time. **A new suite puts its databases under `testdir.PATH`**, never
+at a fixed name in `tempfile.gettempdir()`: that is the shared folder, and two
+runs at once wrote over each other's data (UPGRADES.md, item 2).
 
 **THERE IS NO CHECK COUNT WRITTEN DOWN HERE, AND THAT IS DELIBERATE.** This
 line used to say "262 checks" and the Layout below used to give a figure for
@@ -2053,6 +2057,13 @@ only, `test_stats.py`.
   the name does not exist yet when register() runs. And `saves/` (18 Oct:
   GET and PUT /api/save, GET /api/character and deleting a character;
   registered late, after everything it is handed, so nothing is a lookup).
+  And `status/` (18 Oct: GET and PUT /api/player/status and the healing
+  check; **the healing tunables stay in app.py and are handed in as
+  lookups** - `HEAL_CLAMP_ENFORCED` is a switch that has been flipped twice for
+  reasons written beside it, so the one place it is flipped must stay the one
+  place it is read). And `shop/` (18 Oct: buying, selling and the shelf; it
+  writes no table of its own - the carry's grant and cells, the ledger and
+  trade's hold are handed in).
   **Something noticed along the way that needs upgrading goes in
   UPGRADES.md** (the owner asked to be kept told): checked first, then where
   it is, why it matters, how big the fix is.

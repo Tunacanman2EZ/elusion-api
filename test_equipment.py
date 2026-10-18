@@ -17,7 +17,8 @@ import sim_client as C
 # broken test rather than the finding it actually is.
 #
 # The finding: gamedata.json carries no equipment data, so the server cannot
-# tell a helmet from a sword and /api/save accepts any item in any slot.
+# tell a helmet from a sword (it once let /api/save store any item in any
+# slot; today the equip route refuses every piece).
 # wsgi.py now refuses to start in that state. This says the same thing to
 # whoever runs the tests, in words, before the first assertion.
 if not any("equip_slot" in item for item in C.ITEMS.values()):

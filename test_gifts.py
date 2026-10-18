@@ -28,10 +28,11 @@ much did i inflate my server". THE GIFTS LEDGER in app.py.
   GL-8  giftwatch.py ON THE SERVER: the same answer from the database, read
         only, and a plain sentence when the table is not there yet.
 """
-import importlib.util, json, os, sqlite3, subprocess, sys, tempfile
+import importlib.util, os, sqlite3, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_gifts_test.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+DB_PATH = os.path.join(testdir.PATH, "elusion_gifts_test.db")
 os.environ["ELUSION_DB"] = DB_PATH
 os.environ["ELUSION_OWNER"] = "boss"
 os.environ.pop("ELUSION_GAMEDATA", None)
@@ -371,7 +372,7 @@ check("  one player's alone with --player", out.returncode == 0 and "friend" in 
 source = open(os.path.join(HERE, "giftwatch.py")).read()
 check("  read only: opened mode=ro, so it cannot write", "mode=ro" in source and "INSERT" not in source
       and "UPDATE" not in source and "DELETE" not in source)
-bare = os.path.join(tempfile.gettempdir(), "elusion_gifts_bare.db")
+bare = os.path.join(testdir.PATH, "elusion_gifts_bare.db")
 if os.path.exists(bare):
     os.remove(bare)
 sqlite3.connect(bare).execute("CREATE TABLE users (id INTEGER)").connection.close()

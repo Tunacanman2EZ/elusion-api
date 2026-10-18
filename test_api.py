@@ -27,7 +27,8 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_test.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+DB_PATH = os.path.join(testdir.PATH, "elusion_test.db")
 
 # Point the app at a scratch database BEFORE importing it - app.py calls
 # init_db() at import time, and we do not want that touching the real one.
@@ -1174,8 +1175,8 @@ def slot_zero():
 
 
 # THE CHARACTER HAS TO BE OLD ENOUGH TO WEAR THIS, and until the equipment
-# export existed it did not have to be. parse_equipment() skips
-# gamedata.equip_check() entirely on a gamedata.json that predates
+# export existed it did not have to be. parse_equipment() (gone since 18 Oct)
+# skipped gamedata.equip_check() entirely on a gamedata.json that predated
 # equip_slot_name, so this block spent its whole life dressing a LEVEL 1
 # warrior in level 22 ember gear and getting a 200 for it. The first run after
 # the export turned that into five failures - which is the gate reporting for
@@ -2311,7 +2312,7 @@ def _user_cols_after(conn):
 
 section("MIGRATION - AN EXISTING DATABASE")
 
-LEGACY_DB = os.path.join(tempfile.gettempdir(), "elusion_legacy_test.db")
+LEGACY_DB = os.path.join(testdir.PATH, "elusion_legacy_test.db")
 if os.path.exists(LEGACY_DB):
     os.remove(LEGACY_DB)
 

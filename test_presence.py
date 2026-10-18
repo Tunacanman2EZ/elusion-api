@@ -20,7 +20,8 @@ throwaway database in the temp folder - never elusion.db.
 import asyncio, importlib.util, json, math, os, sqlite3, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_presence_test.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+DB_PATH = os.path.join(testdir.PATH, "elusion_presence_test.db")
 os.environ["ELUSION_DB"] = DB_PATH
 os.environ["ELUSION_OWNER"] = "presowner"
 os.environ.pop("ELUSION_GAMEDATA", None)
@@ -700,7 +701,7 @@ async def run(port, server):
     a, _ = await enter(port, ALICE, "field", x=100.0, y=200.0)
     await collect(b)
 
-    bare = os.path.join(tempfile.gettempdir(), "elusion_presence_bare.db")
+    bare = os.path.join(testdir.PATH, "elusion_presence_bare.db")
     if os.path.exists(bare):
         os.remove(bare)
     sqlite3.connect(bare).close()

@@ -129,18 +129,15 @@ if _hops_n == 0:
 # A STALE EQUIPMENT EXPORT IS A SERVER WITH NO AUTHORITY OVER EQUIPMENT, and
 # that is a refusal rather than a warning.
 #
-# parse_equipment() skips gamedata.equip_check() entirely when gamedata.json
-# predates the equipment export, and does so deliberately: without
-# equip_slot_name every slot reads as "" and failing closed would refuse every
-# honest equip on a half-upgraded server. That reasoning is sound for a server
-# mid-upgrade. It is not sound for one about to accept players.
-#
-# In that state the only checks left are "the slot name is in the fallback
-# tuple" and "the item exists" - which is exactly the state parse_equipment's
-# own docstring names as the one that let {"helm": "embersword"} through.
-# Confirmed against this codebase rather than assumed: a level 1 warrior saved
-# a 100-damage two-handed sword into the helm slot and it was written straight
-# to saves.equipment.
+# Without equip_slot_name every item's slot reads as "", and the catalogue
+# cannot tell a helmet from a sword. Today that fails closed - the equip route
+# refuses every piece as "not equipment", so nobody can put anything on - and
+# it used to fail open: parse_equipment() skipped gamedata.equip_check() in that
+# state, the one that let a level 1 warrior save a 100-damage two-handed sword
+# into the helm slot, written straight to saves.equipment. That function is
+# gone (18 Oct) and the save no longer writes equipment, but either way a
+# server in this state has no authority over what is worn, and should not
+# accept players.
 #
 # app.py warns about this at boot. That is the right weight for a dev loop and
 # the wrong weight for a deploy, where it scrolls past and the server comes up
@@ -159,9 +156,9 @@ else:
     if not _gamedata.EQUIP_EXPORTED:
         _problems.append(
             "gamedata.json predates the equipment export, so the server cannot "
-            "tell a helmet from a sword and /api/save will accept any item in "
-            "any slot. Re-run src/tools/exportgamedata.gd in the Godot editor, "
-            "then copy the new gamedata.json beside app.py."
+            "tell a helmet from a sword and every equip is refused. Re-run "
+            "src/tools/exportgamedata.gd in the Godot editor, then copy the new "
+            "gamedata.json beside app.py."
         )
 
 # The database should not live anywhere a web server might serve it. This

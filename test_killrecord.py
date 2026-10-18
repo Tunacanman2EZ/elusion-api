@@ -25,7 +25,8 @@ kind of monster, for good; GET /api/kills is one character's, GET
 import importlib.util, os, sqlite3, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_killrecord_test.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+DB_PATH = os.path.join(testdir.PATH, "elusion_killrecord_test.db")
 os.environ["ELUSION_DB"] = DB_PATH
 os.environ["ELUSION_OWNER"] = "NOT_A_TEST_ACCOUNT"
 os.environ.pop("ELUSION_GAMEDATA", None)

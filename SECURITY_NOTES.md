@@ -1114,7 +1114,9 @@ Each of those is a gate, so each was open:
 - **E-1's equipment half.** Without `equip_slot_name` the server cannot tell a
   helmet from a sword, and `parse_equipment()` falls back to checking only that
   the slot name is in `EQUIP_SLOTS_FALLBACK` — the state that let
-  `{"helm": "embersword"}` through in the first place.
+  `{"helm": "embersword"}` through in the first place. (Since removed, 18 Oct:
+  the save no longer writes equipment, and in this state the equip route now
+  refuses every piece instead.)
 - **E-3's spawn ceiling.** Gated entirely on `SPAWNS_EXPORTED`. Kill claims were
   bounded by the token bucket alone: 18,000/hour rather than 5,208.
 - **E-9's measurement.** The allowance was computed from `app.py`'s fallback

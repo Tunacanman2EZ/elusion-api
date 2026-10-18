@@ -33,7 +33,8 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_chatrooms_test.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+DB_PATH = os.path.join(testdir.PATH, "elusion_chatrooms_test.db")
 
 os.environ["ELUSION_DB"] = DB_PATH
 if os.path.exists(DB_PATH):

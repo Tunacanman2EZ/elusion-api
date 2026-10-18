@@ -24,6 +24,12 @@ routes.lock holds one line per route the server answers:
         cannot pass RT-1 on a tag alone.
   RT-3  THE LOCK IS ONE LINE A ROUTE, sorted, no route twice: a hand edit
         that leaves it ragged is caught too.
+  RT-4  THE DOCS BUILD (18 Oct, UPGRADES.md). /apispec_1.json answers 200 and
+        holds every route and method that has a docstring, and no field in it
+        is named true or false. One docstring with quotes inside quotes made
+        the whole spec a 500 - /apidocs loaded empty - and four owner switches
+        documented their `on` field as `true`, because YAML reads a bare `on`
+        as a boolean. Nothing tested either, which is how both went unseen.
 
 A change to the table that is meant - a new route, a route moved on purpose -
 is written with --write, and the diff of routes.lock in the commit says what
@@ -33,7 +39,8 @@ import importlib.util, os, re, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOCK = os.path.join(HERE, "routes.lock")
-DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_routes_test.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+DB_PATH = os.path.join(testdir.PATH, "elusion_routes_test.db")
 os.environ["ELUSION_DB"] = DB_PATH
 os.environ["ELUSION_OWNER"] = "NOT_A_TEST_ACCOUNT"
 os.environ.pop("ELUSION_GAMEDATA", None)
@@ -126,6 +133,38 @@ section("RT-3  the lock is one line a route")
 check("sorted, and no line twice", locked == sorted(locked) and len(set(locked)) == len(locked))
 check("every line has its eight fields", all(len(line.split()) == 8 for line in locked),
       [line for line in locked if len(line.split()) != 8][:3])
+
+# =============================================================================
+section("RT-4  the docs build")
+spec_res = client.get("/apispec_1.json", environ_base={"REMOTE_ADDR": "10.8.0.1"})
+spec = spec_res.get_json(silent=True) or {}
+check("/apispec_1.json answers 200 - /apidocs has something to show", spec_res.status_code == 200,
+      spec_res.status_code)
+documented = []
+for line in now_lines:
+    method, path, _endpoint = line.split()[:3]
+    if line.split()[7] == "doc=yes" and path.startswith("/api/"):
+        documented.append((method.lower(), re.sub(r"<(?:\w+:)?(\w+)>", r"{\1}", path)))
+missing = [(m, p) for m, p in documented if m not in spec.get("paths", {}).get(p, {})]
+check("  and every one of the %d documented routes and methods is in it" % len(documented),
+      missing == [] and len(documented) > 100, missing[:8])
+bool_named = []
+
+
+def _walk(node, where):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ("true", "false", True, False):
+                bool_named.append(where)
+            _walk(value, where + "/" + str(key))
+    elif isinstance(node, list):
+        for value in node:
+            _walk(value, where)
+
+
+_walk(spec, "")
+check("  and no field is named true or false - a bare `on:` in YAML is a boolean", bool_named == [],
+      bool_named[:4])
 
 print("\n=== %d passed, %d failed ===" % (passed, failed))
 sys.exit(1 if failed else 0)

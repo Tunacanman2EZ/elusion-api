@@ -16,7 +16,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Temp directory, not beside this file - see the note in test_healing.py. A
 # scratch database written into the project folder is a file the virus scanner
 # takes a handle on, and on Windows an open handle means it cannot be deleted.
-DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_equipmove_test.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+DB_PATH = os.path.join(testdir.PATH, "elusion_equipmove_test.db")
 os.environ["ELUSION_DB"] = DB_PATH
 os.environ["ELUSION_OWNER"] = "NOT_A_TEST_ACCOUNT"
 os.environ.pop("ELUSION_GAMEDATA", None)

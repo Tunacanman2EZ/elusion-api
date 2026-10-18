@@ -11,65 +11,84 @@ go at the end of **Open**.
 
 ## Open
 
-### 1. The API docs page is blank
+### 6. The test runs could now go in parallel
 
-- **Where:** the docstring of `POST /api/staff/skill` (`staff_skill()` in
-  app.py), the line `description: "One skill, or \"all\""`.
-- **What happens:** in a Python string `\"` is just `"`, so the docs builder
-  reads `"One skill, or "all""`, which is broken YAML. `/apispec_1.json` then
-  answers 500, so `/apidocs` loads with nothing in it. Every route's
-  documentation is missing, not just this one.
-- **Why it matters:** ARCHITECTURE.md calls each docstring "its page in
-  /apidocs", and none of them can be read there today. Nothing tests that the
-  spec builds, which is how this went unnoticed.
-- **Fix:** small. Write the line as `description: 'One skill, or "all"'`, and
-  add a check to test_routes.py that `/apispec_1.json` answers 200.
+- **Where:** run_tests.ps1, and the CI workflow in the API repo's .github
+  folder. Both run the suites one after another.
+- **What changed:** since item 2 every suite keeps its databases in a private
+  folder (testdir.py), so two suites - or two copies of one - can run at the
+  same time without touching each other.
+- **Why it matters:** the full API run is about ten minutes one at a time; four
+  or so at once would take a few.
+- **Fix:** small, but in two files this session has not been able to run (a
+  PowerShell script, and CI). Worth doing with a run on the PC to watch it.
 
-### 2. The test suites cannot run side by side
+### 7. `saves.bank_gold` is a leftover column
 
-- **Where:** 52 of the 61 API suites put their test database at a fixed name
-  in the shared temp folder (`tempfile.gettempdir()`).
-- **What happens:** two copies of a suite running at once write over each
-  other's database and fail for no real reason. So every run is one suite at a
-  time, about ten minutes for all of them.
-- **Why it matters:** a private temp folder per run would let CI and local runs
-  go in parallel, several times faster, and stop the false failures.
-- **Fix:** medium, but mechanical: one line per suite (`tempfile.mkdtemp()`
-  instead of the fixed path), checked suite by suite.
-
-### 3. `parse_equipment()` is called by nothing
-
-- **Where:** app.py, under SAVES.
-- **What happens:** since equipment became server-owned (the equip routes),
-  no route calls it. Its comment says the equip route's checks are made of it,
-  but equipment/ asks `gamedata.equip_check()` directly. wsgi.py,
-  SECURITY_NOTES.md and two test comments still describe what it does.
-- **Why it matters:** a function that looks like a guard but guards nothing
-  invites the next route to trust it without checking it is still wired in.
-- **Fix:** small. Remove it and correct the four places that describe it.
-
-### 4. A leftover in the save route
-
-- **Where:** `PUT /api/save` (`write_save()`, saves/routes.py since 18 Oct),
-  the line `stored_level = 1 if is_new else int(existing["level"])`.
-- **What happens:** the value is never used. The comment above it says
-  equipment is gated on it, which stopped being true when the save stopped
-  writing equipment.
-- **Fix:** tiny. Drop the variable, keep the read (it still decides whether the
-  character is new), and correct the comment.
-
-### 5. Small tidy-ups
-
-- test_ownership.py, `sql_statements()`: a regex named `pattern` that is never
-  used (the scan uses the one written inline below it).
-- test_gifts.py: `json` is imported and never used.
-- `GET /api/character` (saves/data.py, `identity()`) reads `saves.bank_gold`
-  and never uses it. That column is a leftover of the per-character bank: its
-  gold was moved to `accounts` once, at startup, and nothing writes it now.
-  Drop it from the read; the column itself can go with the table moves
-  (ARCHITECTURE.md step 11).
-- **Fix:** tiny.
+- **Where:** the saves table in init_db().
+- **What happens:** the bank moved to `accounts` long ago. The only thing that
+  still touches this column is the boot migration that moved its gold across
+  (and finds nothing left to move); item 5's read was the last other one.
+- **Fix:** tiny, but a schema change: it goes with each table's CREATE moving
+  into its package (ARCHITECTURE.md step 11), where the order of creation is
+  checked once.
 
 ## Done
 
-Nothing yet.
+### 1. The API docs page was blank - fixed 18 Oct
+
+`POST /api/staff/skill`'s docstring had `description: "One skill, or
+\"all\""`. In a Python string `\"` is just `"`, so the docs builder read broken
+YAML, `/apispec_1.json` answered 500, and `/apidocs` loaded with nothing in it -
+every route's documentation was missing. Now `'One skill, or "all"'`.
+
+Found with it: four owner switches (maintenance, pvp, trade, co-owners)
+documented their `on` field as `true`, because YAML reads a bare `on` as a
+boolean - and the spec could only be sent by a fallback that logged an ERROR
+with a traceback on every fetch. Now `"on":`.
+
+test_routes.py's new RT-4 asks for the spec on every run: it must answer 200,
+hold every documented route and method (136), and name no field true or false.
+It fails against the code before the fix.
+
+### 2. The test suites could not run side by side - fixed 18 Oct
+
+52 of the 61 API suites put their database at a fixed name in the shared temp
+folder, so two runs at once wrote over each other. Shown, not supposed: two
+copies of test_chardelete.py at once, and the second died on "That username is
+already taken". Every suite now asks testdir.py for a private folder, made per
+run and removed after it; the same two copies both pass. (Running them in
+parallel is item 6.)
+
+### 3. `parse_equipment()` was called by nothing - removed 18 Oct
+
+A guard that guarded nothing since the save stopped writing equipment. Gone,
+with the places that described it corrected: wsgi.py's refusal (which also
+said /api/save "will accept any item in any slot" - today the equip route
+refuses every piece in that state), the boot check's description, the equip
+route's comment, test_catalogue.py, test_api.py, test_equipment.py and
+SECURITY_NOTES.md.
+
+### 4. A leftover in the save route - fixed 18 Oct
+
+`stored_level` in `PUT /api/save` was read and never used, under a comment
+saying equipment was gated on it. Dropped, and the two comments beside it that
+still described parsing equipment there are corrected.
+
+### 5. Small tidy-ups - fixed 18 Oct
+
+- test_ownership.py: the unused regex `pattern` in `sql_statements()`.
+- test_gifts.py: the unused `json` import.
+- `GET /api/character` no longer reads `saves.bank_gold` (see item 7).
+
+### Found and fixed with the status move, 18 Oct
+
+- **Stale comments on the status rules.** The note above SERVER_OWNED_STATS
+  said gold was "NOT IN THIS LIST" because the loot pickup was the client's -
+  directly above a list that has held gold since that hole was closed, and
+  with the hp/mana/stamina lines written out twice. Rewritten as one accurate
+  note in status/services.py. The healing check's docstring said a 400 would
+  lose "XP, gold, position and inventory", which a status write has not
+  carried for a long time; it now says what it does carry.
+- **`REVIVE_EXPLAINS_EVERYTHING`** was defined and read by nothing (the check
+  names the refill grants directly). Removed.

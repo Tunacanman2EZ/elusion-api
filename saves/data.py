@@ -21,7 +21,8 @@ def row_of(db, user_id, slot):
 
 
 def level_of(db, user_id, slot):
-    """The level, or None for a character that does not exist yet."""
+    """The level, or None for a character that does not exist yet - which is
+    what the save asks it."""
     return db.execute(
         "SELECT level FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)
     ).fetchone()
@@ -117,7 +118,7 @@ def identity(db, user_id, slot):
     """What GET /api/character answers besides the vitals, the carry and the
     skills."""
     return db.execute(
-        "SELECT class_id, name, area, active_pet_id, bank_gold, equipment "
+        "SELECT class_id, name, area, active_pet_id, equipment "
         "FROM saves WHERE user_id = ? AND slot = ?",
         (user_id, slot),
     ).fetchone()

@@ -22,7 +22,8 @@ import json
 import sqlite3
 import tempfile
 
-DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_gathering_test.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+DB_PATH = os.path.join(testdir.PATH, "elusion_gathering_test.db")
 os.environ["ELUSION_DB"] = DB_PATH
 os.environ["ELUSION_OWNER"] = "gatherowner"
 if os.path.exists(DB_PATH):

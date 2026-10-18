@@ -52,7 +52,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 #
 # HERE is still needed - for sys.path and for locating app.py. It was never
 # needed for a throwaway database.
-DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_healing_test.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+DB_PATH = os.path.join(testdir.PATH, "elusion_healing_test.db")
 
 os.environ["ELUSION_DB"] = DB_PATH
 os.environ["ELUSION_OWNER"] = "NOT_A_TEST_ACCOUNT"

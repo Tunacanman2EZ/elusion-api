@@ -27,7 +27,8 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_parties_test.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+DB_PATH = os.path.join(testdir.PATH, "elusion_parties_test.db")
 
 os.environ["ELUSION_DB"] = DB_PATH
 if os.path.exists(DB_PATH):

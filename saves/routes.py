@@ -203,26 +203,11 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, cl
 
         # Read BEFORE the upsert, because afterwards there is no way to tell a
         # character that was just created from one that already existed - and they
-        # need different treatment below. The level comes back with it: equipment
-        # is gated on it, and taking that number from the payload would hand the
-        # gate to the client. A character that does not exist yet is level 1,
-        # which is what the INSERT below is about to store.
+        # need different treatment below.
         existing = data.level_of(db, g.user["id"], slot)
         is_new = existing is None
-        stored_level = 1 if is_new else int(existing["level"])
 
-        # SAME KEY-PRESENT RULE AS THE PET, for the same reason spelled out above.
-        # Several callers write this slot and not all of them know what the player
-        # is wearing; a missing key must keep what is stored, and an explicit
-        # empty one is how you take everything off.
-        #
-        # PARSED HERE RATHER THAN WITH THE REST OF THE BODY because it is the one
-        # field whose validity depends on the character, not just on the JSON - the
-        # slot has to suit the item, the class has to be allowed it and the level
-        # has to reach it. The SELECT above is the only thing between the two, and
-        # a read is not a write: every refusal below still happens before anything
-        # is stored.
-        # IGNORED, NOT REFUSED - and this is the line that makes equipment
+        # EQUIPMENT: IGNORED, NOT REFUSED - and this is the line that makes equipment
         # server-owned rather than merely server-moved.
         #
         # /api/character/equip and /unequip take the item OUT of the backpack and
@@ -239,9 +224,9 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, cl
         # client can see it is being dropped rather than silently disagreeing with
         # the server forever.
         #
-        # parse_equipment() is still used - by nothing on this path now, but it is
-        # what the equip endpoint's checks are made of, and it stays the one place
-        # that knows what a wearable map looks like.
+        # parse_equipment(), which once checked a whole map sent here, is gone
+        # (18 Oct): the equip routes ask gamedata.equip_check() for one item at a
+        # time, and nothing else writes the column.
         equipment_ignored = "equipment" in payload
 
         # ALWAYS 0, and that is the whole point rather than a leftover.

@@ -28,7 +28,8 @@ import collections, importlib.util, os, random, re, sqlite3, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Temp directory, not beside this file - see the note in test_healing.py.
-DB_PATH = os.path.join(tempfile.gettempdir(), "elusion_quality_test.db")
+import testdir  # noqa: E402  (a private folder per run - testdir.py)
+DB_PATH = os.path.join(testdir.PATH, "elusion_quality_test.db")
 os.environ["ELUSION_DB"] = DB_PATH
 os.environ["ELUSION_OWNER"] = "qowner"
 os.environ.pop("ELUSION_GAMEDATA", None)
