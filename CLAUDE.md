@@ -402,8 +402,8 @@ updating the maxima it implies.
   somebody else's and answers 403 has fixed the write and kept the oracle —
   the attacker now enumerates ids by 403-versus-404.)
 - **Better still, where it is available: do not let the client name the row.**
-  Not one trade route accepts a `trade_id` — every one calls
-  `_trade_find_open(db, g.user["id"])` and works on what comes back. An
+  Not one trade route accepts a `trade_id` — every one calls trade/'s
+  `find_open(db, g.user["id"])` and works on what comes back. An
   ownership bug needs an id to tamper with, and these routes have none to offer.
   A check can be forgotten on the route added next month; a missing parameter
   cannot. `POST /api/staff/gold` is the same idea: owner-only and *still* unable
@@ -1094,7 +1094,7 @@ found by driving a trade between two real accounts:
 - **Only to somebody online.** An unanswerable trade blocks both players for
   `TRADE_EXPIRY_SECONDS`.
 - **Accept names the revision it saw.** `trades.revision` moves on every real
-  change (`_trade_touch`); `trade_confirm` requires it and conditions the UPDATE
+  change (trade/data.py `touch()`); `trade_confirm` requires it and conditions the UPDATE
   on it - a compare-and-set, not a read-then-write. An identical update is not
   a change and un-accepts nobody.
 - **Both bags are flagged when a trade runs** (`saves.resync_trade`, in the
@@ -1106,19 +1106,20 @@ found by driving a trade between two real accounts:
   delivery). The requester is flagged too, in case their response was lost.
 - **Items leave the bag before the hotbar keys** (`keys_last=True`).
 - **History** is `GET /api/trade/history`, worded from the caller's side
-  (`_trade_record`). Finished trades are kept for good - they are what a
+  (trade/data.py `record()`). Finished trades are kept for good - they are what a
   moderator reads when somebody says they were scammed; cancelled ones are
   pruned after `TRADE_CANCELLED_KEPT_SECONDS`, on the offer route, through the
   partial index `idx_trades_cancelled`. **Partial on purpose:** a plain
   `(state, updated_at)` index was picked by the planner for "find my open
   trade" and turned the most-polled read into a scan of every open trade.
-- **Same-second ties break on rowid** in `_trade_find_recent`.
+- **Same-second ties break on rowid** in trade/data.py's `find_page()`.
 
 - **Staff read an account's trades** at `GET /api/staff/trades` - every state,
   worded from that account's side, a tally by state, under reach
   (`_moderation_target`: out of reach is the same 404 as no such account).
-  Paged by the pair `(updated_at, rowid)` through `_trade_find_page`, one
-  bounded index read per (side, state); `_trade_find_recent` is its first page.
+  Paged by the pair `(updated_at, rowid)` through trade/data.py `find_page()`,
+  one bounded index read per (side, state); `find_recent()` is its first page.
+  app.py still calls the two `_trade_find_page` and `_trade_find_recent`.
 
 **Which character an account is playing** is one rule, `PLAYING_SLOT_SQL`,
 and every surface asks it: the trade offer, `/api/players/nearby`, the online
@@ -1152,7 +1153,7 @@ to another, so the gates are on it. `test_tradegates.py`.
   piece for `TRADE_HOLD_SECONDS` (48 h) - `place_trade_hold()`, called by
   `/api/loot/take` and `/api/shop/buy`. Not by staff grants or trades. A held
   piece is refused by `/api/trade/update` and again at execution
-  (`trade_hold_refusal()`, the same sentence both times, saying when).
+  (trade/data.py `hold_refusal()`, the same sentence both times, saying when).
 - **Counted per account and id, not per cell**: free = owned in every
   character's bag and the bank, less live holds. A piece walked to an alt
   through the bank is still held; an older copy of the same id may go. Two
@@ -2001,7 +2002,14 @@ only, `test_stats.py`.
   seven routes, voice's included; the TURN key and the call to Cloudflare stay
   in app.py and are handed in) and `chat/` (18 Oct: send, read, pictures,
   delete and the ignore list; broadcasts, reports, mutes and the picture
-  fetch stay in app.py). **A name a suite replaces on app.py**
+  fetch stay in app.py) and `trade/` and `kingdom/` (18 Oct: the seven trade
+  routes and every write to the three trade tables, then the Kingdom Tax
+  board and its cache; the backpack grants, `gold_delta()`, the playing-slot
+  rule and the resync flag stay in app.py and are handed in, and kingdom/
+  hands back `cache_clear()`, which app.py keeps as `_kingdom_cache_clear()`).
+  **trade/ is handed gamedata whole, as `catalogue`**, so a rule checked by
+  searching for `gamedata.` reads `catalogue.` too (test_quality Q-7).
+  **A name a suite replaces on app.py**
   (`_turn_fetch`, `gold_item_value`) **is handed in as a lambda that looks it
   up**, or the suite's stand-in is never asked.
   **`routes.lock`, held by

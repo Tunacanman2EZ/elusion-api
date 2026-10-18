@@ -28,6 +28,8 @@ Beside it, **feature packages**: a folder per area, each in three layers.
 | `guilds/` | 18 Oct | **moved out** of app.py: guilds, staff's two guild routes too |
 | `parties/` | 18 Oct | **moved out** of app.py: parties and party voice |
 | `chat/` | 18 Oct | **moved out** of app.py: chat, pictures, the ignore list |
+| `trade/` | 18 Oct | **moved out** of app.py: player trade and the kingdom tax |
+| `kingdom/` | 18 Oct | **moved out** of app.py: the Kingdom Tax board |
 
 ## Where it is going
 
@@ -56,6 +58,11 @@ area, handing each package what it needs. Every area in a package of its own.
   function handed in once is one the suite never touches - which is how
   test_concurrency's hold stopped reaching the loot take, still passing, until
   it was found on 18 Oct.
+- **A module handed in whole is a new name for it.** trade/ asks five things of
+  the catalogue (what an item is, its worth, the mythic tier, the tax, whether
+  it exists) and is handed gamedata itself, as `catalogue`, looked up on every
+  call. A suite that holds a rule by searching for `gamedata.` must search
+  for `catalogue.` too - test_quality's Q-7 does, since the move.
 - **A moved route keeps its endpoint name** (`add_url_rule(..., endpoint=...)`)
   - rate limiting, request timing and `/api/staff/powers` key on it - **and its
   docstring**, which is its page in `/apidocs`.
@@ -145,7 +152,18 @@ areas that hold money and items:
    the broadcasts (the server's voice), `clean_player_text()` (every typed
    name), reports and mutes (moderation, 9), and the picture fetch (the
    server's call out, which test_chatrooms points at a local server).
-7. trade and the kingdom tax
+7. ~~trade and the kingdom tax~~ (18 Oct), as two packages: `trade/` - all
+   seven routes, the execution, and every write to the three trade tables -
+   and `kingdom/`, the board that shows what the tax and every other burn
+   took, with its cache, which is per register() now rather than a module
+   global (test_packages runs two apps and asks). **What stays in app.py**:
+   the grants the execution pays with (the carry, 10) - handed in as lambdas,
+   since they are defined further down the file than the trade's register() -
+   `gold_delta()`, the owner's switch, which character an account is playing
+   (`PLAYING_SLOT_SQL`, shared with the nearby list and parties), and the
+   resync flag both clients re-read their bags by, which an owner's gift rides
+   too. A rollback, a character delete and the poll still find an open trade
+   by app.py's old names, which are the package's.
 8. the stirring lands (`world/`) - combat asks it what a kill pays
 9. moderation and the staff list
 10. the carry: saves, character, bank, equipment, consuming, reviving

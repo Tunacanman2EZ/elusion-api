@@ -532,10 +532,14 @@ for _package, _rows, _layers in codemap.feature_packages():
     for _name in sorted(os.listdir(os.path.join(HERE, _package))):
         if _name.endswith(".py"):
             app_src += "\n" + open(os.path.join(HERE, _package, _name), encoding="utf-8").read()
-FINE = re.compile(r"for\s+\w+\s+in\s+gamedata\.ITEMS\s*:|gamedata\.ITEMS\.(?:values|items)\(\)|len\(gamedata\.ITEMS\)")
+# BY EITHER NAME. trade/ is handed gamedata whole and calls it `catalogue`
+# (18 Oct), so a lookup written there reads catalogue.ITEMS - the same trap
+# under a name a search for "gamedata." walks straight past.
+ITEMS_AT = r"(?:gamedata|catalogue)\.ITEMS"
+FINE = re.compile(r"for\s+\w+\s+in\s+%s\s*:|%s\.(?:values|items)\(\)|len\(%s\)" % (ITEMS_AT, ITEMS_AT, ITEMS_AT))
 by_id = [line.strip() for line in app_src.splitlines()
-         if "gamedata.ITEMS" in line and not line.lstrip().startswith("#")
-         and len(re.findall(r"gamedata\.ITEMS", line)) != len(FINE.findall(line))]
+         if re.search(ITEMS_AT, line) and not line.lstrip().startswith("#")
+         and len(re.findall(ITEMS_AT, line)) != len(FINE.findall(line))]
 check("app.py and its packages look nothing up in gamedata.ITEMS by id (they walk it, and count it)",
       not by_id, by_id)
 gd_src = open(os.path.join(HERE, "gamedata.py"), encoding="utf-8").read()

@@ -1,7 +1,8 @@
 """The feature packages stand on their own (game 0.50.0).
 
 Every feature package (ARCHITECTURE.md) - playerstats/, events/, insights/,
-and killrecord/, friends/, gathering/, loot/, guilds/, parties/ and chat/, taken out of app.py - is built the BE105 way: each has a
+and killrecord/, friends/, gathering/, loot/, guilds/, parties/, chat/, trade/ and kingdom/, taken out of app.py -
+is built the BE105 way: each has a
 register(app, ...) that is HANDED the app, its login checks and its database,
 and never imports app.py. The source of each is checked for that elsewhere
 (test_stats.py); this RUNS them without it - the "application factory"
@@ -44,13 +45,15 @@ import chat  # noqa: E402
 import loot  # noqa: E402
 import insights  # noqa: E402
 import killrecord  # noqa: E402
+import kingdom  # noqa: E402
 import playerstats  # noqa: E402
+import trade  # noqa: E402
 
 # Found, not listed: what app.py imports that has a routes.py (codemap.py).
 PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
 # The ones this file registers on its bare apps, below.
 RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds", "parties",
-            "chat")
+            "chat", "trade", "kingdom")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -117,7 +120,8 @@ def bare_app(name):
         os.remove(path)
     conn = sqlite3.connect(path)
     conn.executescript(
-        "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, role TEXT, created_at INTEGER, name_hue INTEGER,"
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT COLLATE NOCASE, role TEXT, created_at INTEGER, name_hue INTEGER,"
+        " deaths INTEGER NOT NULL DEFAULT 0,"
         " chat_tokens REAL NOT NULL DEFAULT 8.0, last_chat_at INTEGER NOT NULL DEFAULT 0,"
         " last_image_at INTEGER NOT NULL DEFAULT 0, last_world_image_at INTEGER NOT NULL DEFAULT 0);"
         "CREATE TABLE chat_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, role TEXT,"
@@ -154,7 +158,20 @@ def bare_app(name):
         "CREATE TABLE kill_tally (user_id INTEGER, slot INTEGER, enemy_id TEXT, kills INTEGER, first_at INTEGER,"
         " last_at INTEGER);"
         "CREATE TABLE friends (requester_id INTEGER, addressee_id INTEGER, state TEXT DEFAULT 'pending',"
-        " created_at INTEGER, decided_at INTEGER);")
+        " created_at INTEGER, decided_at INTEGER);"
+        "CREATE TABLE trades (trade_id TEXT PRIMARY KEY, a_user INTEGER, a_slot INTEGER, a_gold INTEGER NOT NULL DEFAULT 0,"
+        " a_confirmed INTEGER NOT NULL DEFAULT 0, b_user INTEGER, b_slot INTEGER, b_gold INTEGER NOT NULL DEFAULT 0,"
+        " b_confirmed INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'open', created_at INTEGER, updated_at INTEGER,"
+        " revision INTEGER NOT NULL DEFAULT 0, a_tax INTEGER NOT NULL DEFAULT 0, b_tax INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE trade_items (trade_id TEXT, side TEXT, item_id TEXT, quantity INTEGER,"
+        " PRIMARY KEY (trade_id, side, item_id));"
+        "CREATE TABLE trade_holds (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, item_id TEXT, created_at INTEGER,"
+        " held_until INTEGER);"
+        "CREATE TABLE bank_items (user_id INTEGER, position INTEGER, item_id TEXT, quantity INTEGER);"
+        "CREATE TABLE gold_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, user_id INTEGER, slot INTEGER,"
+        " delta INTEGER, reason TEXT, detail TEXT NOT NULL DEFAULT '');"
+        "CREATE TABLE lusion_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, user_id INTEGER, slot INTEGER,"
+        " delta INTEGER, reason TEXT, detail TEXT NOT NULL DEFAULT '');")
     now = int(time.time())
     for user in USERS.values():
         conn.execute("INSERT INTO users (id, username, role, created_at) VALUES (?, ?, ?, ?)",
@@ -406,11 +423,99 @@ def bare_app(name):
         party_membership=parties.membership,
         keep_per_channel=lambda: talk["keep"], ignore_limit=lambda: talk["ignore_limit"],
         fetch_image=fetch_image)
+
+    # trade/: the catalogue is a stand-in with three things in it and a tenth
+    # for the kingdom; the gold ledger writes the purse AND gold_ledger, as
+    # app.py's does, so the board below reads what a trade burned. Everybody
+    # is online but the owner; the switch is app.config's.
+    app.config["trading"] = True
+    took = app.config.setdefault("took", [])
+    resynced = app.config.setdefault("resynced", [])
+
+    def ledger_delta(db, user_id, slot, delta, reason, detail=""):
+        db.execute("UPDATE saves SET gold = gold + ? WHERE user_id = ? AND slot = ?", (delta, user_id, slot))
+        db.execute("INSERT INTO gold_ledger (at, user_id, slot, delta, reason, detail) VALUES (?, ?, ?, ?, ?, ?)",
+                   (int(time.time()), user_id, slot, delta, reason, detail))
+
+    def take_for_trade(user_id, slot, item_id, quantity, keys_last=False):
+        took.append(keys_last)
+        return take(user_id, slot, item_id, quantity)
+
+    def moderation_target(payload):
+        found = find_user(str(payload.get("username", "")))
+        if found is None:
+            return None, ({"error": "Not Found", "message": "No such account."}, 404)
+        return found, None
+
+    def query_int(name, default, low, high):
+        raw = request.args.get(name)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            return None
+        return value if low <= value <= high else None
+
+    def playing_slot(db, user_id):
+        row = db.execute("SELECT MIN(slot) AS slot FROM saves WHERE user_id = ?", (user_id,)).fetchone()
+        return None if row["slot"] is None else int(row["slot"])
+
+    trade.register(app, require_auth=require_auth, require_role=owner_only, get_db=get_db,
+                   bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+                   parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None, max_slot=3,
+                   slot_exists=lambda user_id, slot: get_db().execute(
+                       "SELECT 1 FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone() is not None,
+                   # bo ignores ann, as for friends and parties.
+                   ignores=lambda _db, a, b: (a, b) == (3, 2),
+                   presence_for=lambda _db, ids: {i: int(time.time()) for i in ids if i != 1}, online_window=45,
+                   playing_slot=playing_slot, trades_enabled=lambda: app.config["trading"],
+                   take_from_backpack=take_for_trade, add_to_backpack=add, gold_delta=ledger_delta,
+                   inventory_of=lambda user_id, slot: [{"position": p, "item_id": i, "quantity": q}
+                                                       for p, (i, q) in sorted(carried(user_id, slot).items())],
+                   mark_resync=lambda _db, row: resynced.append(row["trade_id"]),
+                   take_resync=lambda _db, _user_id: None,
+                   name_hue_of=lambda row: row["name_hue"], moderation_target=moderation_target,
+                   query_int=query_int, staff_page=(50, 200), catalogue=TradeCatalogue)
+
+    # kingdom/: the board, over the same ledgers; register() hands back the
+    # snapshot's cache_clear().
+    app.config["kingdom"] = kingdom.register(app, require_auth=require_auth, get_db=get_db,
+                                             guild_tag=lambda name: name.upper())
     return app, said, logged, path
 
 
 # A four-cell bag for gathering/'s stand-ins.
 GATHER_CELLS = 4
+
+
+class TradeCatalogue:
+    """What trade/ asks of gamedata, for three things: a pebble, a raw shark,
+    and an old crown of the mythic tier. The kingdom's cut is a tenth."""
+    ITEMS = {"pebble": {"tier": 0, "value": 2, "display_name": "Pebble"},
+             "rawshark": {"tier": 1, "value": 30, "display_name": "Raw Shark"},
+             "crown": {"tier": 9, "value": 1000, "display_name": "Old Crown"}}
+
+    @staticmethod
+    def item_row(item_id):
+        return TradeCatalogue.ITEMS.get(item_id)
+
+    @staticmethod
+    def has_item(item_id):
+        return item_id in TradeCatalogue.ITEMS
+
+    @staticmethod
+    def mythic_tier():
+        return 9
+
+    @staticmethod
+    def stack_value(item_id, quantity):
+        row = TradeCatalogue.ITEMS.get(item_id)
+        return None if row is None else row["value"] * int(quantity)
+
+    @staticmethod
+    def trade_tax(value):
+        return int(value) // 10
 
 
 def who(name):
@@ -444,7 +549,9 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/party/leave", "/api/party/kick", "/api/party/lead", "/api/party/voice",
                        "/api/chat/send", "/api/chat", "/api/chat/image", "/api/chat/upload", "/api/chat/image/upload",
                        "/api/chat/image/<image_id>", "/api/chat/delete", "/api/ignores", "/api/ignores",
-                       "/api/ignores/remove"]), rules)
+                       "/api/ignores/remove", "/api/trade/offer", "/api/trade", "/api/trade/update",
+                       "/api/trade/confirm", "/api/trade/cancel", "/api/staff/trades", "/api/trade/history",
+                       "/api/economy/kingdom"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -858,16 +965,173 @@ if chat.services.PILLOW_AVAILABLE:
           client_a.get(image_path, headers=who("bo")).status_code == 200)
 else:
     print("  skip  pictures: this machine has no Pillow")
-check("  and nobody without a login gets in anywhere",
+def trade_post(as_who, path, body=None):
+    res = client_a.post(path, headers=who(as_who), json=body or {})
+    return res.status_code, res.get_json() or {}
+
+
+def purse_of(user_id):
+    conn = sqlite3.connect(path_a)
+    gold = conn.execute("SELECT gold FROM saves WHERE user_id = ? AND slot = 0", (user_id,)).fetchone()[0]
+    conn.close()
+    return int(gold)
+
+
+def bag_of(user_id):
+    conn = sqlite3.connect(path_a)
+    rows = conn.execute("SELECT item_id, SUM(quantity) FROM carry_items WHERE user_id = ? AND slot = 0"
+                        " GROUP BY item_id ORDER BY item_id", (user_id,)).fetchall()
+    conn.close()
+    return dict(rows)
+
+
+# Two fresh bags and two purses: ann carries a raw shark and an old crown she
+# found a moment ago, bo three pebbles and 500 gold.
+conn = sqlite3.connect(path_a)
+conn.row_factory = sqlite3.Row
+conn.execute("DELETE FROM carry_items WHERE user_id IN (2, 3)")
+conn.execute("UPDATE saves SET gold = 100 WHERE user_id = 2 AND slot = 0")
+conn.execute("INSERT INTO saves (user_id, slot, class_id, level, area, updated_at, gold, name)"
+             " VALUES (3, 0, 'mage', 3, 'field', ?, 500, 'Bo')", (int(time.time()),))
+conn.executemany("INSERT INTO carry_items VALUES (?, 0, ?, ?, ?)",
+                 [(2, 0, "rawshark", 1), (2, 1, "crown", 1), (3, 0, "pebble", 3)])
+trade.place_hold(conn, TradeCatalogue, 2, "crown")
+trade.place_hold(conn, TradeCatalogue, 2, "pebble")
+conn.commit()
+holds = [tuple(r) for r in conn.execute("SELECT user_id, item_id FROM trade_holds")]
+conn.close()
+check("trade: a fresh find of the mythic tier is held, and an ordinary one is not",
+      holds == [(2, "crown")], holds)
+app_a.config["trading"] = False
+check("  with the owner's switch handed in off, a new trade is the 503 it was",
+      trade_post("bo", "/api/trade/offer", {"slot": 0, "username": "ann"})[0] == 503)
+app_a.config["trading"] = True
+check("  bo ignores ann, so her trade is the 403 it was - the ignore list handed in",
+      trade_post("ann", "/api/trade/offer", {"slot": 0, "username": "bo"})
+      == (403, {"error": "Forbidden", "message": "bo is not taking trades from you."}))
+check("  and nobody trades with somebody the presence handed in has not seen",
+      trade_post("bo", "/api/trade/offer", {"slot": 0, "username": "boss"})
+      == (400, {"error": "Bad Request", "message": "boss is not online."}))
+code, body = trade_post("bo", "/api/trade/offer", {"slot": 0, "username": "ANN"})
+check("  bo asks ann - by her name in any case - with the character she plays, both shown online",
+      code == 200 and body.get("state") == "open" and body.get("revision") == 0
+      and (body["a"]["username"], body["b"]["username"], body["b"]["name"], body["b"]["slot"]) == ("bo", "ann", "Ann", 0)
+      and body["a"]["online"] is True and body["b"]["online"] is True, body)
+check("  a second while one is open is the 409 it was",
+      trade_post("bo", "/api/trade/offer", {"slot": 0, "username": "ann"})
+      == (409, {"error": "Conflict", "message": "Already in a trade."}))
+check("  what bo does not carry, and gold he does not have, the 400s they were",
+      trade_post("bo", "/api/trade/update", {"items": [{"item_id": "crown", "quantity": 1}]})[1].get("message")
+      == "You only have 0 x crown."
+      and trade_post("bo", "/api/trade/update", {"gold": 600})[1].get("message") == "You only have 500 gold.")
+code, body = trade_post("bo", "/api/trade/update", {"items": [{"item_id": "pebble", "quantity": 1}], "gold": 200})
+check("  bo puts up a pebble and 200 gold: valued by the catalogue handed in, ann's cut quoted from it",
+      code == 200 and body.get("revision") == 1 and body["a"]["offering_value"] == 202
+      and body["b"]["tax"] == 20 and body["a"]["tax"] == 0, body)
+code, body = trade_post("ann", "/api/trade/update", {"items": [{"item_id": "crown", "quantity": 1}]})
+check("  the crown ann found a moment ago waits its %d hours, and says so" % (trade.TRADE_HOLD_SECONDS // 3600),
+      code == 400 and body.get("message", "").startswith(
+          "Old Crown was found less than 48 hours ago and can be traded in 48 hours."), body)
+code, body = trade_post("ann", "/api/trade/update", {"items": [{"item_id": "rawshark", "quantity": 1}]})
+check("  she puts up the shark instead, and the revision moves", code == 200 and body.get("revision") == 2, body)
+code, body = trade_post("ann", "/api/trade/confirm", {"revision": 1})
+check("  an accept of an offer she was not shown is the 409 it was, with the offer as it stands",
+      code == 409 and body.get("message") == "The offer changed. Look at it again before you accept."
+      and body.get("trade", {}).get("revision") == 2, body)
+code, body = trade_post("bo", "/api/trade/confirm", {"revision": 2})
+check("  bo accepts what he saw", code == 200 and body["a"]["confirmed"] is True and body["b"]["confirmed"] is False, body)
+code, body = trade_post("ann", "/api/trade/confirm", {"revision": 2})
+check("  and ann's accept runs it: both crossed, both taxed on what they received",
+      code == 200 and body.get("state") == "done" and body.get("tax_paid") == {"a": 3, "b": 20}
+      and body.get("kingdom_take") == 23 and body["a"]["gold"] == 297 and body["b"]["gold"] == 280
+      and bag_of(2) == {"crown": 1, "pebble": 1} and bag_of(3) == {"pebble": 2, "rawshark": 1}
+      and (purse_of(2), purse_of(3)) == (280, 297), (body, bag_of(2), bag_of(3)))
+conn = sqlite3.connect(path_a)
+burned = conn.execute("SELECT user_id, delta, reason FROM gold_ledger ORDER BY id").fetchall()
+conn.close()
+check("  the cut burned through the gold ledger handed in - and the transfer wrote no row",
+      burned == [(3, -3, "kingdom_tax"), (2, -20, "kingdom_tax")], burned)
+check("  taken bag before keys, every time, and both bags flagged to be read again",
+      app_a.config["took"] == [True, True] and app_a.config["resynced"] == [body.get("trade_id")],
+      (app_a.config["took"], app_a.config["resynced"]))
+history = client_a.get("/api/trade/history", headers=who("ann")).get_json() or {}
+line = (history.get("trades") or [{}])[0]
+check("  ann's history says it from her side: who with, on which character, what went each way, her cut",
+      len(history.get("trades", [])) == 1 and line.get("with") == "bo" and line.get("with_name") == "Bo"
+      and line.get("character") == "Ann" and line.get("gave") == [{"item_id": "rawshark", "quantity": 1}]
+      and line.get("got") == [{"item_id": "pebble", "quantity": 1}] and line.get("gold_got") == 200
+      and line.get("tax") == 20, history)
+current = client_a.get("/api/trade", headers=who("ann")).get_json() or {}
+check("  and the window, asked after, says how the last one ended",
+      current.get("trade") is None and current.get("last") == {"trade_id": body.get("trade_id"), "state": "done"}, current)
+trade_post("bo", "/api/trade/offer", {"slot": 0, "username": "ann"})
+code, body = trade_post("ann", "/api/trade/cancel")
+check("  either side calls one off; a second time there is nothing to",
+      code == 200 and body.get("cancelled") is True and trade_post("ann", "/api/trade/cancel")[1] == {"cancelled": False})
+staff = client_a.get("/api/staff/trades?username=bo", headers=who("boss")).get_json() or {}
+check("staff: an account's trades, worded from its side, and the tally - through the reach handed in",
+      [t["state"] for t in staff.get("trades", [])] == ["cancelled", "done"]
+      and staff.get("summary") == {"open": 0, "done": 1, "cancelled": 1} and staff.get("more") is False
+      and staff["trades"][1].get("gave") == [{"item_id": "pebble", "quantity": 1}], staff)
+check("  a page and its cursor",
+      (client_a.get("/api/staff/trades?username=bo&limit=1", headers=who("boss")).get_json() or {}).get("more") is True)
+check("  nobody else is shown them, and nobody is no account",
+      client_a.get("/api/staff/trades?username=bo", headers=who("ann")).status_code == 404
+      and client_a.get("/api/staff/trades?username=nobody", headers=who("boss")).status_code == 404)
+
+# The board reads the ledgers: the two cuts above, and boss, who has only ever
+# paid in lusions. bo is in a guild of his own.
+conn = sqlite3.connect(path_a)
+conn.execute("INSERT INTO lusion_ledger (at, user_id, slot, delta, reason) VALUES (?, 1, NULL, -5, 'revive')",
+             (int(time.time()),))
+conn.execute("UPDATE users SET deaths = 2 WHERE id = 1")
+conn.execute("UPDATE users SET deaths = 1 WHERE id = 2")
+conn.execute("INSERT INTO guilds (id, name, folded, founded_by, created_at) VALUES (50, 'Fishers', 'fishers', 'bo', 0)")
+conn.execute("INSERT INTO guild_members VALUES (3, 50, 'leader', 0)")
+conn.commit()
+conn.close()
+board = client_a.get("/api/economy/kingdom", headers=who("ann")).get_json() or {}
+check("kingdom: what the realm took - the cuts, by reason, and the lusions in a column of their own",
+      (board.get("total"), board.get("total_taxed"), board.get("total_lusions"), board.get("total_deaths"))
+      == (23, 23, 5, 3) and board.get("by_reason") == {"kingdom_tax": 23}
+      and board.get("lusions_by_reason") == {"revive": 5}, board)
+check("  ranked by gold, lusions breaking the tie - and somebody who only paid in lusions is on it",
+      [(e["username"], e["contributed"], e["lusions"], e["rank"]) for e in board.get("top", [])]
+      == [("ann", 20, 0, 1), ("bo", 3, 0, 2), ("boss", 0, 5, 3)] and board.get("contributors") == 3, board.get("top"))
+check("  the guilds' board, tagged by the guild_tag handed in, and ann's own line",
+      board.get("guilds") == [{"name": "Fishers", "tag": "FISHERS", "contributed": 3, "lusions": 0, "deaths": 0,
+                               "members": 1, "rank": 1}]
+      and board.get("your_guild") is None and board.get("you", {}).get("rank") == 1
+      and board.get("you", {}).get("deaths") == 1, board)
+check("  bo's line, and his guild's, are his",
+      ((client_a.get("/api/economy/kingdom", headers=who("bo")).get_json() or {}).get("your_guild") or {}).get("name")
+      == "Fishers")
+conn = sqlite3.connect(path_a)
+conn.execute("INSERT INTO gold_ledger (at, user_id, slot, delta, reason) VALUES (?, 2, 0, -100, 'shop')",
+             (int(time.time()),))
+conn.commit()
+conn.close()
+again = client_a.get("/api/economy/kingdom", headers=who("ann")).get_json() or {}
+app_a.config["kingdom"].cache_clear()
+fresh = client_a.get("/api/economy/kingdom", headers=who("ann")).get_json() or {}
+check("  the shared half is kept for %ds; the cache_clear() handed back drops it"
+      % kingdom.KINGDOM_BOARD_CACHE_SECONDS,
+      again.get("total") == 23 and fresh.get("total") == 123
+      and fresh.get("by_reason") == {"shop": 100, "kingdom_tax": 23}, (again.get("total"), fresh.get("total")))
+check("and nobody without a login gets in anywhere",
       [client_a.get(path).status_code for path in ("/api/server/stats", "/api/world/events/active", "/api/server/insights",
                                                   "/api/kills?slot=0", "/api/kills/everyone", "/api/friends",
                                                   "/api/loot/bag?bag_id=%s" % bag, "/api/guild", "/api/guild/list",
-                                                  "/api/party", "/api/party/voice", "/api/chat", "/api/ignores")]
+                                                  "/api/party", "/api/party/voice", "/api/chat", "/api/ignores",
+                                                  "/api/trade", "/api/trade/history", "/api/staff/trades",
+                                                  "/api/economy/kingdom")]
       + [client_a.post(path, json={"slot": 0}).status_code for path in ("/api/fishing/catch", "/api/cooking/cook",
                                                                          "/api/loot/take", "/api/guild/create",
                                                                          "/api/staff/guild", "/api/party/invite",
-                                                                         "/api/chat/send", "/api/chat/image")]
-      == [401] * 21)
+                                                                         "/api/chat/send", "/api/chat/image",
+                                                                         "/api/trade/offer", "/api/trade/update",
+                                                                         "/api/trade/confirm", "/api/trade/cancel")]
+      == [401] * 29)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")
@@ -886,6 +1150,9 @@ check("  and what it says - begun, when first asked; one set ahead, coming - is 
       and said_a[0].endswith(": 2x XP from every monster.")
       and said_a[1] == "Coming up: 1.5x Loot, in 1 day, for 2 hours - Loot bags drop 1.5x as often from every monster."
       and said_b == [], (said_a, said_b))
+board_b = app_b.test_client().get("/api/economy/kingdom", headers=who("ann")).get_json() or {}
+check("  and the kingdom board's snapshot is its own app's: the second, asked while the first's is fresh, has nothing",
+      board_b.get("total") == 0 and board_b.get("top") == [] and fresh.get("total") == 123, board_b)
 for path in (path_a, path_b):
     if os.path.exists(path):
         os.remove(path)
@@ -894,7 +1161,7 @@ for path in (path_a, path_b):
 section("P-4  every package is here")
 check("the code map finds the packages app.py imports: %s" % ", ".join(PACKAGES),
       set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds",
-                        "parties", "chat"},
+                        "parties", "chat", "trade", "kingdom"},
       PACKAGES)
 check("  and every one of them runs on a bare app in this file", set(PACKAGES) == set(RUN_HERE),
       sorted(set(PACKAGES) ^ set(RUN_HERE)))

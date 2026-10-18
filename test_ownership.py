@@ -19,8 +19,8 @@ them is the lesson's:
      "found it" and "checked it", because there is no separate check.
 
   2. BETTER: DO NOT LET THE CLIENT NAME THE ROW AT ALL. Not one trade route
-     accepts a trade_id. Every one calls _trade_find_open(db, g.user["id"]) and
-     works on whatever that returns. An ownership bug needs an id to tamper with;
+     accepts a trade_id. Every one calls trade/'s find_open(db, g.user["id"])
+     and works on whatever that returns. An ownership bug needs an id to tamper with;
      these routes do not have one to offer. That is the strongest version of the
      lesson and it is not what the lesson teaches.
 
@@ -279,9 +279,26 @@ section("O-2  THE TRADE ROUTES CANNOT BE ADDRESSED AT ALL")
 # check. A trade is the most valuable row in the database - it moves items and
 # gold between two accounts - and no route will let a client say WHICH one.
 
+# WHEREVER THE ROUTES LIVE. In app.py they are split at their decorators; since
+# 18 Oct they are trade/'s, a function each inside register(), found by the
+# add_url_rule() that names it - and the packages are found the code map's way,
+# so the next move is read without a change here.
+import codemap  # noqa: E402
+
 trade_src = open(os.path.join(HERE, "app.py"), "r", encoding="utf-8").read()
 routes = re.split(r'\n@app\.(?:get|post|put|patch|delete)\("', trade_src)
 trade_bodies = [r for r in routes if r.startswith("/api/trade")]
+
+# Where the resolvers' own source is: app.py's, then every package's data.py.
+resolver_src = trade_src
+for _package, _rows, _layers in codemap.feature_packages():
+    _routes_py = open(os.path.join(HERE, _package, "routes.py"), encoding="utf-8").read()
+    for _rule in re.finditer(r'add_url_rule\(\s*"(/api/trade[^"]*)".*?view_func=([^,]+),', _routes_py, re.S):
+        _view = re.findall(r"\w+", _rule.group(2).split("(")[-1])[0]
+        _def = re.search(r"\n(    def %s\(.*?)(?=\n    def |\n    app\.add_url_rule)" % _view, _routes_py, re.S)
+        trade_bodies.append(_rule.group(1) + '"' + (_def.group(1) if _def else ""))
+    if os.path.exists(os.path.join(HERE, _package, "data.py")):
+        resolver_src += "\n" + open(os.path.join(HERE, _package, "data.py"), encoding="utf-8").read()
 check("the trade routes are found", len(trade_bodies) >= 4, len(trade_bodies))
 
 named = []
@@ -292,15 +309,18 @@ for body in trade_bodies:
 check("no trade route accepts a trade_id from the client", named == [],
       "%s - an id the client can name is an id the client can change" % named)
 
-# THE RESOLVERS THAT START FROM THE CALLER. _trade_find_open for the open trade,
-# _trade_find_recent for the history - both take the caller's own id and nothing
-# a request supplies. A route that finds its trade any other way is the one to
-# look at.
+# THE RESOLVERS THAT START FROM THE CALLER. find_open for the open trade,
+# find_recent for the history (trade/data.py; app.py still calls them
+# _trade_find_open and _trade_find_recent) - both take the caller's own id and
+# nothing a request supplies. A route that finds its trade any other way is the
+# one to look at.
 CALLER_RESOLVERS = ("_trade_find_open(db, ", "_trade_find_open(db,",
-                    "_trade_find_recent(db, user_id", "_trade_find_recent(db, g.user")
+                    "_trade_find_recent(db, user_id", "_trade_find_recent(db, g.user",
+                    "data.find_open(db, ", "data.find_recent(db, user_id",
+                    "data.find_recent(db, g.user")
 for body in trade_bodies:
     path = body.split('"', 1)[0]
-    if "db.execute" not in body and "_trade_" not in body:
+    if "db.execute" not in body and "_trade_" not in body and "data." not in body:
         continue
     check("%s resolves the trade from the caller" % path,
           any(r in body for r in CALLER_RESOLVERS) or "trade_current" in body,
@@ -309,14 +329,15 @@ for body in trade_bodies:
 # AND THE HISTORY'S RESOLVER REALLY IS SCOPED TO ITS FIRST ARGUMENT. The check
 # above trusts the name; this reads the function that holds the query and
 # holds it to the name - every branch, for both sides, filtered on the user it
-# was given, and nothing else. _trade_find_recent is the first page of it.
-_recent = re.search(r"\ndef _trade_find_recent\(.*?(?=\ndef )", trade_src, re.S)
-_page = re.search(r"\ndef _trade_find_page\(.*?(?=\ndef )", trade_src, re.S)
+# was given, and nothing else. find_recent is the first page of it.
+_recent = re.search(r"\ndef (?:_trade_)?find_recent\(.*?(?=\ndef |\n# |$)", resolver_src, re.S)
+_page = re.search(r"\ndef (?:_trade_)?find_page\(.*?(?=\ndef |\n# |$)", resolver_src, re.S)
 _recent_src = _recent.group(0) if _recent else ""
 _page_src = _page.group(0) if _page else ""
-check("_trade_find_recent is a page of _trade_find_page",
-      "return _trade_find_page(db, user_id," in _recent_src, _recent_src[:200])
-check("_trade_find_page filters every branch, both sides, on the caller",
+check("find_recent is a page of find_page",
+      re.search(r"return (?:_trade_)?find_page\(db, user_id,", _recent_src) is not None,
+      _recent_src[:200])
+check("find_page filters every branch, both sides, on the caller",
       'for side in ("a", "b"):' in _page_src
       and 'where = "%s_user = ? AND state = ?" % side' in _page_src
       and "branch_params = [user_id, state]" in _page_src,
@@ -713,8 +734,6 @@ SWEEPS_ALLOWED = [
 # loot's, guilds', parties' - and a scan of app.py alone stopped seeing them.
 # Found the code map's way, so a package added later is read without a change
 # here.
-import codemap  # noqa: E402
-
 written_src = source
 for package, _rows, _layers in codemap.feature_packages():
     for name in sorted(os.listdir(os.path.join(HERE, package))):
