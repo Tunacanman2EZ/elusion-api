@@ -632,19 +632,38 @@ for source in sources:
     with open(source, encoding="utf-8") as fh:
         trees.append(ast.parse(fh.read()))
 
+# EACH CALL BELONGS TO THE FUNCTION IT IS WRITTEN IN - the innermost one. A
+# package's routes are functions inside its register(), so walking every
+# function's whole body counted each call once for its route and again for
+# register() (staffdesk/, 18 Oct: the note route's computed kind came back as
+# ["register", "staff_note"]).
+def calls_in(tree):
+    """[(the innermost function's name, call)] for every call in `tree`."""
+    found = []
+
+    def visit(node, owner):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit(child, child.name)
+                continue
+            if isinstance(child, ast.Call):
+                found.append((owner, child))
+            visit(child, owner)
+
+    visit(tree, None)
+    return found
+
+
 literal_kinds = set()
 computed = []
-for fn in (node for tree in trees for node in ast.walk(tree)):
-    if not isinstance(fn, ast.FunctionDef):
-        continue
-    for node in ast.walk(fn):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id == "log_staff_action" and len(node.args) >= 2):
-            arg = node.args[1]
-            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                literal_kinds.add(arg.value)
-            else:
-                computed.append(fn.name)
+for owner, node in (pair for tree in trees for pair in calls_in(tree)):
+    if (owner is not None and isinstance(node.func, ast.Name)
+            and node.func.id == "log_staff_action" and len(node.args) >= 2):
+        arg = node.args[1]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            literal_kinds.add(arg.value)
+        else:
+            computed.append(owner)
 
 kinds = set(app_module.STAFF_ACTION_KINDS)
 check("found the call sites", len(literal_kinds) >= 10, literal_kinds)

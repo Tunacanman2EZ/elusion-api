@@ -32,6 +32,7 @@ Beside it, **feature packages**: a folder per area, each in three layers.
 | `kingdom/` | 18 Oct | **moved out** of app.py: the Kingdom Tax board |
 | `world/` | 18 Oct | **moved out** of app.py: the stirring lands |
 | `moderation/` | 18 Oct | **moved out** of app.py: sanctions, reports, mutes |
+| `staffdesk/` | 18 Oct | **moved out** of app.py: the staff list and the record |
 
 ## Where it is going
 
@@ -187,9 +188,17 @@ areas that hold money and items:
    log's writer, `log_staff_action()` - which test_moderation's M-8 finds in
    the package by that name, so it is handed in under it. So do the three
    tunables a suite turns down (`REPORTS_PER_HOUR`, `REPORT_LINES_PER_PLAYER`,
-   `MUTE_MAX_MINUTES_MOD`, which the staff powers page quotes too). Next: the
-   staff list and the moderation record - `/api/staff/users`, `actions`,
-   `note` and `user/<username>`.
+   `MUTE_MAX_MINUTES_MOD`, which the staff powers page quotes too).
+   ~~The staff list and the moderation record (`staffdesk/`)~~ (18 Oct):
+   `/api/staff/users`, `actions`, `note` and `user/<username>`. It hands back
+   the two query builders, which app.py keeps under their old names because
+   test_moderation's M-9 asks SQLite for the plan of exactly what the routes
+   run. role_for() as SQL (`_rank_level_sql()`) stays with the ladder, and
+   test_moderation's M-8 learned to count each logged call once, for the
+   function it is written in - a package's routes are functions inside its
+   register(), and the note route's computed kind came back twice.
+   `/api/staff/powers` stays in app.py: it reads every route on the server and
+   quotes limits from every area, so it is the composition root's own page.
 10. the carry: saves, character, bank, equipment, consuming, reviving
 11. then the core itself (sessions, tokens, auth) into a package of its own,
     and each table's `CREATE` into its area - and app.py is the composition

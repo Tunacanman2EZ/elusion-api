@@ -1,8 +1,8 @@
 """The feature packages stand on their own (game 0.50.0).
 
 Every feature package (ARCHITECTURE.md) - playerstats/, events/, insights/,
-and killrecord/, friends/, gathering/, loot/, guilds/, parties/, chat/, trade/, kingdom/, world/ and moderation/,
-taken out of app.py - is built the BE105 way: each has a
+and killrecord/, friends/, gathering/, loot/, guilds/, parties/, chat/, trade/, kingdom/, world/, moderation/ and
+staffdesk/, taken out of app.py - is built the BE105 way: each has a
 register(app, ...) that is HANDED the app, its login checks and its database,
 and never imports app.py. The source of each is checked for that elsewhere
 (test_stats.py); this RUNS them without it - the "application factory"
@@ -49,6 +49,7 @@ import insights  # noqa: E402
 import killrecord  # noqa: E402
 import kingdom  # noqa: E402
 import playerstats  # noqa: E402
+import staffdesk  # noqa: E402
 import trade  # noqa: E402
 import world  # noqa: E402
 
@@ -56,7 +57,7 @@ import world  # noqa: E402
 PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
 # The ones this file registers on its bare apps, below.
 RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds", "parties",
-            "chat", "trade", "kingdom", "world", "moderation")
+            "chat", "trade", "kingdom", "world", "moderation", "staffdesk")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -183,6 +184,10 @@ def bare_app(name):
         " delta INTEGER, reason TEXT, detail TEXT NOT NULL DEFAULT '');"
         "CREATE TABLE lusion_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, user_id INTEGER, slot INTEGER,"
         " delta INTEGER, reason TEXT, detail TEXT NOT NULL DEFAULT '');"
+        "CREATE TABLE staff_actions (id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id INTEGER, actor_name TEXT,"
+        " action TEXT, target_id INTEGER, target_name TEXT, detail TEXT, created_at INTEGER);"
+        "CREATE TABLE login_attempts (username TEXT, ok INTEGER, reason TEXT, ip TEXT, at INTEGER);"
+        "CREATE TABLE accounts (user_id INTEGER PRIMARY KEY, lusions INTEGER NOT NULL DEFAULT 0);"
         "CREATE TABLE world_ticks (tick INTEGER PRIMARY KEY, element INTEGER NOT NULL, started_at INTEGER NOT NULL,"
         " ends_at INTEGER NOT NULL, chosen_by TEXT NOT NULL DEFAULT '');"
         "CREATE TABLE kill_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, slot INTEGER, enemy_id TEXT,"
@@ -555,6 +560,30 @@ def bare_app(name):
         wait_words=lambda seconds: "%d minutes" % (seconds // 60), default_channel="world",
         reports_per_hour=lambda: limits["per_hour"], report_lines_per_player=lambda: limits["per_card"],
         mute_max_minutes_mod=lambda: limits["mod_mute"])
+
+    # staffdesk/: the moderation log is the database's staff_actions, written
+    # by a stand-in for app.py's log_staff_action(); role_for() as SQL knows
+    # the owner by name and the rest by their column.
+    def write_log(user, action, target, target_id=None, detail=""):
+        get_db().execute("INSERT INTO staff_actions (actor_id, actor_name, action, target_id, target_name, detail,"
+                         " created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                         (user["id"], user["username"], action, target_id, target, detail, int(time.time())))
+
+    def rank_sql(alias):
+        return ("(CASE WHEN {a}.id IS NULL THEN NULL WHEN {a}.username = ? THEN 4 WHEN {a}.role = 'mod' THEN 1"
+                " WHEN {a}.role = 'dev' THEN 2 ELSE 0 END)".format(a=alias), [OWNER])
+
+    app.config["staffdesk"] = staffdesk.register(
+        app, require_auth=require_auth, require_role=owner_only, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400), query_int=query_int,
+        moderation_target=within_reach, can_act_on=outranks, role_for=rank_of, rank_sql=rank_sql, roles=RANKS,
+        default_role="player",
+        ban_state=lambda row: {"reason": row["ban_reason"]} if row["is_banned"] else None,
+        mute_state=lambda row, now=None: ({"until": row["chat_muted_until"]}
+                                          if row["chat_muted_until"] > (now or time.time()) else None),
+        log_staff_action=write_log, online_window=45, playing_slot=playing_slot,
+        linked_accounts=lambda _db, user_id: ([{"username": "bo", "strength": "strong"}], False),
+        crowded_at=6, row_int=lambda row, column: int(row[column] or 0) if column in row.keys() else 0)
     return app, said, logged, path
 
 
@@ -627,7 +656,9 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/economy/kingdom", "/api/server/world", "/api/server/world",
                        "/api/server/world/stir", "/api/staff/ban", "/api/staff/kick", "/api/staff/unban",
                        "/api/staff/role", "/api/chat/report", "/api/report/player", "/api/staff/reports",
-                       "/api/staff/reports/resolve", "/api/staff/mute", "/api/staff/unmute"]), rules)
+                       "/api/staff/reports/resolve", "/api/staff/mute", "/api/staff/unmute",
+                       "/api/staff/users", "/api/staff/actions", "/api/staff/note",
+                       "/api/staff/user/<username>"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -1377,13 +1408,95 @@ check("closing a line's reports: closed, logged, and nothing left to close",
       (code, body) == (200, {"message_id": ann_lines[1], "outcome": "dismissed", "closed": 1})
       and staff_log[-1].startswith("boss report ann: dismissed: line")
       and staff_post("/api/staff/reports/resolve", {"username": "ann", "outcome": "dismissed"})[0] == 404, body)
+def desk(path, as_who="boss"):
+    res = client_a.get(path, headers=who(as_who))
+    return res.status_code, res.get_json() or {}
+
+
+# The record so far, as staff wrote it, and what the account page reads.
+conn = sqlite3.connect(path_a)
+start = int(time.time()) - 60
+conn.executemany("INSERT INTO staff_actions (actor_id, actor_name, action, target_id, target_name, detail, created_at)"
+                 " VALUES (1, 'boss', ?, ?, ?, ?, ?)",
+                 [("ban", 3, "bo", "3 days: griefing", start), ("note", 2, "ann", "talks a lot", start + 1),
+                  ("guild_rename", None, "The Crowned", "-> The First", start + 2)])
+conn.executemany("INSERT INTO login_attempts VALUES ('ann', ?, ?, ?, ?)",
+                 [(1, "ok", "203.0.113.7", start), (0, "password", "203.0.113.9", start + 5)])
+conn.execute("INSERT INTO accounts VALUES (2, 7)")
+conn.execute("INSERT INTO sessions (user_id, last_seen_at, expires_at) VALUES (2, ?, ?)",
+             (int(time.time()), int(time.time()) + 3600))
+conn.commit()
+conn.close()
+code, page = desk("/api/staff/users?limit=2")
+check("staffdesk: the list is a page - two names, the cursor after the last, and how many matched",
+      code == 200 and [a["username"] for a in page.get("accounts", [])] == ["ann", "bo"]
+      and page.get("more") is True and page.get("next_after") == "bo" and page.get("matched") == 3, page)
+ann_row = (page.get("accounts") or [{}])[0]
+check("  each name with its rank, its record and whether it is online - by the stand-ins handed in",
+      ann_row.get("record") == {"note": 1} and page["accounts"][1].get("record") == {"ban": 1}
+      and ann_row.get("online") is True and ann_row.get("role") == "player" and page.get("online") == 1, ann_row)
+code, rest = desk("/api/staff/users?limit=2&after=bo")
+check("  the next page starts after the cursor, and says it is the last",
+      [a["username"] for a in rest.get("accounts", [])] == ["boss"] and rest.get("more") is False
+      and rest["accounts"][0]["role"] == "owner", rest)
+check("  filtered in the query - staff by role_for() as SQL, a search by any part of a name",
+      [a["username"] for a in desk("/api/staff/users?show=staff")[1].get("accounts", [])] == ["boss"]
+      and [a["username"] for a in desk("/api/staff/users?q=O")[1].get("accounts", [])] == ["bo", "boss"])
+check("  an unknown filter or limit is the 400 it was, and nobody else sees the list",
+      desk("/api/staff/users?show=friends")[0] == 400 and desk("/api/staff/users?limit=0")[0] == 400
+      and desk("/api/staff/users", as_who="ann")[0] == 404)
+code, log = desk("/api/staff/actions")
+check("the moderation log, newest first, with every kind it knows",
+      code == 200 and [e["action"] for e in log.get("actions", [])] == ["guild_rename", "note", "ban"]
+      and log.get("kinds") == list(staffdesk.STAFF_ACTION_KINDS), log.get("actions"))
+code, about = desk("/api/staff/actions?player=BO")
+check("  about one player - by the account, in any case - with the tally of the whole record",
+      [e["detail"] for e in about.get("actions", [])] == ["3 days: griefing"] and about.get("summary") == {"ban": 1},
+      about)
+check("  a page and its cursor, and an unknown kind is the 400 it was",
+      desk("/api/staff/actions?limit=1")[1].get("next_before") is not None
+      and desk("/api/staff/actions?action=hug")[0] == 400)
+code, body = staff_post("/api/staff/note", {"username": "ann", "text": "  told to stop\n spamming ", "kind": "warn"})
+check("a warning on ann's record: one line, logged through the writer handed in, its id the log's",
+      code == 200 and body["entry"]["detail"] == "told to stop spamming" and body["entry"]["action"] == "warn"
+      and desk("/api/staff/actions?limit=1")[1]["actions"][0]["id"] == body["entry"]["id"], body)
+check("  a kind that is not one, or no text, is the 400 it was",
+      staff_post("/api/staff/note", {"username": "ann", "text": "x", "kind": "praise"})[0] == 400
+      and staff_post("/api/staff/note", {"username": "ann", "text": "   "})[0] == 400)
+code, view = desk("/api/staff/user/ann")
+check("an account's page: the character she plays, her logins with their addresses, her kills, lusions, record",
+      code == 200 and [(c["name"], c["playing"]) for c in view.get("characters", [])] == [("Ann", True)]
+      and [r.get("ip") for r in view["logins"]["recent"]] == ["203.0.113.9", "203.0.113.7"]
+      and view["logins"]["failed"] == 1 and view["logins"]["addresses"] == 2 and view.get("lusions") == 7
+      and len(view.get("kills", [])) == 6 and [h["action"] for h in view.get("staff_history", [])] == ["warn", "note"]
+      and view["sessions"]["active"] == 1 and view["linked_accounts"]["visible"] is True
+      and view["linked_accounts"]["crowded_at"] == 6, view)
+check("  and nobody is the 404 it was", desk("/api/staff/user/nobody")[0] == 404)
+conn = sqlite3.connect(path_a)
+conn.execute("UPDATE users SET role = 'mod' WHERE id = 3")
+conn.execute("INSERT INTO staff_actions (actor_id, actor_name, action, target_id, target_name, detail, created_at)"
+             " VALUES (1, 'boss', 'note', 3, 'bo', 'a private word', ?)", (int(time.time()),))
+conn.commit()
+conn.close()
+app_a.config["boss_rank"] = "mod"
+hidden = [e["detail"] for e in desk("/api/staff/actions?player=bo")[1].get("actions", [])]
+code, view = desk("/api/staff/user/bo")
+check("a mod reading another mod: no notes about them, in the log or on their page, and no addresses",
+      hidden == ["3 days: griefing"] and [h["action"] for h in view.get("staff_history", [])] == ["ban"]
+      and view["linked_accounts"]["visible"] is False and view.get("actionable") is False, (hidden, view))
+app_a.config["boss_rank"] = "owner"
+conn = sqlite3.connect(path_a)
+conn.execute("UPDATE users SET role = 'player' WHERE id = 3")
+conn.commit()
+conn.close()
 check("and nobody without a login gets in anywhere",
       [client_a.get(path).status_code for path in ("/api/server/stats", "/api/world/events/active", "/api/server/insights",
                                                   "/api/kills?slot=0", "/api/kills/everyone", "/api/friends",
                                                   "/api/loot/bag?bag_id=%s" % bag, "/api/guild", "/api/guild/list",
                                                   "/api/party", "/api/party/voice", "/api/chat", "/api/ignores",
                                                   "/api/trade", "/api/trade/history", "/api/staff/trades",
-                                                  "/api/economy/kingdom", "/api/server/world", "/api/staff/reports")]
+                                                  "/api/economy/kingdom", "/api/server/world", "/api/staff/reports",
+                                                  "/api/staff/users", "/api/staff/actions", "/api/staff/user/ann")]
       + [client_a.post(path, json={"slot": 0}).status_code for path in ("/api/fishing/catch", "/api/cooking/cook",
                                                                          "/api/loot/take", "/api/guild/create",
                                                                          "/api/staff/guild", "/api/party/invite",
@@ -1395,9 +1508,10 @@ check("and nobody without a login gets in anywhere",
                                                                          "/api/staff/unban", "/api/staff/mute",
                                                                          "/api/staff/unmute", "/api/chat/report",
                                                                          "/api/report/player",
-                                                                         "/api/staff/reports/resolve")]
+                                                                         "/api/staff/reports/resolve",
+                                                                         "/api/staff/note")]
       + [client_a.put("/api/staff/role", json={}).status_code]
-      == [401] * 42)
+      == [401] * 46)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")
@@ -1427,7 +1541,7 @@ for path in (path_a, path_b):
 section("P-4  every package is here")
 check("the code map finds the packages app.py imports: %s" % ", ".join(PACKAGES),
       set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds",
-                        "parties", "chat", "trade", "kingdom", "world", "moderation"},
+                        "parties", "chat", "trade", "kingdom", "world", "moderation", "staffdesk"},
       PACKAGES)
 check("  and every one of them runs on a bare app in this file", set(PACKAGES) == set(RUN_HERE),
       sorted(set(PACKAGES) ^ set(RUN_HERE)))

@@ -701,8 +701,12 @@ an account is gone.
 **And the log can be read now, which is what makes it a review rather than a
 promise of one.** `GET /api/staff/actions` pages it newest-first, filtered by
 player, by member of staff or by kind; `POST /api/staff/note` writes a note or a
-warning onto an account's record. `test_moderation.py` is the suite. Four things
-in it are decisions, not details:
+warning onto an account's record. Both, the account list and one account's
+page are the staffdesk/ package (18 Oct); the query builders keep their app.py
+names (`_staff_users_query`, `_staff_log_query`) for the plan checks, and
+`log_staff_action()` - the writer every staff action calls - stays in app.py.
+`test_moderation.py` is the suite. Four things in it are decisions, not
+details:
 
 - **Both lists are pages, with a keyset cursor.** The staff panel used to fetch
   every account every ten seconds. `after=<last name>` and `before=<last id>` are
@@ -717,9 +721,11 @@ in it are decisions, not details:
 - **"About this player" means the account id when the account exists**, and the
   stored name only when it does not. A guild can share a player's name, and
   guild actions carry no id.
-- **`STAFF_ACTION_KINDS` is checked against the source** with `ast`, so a new
-  `log_staff_action()` call with a new kind fails the suite until the log's
-  filter knows it. The index checks read SQLite's own `EXPLAIN QUERY PLAN` for
+- **`STAFF_ACTION_KINDS` is checked against the source** with `ast` - app.py
+  and every package - so a new `log_staff_action()` call with a new kind fails
+  the suite until the log's filter knows it. Each call counts for the function
+  it is written in, the innermost: a package's routes sit inside its
+  register(). The index checks read SQLite's own `EXPLAIN QUERY PLAN` for
   the statement the route builds - a plan, not a stopwatch, because a stopwatch
   is green on a fast machine.
 
@@ -2022,7 +2028,9 @@ only, `test_stats.py`.
   the poll, the events and the insights ask, and is handed the events and
   insights as lookups, since they are registered after it). And `moderation/`
   (18 Oct: the sanctions, the reports and the mutes - ten routes; it hands
-  back the two open-report counts the poll shows staff).
+  back the two open-report counts the poll shows staff). And `staffdesk/` (18
+  Oct: the staff list, the moderation log, notes and one account's page; it
+  hands back the two query builders whose plans test_moderation checks).
   **trade/ is handed gamedata whole, as `catalogue`**, so a rule checked by
   searching for `gamedata.` reads `catalogue.` too (test_quality Q-7).
   **A name a suite replaces on app.py**
