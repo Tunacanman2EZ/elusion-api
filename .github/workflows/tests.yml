@@ -6,6 +6,10 @@
 #
 # A pull request from a fork gets no secrets and needs none: every suite builds
 # its own throwaway database, and nothing here talks to the live server.
+#
+# Beside it, a second job checks that every import is used and every name
+# exists (UPGRADES.md, item 8) - a job of its own, so a stray import never
+# hides how the suites went, or the other way round.
 
 name: API tests
 
@@ -55,3 +59,23 @@ jobs:
           name: api-test-results
           path: test_results.txt
           if-no-files-found: ignore
+
+  # flake8's pyflakes checks only (--select=F): unused imports, names that do
+  # not exist, a name defined twice - no style rules. They honour the `# noqa`
+  # marks the packages' __init__.py files and wsgi.py carry on purpose, where
+  # an import is the export. Pinned, so a new release cannot turn it red on
+  # its own.
+  imports:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Every import used, every name defined
+        run: |
+          python -m pip install flake8==7.1.1
+          python -m flake8 --select=F --exclude=venv,__pycache__ .

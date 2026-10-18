@@ -1908,7 +1908,7 @@ The owner, 7 Oct: "lets make a button in game that records all players kills
 with icons of the enemies". THE KILL RECORD in app.py, `test_killrecord.py`.
 
 - **`kill_tally`**: one row per character per monster - kills, first and
-  last - counted by `_record_kill()` in the paid kill's own transaction, so a
+  last - counted by kill/'s `record_kill()` in the paid kill's own transaction, so a
   refused kill (unknown monster, one that grants nothing, the rate limit or
   the ceiling) counts nowhere. Kept for good; `kill_reports` is the log and is
   pruned after `KILL_LOG_RETENTION_SECONDS`.
@@ -2075,7 +2075,13 @@ only, `test_stats.py`.
   ask run on every request; they are handed in. The co-owner names are
   handed as a lookup, since test_coowner empties them. **The broadcast poll
   stays in app.py**: it is the heartbeat and gathers every area's news, like
-  `/api/staff/powers`.)
+  `/api/staff/powers`.) And `kill/` (18 Oct: `/api/combat/kill` with its
+  token bucket, its spawn ceiling and **the kill's two records**,
+  `record_kill()` - kill_reports and kill_tally - in the kill's own
+  transaction. gamedata is handed whole as `catalogue`, so a suite that
+  seeds `gamedata._rng` or holds `roll_kill_rewards` is heard. killwatch.py
+  keeps its own copy of the window and respawn floor; test_killwatch holds it
+  to kill/services.py's.)
   **Something noticed along the way that needs upgrading goes in
   UPGRADES.md** (the owner asked to be kept told): checked first, then where
   it is, why it matters, how big the fix is.

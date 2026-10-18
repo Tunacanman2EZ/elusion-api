@@ -125,3 +125,27 @@ rules), pinned to flake8 7.1.1. It honours the `# noqa` marks the packages'
 on the whole API with that version: no findings; a planted unused import and
 an undefined name each fail it. A job of its own, so it never hides how the
 suites went. Its first run on GitHub is the first push after this one.
+
+### Found and fixed with the kill move, 18 Oct
+
+- **The kill bucket's comment described the old bucket.** It said twenty
+  tokens and one a second - sixty kills a minute - directly above the fifty
+  and five the code has; the paragraph after it gave the new reasons without
+  taking the old numbers back. It now says what shipped first and why it is
+  fifty and five (kill/services.py).
+- **killwatch.py's copy of the gate's numbers was held by a comment only.**
+  It keeps its own window and respawn floor so it runs without the server,
+  and said "move them here in lockstep". test_killwatch.py now checks both,
+  and the ceiling they give for any count of monsters, against kill/'s; a
+  window changed in one place fails it.
+
+### 9. A loot bag was still made in app.py - fixed 18 Oct
+
+Found with the kill move: `_create_loot_bag()` - stamp the roll's cells, mint
+the bag's id, store it, commit - stayed in app.py when loot/ moved, because it
+was the kill's last step and the kill was still there. It is loot/'s now,
+`create_bag()`, handed back from register() (as carry/ hands back its grants)
+and handed to kill/ through app.py, which keeps the old name. The bare-app
+run makes a kill's bag with it, and checks that nothing dropped makes no bag
+and a roll past nine cells is cut and committed; three sabotages in it each
+fail a check.

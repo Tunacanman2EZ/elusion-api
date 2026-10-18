@@ -102,9 +102,11 @@ except Exception as exc:                      # GameDataError, ImportError, ...
 
 
 # THE LIVE GATE'S OWN NUMBERS, so the retrospective check flags exactly what the
-# live check would have refused and never anything else. If these move in app.py,
-# move them here in lockstep - a mismatch is how this tool would start crying
-# wolf on honest kills or missing real breaches.
+# live check would have refused and never anything else. They are kill/services.py's
+# (since 18 Oct), copied so this runs without the server; if they change there,
+# change them here in lockstep - a mismatch is how this tool would start crying
+# wolf on honest kills or missing real breaches. test_killwatch.py holds the two
+# copies equal.
 KILL_WINDOW_SECONDS = 300
 KILL_RESPAWN_FLOOR_SECONDS = 30.0
 

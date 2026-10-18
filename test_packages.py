@@ -2,8 +2,8 @@
 
 Every feature package (ARCHITECTURE.md) - playerstats/, events/, insights/,
 and killrecord/, friends/, gathering/, loot/, guilds/, parties/, chat/, trade/, kingdom/, world/, moderation/,
-staffdesk/, equipment/, consuming/, death/, bank/, carry/, skills/, saves/, status/, shop/, players/ and
-switches/, taken out of app.py - is built the
+staffdesk/, equipment/, consuming/, death/, bank/, carry/, skills/, saves/, status/, shop/, players/,
+switches/ and kill/, taken out of app.py - is built the
 BE105 way: each has a
 register(app, ...) that is HANDED the app, its login checks and its database,
 and never imports app.py. The source of each is checked for that elsewhere
@@ -54,6 +54,7 @@ import equipment  # noqa: E402
 import loot  # noqa: E402
 import moderation  # noqa: E402
 import insights  # noqa: E402
+import kill as kill_package  # noqa: E402
 import killrecord  # noqa: E402
 import kingdom  # noqa: E402
 import playerstats  # noqa: E402
@@ -72,7 +73,7 @@ PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
 # The ones this file registers on its bare apps, below.
 RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds", "parties",
             "chat", "trade", "kingdom", "world", "moderation", "staffdesk", "equipment", "consuming",
-            "death", "bank", "carry", "skills", "saves", "status", "shop", "players", "switches")
+            "death", "bank", "carry", "skills", "saves", "status", "shop", "players", "switches", "kill")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -172,6 +173,7 @@ def bare_app(name):
         " last_train_at INTEGER NOT NULL DEFAULT 0, active_pet_id TEXT NOT NULL DEFAULT '',"
         " explored TEXT NOT NULL DEFAULT '{}', xp INTEGER NOT NULL DEFAULT 0,"
         " xp_to_next INTEGER NOT NULL DEFAULT 100, bank_gold INTEGER NOT NULL DEFAULT 0,"
+        " last_kill_at INTEGER NOT NULL DEFAULT 0, kill_tokens REAL NOT NULL DEFAULT 20.0,"
         " PRIMARY KEY (user_id, slot));"
         "CREATE TABLE character_deletions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, slot INTEGER,"
         " class_id TEXT, name TEXT, level INTEGER, gold INTEGER NOT NULL DEFAULT 0, deleted_at INTEGER,"
@@ -197,7 +199,7 @@ def bare_app(name):
         "CREATE TABLE loot_bags (bag_id TEXT PRIMARY KEY, user_id INTEGER, slot INTEGER, enemy_id TEXT, created_at INTEGER);"
         "CREATE TABLE loot_bag_items (bag_id TEXT, position INTEGER, item_id TEXT, quantity INTEGER);"
         "CREATE TABLE kill_tally (user_id INTEGER, slot INTEGER, enemy_id TEXT, kills INTEGER, first_at INTEGER,"
-        " last_at INTEGER);"
+        " last_at INTEGER, PRIMARY KEY (user_id, slot, enemy_id));"
         "CREATE TABLE friends (requester_id INTEGER, addressee_id INTEGER, state TEXT DEFAULT 'pending',"
         " created_at INTEGER, decided_at INTEGER);"
         "CREATE TABLE trades (trade_id TEXT PRIMARY KEY, a_user INTEGER, a_slot INTEGER, a_gold INTEGER NOT NULL DEFAULT 0,"
@@ -222,7 +224,8 @@ def bare_app(name):
         "CREATE TABLE world_ticks (tick INTEGER PRIMARY KEY, element INTEGER NOT NULL, started_at INTEGER NOT NULL,"
         " ends_at INTEGER NOT NULL, chosen_by TEXT NOT NULL DEFAULT '');"
         "CREATE TABLE kill_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, slot INTEGER, enemy_id TEXT,"
-        " xp INTEGER NOT NULL DEFAULT 0, at INTEGER);"
+        " xp INTEGER NOT NULL DEFAULT 0, attack_xp INTEGER NOT NULL DEFAULT 0, level_at INTEGER NOT NULL DEFAULT 0,"
+        " at INTEGER);"
         "CREATE TABLE presence_tickets (token_hash TEXT PRIMARY KEY, session_hash TEXT NOT NULL, user_id INTEGER NOT NULL,"
         " slot INTEGER NOT NULL, identity TEXT NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);"
         "CREATE TABLE server_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_by TEXT NOT NULL DEFAULT '',"
@@ -357,7 +360,7 @@ def bare_app(name):
     def parse_stat(raw):
         return raw if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0 else None
 
-    loot.register(app, require_auth=require_auth, get_db=get_db,
+    app.config["loot"] = loot.register(app, require_auth=require_auth, get_db=get_db,
                   bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
                   parse_stat=parse_stat,
                   item_row={"smallhealthpotion": {"type_name": "CONSUMABLE"}, "silvercoin": {"type_name": "CURRENCY"},
@@ -886,6 +889,28 @@ def bare_app(name):
         online_window=45, end_player_sessions=lambda db: db.execute("DELETE FROM sessions WHERE user_id != 1").rowcount,
         open_trades=lambda db: trade.data.open_count(db, int(time.time())))
 
+    # kill/: the catalogue is a stand-in that rolls the same every time and
+    # writes down what it was asked; the bat is the one monster placed in the
+    # world (once), so its ceiling is reached in eleven kills; it is the land
+    # stirring, so its bag and XP are scaled. The attack XP goes through the
+    # skills' real grant, the notice through the switches' list, and the bag
+    # is made by what loot/ hands back, into this database.
+    app.config["kill_rolls"] = []
+
+    kill_package.register(
+        app, require_auth=require_auth, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+        parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None, max_slot=3,
+        catalogue=KillCatalogue(app.config["kill_rolls"]),
+        stir_for=lambda db, enemy_id: (2.0, 1.5) if enemy_id == "bat" else (1.0, 1.0),
+        derived_stats=lambda row, level=None: {"max_hp": 100 + 10 * level, "max_mana": 50, "max_stamina": 30},
+        levelup_grant_id="__levelup__",
+        proficient_amount=lambda class_id, skill_id, raw: int(raw * 1.5) if (class_id, skill_id) == ("warrior", "attack")
+        else raw,
+        grant_skill_xp=app.config["skills_api"].grant_xp,
+        post_broadcast=lambda body, kind="system", by="": told.append((kind, body[:60], by)) or len(told),
+        create_loot_bag=app.config["loot"].create_bag)
+
     # bank/: a four-cell bank, handed the grid steps the carry hands back -
     # as app.py hands them - and the bank's own catalogue.
     app.config["bank_api"] = bank_package.register(
@@ -960,6 +985,47 @@ class ShopCatalogue:
     @staticmethod
     def roll_quality(item_id):
         return item_id + "~d104" if item_id == "ironsword" else item_id
+
+
+class KillCatalogue:
+    """What kill/ asks of gamedata: the monsters (a slime, a slime too big to
+    pay, a bat, an ice bat, a boss), how many of each are placed (the bat,
+    once), a roll that pays the same every time and is written down, an XP
+    curve of 100 x level, the attack curve at 50 a level, and one item's
+    name for a mythic's notice."""
+    ENEMIES = {"slime": {"display_name": "Slime"}, "bigslime": {"grants_rewards": False},
+               "bat": {"display_name": "Bat"}, "icebat": {"display_name": "Ice Bat"},
+               "boss": {"display_name": "The Crowned Beholder", "slots_are_gear": True}}
+    SPAWNS_EXPORTED = True
+
+    def __init__(self, rolls):
+        self.rolls = rolls
+
+    @staticmethod
+    def spawn_count_for(enemy_id):
+        return {"bat": 1}.get(enemy_id, 0)
+
+    def roll_kill_rewards(self, enemy_id, class_id, bag_scale, xp_scale):
+        self.rolls.append((enemy_id, class_id, bag_scale, xp_scale))
+        mythic = "meteorite" if enemy_id == "boss" else ""
+        return {"xp": int(40 * xp_scale), "attack_xp": 10, "pet_won": False, "mythic": mythic,
+                "contents": [{"item_id": mythic or "pebble", "quantity": 1}]}
+
+    @staticmethod
+    def apply_xp(level, xp, to_next, gained):
+        xp, levels = xp + gained, 0
+        while xp >= to_next:
+            xp, level, levels = xp - to_next, level + 1, levels + 1
+            to_next = 100 * level
+        return level, xp, to_next, levels
+
+    @staticmethod
+    def xp_needed_for_skill_level(skill_id, level):
+        return 50 * level
+
+    @staticmethod
+    def item_row(item_id):
+        return {"meteorite": {"display_name": "Meteorite"}}.get(item_id)
 
 
 class SwitchCatalogue:
@@ -1146,7 +1212,8 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/player/status", "/api/shop/buy", "/api/shop/sell", "/api/shop/<shop_id>",
                        "/api/players/online", "/api/presence/ticket", "/api/players/nearby", "/api/status",
                        "/api/server/maintenance", "/api/server/minbuild", "/api/server/pvp", "/api/server/trade",
-                       "/api/server/coowners", "/api/server/coowners", "/api/server/broadcast"]), rules)
+                       "/api/server/coowners", "/api/server/coowners", "/api/server/broadcast",
+                       "/api/combat/kill"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -2784,6 +2851,82 @@ check("  nobody named is the 409 it was, asked when the switch is thrown; not tr
       and switch("/api/server/coowners", {"on": 1})[0] == 400)
 app_a.config["co_names"] = ("AllMind",)
 switch("/api/server/coowners", {"on": False})
+def slay(enemy_id, slot=0, as_who="ann"):
+    res = client_a.post("/api/combat/kill", headers=who(as_who), json={"slot": slot, "enemy_id": enemy_id})
+    return res.status_code, res.get_json() or {}
+
+
+now = int(time.time())
+around("DELETE FROM kill_reports WHERE user_id = 2; DELETE FROM kill_tally WHERE user_id = 2 AND enemy_id != 'slime';"
+       " UPDATE saves SET level = 4, xp = 0, xp_to_next = 100, kill_tokens = 20, last_kill_at = 0, max_hp = 0"
+       " WHERE user_id = 2 AND slot = 0; DELETE FROM consume_grants WHERE user_id = 2;")
+around("INSERT INTO kill_reports (user_id, slot, enemy_id, xp, at) VALUES (2, 0, 'slime', 1, ?)", [(now - 15 * 86400,)])
+slimes = ann_says("SELECT kills FROM kill_tally WHERE user_id = 2 AND slot = 0 AND enemy_id = 'slime'")[0][0]
+code, body = slay("slime")
+check("kill: a slime paid - the catalogue's roll for a warrior, XP banked, no level, the bag stamped and stored",
+      code == 200 and body.get("xp_gained") == 40 and body.get("xp") == 40 and body.get("level") == 4
+      and body.get("levels_gained") == 0 and len(body.get("bag_id", "")) == 22
+      and ann_says("SELECT user_id, slot, enemy_id FROM loot_bags WHERE bag_id = ?", (body.get("bag_id"),))
+      == [(2, 0, "slime")]
+      and ann_says("SELECT position, item_id, quantity FROM loot_bag_items WHERE bag_id = ?", (body.get("bag_id"),))
+      == [(0, "pebble", 1)]
+      and body.get("contents") == [{"item_id": "pebble", "quantity": 1, "position": 0}]
+      and app_a.config["kill_rolls"][-1] == ("slime", "warrior", 1.0, 1.0) and ann_row("xp") == 40, body)
+check("  the attack XP through the skills' grant, the class specialty applied, and the skill as it now stands",
+      body.get("attack_xp_gained") == 15
+      and ann_says("SELECT level, xp FROM skills WHERE user_id = 2 AND slot = 0 AND skill_id = 'attack'")
+      == [(body.get("attack_level"), body.get("attack_xp"))]
+      and body.get("attack_xp_to_next") == 50 * body.get("attack_level", 0), body)
+check("  its two records, in its transaction: the report as paid, the tally up one - and the old reports pruned",
+      ann_says("SELECT enemy_id, xp, attack_xp, level_at FROM kill_reports WHERE user_id = 2")
+      == [("slime", 40, 15, 4)]
+      and ann_says("SELECT kills FROM kill_tally WHERE user_id = 2 AND slot = 0 AND enemy_id = 'slime'")[0][0]
+      == slimes + 1)
+check("  and the bucket: filled to its fifty, one spent, stamped now",
+      ann_row("kill_tokens") == 49.0 and abs(ann_row("last_kill_at") - int(time.time() * 1000)) < 5000)
+around("UPDATE saves SET xp = 90 WHERE user_id = 2 AND slot = 0")
+code, body = slay("slime")
+check("a kill that levels: the level, the XP left over, the next step, the maxima with it - and the refill noted",
+      (body.get("level"), body.get("xp"), body.get("xp_to_next"), body.get("levels_gained")) == (5, 30, 500, 1)
+      and (ann_row("level"), ann_row("max_hp")) == (5, 150)
+      and ann_says("SELECT item_id FROM consume_grants WHERE user_id = 2 AND slot = 0") == [("__levelup__",)], body)
+check("  the 400s and the 404 it had: a slot, an id, a monster nobody has heard of, one that pays nothing, nobody",
+      slay("slime", slot=9)[1].get("message") == "slot must be an integer 0-3"
+      and slay("  ")[1].get("message") == "enemy_id must be 1-64 characters"
+      and slay("ghost")[1].get("message") == "Unknown enemy_id 'ghost'. Is gamedata.json current?"
+      and slay("bigslime")[1].get("message") == "'bigslime' awards no rewards - it cannot be killed for profit."
+      and slay("slime", slot=3) == (404, {"error": "Not Found", "message": "No character in slot 3."}))
+paid = len(ann_says("SELECT id FROM kill_reports WHERE user_id = 2"))
+around("UPDATE saves SET kill_tokens = 0, last_kill_at = ? WHERE user_id = 2 AND slot = 0", [(int(time.time() * 1000) + 60000,)])
+check("an empty bucket is the 429 it was, and nothing is paid or recorded",
+      slay("slime") == (429, {"error": "Too Many Requests", "message": "Kills are arriving faster than 5 per second."})
+      and len(ann_says("SELECT id FROM kill_reports WHERE user_id = 2")) == paid and ann_row("level") == 5)
+around("UPDATE saves SET kill_tokens = 50, last_kill_at = 0 WHERE user_id = 2 AND slot = 0")
+now = int(time.time())
+around("INSERT INTO kill_reports (user_id, slot, enemy_id, xp, at) VALUES (2, 0, 'bat', 1, ?)", [(now - 60,)] * 11)
+check("one bat in the world: eleven paid in five minutes is the ceiling, and the twelfth is refused, named",
+      slay("bat") == (429, {"error": "Too Many Requests", "message": "Only 1 'bat' exist in the world - that is"
+                            " more kills than could have respawned in the last 5 minutes."}))
+around("UPDATE kill_reports SET at = ? WHERE user_id = 2 AND enemy_id = 'bat'", [(now - 400,)])
+code, body = slay("bat")
+check("  older than the window they do not count; and the stirring land's bat is rolled scaled",
+      code == 200 and app_a.config["kill_rolls"][-1] == ("bat", "warrior", 2.0, 1.5) and body.get("xp_gained") == 60,
+      body)
+said = len(told)
+code, body = slay("boss")
+check("a mythic: told to everyone online in its own kind, the boss named as a name, and handed back",
+      code == 200 and body.get("mythic") == "meteorite"
+      and told[said:] == [("mythic", "ann found the Meteorite on The Crowned Beholder!", "ann")], (body, told[said:]))
+with app_a.app_context():
+    nothing = app_a.config["loot"].create_bag(2, 0, "slime", [])
+    big_id, big = app_a.config["loot"].create_bag(2, 0, "slime", [{"item_id": "pebble", "quantity": 1}] * 12)
+check("loot's own bag-maker, handed back: nothing dropped is no bag; a roll past its cells is cut, and committed",
+      nothing == ("", []) and len(big) == loot.LOOT_BAG_CAPACITY
+      and len(ann_says("SELECT position FROM loot_bag_items WHERE bag_id = ?", (big_id,))) == loot.LOOT_BAG_CAPACITY,
+      (nothing, len(big)))
+check("  and any other monster with its article",
+      kill_package.mythic_find_text(KillCatalogue([]), "ann", "meteorite", "icebat") == "ann found the Meteorite on an Ice Bat!"
+      and kill_package.mythic_find_text(KillCatalogue([]), "ann", "rock", "bat") == "ann found the rock on a Bat!")
 code, body = switch("/api/server/broadcast", {"body": "  Mind the slimes  ", "kind": "Shout"}, again=False)
 check("the owner's voice: said in the world as sent, trimmed, its kind in lower case, its id handed back",
       (code, body) == (200, {"id": len(told), "kind": "shout", "body": "Mind the slimes", "by": "boss"})
@@ -2835,12 +2978,13 @@ check("and nobody without a login gets in anywhere",
                                                                          "/api/server/maintenance",
                                                                          "/api/server/minbuild", "/api/server/pvp",
                                                                          "/api/server/trade", "/api/server/coowners",
-                                                                         "/api/server/broadcast")]
+                                                                         "/api/server/broadcast",
+                                                                         "/api/combat/kill")]
       + [client_a.put(path, json={}).status_code for path in ("/api/staff/role", "/api/account/bank",
                                                               "/api/account/lusions", "/api/character/inventory",
                                                               "/api/character/skills", "/api/save",
                                                               "/api/player/status")]
-      == [401] * 83)
+      == [401] * 84)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")
@@ -2874,7 +3018,7 @@ check("the code map finds the packages app.py imports: %s" % ", ".join(PACKAGES)
       set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds",
                         "parties", "chat", "trade", "kingdom", "world", "moderation", "staffdesk",
                         "equipment", "consuming", "death", "bank", "carry", "skills", "saves", "status",
-                        "shop", "players", "switches"},
+                        "shop", "players", "switches", "kill"},
       PACKAGES)
 check("  and every one of them runs on a bare app in this file", set(PACKAGES) == set(RUN_HERE),
       sorted(set(PACKAGES) ^ set(RUN_HERE)))

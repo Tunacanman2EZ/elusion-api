@@ -96,6 +96,19 @@ print("KILLWATCH TESTS")
 print("gamedata loaded: %s | placed enemies: %d" % (killwatch._GAMEDATA_OK, len(PLACED)))
 print("-" * 68)
 
+# 0. THE SAME NUMBERS AS THE LIVE GATE. killwatch.py keeps its own copy of the
+#    window and the respawn floor so it runs without the server; this is what
+#    holds the copy to the original (kill/services.py since 18 Oct). A drift
+#    is the tool crying wolf on honest kills, or missing real breaches.
+from kill import services as kill_rules  # noqa: E402
+
+check("killwatch's window and respawn floor are the live gate's",
+      (killwatch.KILL_WINDOW_SECONDS, killwatch.KILL_RESPAWN_FLOOR_SECONDS)
+      == (kill_rules.KILL_WINDOW_SECONDS, kill_rules.KILL_RESPAWN_FLOOR_SECONDS))
+check("  and so is its ceiling, for any count of placed monsters",
+      all(killwatch._ceiling_for(n, killwatch.KILL_WINDOW_SECONDS, killwatch.KILL_RESPAWN_FLOOR_SECONDS)
+          == kill_rules.spawn_ceiling(n) for n in range(0, 40)))
+
 # 1. HONEST PLAYER -> nothing. Bushmage every ~40s, 30 kills over 20 minutes.
 con = fresh(); add_user(con, 1, "honest")
 for i in range(30):

@@ -8,7 +8,7 @@ it follows the same road.
 ## Where it stands
 
 `app.py` was about 20,000 lines when this was written (16 Oct), and is about
-11,900 with the carry, who-is-around and the switches out (18 Oct): the shared core (config, the database and
+11,400 with the carry, who-is-around, the switches and the kill out (18 Oct): the shared core (config, the database and
 its write lock, sessions and tokens, the auth decorators, rate limiting,
 request timing) and the areas not yet moved, one after another. It works, and every
 area is covered by its own suite, but one file that size has a cost that grows:
@@ -45,6 +45,7 @@ Beside it, **feature packages**: a folder per area, each in three layers.
 | `shop/` | 18 Oct | **moved out** of app.py: buying, selling, the shelf |
 | `players/` | 18 Oct | **moved out** of app.py: who is online and nearby, the presence ticket |
 | `switches/` | 18 Oct | **moved out** of app.py: the server's switches, `/api/status`, the owner's announcement |
+| `kill/` | 18 Oct | **moved out** of app.py: a kill reported and paid for, and its two records |
 
 ## Where it is going
 
@@ -143,10 +144,10 @@ areas that hold money and items:
    the item grants are carry/'s, the XP grant skills/'s, still handed in by
    those names.
 3. ~~loot bags~~ (18 Oct): both routes, and every line of SQL on the two
-   tables but character delete's. **A new bag is still made in app.py**
-   (`_create_loot_bag()`, with the package's `stamped()` and `store_bag()`),
-   because it is the kill's commit, as `_record_kill()` is. The money and the
-   backpack the take pays into are handed in.
+   tables but character delete's. A new bag was still made in app.py, as
+   the kill's last step, until the kill moved (18 Oct): it is loot/'s now,
+   `create_bag()`, handed back from register() and handed to kill/. The
+   money and the backpack the take pays into are handed in.
 4. ~~guilds~~ (18 Oct): all ten routes - `/api/staff/guild` and
    `/api/guild/list` with them, since they write and read nothing but guilds -
    and every write to the four tables. Other areas still READ the tables in
@@ -289,8 +290,16 @@ areas that hold money and items:
       set_server_setting(). The open trades it counts are trade/'s own count
       now (`trade.open_count()`), not a query into trade's table. **The
       broadcast poll stays** (below).
-    - the kill: `/api/combat/kill` - the XP, the level, the loot roll and the
-      kill's record, in one transaction (1)
+    - ~~the kill: `/api/combat/kill` - the XP, the level, the loot roll and the
+      kill's record, in one transaction (1)~~ (18 Oct, `kill/`), with the
+      token bucket and the spawn ceiling and **its two records** -
+      `record_kill()` writes kill_reports and kill_tally, as `_record_kill()`
+      did here, in the kill's transaction. The catalogue is handed whole, so
+      the suites that seed the die or hold the roll on gamedata are heard; the
+      skills' grant, the stirring lands and the bag's store are lookups,
+      defined further down. test_killrecord's "no commit of its own" reads the
+      packages now, and test_killwatch holds killwatch.py's copy of the
+      window and the respawn floor to the gate's.
     - the owner's tools: gold, level, skill, grant, the gifts ledger, the save
       history and rollback, teleport and its acknowledgement (9)
     - the account's settings: e-mail and its check, the name colour (4)

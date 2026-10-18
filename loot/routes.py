@@ -26,10 +26,15 @@ register() is handed app.py's own pieces - it never imports app.py:
     inventory_of        (user_id, slot) -> the carry, cell by cell
     bag_cells           the backpack's size, for "Your backpack is full"
 
+It hands back create_bag(), which a paid kill calls (kill/, through app.py):
+the one place a bag is made.
+
 THE ENDPOINT NAMES ARE app.py's - take_loot, read_loot_bag - and routes.lock
 holds them.
 """
+import secrets
 import time
+from types import SimpleNamespace
 
 from flask import g, request
 
@@ -261,7 +266,47 @@ def register(app, *, require_auth, get_db, bad_request, parse_stat, item_row, ow
 
         return services.contents_answer(bag_id, bag, data.contents(db, bag_id)), 200
 
+    def create_bag(user_id, slot, enemy_id, contents):
+        """
+        Store a rolled bag and return (bag_id, stored_contents). COMMITS: it is
+        the kill's last step, after the kill's own commit (kill/).
+
+        stored_contents carries the POSITION of every entry, because that position
+        is the only thing /api/loot/take accepts. Returning the roll unstamped and
+        letting the client infer position from array order would work right up until
+        something reordered or dropped an entry between here and there - and the
+        failure would be the client asking for the wrong item, silently.
+
+        bag_id is secrets.token_urlsafe, not a row counter: a sequential id would
+        let a client ask for bag 4,102 and find out what someone else killed.
+        """
+        if not contents:
+            return "", []
+
+        if len(contents) > services.LOOT_BAG_CAPACITY:
+            # Logged rather than raised. A player mid-fight should not lose a kill
+            # because an enemy was configured to drop seven things; they lose the
+            # overflow, and the log says why. stamped() makes the cut.
+            app.logger.warning(
+                "loot: %s rolled %d entries, truncating to the panel's %d cells",
+                enemy_id, len(contents), services.LOOT_BAG_CAPACITY,
+            )
+
+        stored = services.stamped(contents)
+
+        bag_id = secrets.token_urlsafe(16)
+        now = int(time.time())
+
+        db = get_db()
+        data.store_bag(db, bag_id, user_id, slot, enemy_id, stored, now,
+                       prune_before=now - services.LOOT_BAG_TTL_SECONDS)
+
+        db.commit()
+        return bag_id, stored
+
     app.add_url_rule("/api/loot/take", endpoint="take_loot",
                      view_func=require_auth(take_loot), methods=["POST"])
     app.add_url_rule("/api/loot/bag", endpoint="read_loot_bag",
                      view_func=require_auth(read_loot_bag), methods=["GET"])
+
+    return SimpleNamespace(create_bag=create_bag)

@@ -7960,408 +7960,48 @@ def set_name_colour():
 
 
 # =============================================================================
-# COMBAT - KILL REWARDS
+# COMBAT - KILL REWARDS - the kill/ package (since 18 Oct)
 # =============================================================================
-#
-# -----------------------------------------------------------------------------
-# WHAT THIS CHANGES, AND WHAT IT DOES NOT
-# -----------------------------------------------------------------------------
-# Before: BaseEnemy._die() granted the XP, rolled the loot and spawned the bag,
-# all on the player's machine. A modified client could award itself every pet in
-# the game.
-#
-# After: the client reports WHICH enemy died. The server decides what that is
-# worth, rolls the loot with its own entropy, applies the level-ups, and commits
-# the result before the client learns any of it.
-#
-# THIS IS HALF OF A TWO-PART CHANGE AND IS NOT YET A SECURITY FIX ON ITS OWN.
-# The server now knows what a player SHOULD have earned, but PUT /api/save and
-# PUT /api/player/status still accept a client-asserted level, xp and inventory.
-# A modified client can still simply declare itself level 60 holding six pets.
-#
-# The second half is refusing those assertions and treating the server's own
-# record as authoritative - and that half is only POSSIBLE once this one exists,
-# because until now the server had no independent record to compare against. It
-# is worth being plain about that ordering rather than shipping this and calling
-# combat secured.
-#
-# WHAT IT DOES CLOSE TODAY: the loot roll itself. The 1-in-864 slime pet is now
-# decided by the server's SystemRandom, which the client cannot observe, predict
-# or re-run. No amount of patching the game can make that roll come up more
-# often than it should.
-# -----------------------------------------------------------------------------
+# POST /api/combat/kill, as it was here (routes.lock): the client says which
+# monster died and the server decides what that paid. kill/__init__.py tells
+# the story, kill/services.py holds the token bucket and the spawn ceiling with
+# their arithmetic, and kill/data.py writes the kill's two records. Handed what
+# other areas share: the maxima, the class specialty, the broadcast line - and
+# the skills' grant, the stirring lands and the loot bag's store, all defined
+# further down, so asked for when a kill lands.
+import kill as kill_package  # noqa: E402
 
-# A TOKEN BUCKET, NOT A MINIMUM GAP.
-#
-# This was "one kill per 0.35 seconds", and it refused legitimate kills within
-# an hour of shipping:
-#
-#     [KILL] bushmage refused — Kills are limited to one per 0.35s.
-#     [KILL] poisonslimesmall refused — Kills are limited to one per 0.35s.
-#
-# A large poison slime splits into four smalls. An area attack kills several
-# enemies in the same frame. Real combat is BURSTY, and no minimum gap can ever
-# allow a burst - that is what a minimum gap is for. The player lost those
-# rewards, which is the worst possible failure for a limit that cannot prove
-# anything in the first place.
-#
-# A bucket separates the two shapes. Twenty tokens covers any burst a player can
-# actually produce: a slime split, an aura wipe, a slashwave through a group.
-# One token per second refills it, so sustained farming is capped at sixty kills
-# a minute - roughly double the fastest honest rate observed - while a script
-# asking for ten thousand kills now needs about three hours and shows up plainly
-# in the data.
-#
-# WHAT THIS IS NOT: proof. The server cannot tell a real kill from a claimed
-# one; it has no idea where anything is. This caps the rate and nothing more.
-# The real answer is the server owning which enemies exist and having handed
-# this client that one.
-# SIZED FOR A GAME THAT THROWS CROWDS AT YOU. Darza's Dominion - one of this
-# project's stated inspirations - puts dozens of enemies on screen and expects
-# you to clear them without pausing, and Elusion is aiming at the same feel. A
-# bucket that a good fight can empty is a bucket that punishes playing well.
-#
-# Fifty covers any burst a screen can hold. Five a second sustained is three
-# hundred kills a minute, comfortably above the fastest honest rate and still
-# bounded: a script wanting ten thousand kills needs half an hour rather than a
-# few seconds, which is the difference between an exploit and a chore.
-KILL_BUCKET_CAPACITY = 50.0
-KILL_TOKENS_PER_SECOND = 5.0
+kill_package.register(
+    app,
+    require_auth=require_auth,
+    get_db=get_db,
+    bad_request=bad_request,
+    parse_slot=parse_slot,
+    max_slot=MAX_SLOT,
+    catalogue=gamedata,
+    stir_for=lambda db, enemy_id: world_stir_for(db, enemy_id),
+    derived_stats=_derived_stats,
+    levelup_grant_id=LEVELUP_GRANT_ID,
+    proficient_amount=proficient_amount,
+    grant_skill_xp=lambda user_id, slot, skill_id, gained: _grant_skill_xp(user_id, slot, skill_id, gained),
+    post_broadcast=post_broadcast,
+    create_loot_bag=lambda user_id, slot, enemy_id, contents: _create_loot_bag(user_id, slot, enemy_id, contents),
+)
 
-# THE SPAWN CEILING: how many of one enemy could physically have died by now.
-#
-# The token bucket above caps the RATE of claims at a number somebody chose.
-# This caps the COUNT at what the world contains, which is a number nobody
-# chose - it falls out of how many of that enemy are placed and how fast a
-# respawner returns them.
-#
-# THE ARITHMETIC, because the window size is not arbitrary. One spawn point
-# yields at most (W / respawn) + 1 kills in a window of W seconds: one per
-# respawn, plus the one that happened at the very instant the window opened.
-# That +1 is pure slack handed to a cheater, and it dilutes as W grows - so a
-# LONGER window bounds tighter while still refusing nobody honest:
-#
-#     W = 30s    ->  8,400 kills/hour   28.0x honest play
-#     W = 300s   ->  4,620 kills/hour   15.4x
-#     W = 1800s  ->  4,270 kills/hour   14.2x   (the asymptote)
-#
-# 300 is where the curve flattens; past it the table scan grows for nothing.
-# The token bucket alone allows 18,000/hour, or 60x honest play, so this is
-# about four times tighter and the two compose - a claim must satisfy both.
-#
-# RESPAWN_FLOOR IS THE MINIMUM, NOT THE AVERAGE. enemyrespawner.gd waits
-# respawn_seconds and then adds up to respawn_jitter MORE, never less. Using
-# the floor means the ceiling is always at least as generous as reality, so
-# jitter can only ever make an honest player use less of their allowance.
-# If respawn_seconds is ever lowered in a scene, lower this with it.
-KILL_WINDOW_SECONDS = 300
-KILL_RESPAWN_FLOOR_SECONDS = 30.0
-
-
-
-
-@app.post("/api/combat/kill")
-@require_auth
-def combat_kill():
-    """
-    Report a kill and receive its rewards
-    ---
-    tags:
-      - Combat
-    consumes:
-      - application/json
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [slot, enemy_id]
-          properties:
-            slot:     {type: integer, example: 0}
-            enemy_id: {type: string,  example: poisonslimesmall}
-    responses:
-      200:
-        description: XP granted, level-ups applied, and whatever the loot roll produced
-      400:
-        description: Bad slot, unknown enemy_id, or an enemy that awards nothing
-      404:
-        description: That slot is empty
-      429:
-        description: Kills are arriving faster than the cooldown allows
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-
-    enemy_id = str(payload.get("enemy_id", "")).strip()
-    if not enemy_id or len(enemy_id) > 64:
-        return bad_request("enemy_id must be 1-64 characters")
-
-    enemy = gamedata.ENEMIES.get(enemy_id)
-    if enemy is None:
-        # Deliberately names the id back. This is not user input in the hostile
-        # sense - it is the client and the server disagreeing about the roster,
-        # which in practice means gamedata.json is stale on one side. Saying
-        # which id was not found is the difference between a five-minute fix
-        # and an afternoon.
-        return bad_request("Unknown enemy_id '%s'. Is gamedata.json current?" % enemy_id)
-
-    # The large poison slime is the case this exists for: it never dies, it
-    # splits, and everything it is worth walks away as four smalls. A client
-    # reporting it as a kill is either broken or lying, and either way there is
-    # nothing to pay.
-    if not enemy.get("grants_rewards", True):
-        return bad_request("'%s' awards no rewards - it cannot be killed for profit." % enemy_id)
-
-    db = get_db()
-    row = db.execute(
-        "SELECT class_id, level, equipment, xp, xp_to_next, last_kill_at, kill_tokens FROM saves WHERE user_id = ? AND slot = ?",
-        (user_id, slot),
-    ).fetchone()
-    if row is None:
-        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
-
-    now_ms = int(time.time() * 1000)
-
-    # Refill first, then spend. last_kill_at of 0 means this character has never
-    # reported a kill, and the elapsed time since 1970 would overfill the bucket
-    # - min() against the capacity handles that without a special case.
-    elapsed_seconds = max(now_ms - int(row["last_kill_at"]), 0) / 1000.0
-    tokens = min(
-        KILL_BUCKET_CAPACITY,
-        float(row["kill_tokens"]) + elapsed_seconds * KILL_TOKENS_PER_SECOND,
-    )
-
-    if tokens < 1.0:
-        # 429 rather than 400: nothing about the request is malformed, it simply
-        # arrived faster than the bucket allows. An honest client can read that
-        # and retry; a 400 would tell it to give up.
-        return {
-            "error": "Too Many Requests",
-            "message": "Kills are arriving faster than %g per second." % KILL_TOKENS_PER_SECOND,
-        }, 429
-
-    tokens -= 1.0
-
-    # THE SPAWN CEILING. Read KILL_WINDOW_SECONDS for the arithmetic; this is
-    # the half that asks whether this many of THIS enemy could have died.
-    #
-    # Counted out of kill_reports rather than a new table: it already holds one
-    # row per PAID kill, indexed on (user_id, at), and a refused kill leaves no
-    # row - so the count is exactly "kills this account was paid for" and
-    # cannot drift from what was granted.
-    #
-    # FAILS OPEN TWICE, both deliberate. A gamedata.json exported before the
-    # spawn tally existed knows nothing about the world and must not refuse
-    # every kill on a half-upgraded server. And a placed_count of 0 means
-    # "this comes from somewhere I cannot see" - the poison slime's smalls are
-    # spawned by its own script and appear in no scene - where refusing would
-    # break a real fight. See gamedata.spawn_count_for().
-    placed = gamedata.spawn_count_for(enemy_id) if gamedata.SPAWNS_EXPORTED else 0
-    if placed > 0:
-        window_start = int(time.time()) - KILL_WINDOW_SECONDS
-        recent = db.execute(
-            "SELECT COUNT(*) AS n FROM kill_reports"
-            " WHERE user_id = ? AND enemy_id = ? AND at >= ?",
-            (user_id, enemy_id, window_start),
-        ).fetchone()
-        ceiling = int(placed * (KILL_WINDOW_SECONDS / KILL_RESPAWN_FLOOR_SECONDS + 1))
-        if int(recent["n"] or 0) >= ceiling:
-            # 429, matching the bucket above: this is "not yet", not "never".
-            # The message names the world rather than a policy, because that is
-            # where the number came from and a player reading it can check it.
-            return {
-                "error": "Too Many Requests",
-                "message": "Only %d '%s' exist in the world - that is more kills "
-                           "than could have respawned in the last %d minutes."
-                           % (placed, enemy_id, KILL_WINDOW_SECONDS // 60),
-            }, 429
-
-    # ---- everything above this line is validation; everything below commits --
-
-    # The killer's class goes in for the mythic roll: a win is their own
-    # class's piece. See gamedata.roll_mythic().
-    # THE STIRRING LANDS: a monster of the land stirring now drops loot more
-    # often and gives more XP, as the owner has set it (world_stir_for()).
-    bag_scale, xp_scale = world_stir_for(db, enemy_id)
-    rewards = gamedata.roll_kill_rewards(enemy_id, row["class_id"], bag_scale, xp_scale)
-
-    level, xp, xp_to_next, levels_gained = gamedata.apply_xp(
-        int(row["level"]), int(row["xp"]), int(row["xp_to_next"]), rewards["xp"]
-    )
-
-    # A LEVEL-UP MOVES THE MAXIMA WITH IT.
-    #
-    # Without this the level changed here and max_hp did not, so a character who
-    # levelled from a kill carried the previous level's maximum until something
-    # happened to write a status - and /api/player/status GET returns the stored
-    # row, so the player would simply see the wrong number.
-    #
-    # Found by a test asserting max_hp against the curve rather than against a
-    # hardcoded 180: the moment a kill-burst test started levelling the
-    # character up, the stale value stopped matching.
-    derived = _derived_stats(row, level=level) if levels_gained else None
-
-    if levels_gained:
-        # THE REFILL THAT COMES WITH A LEVEL, recorded so the healing
-        # reconciler does not read it as a cheat. player.gd::level_up() fills
-        # all three pools, which is a jump from wherever you were to full in no
-        # time at all - indistinguishable, from the outside, from a client that
-        # simply claimed it.
-        #
-        # Written here rather than where the client syncs, because this is the
-        # moment the server DECIDED the level-up happened. Same table and same
-        # reasoning as the revive grant.
-        db.execute(
-            "INSERT INTO consume_grants (user_id, slot, item_id, target, amount, at) "
-            "VALUES (?, ?, ?, '', 0, ?)",
-            (user_id, slot, LEVELUP_GRANT_ID, int(time.time())),
-        )
-
-    # ONE UPDATE. The XP, the level and the cooldown stamp move together or not
-    # at all - the same reasoning as the bank gold transfer. Two statements
-    # would leave a window where a crash could bank the XP and lose the level,
-    # or stamp the cooldown for a kill that was never paid.
-    if derived is None:
-        db.execute(
-            """
-            UPDATE saves
-               SET level = ?, xp = ?, xp_to_next = ?,
-                   last_kill_at = ?, kill_tokens = ?, updated_at = ?
-             WHERE user_id = ? AND slot = ?
-            """,
-            (level, xp, xp_to_next, now_ms, tokens, int(time.time()), user_id, slot),
-        )
-    else:
-        # One statement, so the level and the maxima it implies can never be
-        # stored apart from each other.
-        db.execute(
-            """
-            UPDATE saves
-               SET level = ?, xp = ?, xp_to_next = ?,
-                   max_hp = ?, max_mana = ?, max_stamina = ?,
-                   last_kill_at = ?, kill_tokens = ?, updated_at = ?
-             WHERE user_id = ? AND slot = ?
-            """,
-            (level, xp, xp_to_next,
-             derived["max_hp"], derived["max_mana"], derived["max_stamina"],
-             now_ms, tokens, int(time.time()), user_id, slot),
-        )
-
-    # ATTACK XP IS BANKED HERE, not returned for the client to apply.
-    #
-    # The number was always the server's - rewards["attack_xp"] comes from the
-    # enemy's own profile and the client never names it. What used to happen is
-    # that it was handed back and the client was trusted to add it up and PUT
-    # the total to /api/character/skills, so an authored reward became a claim
-    # somewhere in the round trip. Granting it at the moment of the kill removes
-    # the trip the lie lived in.
-    #
-    # BEFORE THE COMMIT, AND THAT IS NOT INCIDENTAL. _grant_skill_xp() does not
-    # commit - it expects its caller's transaction, the way the fishing and
-    # cooking routes use it. Called after this commit it inserts into a
-    # transaction nothing ever finishes, and the row is discarded at the end of
-    # the request: the response still reports a level, the database never sees
-    # it. Sharing the commit also means the character's XP and the attack XP
-    # from one kill can never be stored apart from each other.
-    #
-    # THE CLASS SPECIALTY APPLIES. A warrior trains attack half again as fast
-    # (SKILL_PROFICIENCY), and this is the only place attack trains.
-    attack_gained = proficient_amount(row["class_id"], "attack", rewards["attack_xp"])
-    attack_level, attack_xp, attack_levels = _grant_skill_xp(
-        user_id, slot, "attack", attack_gained
-    )
-
-    # Recorded in the same transaction, for the same reason the grant is: a kill
-    # that paid out and left no trace, or a trace for a kill that was rolled
-    # back, would both make the log a thing you cannot reason from.
-    # AS PAID: the attack XP the character actually banked, specialty included.
-    _record_kill(db, user_id, slot, enemy_id, dict(rewards, attack_xp=attack_gained),
-                 level, now_ms // 1000)
-
-    db.commit()
-
-    # THE BAG IS STORED, and its id goes back with the contents. The client
-    # spawns a node to render it, but the node is a picture: taking anything out
-    # of it goes through /api/loot/take, against these rows.
-    #
-    # An empty bag_id means nothing dropped, and the client spawns nothing.
-    #
-    # `stored` is the roll with a position stamped on every entry - which is
-    # what the client renders into its grid and what it sends back to take
-    # anything out. The roll itself is never returned: position is not a detail
-    # the two sides should be inferring separately.
-    # A MYTHIC IS TOLD TO EVERYONE ONLINE, through the broadcast poll every
-    # client already runs, as kind "mythic". The game draws that as a red
-    # banner, and the finder, whose game is already celebrating, keeps only
-    # the chat line (it matches "by" to its own name).
-    #
-    # Before _create_loot_bag(), so the notice and the bag land in one commit
-    # (post_broadcast() leaves the commit to its caller). It cannot announce
-    # a piece the bag then dropped: rarest_first() ranks a mythic with the pet,
-    # ahead of everything LOOT_BAG_CAPACITY could cut.
-    mythic = rewards.get("mythic", "")
-    if mythic:
-        post_broadcast(mythic_find_text(g.user["username"], mythic, enemy_id),
-                       MYTHIC_BROADCAST_KIND, g.user["username"])
-        app.logger.info("mythic: %s (slot %d, %s) found %s on %s",
-                        g.user["username"], slot, row["class_id"], mythic, enemy_id)
-
-    bag_id, stored = _create_loot_bag(user_id, slot, enemy_id, rewards["contents"])
-
-    return {
-        "bag_id": bag_id,
-        "enemy_id": enemy_id,
-        "xp_gained": rewards["xp"],
-        # WHAT WAS BANKED, specialty included, and where it left the skill -
-        # the client sets its attack bar to these rather than adding up its
-        # own, so the screen and the record cannot drift apart.
-        "attack_xp_gained": attack_gained,
-        "attack_level": attack_level,
-        "attack_xp": attack_xp,
-        "attack_xp_to_next": gamedata.xp_needed_for_skill_level("attack", attack_level),
-        "attack_levelled_up": attack_levels > 0,
-        "levels_gained": levels_gained,
-        "level": level,
-        "xp": xp,
-        "xp_to_next": xp_to_next,
-        "pet_won": rewards["pet_won"],
-        # The mythic item_id in this bag, or "". The game celebrates on it.
-        "mythic": mythic,
-        "contents": stored,
-    }, 200
-
-
-# THE KIND A MYTHIC'S NOTICE IS POSTED UNDER. The game draws it as the red
-# banner. The staff broadcast route accepts only "system" and "shout", so
-# nobody can type one.
-MYTHIC_BROADCAST_KIND = "mythic"
+# Named here as well, for the suites and the notes that read them off this
+# module; kill/services.py is where they are set.
+KILL_BUCKET_CAPACITY = kill_package.KILL_BUCKET_CAPACITY
+KILL_TOKENS_PER_SECOND = kill_package.KILL_TOKENS_PER_SECOND
+KILL_WINDOW_SECONDS = kill_package.KILL_WINDOW_SECONDS
+KILL_RESPAWN_FLOOR_SECONDS = kill_package.KILL_RESPAWN_FLOOR_SECONDS
+KILL_LOG_RETENTION_SECONDS = kill_package.KILL_LOG_RETENTION_SECONDS
+MYTHIC_BROADCAST_KIND = kill_package.MYTHIC_BROADCAST_KIND
 
 
 def mythic_find_text(username, item_id, enemy_id):
-    """
-    "Tunacan found the Meteorite on a Dark Sprite!" The enemy is named because
-    a mythic off a light slime is a story worth telling. A boss is a name
-    ("The Crowned Beholder", "Fire The Crowned Beholder") and takes no article.
-    """
-    item = gamedata.item_row(item_id) or {}
-    enemy = gamedata.ENEMIES.get(enemy_id, {})
-    what = item.get("display_name") or item_id
-    who = enemy.get("display_name") or enemy_id
-    if not enemy.get("slots_are_gear"):
-        who = ("an " if who[:1].lower() in ("a", "e", "i", "o", "u") else "a ") + who
-    return "%s found the %s on %s!" % (username, what, who)
+    """What the world is told when a mythic drops, named from this server's
+    own catalogue - kill/services.py's mythic_find_text()."""
+    return kill_package.mythic_find_text(gamedata, username, item_id, enemy_id)
 
 
 # =============================================================================
@@ -11482,15 +11122,13 @@ MAX_EXPLORED_TILES = saves_package.MAX_EXPLORED_TILES
 # =============================================================================
 # POST /api/loot/take and GET /api/loot/bag, as they were here - endpoint
 # names, docstrings and every message (routes.lock) - and the two tables'
-# SQL. loot/__init__.py tells why a bag is the server's. A new bag is still
-# made here, in the kill's own commit (_create_loot_bag(), below), and the
-# money and the backpack the take pays into are this file's, handed in at
-# the take's old place under THE SERVER'S GRANTS.
-#
-# The other helper under this banner was never the loot bag's: the kill's own
-# record. Whether an account holds an item (the save, the rollback and the
-# presence socket ask too) and taking from the backpack (a grant) were here as
-# well, and are carry/'s since 18 Oct (_owns_item(), _take_from_backpack()).
+# SQL. loot/__init__.py tells why a bag is the server's. A new bag is made
+# there too, by the create_bag() register() hands back (kept here as
+# _create_loot_bag(), for the kill), and the money and the backpack the take
+# pays into are this file's, handed in at the take's old place under THE
+# SERVER'S GRANTS. The other helpers that were under this banner went to
+# their own areas: the kill's record to kill/, whether an account holds an
+# item and taking from the backpack to carry/.
 import loot  # noqa: E402
 
 # Named here as well, for the suites and anything else that reads them off
@@ -11508,81 +11146,12 @@ LOOT_BAG_CAPACITY = loot.LOOT_BAG_CAPACITY
 LUSIONS_ITEM_ID = "lusions"
 
 
-def _create_loot_bag(user_id, slot, enemy_id, contents):
-    """
-    Store a rolled bag and return (bag_id, stored_contents).
-
-    stored_contents carries the POSITION of every entry, because that position
-    is the only thing /api/loot/take accepts. Returning the roll unstamped and
-    letting the client infer position from array order would work right up until
-    something reordered or dropped an entry between here and there - and the
-    failure would be the client asking for the wrong item, silently.
-
-    bag_id is secrets.token_urlsafe, not a row counter: a sequential id would
-    let a client ask for bag 4,102 and find out what someone else killed.
-    """
-    if not contents:
-        return "", []
-
-    if len(contents) > LOOT_BAG_CAPACITY:
-        # Logged rather than raised. A player mid-fight should not lose a kill
-        # because an enemy was configured to drop seven things; they lose the
-        # overflow, and the log says why. stamped() makes the cut.
-        app.logger.warning(
-            "loot: %s rolled %d entries, truncating to the panel's %d cells",
-            enemy_id, len(contents), LOOT_BAG_CAPACITY,
-        )
-
-    stored = loot.stamped(contents)
-
-    bag_id = secrets.token_urlsafe(16)
-    now = int(time.time())
-
-    db = get_db()
-    loot.store_bag(db, bag_id, user_id, slot, enemy_id, stored, now,
-                   prune_before=now - LOOT_BAG_TTL_SECONDS)
-
-    db.commit()
-    return bag_id, stored
-
-
-# How long a kill report is kept. Long enough to see a slow, patient cheat in
-# the log; short enough that the table does not grow forever unattended. The
-# same reasoning and the same self-pruning shape as LOGIN_LOG_RETENTION_SECONDS.
-KILL_LOG_RETENTION_SECONDS = 60 * 60 * 24 * 14
-
-
-def _record_kill(db, user_id, slot, enemy_id, rewards, level_at, now):
-    """Write one row for this claimed kill, and prune the old ones - and count
-    it on the kill record, which is never pruned.
-
-    NO COMMIT - this shares combat_kill's transaction on purpose, so a kill is
-    never banked without its record, and a record never exists for a kill that
-    was rolled back.
-    """
-    db.execute(
-        "INSERT INTO kill_reports (user_id, slot, enemy_id, xp, attack_xp, level_at, at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (user_id, slot, str(enemy_id)[:64], int(rewards.get("xp", 0)),
-         int(rewards.get("attack_xp", 0)), int(level_at), now),
-    )
-    db.execute("DELETE FROM kill_reports WHERE at < ?",
-               (now - KILL_LOG_RETENTION_SECONDS,))
-    db.execute(
-        "INSERT INTO kill_tally (user_id, slot, enemy_id, kills, first_at, last_at)"
-        " VALUES (?, ?, ?, 1, ?, ?)"
-        " ON CONFLICT(user_id, slot, enemy_id) DO UPDATE SET"
-        "   kills = kills + 1, last_at = excluded.last_at",
-        (user_id, slot, str(enemy_id)[:64], now, now),
-    )
-
-
 # =============================================================================
 # THE KILL RECORD (game 0.9.0) - the killrecord/ package (since 16 Oct)
 # =============================================================================
 # GET /api/kills and /api/kills/everyone, the game's Kills window: the counts
 # kill_tally holds - paid kills only - and the day counting began. READS ONLY;
-# _record_kill() above, in the kill's own transaction, is the only writer.
+# kill/'s record_kill(), in the kill's own transaction, is what adds to it.
 # The first area taken OUT of this file (ARCHITECTURE.md): the routes, their
 # docstrings and endpoint names are as they were (routes.lock).
 import killrecord  # noqa: E402
@@ -11612,8 +11181,9 @@ killrecord.register(app, require_auth=require_auth, get_db=get_db, parse_slot=pa
 
 # THE LOOT BAG'S TWO ROUTES - the loot/ package (see LOOT BAGS). Handed the
 # money and the backpack from here: the gold and lusion ledgers, the backpack
-# grant, the trade hold, and whether a pet is already held.
-loot.register(
+# grant, the trade hold, and whether a pet is already held. It hands back the
+# making of a new bag, which the kill (kill/, above) is handed as a lookup.
+_LOOT = loot.register(
     app,
     require_auth=require_auth,
     get_db=get_db,
@@ -11637,6 +11207,7 @@ loot.register(
     inventory_of=inventory_payload,
     bag_cells=INVENTORY_CAPACITY,
 )
+_create_loot_bag = _LOOT.create_bag
 
 
 # =============================================================================

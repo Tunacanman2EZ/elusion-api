@@ -13,9 +13,9 @@ WHAT IS COUNTED, AND WHO.
 - DAYS ARE THE OWNER'S, not the server's: the game sends its UTC offset, and a
   day starts at the owner's midnight.
 
-WHAT IT CANNOT SAY. Logins and per-kill rows are kept two weeks (app.py
-LOGIN_LOG_RETENTION_SECONDS, KILL_LOG_RETENTION_SECONDS), so "played on this
-day" and the monster counts reach back DAILY_DAYS at most. And "came back" is
+WHAT IT CANNOT SAY. Logins and per-kill rows are kept two weeks (app.py's
+LOGIN_LOG_RETENTION_SECONDS, kill/'s KILL_LOG_RETENTION_SECONDS), so "played
+on this day" and the monster counts reach back DAILY_DAYS at most. And "came back" is
 read from the LAST time an account was seen: someone who came back once and
 then left is counted, someone who never left but has not been seen since is
 too - it is a floor, not a diary.

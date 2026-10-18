@@ -13,8 +13,8 @@ a potion and had no idea whether you picked it up, dropped it, or invented
 forty more. So the bag exists HERE:
 
   1. A kill that drops something creates a bag with an unguessable id
-     (app.py's _create_loot_bag(), in the kill's own commit, with
-     stamped() and store_bag() from this package).
+     (create_bag(), which register() hands back for the kill - kill/ - to
+     call once the kill itself is committed).
   2. The client renders it, but the contents it renders are a copy.
   3. Taking an item is a REQUEST. The server checks the bag is yours, that it
      still holds that item, and moves it into your backpack or your purse.

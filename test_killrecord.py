@@ -136,9 +136,20 @@ check("a sprite is a row of its own", (tally(me, 0, SPRITE) or [0])[0] == 1)
 check("the other character has none", tally(me, 1, SLIME) is None)
 kill(hunter, SLIME, slot=1)
 check("  until it kills one itself", (tally(me, 1, SLIME) or [0])[0] == 1)
-_record = open(os.path.join(HERE, "app.py")).read().split("def _record_kill(")[1].split("\ndef ")[0]
+# WHEREVER IT LIVES: app.py, or the package the kill moved to (kill/, 18 Oct) -
+# found the code map's way, so the next move is read without a change here.
+import codemap  # noqa: E402
+
+_sources = [open(os.path.join(HERE, "app.py"), encoding="utf-8").read()]
+for _package, _rows, _layers in codemap.feature_packages():
+    _sources += [open(os.path.join(HERE, _package, _name), encoding="utf-8").read()
+                 for _name in sorted(os.listdir(os.path.join(HERE, _package))) if _name.endswith(".py")]
+_records = [src.split(mark)[1].split("\ndef ")[0] for src in _sources
+            for mark in ("\ndef _record_kill(", "\ndef record_kill(") if mark in src]
+_record = _records[0] if len(_records) == 1 else ""
 check("the count is written beside kill_reports, in the kill's transaction (no commit of its own)",
-      "INSERT INTO kill_tally" in _record and "commit" not in _record.replace("NO COMMIT", ""))
+      len(_records) == 1 and "INSERT INTO kill_tally" in _record and "commit" not in _record.replace("NO COMMIT", ""),
+      len(_records))
 
 
 # =============================================================================
