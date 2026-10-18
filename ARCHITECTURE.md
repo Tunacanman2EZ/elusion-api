@@ -7,7 +7,7 @@ it follows the same road.
 
 ## Where it stands
 
-`app.py` is about 23,700 lines: the shared core (config, the database and its
+`app.py` is about 22,900 lines: the shared core (config, the database and its
 write lock, sessions and tokens, the auth decorators, rate limiting, request
 timing) and most of the game's areas, one after another. It works, and every
 area is covered by its own suite, but one file that size has a cost that grows:
@@ -23,6 +23,8 @@ Beside it, **feature packages**: a folder per area, each in three layers.
 | `insights/` | game 0.50.0 | built outside app.py |
 | `killrecord/` | 16 Oct | **moved out** of app.py |
 | `friends/` | 16 Oct | **moved out** of app.py |
+| `gathering/` | 18 Oct | **moved out** of app.py: fishing and cooking |
+| `loot/` | 18 Oct | **moved out** of app.py: the loot bag |
 
 ## Where it is going
 
@@ -79,7 +81,8 @@ checked, not hoped:
 4. In app.py, at the area's old banner: the import and the `register()` call,
    with a line saying where the code went.
 5. Run `test_routes.py` (no difference), the area's suite, `test_packages.py`
-   (add the package's bare-app checks), then every suite; `codemap.py --check`.
+   (add the package's bare-app checks), then every suite; re-run `codemap.py`
+   (CODEMAP.md is generated, never edited).
 6. **`git add` the new folder** - the server updates by `git pull`, and a
    package left out of the commit is an import error on the next restart.
 
@@ -89,8 +92,16 @@ Least tangled first, so each move is small and the pattern is proven before the
 areas that hold money and items:
 
 1. ~~the kill record~~, ~~friends~~ (16 Oct)
-2. fishing and cooking (`gathering/`), with the server's grants they pay with
-3. loot bags
+2. ~~fishing and cooking (`gathering/`)~~ (18 Oct). The bait, the rod and the
+   cast bucket went with them. **The grants they pay with stayed in app.py and
+   are handed in** - `_grant_skill_xp()`, `_add_to_backpack()`,
+   `_take_from_backpack()` - because the loot bag, the shop, trades, the bank
+   and gifts pay with the same three. They go with the carry (10).
+3. ~~loot bags~~ (18 Oct): both routes, and every line of SQL on the two
+   tables but character delete's. **A new bag is still made in app.py**
+   (`_create_loot_bag()`, with the package's `stamped()` and `store_bag()`),
+   because it is the kill's commit, as `_record_kill()` is. The money and the
+   backpack the take pays into are handed in.
 4. guilds
 5. parties and party voice
 6. chat: world chat, channels, pictures, the ignore list's routes

@@ -1,7 +1,7 @@
 """The feature packages stand on their own (game 0.50.0).
 
 Every feature package (ARCHITECTURE.md) - playerstats/, events/, insights/,
-and killrecord/ and friends/, taken out of app.py - is built the BE105 way: each has a
+and killrecord/, friends/, gathering/ and loot/, taken out of app.py - is built the BE105 way: each has a
 register(app, ...) that is HANDED the app, its login checks and its database,
 and never imports app.py. The source of each is checked for that elsewhere
 (test_stats.py); this RUNS them without it - the "application factory"
@@ -37,6 +37,8 @@ from flask import Flask, g, request  # noqa: E402
 import codemap  # noqa: E402
 import events  # noqa: E402
 import friends  # noqa: E402
+import gathering  # noqa: E402
+import loot  # noqa: E402
 import insights  # noqa: E402
 import killrecord  # noqa: E402
 import playerstats  # noqa: E402
@@ -44,7 +46,7 @@ import playerstats  # noqa: E402
 # Found, not listed: what app.py imports that has a routes.py (codemap.py).
 PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
 # The ones this file registers on its bare apps, below.
-RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends")
+RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -112,7 +114,12 @@ def bare_app(name):
     conn = sqlite3.connect(path)
     conn.executescript(
         "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, role TEXT, created_at INTEGER, name_hue INTEGER);"
-        "CREATE TABLE saves (user_id INTEGER, slot INTEGER, class_id TEXT, level INTEGER, area TEXT, updated_at INTEGER);"
+        "CREATE TABLE saves (user_id INTEGER, slot INTEGER, class_id TEXT, level INTEGER, area TEXT, updated_at INTEGER,"
+        " last_cast_at INTEGER NOT NULL DEFAULT 0, cast_tokens REAL NOT NULL DEFAULT 6.0);"
+        "CREATE TABLE carry_items (user_id INTEGER, slot INTEGER, position INTEGER, item_id TEXT, quantity INTEGER);"
+        "CREATE TABLE skills (user_id INTEGER, slot INTEGER, skill_id TEXT, level INTEGER, xp INTEGER);"
+        "CREATE TABLE loot_bags (bag_id TEXT PRIMARY KEY, user_id INTEGER, slot INTEGER, enemy_id TEXT, created_at INTEGER);"
+        "CREATE TABLE loot_bag_items (bag_id TEXT, position INTEGER, item_id TEXT, quantity INTEGER);"
         "CREATE TABLE kill_tally (user_id INTEGER, slot INTEGER, enemy_id TEXT, kills INTEGER, first_at INTEGER,"
         " last_at INTEGER);"
         "CREATE TABLE friends (requester_id INTEGER, addressee_id INTEGER, state TEXT DEFAULT 'pending',"
@@ -120,7 +127,8 @@ def bare_app(name):
     now = int(time.time())
     for user in USERS.values():
         conn.execute("INSERT INTO users VALUES (?, ?, ?, ?, NULL)", (user["id"], user["username"], user["role"], now - 3600))
-    conn.execute("INSERT INTO saves VALUES (2, 0, 'warrior', 4, 'field', ?)", (now,))
+    conn.execute("INSERT INTO saves (user_id, slot, class_id, level, area, updated_at) VALUES (2, 0, 'warrior', 4, 'field', ?)",
+                 (now,))
     for user_id, slot, enemy, kills in ((2, 0, "slime", 5), (2, 1, "slime", 2), (3, 0, "slime", 6), (2, 0, "bat", 1)):
         conn.execute("INSERT INTO kill_tally VALUES (?, ?, ?, ?, ?, ?)", (user_id, slot, enemy, kills, now - 600, now))
     conn.commit()
@@ -166,7 +174,104 @@ def bare_app(name):
                      presence=lambda _db, ids: {2: int(time.time())} if 2 in ids else {},
                      person=lambda row, seen, now: {"username": row["username"], "online": 2 in seen and row["id"] == 2},
                      limits=lambda: (100, 1))
+
+    # gathering/: the grants are app.py's, so here they are four-cell stand-ins
+    # over this database - writing without committing, as app.py's do, so a
+    # refusal after a take leaves nothing behind.
+    def carried(user_id, slot):
+        return {int(r["position"]): (r["item_id"], int(r["quantity"])) for r in get_db().execute(
+            "SELECT position, item_id, quantity FROM carry_items WHERE user_id = ? AND slot = ?", (user_id, slot))}
+
+    def take(user_id, slot, item_id, quantity):
+        cells = [(p, q) for p, (i, q) in sorted(carried(user_id, slot).items()) if i == item_id]
+        if sum(q for _p, q in cells) < quantity:
+            return False
+        for position, have in cells:
+            gone = min(have, quantity)
+            quantity -= gone
+            get_db().execute("UPDATE carry_items SET quantity = quantity - ? WHERE user_id = ? AND slot = ? AND position = ?",
+                             (gone, user_id, slot, position))
+        get_db().execute("DELETE FROM carry_items WHERE quantity <= 0")
+        return True
+
+    def add(user_id, slot, item_id, quantity):
+        free = [p for p in range(GATHER_CELLS) if p not in carried(user_id, slot)]
+        if not free:
+            return None
+        get_db().execute("INSERT INTO carry_items VALUES (?, ?, ?, ?, ?)", (user_id, slot, free[0], item_id, quantity))
+        return [free[0]]
+
+    def skills_of(user_id, slot):
+        return {r["skill_id"]: {"level": int(r["level"]), "xp": int(r["xp"])} for r in get_db().execute(
+            "SELECT skill_id, level, xp FROM skills WHERE user_id = ? AND slot = ?", (user_id, slot))}
+
+    def grant(user_id, slot, skill_id, gained):
+        had = skills_of(user_id, slot).get(skill_id, {"level": 1, "xp": 0})
+        xp = had["xp"] + int(gained)
+        level = 1 + xp // 100
+        get_db().execute("DELETE FROM skills WHERE user_id = ? AND slot = ? AND skill_id = ?", (user_id, slot, skill_id))
+        get_db().execute("INSERT INTO skills VALUES (?, ?, ?, ?, ?)", (user_id, slot, skill_id, level, xp))
+        return level, xp, level - had["level"]
+
+    def roll_catch(rod_tier, level):
+        rolled.append((rod_tier, level))
+        return {"item_id": "rawmudfish", "quantity": 1, "xp": 150}
+
+    def roll_cook(item_id, level):
+        if item_id == "rawshark":
+            return {"ok": False, "reason": "level", "needs": 40}
+        if item_id != "rawmudfish":
+            return {"ok": False, "reason": "recipe"}
+        return {"ok": True, "burnt": False, "output": "cookedmudfish", "xp": 30}
+
+    rolled = app.config.setdefault("rolled", [])
+    gathering.register(app, require_auth=require_auth, get_db=get_db,
+                       parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None, max_slot=3,
+                       bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+                       slot_exists=lambda user_id, slot: get_db().execute(
+                           "SELECT 1 FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone() is not None,
+                       item_row={"bronzefishingrod": {"tier": 2}}.get, roll_catch=roll_catch, roll_cook=roll_cook,
+                       skills_of=skills_of, take_from_backpack=take, add_to_backpack=add, grant_skill_xp=grant,
+                       status_of=lambda user_id, slot: {"slot": slot},
+                       inventory_of=lambda user_id, slot: [{"position": p, "item_id": i, "quantity": q}
+                                                           for p, (i, q) in sorted(carried(user_id, slot).items())],
+                       bag_cells=GATHER_CELLS)
+
+    # loot/: the money and the backpack are app.py's, so here the ledgers are
+    # lists on the app (what was minted, and why), the lusions a total, and
+    # the backpack the same four cells.
+    minted = app.config.setdefault("minted", {"gold": [], "lusions": [], "holds": []})
+
+    def gold_delta(_db, user_id, slot, delta, reason, _detail=""):
+        minted["gold"].append((user_id, slot, delta, reason))
+
+    def lusion_delta(_db, user_id, slot, delta, reason, _detail=""):
+        minted["lusions"].append((user_id, slot, delta, reason))
+
+    def parse_stat(raw):
+        return raw if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0 else None
+
+    loot.register(app, require_auth=require_auth, get_db=get_db,
+                  bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+                  parse_stat=parse_stat,
+                  item_row={"smallhealthpotion": {"type_name": "CONSUMABLE"}, "silvercoin": {"type_name": "CURRENCY"},
+                            "petmage": {"type_name": "PET"}}.get,
+                  owns_item=lambda user_id, slot, item_id: any(i == item_id for i, _q in carried(user_id, slot).values()),
+                  lusions_item_id="lusions", dupe_pet_lusions=lambda: 20,
+                  gold_item_value=lambda item_id: {"silvercoin": 50}.get(item_id, 0),
+                  gold_delta=gold_delta, lusion_delta=lusion_delta,
+                  ensure_account=lambda user_id: {"lusions": sum(d for u, _s, d, _r in minted["lusions"] if u == user_id)},
+                  add_to_backpack=add,
+                  place_trade_hold=lambda _db, user_id, item_id, quantity: minted["holds"].append((user_id, item_id, quantity)),
+                  status_of=lambda user_id, slot: {"slot": slot},
+                  inventory_of=lambda user_id, slot: [{"position": p, "item_id": i, "quantity": q}
+                                                      for p, (i, q) in sorted(carried(user_id, slot).items())],
+                  bag_cells=GATHER_CELLS)
     return app, said, logged, path
+
+
+# A four-cell bag for gathering/'s stand-ins.
+GATHER_CELLS = 4
 
 
 def who(name):
@@ -192,7 +297,8 @@ check("a bare app has the packages' routes and nothing else",
       rules == sorted(["/api/server/stats", "/api/world/events/active", "/api/world/events/schedule", "/api/world/events",
                        "/api/world/events/cancel", "/api/world/events/preview", "/api/world/events/report",
                        "/api/server/insights", "/api/kills", "/api/kills/everyone", "/api/friends",
-                       "/api/friends/request", "/api/friends/respond", "/api/friends/remove"]), rules)
+                       "/api/friends/request", "/api/friends/respond", "/api/friends/remove",
+                       "/api/fishing/catch", "/api/cooking/cook", "/api/loot/take", "/api/loot/bag"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -242,10 +348,167 @@ check("  and removed, the link is gone both ways",
       client_a.post("/api/friends/remove", headers=who("ann"), json={"username": "boss"}).get_json()
       == {"username": "boss", "state": "none"}
       and client_a.get("/api/friends", headers=who("boss")).get_json()["friends"] == [])
+
+
+def ann_holds(item_id):
+    conn = sqlite3.connect(path_a)
+    held = conn.execute("SELECT COALESCE(SUM(quantity), 0) FROM carry_items WHERE user_id = 2 AND slot = 0 AND item_id = ?",
+                        (item_id,)).fetchone()[0]
+    conn.close()
+    return int(held)
+
+
+def ann_gets(item_id, quantity, position):
+    conn = sqlite3.connect(path_a)
+    conn.execute("INSERT INTO carry_items VALUES (2, 0, ?, ?, ?)", (position, item_id, quantity))
+    conn.commit()
+    conn.close()
+
+
+def fish(slot=0):
+    return client_a.post("/api/fishing/catch", headers=who("ann"), json={"slot": slot})
+
+
+def cook(item_id):
+    return client_a.post("/api/cooking/cook", headers=who("ann"), json={"slot": 0, "item_id": item_id})
+
+
+check("gathering: no rod is the 403 it was", fish().get_json() == {"error": "Forbidden", "message": "You need a fishing rod."})
+ann_gets("bronzefishingrod", 1, 0)
+check("  a rod and no worms, the other 403", fish().get_json() == {"error": "Forbidden", "message": "You need worms for bait."})
+ann_gets("fishingworm", 3, 1)
+res = fish()
+body = res.get_json() or {}
+check("  a rod and worms: the fish lands in a free cell, one worm is spent, the skill handed in pays",
+      res.status_code == 200 and body.get("item_id") == "rawmudfish" and body.get("carry_positions") == [2]
+      and body.get("fishing_level") == 2 and body.get("levelled_up") is True and ann_holds("fishingworm") == 2
+      and body.get("skills", {}).get("fishing") == {"level": 2, "xp": 150}, body)
+check("  rolled with the rod's tier from the catalogue handed in, and the fishing level before the cast",
+      app_a.config["rolled"] == [(2, 1)], app_a.config["rolled"])
+conn = sqlite3.connect(path_a)
+tokens, cast_at = conn.execute("SELECT cast_tokens, last_cast_at FROM saves WHERE user_id = 2 AND slot = 0").fetchone()
+conn.execute("UPDATE saves SET cast_tokens = 0.2, last_cast_at = ? WHERE user_id = 2 AND slot = 0", (int(time.time() * 1000),))
+conn.commit()
+conn.close()
+check("  the cast bucket paid one token (%g of %g), and the cast's time" % (tokens, gathering.CAST_BUCKET_CAPACITY),
+      abs(tokens - (gathering.CAST_BUCKET_CAPACITY - 1.0)) < 1e-6 and cast_at > 0, (tokens, cast_at))
+check("  an empty bucket is the 429 it was, in its words",
+      fish().get_json() == {"error": "Too Many Requests", "message": "Casts are arriving faster than 0.4 per second."})
+conn = sqlite3.connect(path_a)
+conn.execute("UPDATE saves SET cast_tokens = 6.0 WHERE user_id = 2 AND slot = 0")
+conn.commit()
+conn.close()
+ann_gets("pebble", 1, 3)
+res = fish()
+check("  a full bag is the 409 it was - and the worm is NOT spent: nothing was committed",
+      res.get_json() == {"error": "Conflict", "message": "Your backpack is full (4 slots)."} and ann_holds("fishingworm") == 2,
+      (res.get_json(), ann_holds("fishingworm")))
+check("  an empty slot and a bad one, the 404 and 400 they were",
+      fish(slot=1).get_json() == {"error": "Not Found", "message": "No character in slot 1."}
+      and fish(slot=9).get_json() == {"error": "Bad Request", "message": "slot must be an integer 0-3"})
+res = cook("rawmudfish")
+body = res.get_json() or {}
+check("cooking: the raw fish goes, the dish comes, and cooking XP is paid",
+      res.status_code == 200 and body.get("burnt") is False and body.get("output") == "cookedmudfish"
+      and ann_holds("rawmudfish") == 0 and ann_holds("cookedmudfish") == 1 and body.get("cooking_level") == 1
+      and body.get("skills", {}).get("cooking") == {"level": 1, "xp": 30}, body)
+conn = sqlite3.connect(path_a)
+conn.execute("DELETE FROM carry_items WHERE item_id = 'pebble'")
+conn.execute("INSERT INTO carry_items VALUES (2, 0, 3, 'rawshark', 1)")
+conn.commit()
+conn.close()
+check("  a level too low, the 403 it was, and the fish kept",
+      cook("rawshark").get_json() == {"error": "Forbidden", "message": "You need cooking level 40."} and ann_holds("rawshark") == 1)
+check("  what is not carried, the 404; what has no recipe, the 409",
+      cook("rawtuna").get_json() == {"error": "Not Found", "message": "You are not carrying that."}
+      and cook("bronzefishingrod").get_json() == {"error": "Conflict", "message": "That cannot be cooked."})
+
+
+BAGS_MADE = []
+
+
+def bag_for_bo(entries, made_at=None):
+    """A bag rolled for bo (account 3, slot 0) the way a kill makes one -
+    stamped() and store_bag() - and its id."""
+    conn = sqlite3.connect(path_a)
+    now = int(time.time())
+    BAGS_MADE.append(1)
+    bag_id = "bag%d" % len(BAGS_MADE)
+    stored = loot.stamped([{"item_id": i, "quantity": q} for i, q in entries])
+    loot.store_bag(conn, bag_id, 3, 0, "slime", stored, now if made_at is None else made_at,
+                   prune_before=now - loot.LOOT_BAG_TTL_SECONDS - 3600)
+    conn.commit()
+    conn.close()
+    return bag_id, stored
+
+
+def take(bag_id, position, as_who="bo"):
+    return client_a.post("/api/loot/take", headers=who(as_who), json={"bag_id": bag_id, "position": position})
+
+
+def bo_gets(item_id, position):
+    conn = sqlite3.connect(path_a)
+    conn.execute("INSERT INTO carry_items VALUES (3, 0, ?, ?, 1)", (position, item_id))
+    conn.commit()
+    conn.close()
+
+
+minted = app_a.config["minted"]
+bo_gets("petmage", 0)
+bag, stored = bag_for_bo([("smallhealthpotion", 2), ("silvercoin", 3), ("petmage", 1), ("smallhealthpotion", 1)]
+                         + [("pebble", 1)] * 7)
+check("loot: a roll past %d cells is stored cut to them, each entry with its cell" % loot.LOOT_BAG_CAPACITY,
+      [e["position"] for e in stored] == list(range(loot.LOOT_BAG_CAPACITY)), stored)
+res = take(bag, 0)
+body = res.get_json() or {}
+check("  a potion goes into the backpack handed in, and is held from trade there",
+      res.status_code == 200 and body.get("credited") == "inventory" and body.get("carry_positions") == [1]
+      and body.get("granted_quantity") == 2 and minted["holds"] == [(3, "smallhealthpotion", 2)], body)
+check("  the same cell again is the 404 it was - a second take changes nothing",
+      take(bag, 0).get_json() == {"error": "Not Found", "message": "Nothing in that slot of the bag."})
+body = take(bag, 1).get_json() or {}
+check("  three silver coins are 150 gold, through the gold ledger handed in, as loot",
+      body.get("credited") == "gold" and body.get("gold_amount") == 150 and minted["gold"] == [(3, 0, 150, "loot")], body)
+body = take(bag, 2).get_json() or {}
+check("  a pet bo already holds is 20 lusions instead, through the lusion ledger",
+      body.get("duplicate_pet") is True and body.get("credited") == "lusions" and body.get("granted_item_id") == "lusions"
+      and body.get("granted_quantity") == 20 and body.get("lusions") == 20
+      and minted["lusions"] == [(3, 0, 20, "duplicate_pet")], body)
+check("  a cell past the bag's is the 400 it was, in its words",
+      take(bag, loot.LOOT_BAG_CAPACITY).get_json()
+      == {"error": "Bad Request", "message": "position must be an integer 0-%d" % (loot.LOOT_BAG_CAPACITY - 1)})
+check("  and somebody else's bag is the same 404 as no bag at all",
+      take(bag, 3, as_who="ann").get_json() == {"error": "Not Found", "message": "No such loot bag."}
+      and take("nosuchbag", 3).get_json() == {"error": "Not Found", "message": "No such loot bag."})
+res = client_a.get("/api/loot/bag?bag_id=%s" % bag, headers=who("bo"))
+body = res.get_json() or {}
+check("  what is left: cells 3 to 8, the monster, the slot",
+      res.status_code == 200 and [c["position"] for c in body.get("contents", [])] == list(range(3, loot.LOOT_BAG_CAPACITY))
+      and body.get("enemy_id") == "slime" and body.get("slot") == 0, body)
+check("  and asked with no bag, the 400 it was",
+      client_a.get("/api/loot/bag", headers=who("bo")).get_json() == {"error": "Bad Request", "message": "bag_id is required"})
+bo_gets("pebble", 2)
+bo_gets("pebble", 3)
+res = take(bag, 3)
+check("  a full backpack is the 409 it was, and the potion stays in the bag",
+      res.get_json() == {"error": "Conflict", "message": "Your backpack is full (4 slots)."}
+      and 3 in [c["position"] for c in client_a.get("/api/loot/bag?bag_id=%s" % bag, headers=who("bo")).get_json()["contents"]])
+old_bag, _stored = bag_for_bo([("silvercoin", 1)], made_at=int(time.time()) - loot.LOOT_BAG_TTL_SECONDS - 5)
+check("  a bag past its %d seconds is the 410 it was, and gone after" % loot.LOOT_BAG_TTL_SECONDS,
+      take(old_bag, 0).get_json() == {"error": "Gone", "message": "That loot bag has expired."}
+      and client_a.get("/api/loot/bag?bag_id=%s" % old_bag, headers=who("bo")).status_code == 404)
+last_bag, _stored = bag_for_bo([("silvercoin", 2)])
+body = take(last_bag, 0).get_json() or {}
+check("  the last thing out empties the bag, and the bag goes with it",
+      body.get("bag_empty") is True and body.get("gold_amount") == 100
+      and client_a.get("/api/loot/bag?bag_id=%s" % last_bag, headers=who("bo")).status_code == 404, body)
 check("  and nobody without a login gets in anywhere",
       [client_a.get(path).status_code for path in ("/api/server/stats", "/api/world/events/active", "/api/server/insights",
-                                                  "/api/kills?slot=0", "/api/kills/everyone", "/api/friends")]
-      == [401, 401, 401, 401, 401, 401])
+                                                  "/api/kills?slot=0", "/api/kills/everyone", "/api/friends",
+                                                  "/api/loot/bag?bag_id=%s" % bag)]
+      + [client_a.post(path, json={"slot": 0}).status_code for path in ("/api/fishing/catch", "/api/cooking/cook",
+                                                                         "/api/loot/take")]
+      == [401] * 10)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")
@@ -271,7 +534,7 @@ for path in (path_a, path_b):
 # =============================================================================
 section("P-4  every package is here")
 check("the code map finds the packages app.py imports: %s" % ", ".join(PACKAGES),
-      set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends"}, PACKAGES)
+      set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot"}, PACKAGES)
 check("  and every one of them runs on a bare app in this file", set(PACKAGES) == set(RUN_HERE),
       sorted(set(PACKAGES) ^ set(RUN_HERE)))
 

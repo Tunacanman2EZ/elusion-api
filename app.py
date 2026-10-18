@@ -22260,79 +22260,27 @@ def character_delete():
 
 
 # =============================================================================
-# LOOT BAGS
+# LOOT BAGS - the loot/ package (since 18 Oct)
 # =============================================================================
+# POST /api/loot/take and GET /api/loot/bag, as they were here - endpoint
+# names, docstrings and every message (routes.lock) - and the two tables'
+# SQL. loot/__init__.py tells why a bag is the server's. A new bag is still
+# made here, in the kill's own commit (_create_loot_bag(), below), and the
+# money and the backpack the take pays into are this file's, handed in at
+# the take's old place under THE SERVER'S GRANTS.
 #
-# THE LAST THING THE CLIENT GETS TO ASSERT.
-#
-# /api/combat/kill already decides what drops. But the bag then existed only in
-# the client's world: it spawned a node, the player walked over it, items landed
-# in the local inventory, and the next save simply TOLD the server what was now
-# being carried. The server rolled a potion and had no idea whether you picked it
-# up, dropped it, or invented forty more.
-#
-# That is why `gold` is still on the client-asserted list next to
-# SERVER_OWNED_STATS. Closing it means the bag has to exist HERE:
-#
-#   1. A kill that drops something creates a bag with an unguessable id.
-#   2. The client renders it, but the contents it renders are a copy.
-#   3. Taking an item is a REQUEST. The server checks the bag is yours, that it
-#      still holds that item, and moves it into your backpack or your purse.
-#
-# After this, gold and carried items only change through an endpoint that
-# verified where they came from.
-#
-# WHY POSITION-KEYED, LIKE EVERY OTHER CONTAINER HERE
-# ---------------------------------------------------
-# Same reason as carry_items and bank_items: "take the item in slot 2" is a
-# request the server can answer exactly once, whereas "take a smallhealthpotion"
-# is ambiguous when the bag holds two stacks of them, and a client that sends it
-# twice would be asking for a duplication bug.
+# The other helpers under this banner were never the loot bag's: whether an
+# account holds an item (the save, the rollback and the presence socket ask
+# too), taking from the backpack (a grant), and the kill's own record.
+import loot  # noqa: E402
 
-# How long the server will honour a bag after it is created.
-#
-# Deliberately far longer than the client's LOOT_BAG_DESPAWN_SECONDS (45). The
-# client despawning the node is a display decision; if the two disagree the
-# player should lose the bag to the ANIMATION, never to a 410 from a server that
-# expired it a moment early. This exists to stop bags accumulating forever, not
-# to enforce the despawn.
-LOOT_BAG_TTL_SECONDS = 600
+# Named here as well, for the suites and anything else that reads them off
+# this module; loot/services.py is where they are set.
+LOOT_BAG_TTL_SECONDS = loot.LOOT_BAG_TTL_SECONDS
+LOOT_BAG_CAPACITY = loot.LOOT_BAG_CAPACITY
 
-# What a fishing spot takes as bait, one per fish landed.
-#
-# NAMED HERE RATHER THAN SENT BY THE CLIENT. fishingspot.gd has its own
-# bait_item_id export so a spot can want something else, but that is a display
-# and early-refusal concern - a client that named its own bait would name the
-# cheapest thing it had.
-FISHING_BAIT_ID = "fishingworm"
-
-# Rods are matched on this suffix, matching fishingspot.gd's _best_rod_tier().
-FISHING_ROD_SUFFIX = "fishingrod"
-
-# Cast rate limit, the same token bucket /api/combat/kill uses.
-#
-# SIZED FOR THE REAL ACTIVITY. A cast is a 2-6.5s wait plus a bite window, so an
-# honest player lands well under one fish every three seconds and never sees
-# this. It exists so a patched client cannot turn the endpoint into a printing
-# press by removing the wait.
-CAST_BUCKET_CAPACITY = 6.0
-CAST_TOKENS_PER_SECOND = 0.4
-
-# The loot panel's grid, in cells. lootbaginventory.gd's LOOT_SIZE.
-#
-# The position IS the grid cell on both sides - that is what lets the client
-# send "take cell 2" and mean the thing the player is looking at. A bag rolled
-# with more entries than the panel can show would put loot behind a cell that
-# does not exist, and the player would never be able to ask for it.
-#
-# NINE, AND IT WAS SIX. The note here said rolls were capped at five - one gold
-# pile, three item slots, one pet - and that stopped being true when gold began
-# dropping as coins: one drop's gold is up to four entries on its own. Measured
-# on the old rules, 76% of boss bags ran past six and the cut fell on the pet,
-# appended last: 573 of 616 boss pet wins never reached the player. Now the
-# roll puts coins last (gamedata.rarest_first) and there are nine cells, so a
-# cut, when there is one, costs the smallest coin.
-LOOT_BAG_CAPACITY = 9
+# The bait, the rod's suffix and the cast bucket are fishing's own: see the
+# gathering/ package (gathering/services.py).
 
 # The item_id the client uses for the lusion pile - lootbaginventory.gd's
 # LUSION_ITEM_ID. There is no constant for it in gamedata.json because the game
@@ -22360,37 +22308,20 @@ def _create_loot_bag(user_id, slot, enemy_id, contents):
     if len(contents) > LOOT_BAG_CAPACITY:
         # Logged rather than raised. A player mid-fight should not lose a kill
         # because an enemy was configured to drop seven things; they lose the
-        # overflow, and the log says why.
+        # overflow, and the log says why. stamped() makes the cut.
         app.logger.warning(
             "loot: %s rolled %d entries, truncating to the panel's %d cells",
             enemy_id, len(contents), LOOT_BAG_CAPACITY,
         )
-        contents = contents[:LOOT_BAG_CAPACITY]
 
-    stored = [
-        {"position": position, "item_id": entry["item_id"], "quantity": int(entry["quantity"])}
-        for position, entry in enumerate(contents)
-    ]
+    stored = loot.stamped(contents)
 
     bag_id = secrets.token_urlsafe(16)
     now = int(time.time())
 
     db = get_db()
-    db.execute(
-        "INSERT INTO loot_bags (bag_id, user_id, slot, enemy_id, created_at) VALUES (?, ?, ?, ?, ?)",
-        (bag_id, user_id, slot, enemy_id, now),
-    )
-    db.executemany(
-        "INSERT INTO loot_bag_items (bag_id, position, item_id, quantity) VALUES (?, ?, ?, ?)",
-        [(bag_id, e["position"], e["item_id"], e["quantity"]) for e in stored],
-    )
-
-    # Opportunistic cleanup. Bags are small and expire on their own terms, so
-    # this runs here rather than on a schedule - a player who is killing things
-    # is exactly the player generating rows worth clearing.
-    db.execute(
-        "DELETE FROM loot_bags WHERE created_at < ?", (now - LOOT_BAG_TTL_SECONDS,)
-    )
+    loot.store_bag(db, bag_id, user_id, slot, enemy_id, stored, now,
+                   prune_before=now - LOOT_BAG_TTL_SECONDS)
 
     db.commit()
     return bag_id, stored
@@ -22484,25 +22415,6 @@ def _take_from_backpack(user_id, slot, item_id, quantity, prefer=None, keys_last
     return True
 
 
-def _best_rod_tier(user_id, slot):
-    """Highest fishing rod tier in this character's backpack, or 0 for none."""
-    rows = get_db().execute(
-        "SELECT DISTINCT item_id FROM carry_items WHERE user_id = ? AND slot = ?",
-        (user_id, slot),
-    ).fetchall()
-
-    best = 0
-    for row in rows:
-        item_id = row["item_id"]
-        if not item_id.endswith(FISHING_ROD_SUFFIX):
-            continue
-        item = gamedata.item_row(item_id)
-        if item is None:
-            continue
-        best = max(best, int(item["tier"]))
-    return best
-
-
 # How long a kill report is kept. Long enough to see a slow, patient cheat in
 # the log; short enough that the table does not grow forever unattended. The
 # same reasoning and the same self-pruning shape as LOGIN_LOG_RETENTION_SECONDS.
@@ -22560,7 +22472,8 @@ killrecord.register(app, require_auth=require_auth, get_db=get_db, parse_slot=pa
 # =============================================================================
 # THE SERVER'S GRANTS - a skill's XP, and items into the backpack
 # =============================================================================
-# What fishing, cooking and the loot bag below pay with. They sat under THE
+# What the loot bag below pays with, and fishing and cooking - the gathering/
+# package, handed these three at its banner below (18 Oct). They sat under THE
 # KILL RECORD's banner until it moved out (16 Oct); they never were it.
 
 def _grant_skill_xp(user_id, slot, skill_id, gained):
@@ -22695,511 +22608,69 @@ def _add_to_backpack(user_id, slot, item_id, quantity):
     return [position for position, _, _ in writes]
 
 
-@app.post("/api/loot/take")
-@require_auth
-def take_loot():
-    """
-    Take one item out of a loot bag
-    ---
-    tags:
-      - Loot
-    consumes:
-      - application/json
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [bag_id, position]
-          properties:
-            bag_id:   {type: string,  example: k3Jx9_QpZ2mNvRt1}
-            position: {type: integer, example: 0}
-    responses:
-      200:
-        description: What was taken, and the state it landed in
-      400:
-        description: Bad bag_id or position
-      404:
-        description: No such bag, not yours, or that cell is already empty
-      409:
-        description: Backpack full - the item stays in the bag
-      410:
-        description: The bag has expired
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-
-    bag_id = str(payload.get("bag_id", "")).strip()
-    if not bag_id or len(bag_id) > 64:
-        return bad_request("bag_id must be 1-64 characters")
-
-    # Bounded by the BAG's capacity, not the backpack's. They were the same
-    # number by accident, and a cell index from a 6-cell grid validated against
-    # a 20-cell one is a check that reads as if it is doing something.
-    position = parse_stat(payload.get("position"))
-    if position is None or position >= LOOT_BAG_CAPACITY:
-        return bad_request("position must be an integer 0-%d" % (LOOT_BAG_CAPACITY - 1))
-
-    db = get_db()
-
-    # SCOPED TO user_id IN THE QUERY ITSELF, not checked afterwards. A bag that
-    # belongs to someone else and a bag that does not exist return exactly the
-    # same 404 - there is nothing to learn from asking.
-    bag = db.execute(
-        "SELECT slot, created_at FROM loot_bags WHERE bag_id = ? AND user_id = ?",
-        (bag_id, user_id),
-    ).fetchone()
-    if bag is None:
-        return {"error": "Not Found", "message": "No such loot bag."}, 404
-
-    if int(bag["created_at"]) < int(time.time()) - LOOT_BAG_TTL_SECONDS:
-        db.execute("DELETE FROM loot_bags WHERE bag_id = ?", (bag_id,))
-        db.commit()
-        return {"error": "Gone", "message": "That loot bag has expired."}, 410
-
-    item = db.execute(
-        "SELECT item_id, quantity FROM loot_bag_items WHERE bag_id = ? AND position = ?",
-        (bag_id, position),
-    ).fetchone()
-    if item is None:
-        # Already taken, or never there. Same answer either way, and it is the
-        # answer that makes a duplicate request harmless: the second one finds
-        # nothing and changes nothing.
-        return {"error": "Not Found", "message": "Nothing in that slot of the bag."}, 404
-
-    slot = int(bag["slot"])
-    item_id = item["item_id"]
-    quantity = int(item["quantity"])
-    definition = gamedata.item_row(item_id) or {}
-    kind = definition.get("type_name", "")
-
-    # WHAT WAS IN THE BAG vs WHAT THE PLAYER ACTUALLY GETS. Those are the same
-    # thing for everything except a pet you already own, and the client needs
-    # both: item_id/quantity to know which cell to clear, granted_* to know what
-    # to say in the notice.
-    result = {"bag_id": bag_id, "position": position, "item_id": item_id, "quantity": quantity}
-    granted_id = item_id
-    granted_qty = quantity
-
-    # A DUPLICATE PET BECOMES LUSIONS, AND THAT DECISION MOVED HERE.
-    #
-    # lootbaginventory.gd used to make it, in _load_contents(), by checking the
-    # local inventory and the local bank. Both of those are now views of rows
-    # this process owns, so the client was checking a copy to decide what a pet
-    # was worth - and a client that decides what it is owed is the thing this
-    # whole endpoint exists to stop.
-    #
-    # The panel still DISPLAYS the substitution so the player sees lusions in
-    # the bag rather than a pet that turns into lusions. That is cosmetic. This
-    # is the grant.
-    if kind == "PET" and _owns_item(user_id, slot, item_id):
-        kind = "CURRENCY"
-        granted_id = LUSIONS_ITEM_ID
-        granted_qty = int(gamedata.CONSTANTS.get("dupe_pet_lusions", 20))
-        result["duplicate_pet"] = True
-
-    if kind == "CURRENCY":
-        # CURRENCY RESOLVES INTO A BALANCE RATHER THAN A BACKPACK CELL. This is
-        # the whole point of the exercise: gold entering the game now goes
-        # through a statement the server wrote, against a bag the server rolled.
-        coin_value = gold_item_value(granted_id)
-        if coin_value > 0:
-            # QUANTITY TIMES VALUE, not the quantity. Ten silver coins at 50
-            # each is 500 gold; crediting 10 would be the bug this line exists
-            # to not have. See gold_item_value() above.
-            credited = granted_qty * coin_value
-
-            # THE ONLY PLACE GOLD IS CREATED. Through gold_delta() rather than a
-            # bare UPDATE so the mint lands in the ledger in the same
-            # transaction as the balance - see gold_ledger in init_db(). If a
-            # second mint site is ever added it goes through here too, or the
-            # invariant stops meaning anything.
-            gold_delta(
-                db, user_id, slot, credited,
-                "loot", "%s x%d from bag %s" % (granted_id, granted_qty, bag_id),
-            )
-            result["credited"] = "gold"
-            result["gold_amount"] = credited
-        else:
-            # Lusions, and anything else account-scoped that shows up later.
-            #
-            # THE ONLY PLACE LUSIONS ARE CREATED, and it goes through
-            # lusion_delta() so the mint lands in lusion_ledger in the same
-            # transaction as the balance - the same discipline the gold mint
-            # two branches up has followed since the ledger existed.
-            _ensure_account(user_id)
-            lusion_delta(db, user_id, slot, granted_qty, "duplicate_pet",
-                         "%s converted from bag %s" % (granted_id, bag_id))
-            result["credited"] = "lusions"
-    else:
-        written = _add_to_backpack(user_id, slot, granted_id, granted_qty)
-        if written is None:
-            # 409, and the item stays where it is. Refusing beats dropping it on
-            # the floor: the player can make room and ask again. Nothing was
-            # written - _add_to_backpack is all-or-nothing.
-            return {
-                "error": "Conflict",
-                "message": "Your backpack is full (%d slots)." % INVENTORY_CAPACITY,
-            }, 409
-
-        result["credited"] = "inventory"
-        result["carry_positions"] = written
-        # A MYTHIC OR A PERFECT IS HELD FROM TRADE for TRADE_HOLD_SECONDS from
-        # the moment it lands - see trade_holds in init_db().
-        place_trade_hold(db, user_id, granted_id, granted_qty)
-
-    result["granted_item_id"] = granted_id
-    result["granted_quantity"] = granted_qty
-
-    # Removed only after it has landed somewhere. If the insert above had failed
-    # the transaction carries the delete with it, so an item cannot evaporate
-    # between the two.
-    db.execute(
-        "DELETE FROM loot_bag_items WHERE bag_id = ? AND position = ?", (bag_id, position)
-    )
-
-    remaining = db.execute(
-        "SELECT COUNT(*) FROM loot_bag_items WHERE bag_id = ?", (bag_id,)
-    ).fetchone()[0]
-    if remaining == 0:
-        db.execute("DELETE FROM loot_bags WHERE bag_id = ?", (bag_id,))
-
-    db.commit()
-
-    result["bag_empty"] = remaining == 0
-
-    # THE BALANCES GO BACK AS TOTALS, NOT AS THE DELTA THAT WAS JUST APPLIED.
-    #
-    # The client still pushes `gold` on every save, so a client that added the
-    # delta to its own figure and got it wrong once would overwrite this row
-    # with the wrong number on the very next save - and the loss would look like
-    # nothing at all. Handing back the balance it landed on means a client that
-    # misses a response is corrected by the next one it does get.
-    result["status"] = status_payload(user_id, slot)
-    result["inventory"] = inventory_payload(user_id, slot)
-    result["lusions"] = int(_ensure_account(user_id)["lusions"])
-    return result, 200
+# THE LOOT BAG'S TWO ROUTES - the loot/ package (see LOOT BAGS). Handed the
+# money and the backpack from here: the gold and lusion ledgers, the grant
+# above, the trade hold, and whether a pet is already held.
+loot.register(
+    app,
+    require_auth=require_auth,
+    get_db=get_db,
+    bad_request=bad_request,
+    parse_stat=parse_stat,
+    item_row=gamedata.item_row,
+    owns_item=_owns_item,
+    lusions_item_id=LUSIONS_ITEM_ID,
+    # Asked on each take: the catalogue's constant.
+    dupe_pet_lusions=lambda: int(gamedata.CONSTANTS.get("dupe_pet_lusions", 20)),
+    gold_item_value=gold_item_value,
+    gold_delta=gold_delta,
+    lusion_delta=lusion_delta,
+    ensure_account=_ensure_account,
+    add_to_backpack=_add_to_backpack,
+    place_trade_hold=place_trade_hold,
+    status_of=status_payload,
+    inventory_of=inventory_payload,
+    bag_cells=INVENTORY_CAPACITY,
+)
 
 
 # =============================================================================
-# FISHING AND COOKING
+# FISHING AND COOKING - the gathering/ package (since 18 Oct)
 # =============================================================================
-# BOTH BUILT TO THE RULE IN docs/inventoryauthority.md, which named them before
-# either existed: "Anything that creates, destroys or moves an item is a server
-# endpoint." The client sends that it fished, never what it caught; it sends
-# which fish it wants cooked, never whether that fish burned.
-#
-# Both copy /api/loot/take's shape exactly - validate and 4xx before the first
-# write, then one transaction ending in a single commit, then hand back the
-# totals rather than the delta so a client that drops a response is corrected by
-# the next one it gets.
+# POST /api/fishing/catch and /api/cooking/cook, as they were here - endpoint
+# names, docstrings and every message (routes.lock). What a rod lands and what
+# a fire makes of it are the package's: the bait, the rod, the cast bucket.
+# What they pay with stays this file's and is handed in - _grant_skill_xp(),
+# _add_to_backpack() and _take_from_backpack() above, which the loot bag, the
+# shop, trades, the bank and gifts pay with too.
+import gathering  # noqa: E402
 
+# Named here as well, for test_gathering.py and anything else that reads them
+# off this module; gathering/services.py is where they are set.
+FISHING_BAIT_ID = gathering.FISHING_BAIT_ID
+CAST_BUCKET_CAPACITY = gathering.CAST_BUCKET_CAPACITY
+CAST_TOKENS_PER_SECOND = gathering.CAST_TOKENS_PER_SECOND
 
-@app.post("/api/fishing/catch")
-@require_auth
-def fishing_catch():
-    """
-    Land a fish
-    ---
-    tags:
-      - Fishing
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [slot]
-          properties:
-            slot: {type: integer, example: 0}
-    responses:
-      200:
-        description: What was caught, and the state it landed in
-      400:
-        description: Bad slot
-      403:
-        description: No rod, or no bait
-      404:
-        description: That slot is empty
-      409:
-        description: Backpack full
-      429:
-        description: Casting faster than the bucket allows
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-
-    row = get_db().execute(
-        "SELECT last_cast_at, cast_tokens FROM saves WHERE user_id = ? AND slot = ?",
-        (user_id, slot),
-    ).fetchone()
-    if row is None:
-        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
-
-    # THE ROD AND THE BAIT ARE CHECKED AGAINST carry_items, not against anything
-    # the client said. fishingspot.gd runs the same two checks so it can refuse
-    # early and explain why, but that copy is a courtesy - this one decides.
-    rod_tier = _best_rod_tier(user_id, slot)
-    if rod_tier <= 0:
-        return {"error": "Forbidden", "message": "You need a fishing rod."}, 403
-
-    bait_held = get_db().execute(
-        "SELECT COALESCE(SUM(quantity), 0) FROM carry_items "
-        "WHERE user_id = ? AND slot = ? AND item_id = ?",
-        (user_id, slot, FISHING_BAIT_ID),
-    ).fetchone()[0]
-    if int(bait_held) <= 0:
-        return {"error": "Forbidden", "message": "You need worms for bait."}, 403
-
-    # Refill then spend, exactly as /api/combat/kill does.
-    now_ms = int(time.time() * 1000)
-    elapsed_seconds = max(now_ms - int(row["last_cast_at"]), 0) / 1000.0
-    tokens = min(
-        CAST_BUCKET_CAPACITY,
-        float(row["cast_tokens"]) + elapsed_seconds * CAST_TOKENS_PER_SECOND,
-    )
-    if tokens < 1.0:
-        return {
-            "error": "Too Many Requests",
-            "message": "Casts are arriving faster than %g per second." % CAST_TOKENS_PER_SECOND,
-        }, 429
-    tokens -= 1.0
-
-    skills = skills_payload(user_id, slot)
-    fishing_level = int(skills.get("fishing", {}).get("level", 1))
-
-    catch = gamedata.roll_fishing_catch(rod_tier, fishing_level)
-    if catch is None:
-        # No FISH-typed items in the catalogue at all. A server misconfiguration
-        # rather than a player problem, and it must not eat their bait.
-        return {
-            "error": "Conflict",
-            "message": "There is nothing to catch here.",
-        }, 409
-
-    # ---- everything above this line is validation; everything below commits --
-    db = get_db()
-
-    if not _take_from_backpack(user_id, slot, FISHING_BAIT_ID, 1):
-        # Re-checked inside the transaction. The count above was read before the
-        # roll, and two casts racing would both have seen the last worm.
-        return {"error": "Forbidden", "message": "You need worms for bait."}, 403
-
-    written = _add_to_backpack(user_id, slot, catch["item_id"], catch["quantity"])
-    if written is None:
-        # The bait is not spent: nothing has been committed, and returning here
-        # abandons the transaction rather than charging for a fish that had
-        # nowhere to go.
-        return {
-            "error": "Conflict",
-            "message": "Your backpack is full (%d slots)." % INVENTORY_CAPACITY,
-        }, 409
-
-    level, xp, levels_gained = _grant_skill_xp(user_id, slot, "fishing", catch["xp"])
-
-    db.execute(
-        "UPDATE saves SET last_cast_at = ?, cast_tokens = ? WHERE user_id = ? AND slot = ?",
-        (now_ms, tokens, user_id, slot),
-    )
-    db.commit()
-
-    return {
-        "item_id": catch["item_id"],
-        "quantity": catch["quantity"],
-        "xp": catch["xp"],
-        "carry_positions": written,
-        "levelled_up": levels_gained > 0,
-        "fishing_level": level,
-        "status": status_payload(user_id, slot),
-        "inventory": inventory_payload(user_id, slot),
-        "skills": skills_payload(user_id, slot),
-    }, 200
-
-
-@app.post("/api/cooking/cook")
-@require_auth
-def cooking_cook():
-    """
-    Cook one raw fish
-    ---
-    tags:
-      - Cooking
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [slot, item_id]
-          properties:
-            slot:    {type: integer, example: 0}
-            item_id: {type: string,  example: rawmudfish}
-    responses:
-      200:
-        description: What happened, and the state it landed in
-      400:
-        description: Bad slot or item_id
-      403:
-        description: Cooking level too low
-      404:
-        description: That slot is empty, or you are not carrying that fish
-      409:
-        description: Backpack full, or the item is not cookable
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-    if not _slot_exists(user_id, slot):
-        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
-
-    item_id = str(payload.get("item_id", "")).strip()
-    if not item_id or len(item_id) > 64:
-        return bad_request("item_id must be 1-64 characters")
-
-    # THE INPUT IS NAMED BY THE CLIENT AND NOTHING ELSE IS. Which of their own
-    # fish to cook is a choice, not a claim - the recipe, the level gate and the
-    # burn roll are all read from data the server holds.
-    held = get_db().execute(
-        "SELECT COALESCE(SUM(quantity), 0) FROM carry_items "
-        "WHERE user_id = ? AND slot = ? AND item_id = ?",
-        (user_id, slot, item_id),
-    ).fetchone()[0]
-    if int(held) <= 0:
-        return {"error": "Not Found", "message": "You are not carrying that."}, 404
-
-    skills = skills_payload(user_id, slot)
-    cooking_level = int(skills.get("cooking", {}).get("level", 1))
-
-    outcome = gamedata.roll_cook(item_id, cooking_level)
-    if not outcome["ok"]:
-        if outcome["reason"] == "level":
-            return {
-                "error": "Forbidden",
-                "message": "You need cooking level %d." % outcome["needs"],
-            }, 403
-        return {
-            "error": "Conflict",
-            "message": "That cannot be cooked.",
-        }, 409
-
-    # ---- everything above this line is validation; everything below commits --
-    db = get_db()
-
-    if not _take_from_backpack(user_id, slot, item_id, 1):
-        return {"error": "Not Found", "message": "You are not carrying that."}, 404
-
-    written = []
-    if not outcome["burnt"]:
-        written = _add_to_backpack(user_id, slot, outcome["output"], 1)
-        if written is None:
-            # The raw fish is not consumed - nothing is committed.
-            return {
-                "error": "Conflict",
-                "message": "Your backpack is full (%d slots)." % INVENTORY_CAPACITY,
-            }, 409
-
-    level, xp, levels_gained = _grant_skill_xp(user_id, slot, "cooking", outcome["xp"])
-    db.commit()
-
-    return {
-        "item_id": item_id,
-        "burnt": outcome["burnt"],
-        "output": outcome["output"],
-        "xp": outcome["xp"],
-        "carry_positions": written,
-        "levelled_up": levels_gained > 0,
-        "cooking_level": level,
-        "status": status_payload(user_id, slot),
-        "inventory": inventory_payload(user_id, slot),
-        "skills": skills_payload(user_id, slot),
-    }, 200
-
-
-@app.get("/api/loot/bag")
-@require_auth
-def read_loot_bag():
-    """
-    What is still in a loot bag
-    ---
-    tags:
-      - Loot
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: query
-        name: bag_id
-        type: string
-        required: true
-    responses:
-      200:
-        description: The bag's remaining contents
-      404:
-        description: No such bag, or not yours
-      401:
-        description: Missing, invalid or expired token
-    """
-    # Exists so a client that reconnects, or one that is unsure whether a take
-    # landed, can ask rather than guess. A bag the server has already emptied is
-    # a 404, which is the same answer as never having existed - and the right
-    # one, because in both cases there is nothing to collect.
-    bag_id = str(request.args.get("bag_id", "")).strip()
-    if not bag_id:
-        return bad_request("bag_id is required")
-
-    user_id = g.user["id"]
-    bag = get_db().execute(
-        "SELECT slot, enemy_id, created_at FROM loot_bags WHERE bag_id = ? AND user_id = ?",
-        (bag_id, user_id),
-    ).fetchone()
-    if bag is None:
-        return {"error": "Not Found", "message": "No such loot bag."}, 404
-
-    rows = get_db().execute(
-        "SELECT position, item_id, quantity FROM loot_bag_items WHERE bag_id = ? ORDER BY position",
-        (bag_id,),
-    ).fetchall()
-
-    return {
-        "bag_id": bag_id,
-        "slot": int(bag["slot"]),
-        "enemy_id": bag["enemy_id"],
-        "contents": [
-            {"position": int(r["position"]), "item_id": r["item_id"], "quantity": int(r["quantity"])}
-            for r in rows
-        ],
-    }, 200
+gathering.register(
+    app,
+    require_auth=require_auth,
+    get_db=get_db,
+    parse_slot=parse_slot,
+    max_slot=MAX_SLOT,
+    bad_request=bad_request,
+    slot_exists=_slot_exists,
+    item_row=gamedata.item_row,
+    # Looked up on each roll, so a suite's stand-in on gamedata is heard.
+    roll_catch=lambda rod_tier, level: gamedata.roll_fishing_catch(rod_tier, level),
+    roll_cook=lambda item_id, level: gamedata.roll_cook(item_id, level),
+    skills_of=skills_payload,
+    take_from_backpack=_take_from_backpack,
+    add_to_backpack=_add_to_backpack,
+    grant_skill_xp=_grant_skill_xp,
+    status_of=status_payload,
+    inventory_of=inventory_payload,
+    bag_cells=INVENTORY_CAPACITY,
+)
 
 
 # =============================================================================

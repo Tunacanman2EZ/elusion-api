@@ -1989,7 +1989,10 @@ only, `test_stats.py`.
   `codemap.py` lists them under their own heading.
 - **And the areas already in app.py are moving out** (16 Oct,
   ARCHITECTURE.md - the road, the contract, the checklist and the order):
-  `killrecord/` and `friends/` first. **`routes.lock`, held by
+  `killrecord/` and `friends/` first, then `gathering/` (18 Oct: fishing and
+  cooking, handed the grants they pay with) and `loot/` (18 Oct: the bag's
+  two routes and its SQL; a new bag is still made in the kill's commit).
+  **`routes.lock`, held by
   `test_routes.py`,** is the promise that a move changes nothing outside:
   every route's method, path, endpoint name, login, rank, password-again,
   write lock and docstring, and a 401 without a token from every route that
