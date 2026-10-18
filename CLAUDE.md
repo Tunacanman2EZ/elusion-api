@@ -307,7 +307,7 @@ Two things to carry from it:
 - **Ask what a delete actually revokes.** "The line is gone from the feed" and
   "the bytes are unreachable" are different claims, and the first one looks like
   the second from the moderator's side.
-- **Reference count before you drop shared storage.** `store_relayed_image()` is
+- **Reference count before you drop shared storage.** `store_image()` (chat/data.py) is
   `INSERT OR IGNORE` on a content hash, so the same picture posted twice is ONE
   row under two messages, possibly in two channels. Deleting the row on the first
   message would blank the picture under a second, innocent line. Count what still
@@ -354,7 +354,7 @@ The poll now returns `removed`, and three decisions in it are worth keeping:
   `CHAT_DELETION_WINDOW_SECONDS` (120). That window is only sufficient because of
   something the client already did: `chatpanel.gd` starts from the **tail** rather
   than a stored cursor when the window opens, so a client away longer than the
-  window is not holding the line anyway. Pruned on write, like `_prune_chat()`.
+  window is not holding the line anyway. Pruned on write, like chat/'s `prune()`.
 
 On the Godot side `_remove_lines()` does the work, and the case that makes it
 worth building properly is **the open viewer**. `_sweep_pictures()` deliberately
@@ -416,15 +416,16 @@ updating the maxima it implies.
   `VALID_SKILLS`) set to a level 1-`MAX_SKILL_LEVEL` with no XP into it, on the
   caller's own character, with a `skill` line in the log; O-8 holds it.
 - **`GET /api/chat/image/<image_id>` is served only to someone who could see
-  it** (`_may_see_image`): a line the caller could read shows it, by
-  `_can_read_chat_row`; or the caller uploaded those bytes
+  it** (chat/'s `may_see_image()`): a line the caller could read shows it,
+  by `can_read_row()` (app.py's `_can_read_chat_row()`); or the caller
+  uploaded those bytes
   (`chat_image_holders`, not `created_by`, which only remembers the first of
   two uploaders of one file); or a mod is judging a report of it. Whisper,
   friends and guild lines get their own copy under a random id
-  (`_private_image_copy`), and `/api/chat/send` refuses an id the sender could
+  (chat/data.py `private_copy()`), and `/api/chat/send` refuses an id the sender could
   not see. World pictures keep the content id, SHA-256 of the bytes, and
   `test_ownership.py` O-3 still pins that it is 64 hex and the hash of what is
-  served. Drop a picture with `_drop_image()`, never a bare DELETE, so its
+  served. Drop a picture with `drop_image()` (chat/data.py), never a bare DELETE, so its
   holders go with it.
 - **Login and unknown-username return byte-identical 401s.** A distinguishable
   answer turns the route into a username enumerator. There is a test asserting
@@ -843,8 +844,9 @@ bank until a relog.
 
 ## Chat: ignore, report, mute
 
-IGNORE, REPORT, MUTE in app.py (the rules sit above `chat_write_check`, the
-routes after `chat_delete`); `test_chatsafety.py` holds all three.
+IGNORE, REPORT, MUTE in app.py (the rules, and the report and mute routes);
+the ignore list's routes and SQL are chat/'s since 18 Oct. `test_chatsafety.py`
+holds all three.
 
 - **Ignore is a WHERE clause.** `IGNORED_AUTHORS_CLAUSE` goes on the end of
   every chat read's `where` (with the reader's id), so the tail, the cursor and
@@ -1124,7 +1126,7 @@ list (and the caller's own "here"), the guild roster, the staff account view's
 `playing` flag and a staff teleport's default area. `test_playing.py` holds
 the surfaces and scans app.py for any new "saved last" pick.
 
-**Guild chat** has been live since guilds: `chat_write_check` and `read_chat`
+**Guild chat** has been live since guilds: chat/'s write check and `read_chat`
 gate it on membership, and a line carries its guild in `target_id`. The one
 sentence for "no guild", reading or writing, is `GUILD_CHAT_NO_GUILD`. The
 client refused the tab locally until it was reported; see the game's CLAUDE.md.
@@ -1997,7 +1999,9 @@ only, `test_stats.py`.
   the four guild tables; `guild_membership()` and `guild_tag()` stay callable
   in app.py for chat, the poll and the boards) and `parties/` (18 Oct: the
   seven routes, voice's included; the TURN key and the call to Cloudflare stay
-  in app.py and are handed in). **A name a suite replaces on app.py**
+  in app.py and are handed in) and `chat/` (18 Oct: send, read, pictures,
+  delete and the ignore list; broadcasts, reports, mutes and the picture
+  fetch stay in app.py). **A name a suite replaces on app.py**
   (`_turn_fetch`, `gold_item_value`) **is handed in as a lambda that looks it
   up**, or the suite's stand-in is never asked.
   **`routes.lock`, held by

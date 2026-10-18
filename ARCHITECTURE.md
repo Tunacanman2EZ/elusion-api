@@ -7,7 +7,7 @@ it follows the same road.
 
 ## Where it stands
 
-`app.py` is about 21,400 lines: the shared core (config, the database and its
+`app.py` is about 20,000 lines: the shared core (config, the database and its
 write lock, sessions and tokens, the auth decorators, rate limiting, request
 timing) and most of the game's areas, one after another. It works, and every
 area is covered by its own suite, but one file that size has a cost that grows:
@@ -27,6 +27,7 @@ Beside it, **feature packages**: a folder per area, each in three layers.
 | `loot/` | 18 Oct | **moved out** of app.py: the loot bag |
 | `guilds/` | 18 Oct | **moved out** of app.py: guilds, staff's two guild routes too |
 | `parties/` | 18 Oct | **moved out** of app.py: parties and party voice |
+| `chat/` | 18 Oct | **moved out** of app.py: chat, pictures, the ignore list |
 
 ## Where it is going
 
@@ -45,6 +46,10 @@ area, handing each package what it needs. Every area in a package of its own.
   (`_presence_for()`), how a person is shown (`friend_entry()`), the limits
   that are this file's tunables (asked through a callable, so a suite can turn
   them down).
+- **What other areas ask of a package, register() can hand back.** chat/
+  returns post_chat() and can_read_row() (the events post lines, a report
+  asks whether its reporter could read the line), and app.py keeps them
+  callable under the names it always used.
 - **A seam a suite replaces is handed as a lookup.** Where a suite swaps or
   slows one of app.py's names (`_turn_fetch`, `gold_item_value`), the package
   is handed `lambda ...: name(...)`, so the swap is heard on every call. A
@@ -131,7 +136,15 @@ areas that hold money and items:
    setting and the server's one outside call, which test_voice replaces - and
    so do the credentials handed out, kept per process. Party chat stays with
    chat (6), the poll's view of a party (`_own_party()`) with the poll.
-6. chat: world chat, channels, pictures, the ignore list's routes
+6. ~~chat: world chat, channels, pictures, the ignore list's routes~~ (18
+   Oct): ten routes on nine endpoints, the rules (length, retention, the flood
+   bucket, the channels, every picture cap) and every write to the chat
+   tables. **register() hands back what other areas ask of chat** -
+   `post_chat()`, `can_read_row()` for a report - and app.py keeps them under
+   their old names; `ignores()` is the package's data. What stays in app.py:
+   the broadcasts (the server's voice), `clean_player_text()` (every typed
+   name), reports and mutes (moderation, 9), and the picture fetch (the
+   server's call out, which test_chatrooms points at a local server).
 7. trade and the kingdom tax
 8. the stirring lands (`world/`) - combat asks it what a kill pays
 9. moderation and the staff list

@@ -30,7 +30,6 @@ import unicodedata
 import math
 import smtplib
 import hashlib
-import io
 import ipaddress
 import socket
 import urllib.error
@@ -38,18 +37,6 @@ import urllib.parse
 import urllib.request
 from email.message import EmailMessage
 from functools import wraps
-
-# PILLOW IS OPTIONAL AND THE SERVER STARTS WITHOUT IT. It is needed only to
-# relay pictures into chat; everything else works untouched. An install that
-# has not run `pip install Pillow` gets a clear refusal on that one route
-# rather than a server that will not boot.
-try:
-    from PIL import Image, ImageSequence
-    PILLOW_AVAILABLE = True
-except ImportError:
-    Image = None
-    ImageSequence = None
-    PILLOW_AVAILABLE = False
 
 app = Flask(__name__)
 
@@ -2474,7 +2461,7 @@ def init_db():
     _migrate_add_column(db, "chat_messages", "channel", "TEXT NOT NULL DEFAULT 'world'")
     _migrate_add_column(db, "chat_messages", "target_id", "INTEGER NOT NULL DEFAULT 0")
     _migrate_add_column(db, "chat_messages", "image_id", "TEXT NOT NULL DEFAULT ''")
-    # Which lines show a picture: _may_see_image() asks it on every picture
+    # Which lines show a picture: chat/'s may_see_image() asks it on every picture
     # fetched. After the column it indexes, for the same reason as
     # idx_sessions_seen - in the schema block it would stop an old database
     # from booting.
@@ -4710,99 +4697,30 @@ def post_broadcast(body, kind="system", by=""):
 
 
 # =============================================================================
-# WORLD CHAT - WHAT THE PLAYERS SAY
+# WORLD CHAT - WHAT THE PLAYERS SAY - the chat/ package (since 18 Oct)
 # =============================================================================
-#
-# One public channel that everybody logged in can read and write. The three
-# things that make chat expensive - a length cap, a flood limit, and a way to
-# take a line back down - are all here, because a chat channel without them is
-# a megaphone handed to whoever types fastest.
-#
-# THE CLIENT POLLS IT exactly the way it polls broadcasts, with the same
-# "everything after id N" cursor, so the two feeds merge into one window on the
-# client without either one having to know about the other.
+# World chat and its other channels, pictures in chat, taking a line down and
+# the ignore list are in chat/; its __init__.py tells what each is. The routes
+# register at CHAT ROUTES below, and hand back what other areas ask of chat -
+# post_chat(), a report's "could they read it", and who ignores whom - which
+# stay callable here under the names this file has always used.
+import chat  # noqa: E402
 
+# Named here as well, for the suites and anything else that reads them off this
+# module; chat/services.py is where they are set.
+MAX_CHAT_LENGTH = chat.MAX_CHAT_LENGTH
+CHAT_RETENTION_SECONDS = chat.CHAT_RETENTION_SECONDS
+CHAT_PAGE_LIMIT = chat.CHAT_PAGE_LIMIT
+CHAT_DELETION_WINDOW_SECONDS = chat.CHAT_DELETION_WINDOW_SECONDS
+CHAT_BUCKET_CAPACITY = chat.CHAT_BUCKET_CAPACITY
+CHAT_TOKENS_PER_SECOND = chat.CHAT_TOKENS_PER_SECOND
+CHAT_DEFAULT_CHANNEL = chat.CHAT_DEFAULT_CHANNEL
 
-# The same 200 as a broadcast. Long enough for a sentence, short enough that no
-# single message can push everything else off a player's screen.
-MAX_CHAT_LENGTH = 200
-
-# A day. Chat is a conversation, not a record: scrollback from last Tuesday is
-# of no use to anyone reading now, and keeping it is keeping a transcript of
-# everything every player has ever said. Pruned on write, like broadcasts.
-CHAT_RETENTION_SECONDS = 24 * 60 * 60
-
-# The most one poll returns. A client that has been away all day gets the tail
-# of the conversation, not the whole day of it.
-CHAT_PAGE_LIMIT = 50
-
-# HOW LONG A DELETION KEEPS BEING ANNOUNCED. See the chat_deletions table.
-#
-# It has to cover the gap between one poll and the next with room to spare, and
-# it does not have to cover anything else: chatpanel.gd starts from the tail when
-# the window opens, so a client away longer than this is not holding the line it
-# would be told about. The chat poll is every 3 seconds, so two minutes is forty
-# polls of margin - enough for a stalled request, a paused game or a laptop lid,
-# and short enough that the table stays a handful of rows.
-#
-# BOUNDED BY DESIGN, not by a sweeper job: rows past the window are dropped on
-# the next delete, the same way _prune_chat() works.
-CHAT_DELETION_WINDOW_SECONDS = 120
-
-# THE FLOOD BUCKET. Eight messages in hand, refilling at one every two seconds.
-#
-# The burst matters as much as the rate: a real person answering three people
-# at once types three lines in a few seconds and must not be throttled for it,
-# while a script holding the channel open needs a sustained rate, and half a
-# message per second is not one. See _spend_chat_token().
-CHAT_BUCKET_CAPACITY = 8.0
-CHAT_TOKENS_PER_SECOND = 0.5
-
-
-def _spend_chat_token(user_id):
-    """
-    Take one token from this account's chat bucket, refilling it first.
-
-    Returns None when the message may go ahead, or a response tuple when it may
-    not. The caller commits; on the refusal path there is nothing to commit.
-    """
-    db = get_db()
-    row = db.execute(
-        "SELECT last_chat_at, chat_tokens FROM users WHERE id = ?", (user_id,)
-    ).fetchone()
-    if row is None:
-        # The token authenticated against a row that has since been deleted.
-        return {"error": "Unauthorized", "message": "No such account."}, 401
-
-    now_ms = int(time.time() * 1000)
-
-    # Refill first, then spend - same shape as the kill bucket, including the
-    # min() that stops a never-used account arriving with decades of credit.
-    elapsed_seconds = max(now_ms - int(row["last_chat_at"] or 0), 0) / 1000.0
-    tokens = min(
-        CHAT_BUCKET_CAPACITY,
-        float(row["chat_tokens"]) + elapsed_seconds * CHAT_TOKENS_PER_SECOND,
-    )
-
-    if tokens < 1.0:
-        # 429 and a Retry-After, not a 400: nothing is wrong with the message,
-        # it simply arrived too soon, and an honest client can wait and resend.
-        wait = int((1.0 - tokens) / CHAT_TOKENS_PER_SECOND) + 1
-        return (
-            {
-                "error": "Too Many Requests",
-                "message": "Messages are arriving faster than one every %g seconds."
-                           % (1.0 / CHAT_TOKENS_PER_SECOND),
-            },
-            429,
-            {"Retry-After": str(wait)},
-        )
-
-    db.execute(
-        "UPDATE users SET chat_tokens = ?, last_chat_at = ? WHERE id = ?",
-        (tokens - 1.0, now_ms, user_id),
-    )
-    return None
+# PILLOW IS OPTIONAL AND THE SERVER STARTS WITHOUT IT. It is needed only to
+# relay pictures into chat (chat/services.py imports it); everything else
+# works untouched. An install that has not run `pip install Pillow` gets a
+# clear refusal on the picture routes rather than a server that will not boot.
+PILLOW_AVAILABLE = chat.PILLOW_AVAILABLE
 
 
 # ONE LINE, AS TYPED. Everything a player types that other players will read
@@ -4848,73 +4766,20 @@ def clean_player_text(raw, limit):
 
 def post_chat(user_row, body, channel="world", target_id=0, image_id=""):
     """
-    Record one player message. Caller commits, like post_broadcast().
-
-    Returns the new row id, or None when there was nothing to say - which now
-    means neither words NOR a picture, because a picture on its own is a
-    perfectly good message.
+    Record one player message. Caller commits, like post_broadcast(). The
+    chat/ package's own (see CHAT ROUTES).
     """
-    text = clean_player_text(body, MAX_CHAT_LENGTH)
-    if text == "" and not image_id:
-        return None
-
-    db = get_db()
-    now = int(time.time())
-    # DENORMALISED, LIKE username AND role BESIDE IT, and for the same reasons
-    # this row already carries those: the read is a poll every three seconds and
-    # must not grow a join, and the line should still make sense after the
-    # author has left the guild - or after the guild is gone entirely.
-    #
-    # It is a SNAPSHOT, then: what they were flying when they said it, not what
-    # they fly now. That is the honest reading of a chat log and it is the rule
-    # the two columns next to it already follow.
-    said_from = db.execute(
-        "SELECT gl.name FROM guild_members m JOIN guilds gl ON gl.id = m.guild_id"
-        " WHERE m.user_id = ?", (int(user_row["id"]),)).fetchone()
-
-    cursor = db.execute(
-        "INSERT INTO chat_messages"
-        " (user_id, username, role, body, created_at, channel, target_id, image_id, guild,"
-        "  name_hue)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (int(user_row["id"]), user_row["username"], role_for(user_row), text, now,
-         channel, int(target_id or 0), str(image_id or ""),
-         said_from["name"] if said_from else "", name_hue_of(user_row)),
-    )
-    _prune_chat(db, channel)
-    return cursor.lastrowid
-
-
-def chat_message_dict(row):
-    """One row as the client reads it. Same field names as a broadcast."""
-    keys = row.keys()
-    return {
-        "id": int(row["id"]),
-        "by": row["username"],
-        "role": row["role"],
-        "body": row["body"],
-        "at": int(row["created_at"]),
-        "channel": row["channel"] if "channel" in keys else "world",
-        # Empty for a line that is only words, which is nearly all of them.
-        "image": row["image_id"] if "image_id" in keys else "",
-        # The guild they were in when they said it. "" for no guild, and for
-        # every line written before the column existed.
-        "guild": row["guild"] if "guild" in keys else "",
-        "guild_tag": guild_tag(row["guild"]) if "guild" in keys and row["guild"] else "",
-        # The colour they had chosen when they said it. None for "never chose
-        # one", and for every line written before the column existed.
-        "name_hue": name_hue_of(row),
-    }
+    return _CHAT.post_chat(user_row, body, channel, target_id, image_id)
 
 
 # =============================================================================
 # CHANNELS
 # =============================================================================
 #
-# FOUR NAMES, ONE TABLE. What separates them is who may write to a channel and
+# FIVE NAMES, ONE TABLE. What separates them is who may write to a channel and
 # who may read it back, and those two questions are answered in exactly two
-# places - chat_write_check() and the SELECT in read_chat(). Nothing else in
-# the chat code knows there is more than one channel.
+# places - the write check and the SELECT in read_chat(), both chat/routes.py.
+# Nothing else in the chat code knows there is more than one channel.
 
 # =============================================================================
 # GUILDS - the guilds/ package (since 18 Oct)
@@ -4997,74 +4862,12 @@ def _own_party(db, user_id):
             "members": [r["username"] for r in rows]}
 
 
-# 'guild' WAS DECLARED HERE BEFORE GUILDS EXISTED, so that the day they arrived
-# would be one branch in chat_write_check() rather than a change to every
-# client, cursor and tab. That day came: guild chat is live, gated only on
-# being in a guild (chat_write_check, read_chat). The client took longer - its
-# Guild tab went on saying "Guilds are not in the game yet." and never asked,
-# until a player typed "oi bruv" into it and nothing happened.
-# 'party' joined in game 0.42.0: a party's own room, stamped with its id like a
-# guild line, so a line said in one party never shows in another.
-CHAT_CHANNELS = ("world", "private", "friends", "guild", "party")
-CHAT_DEFAULT_CHANNEL = "world"
-
-# WHAT GUILD CHAT SAYS TO SOMEBODY WITH NO GUILD - reading it, or writing to it.
-# One sentence, because the chat window shows whichever arrived last, and two
-# wordings of the same fact read as two different problems. It says where to
-# go, not only what is missing.
-GUILD_CHAT_NO_GUILD = "You are not in a guild yet. Open Guild to found one, or answer an invite."
-
 # THE TAIL KEPT PER CHANNEL, on top of the 24 hours. A world channel on a busy
 # night and a private conversation nobody has opened in a week are very
 # different amounts of rows, and a single global cap would let the first one
-# push the second out of the table.
+# push the second out of the table. A TUNABLE OF THIS FILE'S, asked by chat/ on
+# every line: test_chatrooms.py turns it down.
 CHAT_KEEP_PER_CHANNEL = 400
-
-
-def chat_write_check(channel, target_row):
-    """
-    May the caller say something here? Returns None, or a refusal to return.
-
-    THE ONE PLACE THAT DECIDES. Every channel's rule is on this screen, which
-    is the only way to be sure a new one has been given a rule at all.
-    """
-    if channel == "world":
-        return None
-
-    if channel == "friends":
-        # No target: a line here goes to whoever has accepted you, which the
-        # read side works out from the friends table at the time of reading.
-        return None
-
-    if channel == "private":
-        if target_row is None:
-            return bad_request("private messages need a 'to' account")
-        if int(target_row["id"]) == int(g.user["id"]):
-            return bad_request("you cannot message yourself")
-        if ignores(get_db(), int(target_row["id"]), int(g.user["id"])):
-            return {"error": "Forbidden",
-                    "message": "%s is not taking whispers from you." % target_row["username"]}, 403
-        return None
-
-    if channel == "guild":
-        # IN A GUILD, OR THERE IS NOWHERE FOR IT TO GO. Still a 409 rather
-        # than a 404 or a 403: the channel is real and the client is right to
-        # ask about it - what is missing is a guild, which is a thing the
-        # player can go and fix.
-        if guild_membership(g.user["id"]) is None:
-            return {
-                "error": "Conflict",
-                "message": GUILD_CHAT_NO_GUILD,
-            }, 409
-        return None
-
-    if channel == "party":
-        # IN A PARTY, OR THERE IS NOWHERE FOR IT TO GO - a 409, as guild's.
-        if party_membership(get_db(), g.user["id"]) is None:
-            return {"error": "Conflict", "message": PARTY_CHAT_NO_PARTY}, 409
-        return None
-
-    return bad_request("unknown channel")
 
 
 # =============================================================================
@@ -5109,14 +4912,15 @@ REPORT_LINES_PER_PLAYER = 10
 MUTE_MAX_MINUTES_MOD = 24 * 60
 MUTE_MAX_MINUTES = 30 * 24 * 60
 
-# APPENDED TO A CHAT READ'S WHERE, with the reader's id as its one parameter.
-IGNORED_AUTHORS_CLAUSE = " AND user_id NOT IN (SELECT ignored_id FROM ignores WHERE user_id = ?)"
+# APPENDED TO A CHAT READ'S WHERE, with the reader's id as its one parameter -
+# the poll's news uses it too. chat/data.py is where it is written.
+IGNORED_AUTHORS_CLAUSE = chat.IGNORED_AUTHORS_CLAUSE
 
 
 def ignores(db, user_id, other_id):
-    """Does `user_id` ignore `other_id`?"""
-    return db.execute("SELECT 1 FROM ignores WHERE user_id = ? AND ignored_id = ?",
-                      (int(user_id), int(other_id))).fetchone() is not None
+    """Does `user_id` ignore `other_id`? The ignore list is chat/'s; trades,
+    friends, parties and the players menu ask it here."""
+    return chat.ignores(db, user_id, other_id)
 
 
 def chat_mute_state(row, now=None):
@@ -5144,22 +4948,8 @@ def describe_mute(state):
 
 def _can_read_chat_row(db, user_id, row):
     """Could `user_id` have read this line? The read's own rules, one line at a
-    time - a report is only for a line you were shown."""
-    channel = str(row["channel"] or CHAT_DEFAULT_CHANNEL)
-    author = int(row["user_id"] or 0)
-    if channel == "world":
-        return True
-    if channel == "private":
-        return user_id in (author, int(row["target_id"] or 0))
-    if channel == "friends":
-        return author == user_id or author in _friend_ids(db, user_id)
-    if channel == "guild":
-        seat = guild_membership(user_id)
-        return seat is not None and int(seat["guild_id"]) == int(row["target_id"] or 0)
-    if channel == "party":
-        seat = party_membership(db, user_id)
-        return seat is not None and int(seat["party_id"]) == int(row["target_id"] or 0)
-    return False
+    time - a report is only for a line you were shown. chat/'s own."""
+    return _CHAT.can_read_row(db, user_id, row)
 
 
 def _open_report_count(db):
@@ -5223,109 +5013,27 @@ def _friend_ids(db, user_id):
     return out
 
 
-def _prune_chat(db, channel):
-    """
-    Keep the channel's tail, and drop anything past the day.
-
-    Pruned on write, like broadcasts: no sweeper job to forget to run, and the
-    cost lands on the account that is filling the table.
-    """
-    now = int(time.time())
-    db.execute(
-        "DELETE FROM chat_messages WHERE created_at < ?",
-        (now - CHAT_RETENTION_SECONDS,),
-    )
-    db.execute(
-        "DELETE FROM chat_messages WHERE channel = ? AND id NOT IN ("
-        "  SELECT id FROM chat_messages WHERE channel = ?"
-        "  ORDER BY id DESC LIMIT ?)",
-        (channel, channel, CHAT_KEEP_PER_CHANNEL),
-    )
-
-
 # =============================================================================
-# PICTURES IN CHAT - THE RELAY
+# PICTURES IN CHAT - THE RELAY'S ONE CALL OUT
 # =============================================================================
-#
 # A player pastes a link; the SERVER fetches it, decides whether it is really
 # a picture, and stores the bytes. Everyone else is shown the server's copy.
-#
-# WHAT THAT BUYS, and it is the whole reason this exists rather than the two
-# lines it would take to put the raw URL in the message body:
-#
-#   - NOBODY'S IP GOES ANYWHERE. A link rendered client-side is a fetch every
-#     viewer performs on command, and the person who posted it is holding the
-#     log. One relay, by the server, once.
-#   - WHAT WAS MODERATED IS WHAT STAYS. A URL can serve one picture to the mod
-#     who approved it and another to everyone afterwards. A stored copy cannot.
-#   - IT IS ACTUALLY A PICTURE. Pillow decodes it here, so a client is never
-#     handed bytes that merely claimed to be an image.
-#   - ANIMATION WORKS AT ALL. See _sheet_from_animation().
-#
-# WHAT IT DOES NOT BUY: this is not a content filter. It stops a link being a
-# weapon; it does not stop somebody posting something unpleasant. That is what
-# /api/chat/delete and a ban are for.
+# Deciding and storing are chat/'s (services.decode_relayed_image(), the
+# picture caps, who may see one); THE FETCH IS THIS FILE'S, handed in: it is
+# the server reaching out to the internet, and every hop of it is checked
+# against the server's own network here (_address_is_public(), which
+# test_chatrooms.py replaces to fetch from a local test server).
 
-# Eight megabytes in, which is a long GIF or a photograph straight off a
-# phone, and past which somebody is not sharing a picture.
-#
-# THIS IS THE INPUT CAP, NOT THE STORED SIZE. What is kept is bounded far
-# harder and separately - IMAGE_MAX_SIDE for a still, IMAGE_MAX_FRAMES and
-# IMAGE_MAX_FRAME_SIDE for an animation - so raising this costs decode time
-# and buffered memory, not disk. It went up from four because four was
-# refusing ordinary GIFs, and a picture that bounces is worse than one that
-# takes an extra second.
-IMAGE_MAX_BYTES = 8 * 1024 * 1024
-
-# The longest side a stored still may have. Anything bigger is scaled down:
-# chat draws these a couple of hundred pixels wide and storing a 6000px
-# original would be paying for detail nobody will ever see.
-IMAGE_MAX_SIDE = 1024
-
-# Animation is bounded harder, because the cost is per frame in both storage
-# and the size of the spritesheet the client has to hold.
-IMAGE_MAX_FRAMES = 48
-IMAGE_MAX_FRAME_SIDE = 256
-IMAGE_SHEET_COLUMNS = 8
-
-# A decompression bomb is a 200-byte file that decodes to a billion pixels.
-# Pillow has a ceiling of its own; this one is ours and is far lower.
-IMAGE_MAX_DECODED_PIXELS = 40 * 1024 * 1024
+# The input cap, chat/'s - see IMAGE_MAX_BYTES there - and the most a stored
+# still's side may be. Named here for the fetch and for the suites.
+IMAGE_MAX_BYTES = chat.IMAGE_MAX_BYTES
+IMAGE_MAX_SIDE = chat.IMAGE_MAX_SIDE
 
 # How long the fetch is allowed to take, and how many hops it may be moved
 # through. Redirects are followed by hand so that EVERY hop is checked - an
 # allowed host that 302s to 127.0.0.1 is the oldest trick there is.
 IMAGE_FETCH_TIMEOUT = 6.0
 IMAGE_MAX_REDIRECTS = 3
-
-# One relay per account per this many seconds. This is the anti-flood limit on
-# the act of handing the server a picture at all, and it applies everywhere.
-IMAGE_COOLDOWN_SECONDS = 8
-
-# =============================================================================
-# ONE PICTURE IN WORLD CHAT PER HALF HOUR
-# =============================================================================
-# A DIFFERENT KIND OF LIMIT FROM THE ONE ABOVE, which is why it is a second
-# number rather than a bigger version of the first. IMAGE_COOLDOWN_SECONDS is
-# about load: it stops one account making the server fetch and decode twenty
-# files at once. This is about the room: world chat is every player at once,
-# and a picture there is unskippable for all of them in a way a line of text
-# is not.
-#
-# WHERE IT IS CHECKED MATTERS. Not at upload - that route does not know which
-# channel the picture is headed for, and somebody uploading a picture to
-# whisper to one friend has done nothing to world. It is checked and stamped
-# in /api/chat/send, where the channel is finally known.
-#
-# ONLY THE OWNER IS EXEMPT. Not mods, not dev: a rate limit that staff can
-# ignore is one players notice, and the exemption exists so the person running
-# the server can post an announcement or check that pictures still work
-# without waiting half an hour, not as a rank perk.
-WORLD_IMAGE_COOLDOWN_SECONDS = 30 * 60
-
-# The whole store. Oldest out first when it is reached, so a chat that has
-# been running for a year cannot fill the disk.
-IMAGE_STORE_MAX_BYTES = 128 * 1024 * 1024
 
 
 class _NoRedirects(urllib.request.HTTPRedirectHandler):
@@ -5434,362 +5142,6 @@ def _fetch_image_bytes(url):
             return None, "that is not a link"
 
     return None, "that link redirects too many times"
-
-
-def _sheet_from_animation(source):
-    """
-    Flatten an animation into one PNG spritesheet plus how to play it.
-
-    GODOT CANNOT DECODE A GIF. It can play a spritesheet, and has been doing
-    that for every enemy in the game since the beginning - so the animation is
-    taken apart here, where Pillow already is, and the client is handed
-    something it already knows what to do with.
-    """
-    frames = []
-    delay_ms = 0
-    for frame in ImageSequence.Iterator(source):
-        delay_ms = max(delay_ms, int(frame.info.get("duration", 0) or 0))
-        picture = frame.convert("RGBA")
-        picture.thumbnail((IMAGE_MAX_FRAME_SIDE, IMAGE_MAX_FRAME_SIDE))
-        frames.append(picture)
-        if len(frames) >= IMAGE_MAX_FRAMES:
-            break
-
-    if not frames:
-        return None
-
-    # EVERY CELL THE SAME SIZE, taken from the first frame. A GIF may hand back
-    # frames of different sizes (partial-update frames are a real thing), and a
-    # grid whose cells vary is not a grid.
-    cell_w, cell_h = frames[0].size
-    columns = min(IMAGE_SHEET_COLUMNS, len(frames))
-    rows = (len(frames) + columns - 1) // columns
-
-    sheet = Image.new("RGBA", (cell_w * columns, cell_h * rows), (0, 0, 0, 0))
-    for index, picture in enumerate(frames):
-        if picture.size != (cell_w, cell_h):
-            fitted = Image.new("RGBA", (cell_w, cell_h), (0, 0, 0, 0))
-            fitted.paste(picture, (0, 0))
-            picture = fitted
-        sheet.paste(picture, ((index % columns) * cell_w, (index // columns) * cell_h))
-
-    return {
-        "sheet": sheet,
-        "kind": "animated",
-        "width": cell_w,
-        "height": cell_h,
-        "frames": len(frames),
-        "columns": columns,
-        # 100ms is what a browser uses for a GIF that does not say, and a GIF
-        # that does not say is usually an old one that assumed it.
-        "frame_ms": delay_ms if delay_ms > 0 else 100,
-    }
-
-
-def decode_relayed_image(raw):
-    """(record, None) or (None, reason). Never trusts what the bytes claim."""
-    if not PILLOW_AVAILABLE:
-        return None, "this server cannot handle pictures (Pillow is not installed)"
-
-    # A CEILING BEFORE ANY DECODING HAPPENS. Pillow has one of its own that is
-    # far higher; this is the one that matters for a 200-byte file claiming to
-    # be forty thousand pixels square.
-    Image.MAX_IMAGE_PIXELS = IMAGE_MAX_DECODED_PIXELS
-
-    try:
-        # verify() is a structural check and it CONSUMES the object, which is
-        # why the bytes are opened twice. Cheap, and it rejects a truncated or
-        # hand-made file before any pixels are read.
-        Image.open(io.BytesIO(raw)).verify()
-        source = Image.open(io.BytesIO(raw))
-    except Exception:
-        return None, "that file is not a picture this server can read"
-
-    try:
-        if source.width * source.height > IMAGE_MAX_DECODED_PIXELS:
-            return None, "that picture is too large to open"
-
-        if getattr(source, "n_frames", 1) > 1:
-            record = _sheet_from_animation(source)
-            if record is None:
-                return None, "that animation had no frames"
-        else:
-            still = source.convert("RGBA")
-            still.thumbnail((IMAGE_MAX_SIDE, IMAGE_MAX_SIDE))
-            record = {
-                "sheet": still,
-                "kind": "still",
-                "width": still.width,
-                "height": still.height,
-                "frames": 1,
-                "columns": 1,
-                "frame_ms": 0,
-            }
-    except Exception:
-        return None, "that picture could not be decoded"
-
-    # RE-ENCODED, ALWAYS. What leaves here is a file this server wrote, not
-    # the one that arrived - so whatever else was in it (a comment block, a
-    # second image, a payload for some other program's parser) is gone.
-    #
-    # PNG FOR ANIMATION, THE SMALLER OF THE TWO FOR A STILL. The frames of an
-    # animation are capped at 256px and are usually flat or pixel art, which
-    # is what PNG is best at and what lossy compression is worst at; a still
-    # is as likely to be a photograph, where PNG is several times larger than
-    # it needs to be. Measured per picture rather than guessed, because the
-    # guess is wrong often enough to matter - see the same argument on the
-    # client, which does this before sending.
-    sheet = record["sheet"]
-    del record["sheet"]
-
-    buffer = io.BytesIO()
-    sheet.save(buffer, format="PNG", optimize=True)
-    record["data"] = buffer.getvalue()
-    record["format"] = "png"
-
-    if record["kind"] == "still":
-        try:
-            lossy = io.BytesIO()
-            sheet.save(lossy, format="WEBP", quality=88, method=4)
-            if 0 < lossy.tell() < len(record["data"]):
-                record["data"] = lossy.getvalue()
-                record["format"] = "webp"
-        except Exception:
-            # No WebP in this Pillow build, or it refused this picture. PNG
-            # stands - a bigger file is not a failure.
-            pass
-
-    record["bytes"] = len(record["data"])
-    record["id"] = hashlib.sha256(record["data"]).hexdigest()
-    return record, None
-
-
-def store_relayed_image(record, source_url, by, by_id=0):
-    """Keep it, evicting the oldest while the store is over its cap, and note
-    `by_id` as one of the accounts that put it here."""
-    db = get_db()
-    now = int(time.time())
-    db.execute(
-        "INSERT OR IGNORE INTO chat_images"
-        " (id, kind, width, height, frames, columns, frame_ms, bytes,"
-        "  source, created_by, created_at, format, data)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (record["id"], record["kind"], record["width"], record["height"],
-         record["frames"], record["columns"], record["frame_ms"], record["bytes"],
-         str(source_url)[:400], str(by)[:64], now,
-         record.get("format", "png"), record["data"]),
-    )
-    if int(by_id or 0) > 0:
-        db.execute("INSERT OR IGNORE INTO chat_image_holders (image_id, user_id, created_at)"
-                   " VALUES (?, ?, ?)", (record["id"], int(by_id), now))
-
-    _evict_images(db)
-
-
-def _evict_images(db):
-    """OLDEST OUT UNTIL IT FITS. A loop rather than one DELETE, because "enough
-    rows to get under a byte total" is not something SQL answers in one go."""
-    for _ in range(64):
-        total = db.execute(
-            "SELECT COALESCE(SUM(bytes), 0) AS n FROM chat_images").fetchone()["n"]
-        if int(total or 0) <= IMAGE_STORE_MAX_BYTES:
-            break
-        oldest = db.execute(
-            "SELECT id FROM chat_images ORDER BY created_at ASC LIMIT 1").fetchone()
-        if oldest is None:
-            break
-        _drop_image(db, oldest["id"])
-
-
-def _drop_image(db, image_id):
-    """A picture and the record of who put it here, together."""
-    db.execute("DELETE FROM chat_images WHERE id = ?", (image_id,))
-    db.execute("DELETE FROM chat_image_holders WHERE image_id = ?", (image_id,))
-
-
-# =============================================================================
-# WHO MAY SEE A PICTURE
-# =============================================================================
-# A picture used to be a pure capability: any signed-in player holding its id
-# was served it, because 256 unguessable bits could only have come from being
-# shown it. Two honest limits followed from that, and both are closed here.
-#
-#   - A PRIVATE PICTURE GETS ITS OWN ROW. The store deduplicates on the content
-#     hash, so a picture whispered and the same picture in world chat were one
-#     row with one id. Sending a picture to whispers, friends or a guild now
-#     makes a copy under a fresh random id (_private_image_copy), so a private
-#     picture never shares an id with anything else.
-#   - FETCHING ONE IS CHECKED. GET /api/chat/image/<id> serves a picture only
-#     to someone who could read a line showing it, by the read's own rules
-#     (_can_read_chat_row); to an account that put those bytes on the server
-#     (chat_image_holders); or to a mod looking at a report of it. A player
-#     who leaves a guild stops being able to load its pictures, a picture
-#     reposted by id elsewhere still needs a line its reader can see, and a
-#     deleted line stops serving its picture to the people it was deleted for.
-#
-# What it costs: a picture now lasts as long as a line showing it, which is the
-# chat's own 24 hours, instead of until the 128 MB store happened to evict it.
-# The game fetches a picture when it draws the line and keeps it in memory, so
-# nothing on screen goes missing.
-#
-# Refused is the same 404 as missing, so the route still says nothing about
-# which ids exist.
-
-def _may_see_image(db, user_row, image_id):
-    """True when `user_row` could read a line showing `image_id`, put those
-    bytes on the server themselves, or is staff with a report about it."""
-    uid = int(user_row["id"])
-    for line in db.execute(
-            "SELECT user_id, channel, target_id FROM chat_messages WHERE image_id = ?",
-            (image_id,)).fetchall():
-        if _can_read_chat_row(db, uid, line):
-            return True
-    if db.execute("SELECT 1 FROM chat_image_holders WHERE image_id = ? AND user_id = ?",
-                  (image_id, uid)).fetchone() is not None:
-        return True
-    # A REPORT IS A LINE STAFF WERE SHOWN. Somebody reported a whisper with a
-    # picture in it; the mod judging it has to be able to look at it.
-    return role_at_least(user_row, "mod") and db.execute(
-        "SELECT 1 FROM chat_reports WHERE image_id = ? LIMIT 1", (image_id,)).fetchone() is not None
-
-
-def _private_image_copy(db, image_id, by_row):
-    """A copy of a stored picture under a fresh, random id, for one private
-    line. The id is SHA-256 of 32 random bytes and the picture, so it is as
-    unguessable as a content id and shared with nothing."""
-    row = db.execute("SELECT data FROM chat_images WHERE id = ?", (image_id,)).fetchone()
-    new_id = hashlib.sha256(secrets.token_bytes(32) + bytes(row["data"])).hexdigest()
-    now = int(time.time())
-    db.execute(
-        "INSERT INTO chat_images"
-        " (id, kind, width, height, frames, columns, frame_ms, bytes,"
-        "  source, created_by, created_at, format, data)"
-        " SELECT ?, kind, width, height, frames, columns, frame_ms, bytes,"
-        "  source, ?, ?, format, data FROM chat_images WHERE id = ?",
-        (new_id, str(by_row["username"])[:64], now, image_id),
-    )
-    db.execute("INSERT OR IGNORE INTO chat_image_holders (image_id, user_id, created_at)"
-               " VALUES (?, ?, ?)", (new_id, int(by_row["id"]), now))
-    _evict_images(db)
-    return new_id
-
-
-def chat_image_cooldown(now):
-    """None when the caller may post a picture, or the 429 saying they may not.
-
-    STAMPS AS IT PASSES. The cooldown has to start when the attempt begins,
-    not when it finishes: a fetch can take six seconds and an upload can take
-    longer, and a cooldown that only starts on success is an invitation to run
-    twenty at once. Shared by the link relay and the direct upload so the two
-    cannot drift into being two different limits.
-    """
-    db = get_db()
-    row = db.execute(
-        "SELECT last_image_at FROM users WHERE id = ?", (g.user["id"],)).fetchone()
-    waited = now - int(row["last_image_at"] or 0) if row is not None else now
-    if waited < IMAGE_COOLDOWN_SECONDS:
-        return ({
-            "error": "Too Many Requests",
-            "message": "One picture every %d seconds." % IMAGE_COOLDOWN_SECONDS,
-        }, 429, {"Retry-After": str(IMAGE_COOLDOWN_SECONDS - waited)})
-
-    db.execute("UPDATE users SET last_image_at = ? WHERE id = ?", (now, g.user["id"]))
-    db.commit()
-    return None
-
-
-def world_image_wait(user, now=None):
-    """Seconds this account must still wait before a picture may go to world.
-
-    0 when they may post one now. The owner is never made to wait - see the
-    note over WORLD_IMAGE_COOLDOWN_SECONDS for why that exemption stops there.
-
-    READ-ONLY. Stamping is a separate call, because this is asked twice for
-    every send - once by the poll so the client can say so in advance, and
-    once by the send itself - and an "ask" that quietly spends something is a
-    trap for the next person to call it.
-    """
-    if now is None:
-        now = int(time.time())
-
-    # THE OWNER IS ANSWERED WITHOUT A QUERY, which is both the exemption and
-    # the cheap path for the only account that polls while also being the one
-    # most likely to be testing pictures. A co-owner too, while the switch is on.
-    if has_owner_powers(user["username"]):
-        return 0
-
-    # READ FROM THE TABLE, NOT FROM g.user. user_for_token() selects a short
-    # list of columns - id, username, role, the ban fields - and not this one,
-    # so asking the row directly returned 0 forever and the limit silently did
-    # nothing. Its own lookup on the primary key, exactly like the upload
-    # cooldown beside it does for last_image_at.
-    row = get_db().execute(
-        "SELECT last_world_image_at FROM users WHERE id = ?",
-        (user["id"],)).fetchone()
-    if row is None:
-        return 0
-
-    last = int(row["last_world_image_at"] or 0)
-    if last <= 0:
-        return 0
-    return max(0, WORLD_IMAGE_COOLDOWN_SECONDS - (now - last))
-
-
-def stamp_world_image(user_id, now=None):
-    """Start the half hour. Called only once a picture is really in world."""
-    if now is None:
-        now = int(time.time())
-    get_db().execute(
-        "UPDATE users SET last_world_image_at = ? WHERE id = ?", (now, user_id))
-
-
-def describe_wait(seconds):
-    """"22 minutes", "40 seconds" - the sentence a person can act on."""
-    seconds = max(0, int(seconds))
-    if seconds >= 120:
-        return "%d minutes" % ((seconds + 59) // 60)
-    if seconds >= 60:
-        return "a minute"
-    return "%d seconds" % seconds
-
-
-def keep_relayed_image(raw, source):
-    """Decode, store and describe bytes that claim to be a picture.
-
-    The one place bytes become a stored picture, whichever door they came in
-    by. A link fetched from the internet and a file dragged off somebody's
-    desktop get identical treatment from here on: verified, re-encoded from
-    scratch, capped, and given an id that is the hash of what we wrote - so a
-    file cannot smuggle anything past by being uploaded instead of linked.
-    """
-    record, why = decode_relayed_image(raw)
-    if record is None:
-        return bad_request(why)
-
-    store_relayed_image(record, source, g.user["username"], g.user["id"])
-    get_db().commit()
-
-    answer = relayed_image_dict({
-        "id": record["id"], "kind": record["kind"],
-        "width": record["width"], "height": record["height"],
-        "frames": record["frames"], "columns": record["columns"],
-        "frame_ms": record["frame_ms"],
-    })
-    answer["bytes"] = record["bytes"]
-    return answer, 200
-
-
-def relayed_image_dict(row):
-    """The metadata a client needs in order to draw it."""
-    return {
-        "id": row["id"],
-        "kind": row["kind"],
-        "width": int(row["width"]),
-        "height": int(row["height"]),
-        "frames": int(row["frames"]),
-        "columns": int(row["columns"]),
-        "frame_ms": int(row["frame_ms"]),
-    }
 
 
 # =============================================================================
@@ -14974,839 +14326,49 @@ def _own_guild(db, user_id):
     return {"guild": name, "guild_tag": guild_tag(name) if name else ""}
 
 
-@app.post("/api/chat/send")
-@require_auth
-def chat_send():
-    """
-    Say something in world chat
-    ---
-    tags:
-      - Chat
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: message
-        schema:
-          type: object
-          required: [body]
-          properties:
-            body:
-              type: string
-              description: "The message, trimmed and capped at 200 characters"
-    responses:
-      200:
-        description: The message as everyone else will read it
-      400:
-        description: Empty message
-      401:
-        description: Missing, invalid or expired token
-      429:
-        description: Sending faster than the flood bucket allows
-    """
-    payload = request.get_json(silent=True) or {}
-    # CLEANED BEFORE IT IS JUDGED EMPTY, so a message of nothing but invisible
-    # characters is refused rather than posted as a blank line.
-    text = clean_player_text(payload.get("body", ""), MAX_CHAT_LENGTH)
-    image_id = str(payload.get("image", "")).strip()
-
-    channel = str(payload.get("channel", CHAT_DEFAULT_CHANNEL)).strip().lower()
-    if channel not in CHAT_CHANNELS:
-        return bad_request("channel must be one of: %s" % ", ".join(CHAT_CHANNELS))
-
-    # MUTED IS MUTED, in every channel and for pictures too. Before the
-    # throttle, so a muted player's attempts cost them nothing they would
-    # want back when it lifts.
-    muted = chat_mute_state(g.user)
-    if muted is not None:
-        return {"error": "Forbidden", "message": describe_mute(muted), "muted": muted}, 403
-
-    # A PICTURE ON ITS OWN IS A MESSAGE. Demanding words alongside it would be
-    # demanding a caption nobody writes.
-    if text == "" and image_id == "":
-        return bad_request("body must be a non-empty message")
-
-    db = get_db()
-
-    # THE PICTURE MUST ALREADY HAVE BEEN RELAYED. A client cannot name an id
-    # this server has not fetched and decoded for itself - which is what stops
-    # the field being a way to point everyone at an arbitrary URL after all.
-    #
-    # AND THE SENDER MUST BE ABLE TO SEE IT. Otherwise an id glimpsed somewhere
-    # - a report, a log - could be posted to world and served to everyone. The
-    # same answer as a missing picture, so the refusal says nothing either.
-    if image_id != "":
-        held = db.execute(
-            "SELECT id FROM chat_images WHERE id = ?", (image_id,)).fetchone()
-        if held is None or not _may_see_image(db, g.user, image_id):
-            return bad_request("that picture is not on this server")
-
-    target_row = None
-    to_name = str(payload.get("to", "")).strip()
-    if to_name != "":
-        target_row = _user_by_name(to_name)
-        if target_row is None:
-            return {"error": "Not Found", "message": "No such account."}, 404
-
-    refusal = chat_write_check(channel, target_row)
-    if refusal is not None:
-        return refusal
-
-    # ONE PICTURE IN WORLD PER HALF HOUR, checked here because here is where
-    # the channel is finally known. Before the token spend below, so being
-    # refused for this does not also cost a message allowance.
-    now = int(time.time())
-    if channel == "world" and image_id != "":
-        waiting = world_image_wait(g.user, now)
-        if waiting > 0:
-            return ({
-                "error": "Too Many Requests",
-                "message": "One picture in world chat every %d minutes."
-                           " Try again in %s." % (
-                               WORLD_IMAGE_COOLDOWN_SECONDS // 60,
-                               describe_wait(waiting)),
-            }, 429, {"Retry-After": str(waiting)})
-
-    # THROTTLE BEFORE WRITING, not after. Checking afterwards would mean the
-    # flood is already in the table by the time it is refused.
-    refusal = _spend_chat_token(g.user["id"])
-    if refusal is not None:
-        return refusal
-
-    target_id = int(target_row["id"]) if target_row is not None else 0
-
-    # A GUILD LINE CARRIES ITS GUILD. target_id is the "who else does this
-    # line concern" column - a person for a whisper, a guild here - and
-    # writing it at post time is what makes the read above leak-proof.
-    if channel == "guild":
-        seat = guild_membership(g.user["id"])
-        if seat is None:
-            return {"error": "Conflict",
-                    "message": GUILD_CHAT_NO_GUILD}, 409
-        target_id = int(seat["guild_id"])
-
-    # A PARTY LINE CARRIES ITS PARTY, for the same reason (game 0.42.0).
-    if channel == "party":
-        seat = party_membership(db, g.user["id"])
-        if seat is None:
-            return {"error": "Conflict", "message": PARTY_CHAT_NO_PARTY}, 409
-        target_id = int(seat["party_id"])
-
-    # A PRIVATE LINE GETS ITS OWN COPY of the picture - see WHO MAY SEE A
-    # PICTURE. After every refusal above, so a send that is turned away never
-    # leaves a copy behind.
-    if image_id != "" and channel != "world":
-        image_id = _private_image_copy(db, image_id, g.user)
-
-    new_id = post_chat(g.user, text, channel, target_id, image_id)
-
-    # STAMPED ONLY ONCE THE PICTURE IS REALLY IN THE TABLE, and only for
-    # world. A send that was refused above, or one to a friend, leaves the
-    # half hour untouched.
-    if channel == "world" and image_id != "":
-        stamp_world_image(g.user["id"], now)
-
-    # ONE COMMIT FOR ALL OF IT. The spent token, the message it paid for and
-    # the prune land together, so a crash between them cannot give a message
-    # away free.
-    db.commit()
-
-    return {
-        "id": int(new_id or 0),
-        "by": g.user["username"],
-        "role": role_for(g.user),
-        "name_hue": name_hue_of(g.user),
-        "body": text[:MAX_CHAT_LENGTH],
-        "channel": channel,
-        "image": image_id,
-        "to": target_row["username"] if target_row is not None else "",
-    }, 200
-
-
-@app.get("/api/chat")
-@require_auth
-def read_chat():
-    """
-    Everything said in world chat since a given message id
-    ---
-    tags:
-      - Chat
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: query
-        name: since
-        type: integer
-        description: "Return messages with an id greater than this. 0 for the recent tail."
-    responses:
-      200:
-        description: >
-          Messages in id order oldest first, plus the newest id, plus `removed` -
-          the ids of messages taken down in the last two minutes, filtered by the
-          same permission clause as the messages themselves. A client holding one
-          of those ids drops it from its own feed.
-      400:
-        description: since was not a whole number
-      401:
-        description: Missing, invalid or expired token
-    """
-    raw_since = request.args.get("since", "0")
-    try:
-        since = max(0, int(raw_since))
-    except (TypeError, ValueError):
-        return bad_request("since must be a whole number")
-
-    channel = str(request.args.get("channel", CHAT_DEFAULT_CHANNEL)).strip().lower()
-    if channel not in CHAT_CHANNELS:
-        return bad_request("channel must be one of: %s" % ", ".join(CHAT_CHANNELS))
-
-    db = get_db()
-    me = int(g.user["id"])
-
-    # WHO MAY READ WHAT, built as a WHERE clause rather than filtered in
-    # Python afterwards. A read that fetches everything and then hides some of
-    # it is one forgotten line away from hiding none of it.
-    where = "channel = ?"
-    params = [channel]
-    partner = ""
-
-    if channel == "private":
-        with_name = str(request.args.get("with", "")).strip()
-        if with_name == "":
-            return bad_request("a private conversation needs a 'with' account")
-        other = _user_by_name(with_name)
-        if other is None:
-            return {"error": "Not Found", "message": "No such account."}, 404
-        partner = other["username"]
-        them = int(other["id"])
-        # BOTH DIRECTIONS, AND ONLY THESE TWO. Reading someone else's
-        # conversation is the failure this clause exists to make impossible.
-        where += (" AND ((user_id = ? AND target_id = ?)"
-                  "   OR (user_id = ? AND target_id = ?))")
-        params += [me, them, them, me]
-
-    elif channel == "friends":
-        # YOU AND THE PEOPLE WHO ACCEPTED YOU. Worked out at read time from
-        # the friends table, so removing somebody stops their lines appearing
-        # without anything having to go back and rewrite history.
-        allowed = _friend_ids(db, me)
-        allowed.add(me)
-        marks = ",".join("?" for _ in allowed)
-        where += " AND user_id IN (%s)" % marks
-        params += sorted(allowed)
-
-    elif channel == "guild":
-        seat = guild_membership(me)
-        if seat is None:
-            # No guild, nothing to read, and saying so plainly beats an empty
-            # list the client has to guess the meaning of.
-            return {
-                "messages": [],
-                # PRESENT HERE TOO, empty. Same rule as world_image_wait below:
-                # a field that exists on most answers and vanishes on one is how
-                # a client ends up reading a stale copy of it.
-                "removed": [],
-                "latest_id": 0,
-                "now": int(time.time()),
-                "channel": channel,
-                "available": False,
-                # SAYS WHERE TO GO, not only what is missing. The chat window
-                # shows this as it is; see _apply_read() in chatpanel.gd.
-                "notice": GUILD_CHAT_NO_GUILD,
-                # Present here too. A field that exists on most answers and
-                # vanishes on one is how a client ends up with a stale value
-                # it believes is current.
-                "world_image_wait": world_image_wait(g.user),
-                "muted": chat_mute_state(g.user),
-            }, 200
-
-        # BY THE GUILD THE LINE WAS SENT TO, not by who is in the guild now.
-        #
-        # The obvious version filters on "authors who are currently in my
-        # guild", the way the friends channel does - and it leaks. Somebody
-        # who leaves guild A and joins guild B would carry every line they
-        # ever said in A into B's window, because they are a current member
-        # and their old messages match. Stamping the guild on the line at
-        # post time means a message belongs to the room it was said in, for
-        # good, whoever moves afterwards.
-        where += " AND target_id = ?"
-        params += [int(seat["guild_id"])]
-
-    elif channel == "party":
-        # A PARTY'S ROOM, by the party the line was said in (game 0.42.0).
-        seat = party_membership(db, me)
-        if seat is None:
-            return {
-                "messages": [], "removed": [], "latest_id": 0,
-                "now": int(time.time()), "channel": channel, "available": False,
-                "notice": PARTY_CHAT_NO_PARTY,
-                "world_image_wait": world_image_wait(g.user),
-                "muted": chat_mute_state(g.user),
-            }, 200
-        where += " AND target_id = ?"
-        params += [int(seat["party_id"])]
-
-    # NOBODY YOU IGNORE, in any channel. In the WHERE with everything else, so
-    # the cursor, the tail and the removed list all agree about it.
-    where += IGNORED_AUTHORS_CLAUSE
-    params += [me]
-
-    # Same two-shaped read as broadcasts: a first poll wants the tail of the
-    # conversation, a returning poll wants only what it has not seen.
-    if since == 0:
-        rows = db.execute(
-            "SELECT * FROM chat_messages WHERE %s ORDER BY id DESC LIMIT ?" % where,
-            tuple(params + [CHAT_PAGE_LIMIT]),
-        ).fetchall()
-        rows = list(reversed(rows))
-    else:
-        rows = db.execute(
-            "SELECT * FROM chat_messages WHERE %s AND id > ? ORDER BY id ASC LIMIT ?"
-            % where,
-            tuple(params + [since, CHAT_PAGE_LIMIT]),
-        ).fetchall()
-
-    # THE NEWEST ID IN THIS CHANNEL, not in the table. A cursor taken from the
-    # whole table would skip past everything said in the channel the client is
-    # actually reading while another one was busy.
-    newest = db.execute(
-        "SELECT MAX(id) AS n FROM chat_messages WHERE %s" % where,
-        tuple(params),
-    ).fetchone()["n"]
-
-    # The pictures those lines point at, in one query rather than one each.
-    wanted = sorted({r["image_id"] for r in rows if r["image_id"]})
-    pictures = {}
-    if wanted:
-        marks = ",".join("?" for _ in wanted)
-        for row in db.execute(
-            "SELECT id, kind, width, height, frames, columns, frame_ms"
-            " FROM chat_images WHERE id IN (%s)" % marks, tuple(wanted)
-        ).fetchall():
-            pictures[row["id"]] = relayed_image_dict(row)
-
-    # WHAT HAS BEEN TAKEN BACK DOWN, for the clients that already have it.
-    #
-    # THE SAME `where` AND THE SAME `params` the messages were read with. That is
-    # the whole point of storing the deleted line's channel, user_id and
-    # target_id: filtering deletions is not a second permission rule to keep in
-    # step with the first one, it IS the first one. A line you could never have
-    # read cannot produce a deletion you are told about, and nobody has to
-    # remember that - it is the same SQL.
-    #
-    # BY TIME, NOT BY ID, because a deletion is an event and the message it
-    # refers to is almost always BELOW the client's cursor, where `since` can
-    # never reach. See CHAT_DELETION_WINDOW_SECONDS for why a window is enough.
-    removed_rows = db.execute(
-        "SELECT message_id FROM chat_deletions WHERE %s AND deleted_at >= ?"
-        " ORDER BY message_id" % where,
-        tuple(params + [int(time.time()) - CHAT_DELETION_WINDOW_SECONDS]),
-    ).fetchall()
-
-    return {
-        "messages": [chat_message_dict(r) for r in rows],
-        "removed": [int(r["message_id"]) for r in removed_rows],
-        "latest_id": int(newest or 0),
-        # The server's clock, so the client can age a message without trusting
-        # the machine it is running on. Same reason the staff list returns it.
-        "now": int(time.time()),
-        "channel": channel,
-        "with": partner,
-        "available": True,
-        "images": pictures,
-        # HOW LONG BEFORE A PICTURE MAY GO TO WORLD, so the client can say so
-        # BEFORE somebody picks a file, compresses it and uploads it, rather
-        # than after. Always sent, on every channel, because the answer does
-        # not depend on which channel is being read and a client that has just
-        # switched tabs should not have a stale one.
-        "world_image_wait": world_image_wait(g.user),
-        # WHETHER YOU MAY SPEAK, so the box can say so before you type rather
-        # than after. null, or {until, seconds_left, reason}.
-        "muted": chat_mute_state(g.user),
-    }, 200
-
-
-@app.post("/api/chat/image")
-@no_write_lock
-@require_auth
-def chat_relay_image():
-    """
-    Hand the server a link and get back a picture it has stored
-    ---
-    tags:
-      - Chat
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: link
-        schema:
-          type: object
-          required: [url]
-          properties:
-            url:
-              type: string
-              description: "An http or https link to an image or a GIF"
-    responses:
-      200:
-        description: The stored picture's id and how to draw it
-      400:
-        description: Not a link, not a picture, too big, or pointing inside the network
-      401:
-        description: Missing, invalid or expired token
-      429:
-        description: Relaying faster than the cooldown allows
-      503:
-        description: This server has no image support installed
-    """
-    if not PILLOW_AVAILABLE:
-        return {
-            "error": "Service Unavailable",
-            "message": "This server cannot handle pictures yet. Run: pip install Pillow",
-        }, 503
-
-    payload = request.get_json(silent=True) or {}
-    url = str(payload.get("url", "")).strip()
-    if url == "":
-        return bad_request("url is required")
-    if len(url) > 2000:
-        return bad_request("that link is too long")
-
-    refused = chat_image_cooldown(int(time.time()))
-    if refused is not None:
-        return refused
-
-    raw, why = _fetch_image_bytes(url)
-    if raw is None:
-        return bad_request(why)
-
-    return keep_relayed_image(raw, url)
-
-
-# NOT /api/chat/image/upload, AND THE REASON IS WORTH KEEPING.
-#
-# It was that, and it produced a 405 that took a while to read. The path
-# matched `/api/chat/image/<image_id>` - "upload" is a perfectly good value
-# for image_id - and that rule is GET only, so a POST to it came back 405
-# Method Not Allowed. Werkzeug does prefer the static rule once BOTH exist, so
-# this worked the moment the new route was loaded; what it could not survive
-# was a server that had not been restarted. Then the only rule matching that
-# path was the GET one, and the client was told "method not allowed" for a
-# route that simply was not there yet.
-#
-# 405 and 404 are very different messages to the person reading them. 404
-# already says "restart the server, or something else has the port" - the
-# exact diagnosis - and 405 says nothing at all. Sitting outside the
-# `/api/chat/image/` prefix means a stale server gives the useful one.
-#
-# THE OLD PATH IS STILL REGISTERED, deliberately. Once a server HAS the route,
-# Werkzeug prefers the static rule and the old path works fine - the collision
-# only ever bit a server that had not been restarted. Keeping it means a game
-# build from before this move still posts pictures successfully against a
-# current server, which costs one line and removes any window where the two
-# halves have to be updated together.
-@app.post("/api/chat/upload")
-@app.post("/api/chat/image/upload")
-@no_write_lock
-@require_auth
-def chat_upload_image():
-    """
-    Send a picture straight from the player's machine
-    ---
-    tags:
-      - Chat
-    consumes:
-      - application/octet-stream
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: header
-        name: X-Picture-Name
-        type: string
-        required: false
-        description: "The original filename, kept only so a moderator can see where it came from"
-      - in: body
-        name: picture
-        required: true
-        schema:
-          type: string
-          format: binary
-          description: "The file itself as the raw request body - not JSON, not base64"
-    responses:
-      200:
-        description: The stored picture's id and how to draw it
-      400:
-        description: Empty body, too big, or not a picture this server can read
-      401:
-        description: Missing, invalid or expired token
-      413:
-        description: Body over the server's hard request ceiling
-      429:
-        description: Uploading faster than the cooldown allows
-      503:
-        description: This server has no image support installed
-    """
-    # RAW BYTES, NOT BASE64, and that is the whole reason this is not just
-    # another JSON route. Base64 inflates by a third, so a four-megabyte photo
-    # arrives as five and a half and Werkzeug refuses it before this function
-    # is ever called - the player would see "too big" for a file that is not.
-    # Binary costs nothing and fits the limit that is actually written down.
-    if not PILLOW_AVAILABLE:
-        return {
-            "error": "Service Unavailable",
-            "message": "This server cannot handle pictures yet. Run: pip install Pillow",
-        }, 503
-
-    raw = request.get_data(cache=False)
-    if not raw:
-        return bad_request("send the picture as the body of the request")
-    if len(raw) > IMAGE_MAX_BYTES:
-        return bad_request("that picture is over %d MB" % (
-            IMAGE_MAX_BYTES // (1024 * 1024)))
-
-    refused = chat_image_cooldown(int(time.time()))
-    if refused is not None:
-        return refused
-
-    # THE NAME IS A LABEL, NEVER A PATH. It is written to the `source` column
-    # so a moderator looking at a reported picture can see it was "upload:
-    # screenshot.png" rather than a link, and it is used for nothing else -
-    # not to open anything, not to decide the format. What the file claims to
-    # be has no bearing on what decode_relayed_image() makes of the bytes.
-    name = str(request.headers.get("X-Picture-Name", "")).strip()
-    name = re.sub(r"[^A-Za-z0-9._ -]", "", name)
-    # Runs of dots collapsed and leading ones dropped, so "../../etc/passwd"
-    # cannot survive as "......etcpasswd". Nothing opens this string, so that
-    # is cosmetic rather than a defence - but a moderator reading the source
-    # column should not have to work out whether what they are looking at was
-    # an attack, and a label that still looks like one invites somebody to
-    # later "helpfully" use it as a path.
-    name = re.sub(r"\.{2,}", ".", name).lstrip(". ")[:120]
-    return keep_relayed_image(raw, "upload:" + name if name else "upload")
-
-
-@app.get("/api/chat/image/<image_id>")
-@require_auth
-def chat_read_image(image_id):
-    """
-    The bytes of a relayed picture
-    ---
-    tags:
-      - Chat
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: path
-        name: image_id
-        type: string
-        required: true
-    responses:
-      200:
-        description: A PNG - one frame, or a spritesheet if it was animated
-      401:
-        description: Missing, invalid or expired token
-      404:
-        description: No such picture
-    """
-    # SIGNED IN TO LOOK, which keeps this from being a public file host run by
-    # accident. The client already holds a token and sends it on every other
-    # call; this is no different.
-    clean = str(image_id or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", clean):
-        return {"error": "Not Found", "message": "No such picture."}, 404
-
-    # ONLY TO SOMEONE WHO COULD SEE IT - see WHO MAY SEE A PICTURE. The same
-    # 404 as a missing row, so this cannot be used to learn which ids exist.
-    db = get_db()
-    if not _may_see_image(db, g.user, clean):
-        return {"error": "Not Found", "message": "No such picture."}, 404
-
-    row = db.execute(
-        "SELECT data, format FROM chat_images WHERE id = ?", (clean,)).fetchone()
-    if row is None:
-        return {"error": "Not Found", "message": "No such picture."}, 404
-
-    # THE TYPE IS WHAT WAS STORED, and the column defaults to png so every row
-    # written before stills could be WebP still describes itself correctly.
-    # Not sniffed from the bytes: nosniff is set below precisely so the
-    # browser does not guess, and it would be odd to guess here instead.
-    kind = "webp" if str(row["format"] or "png") == "webp" else "png"
-
-    # IMMUTABLE, AND IT REALLY IS: an id names these exact bytes for as long
-    # as the row lives, so a client that has one can keep it. PRIVATE, because
-    # who may fetch it now depends on who is asking - a shared cache must never
-    # hand one player's answer to another.
-    return bytes(row["data"]), 200, {
-        "Content-Type": "image/%s" % kind,
-        "Cache-Control": "private, max-age=31536000, immutable",
-        "Content-Disposition": "inline",
-        "X-Content-Type-Options": "nosniff",
-    }
-
-
-@app.post("/api/chat/delete")
-@require_auth
-@require_role("mod")
-def chat_delete():
-    """
-    Take a chat message back down
-    ---
-    tags:
-      - Chat
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: target
-        schema:
-          type: object
-          required: [id]
-          properties:
-            id:
-              type: integer
-    responses:
-      200:
-        description: The message is gone
-      400:
-        description: id was missing or not a whole number
-      404:
-        description: No such message, or the caller is not staff
-    """
-    payload = request.get_json(silent=True) or {}
-    try:
-        message_id = int(payload.get("id", 0))
-    except (TypeError, ValueError):
-        return bad_request("id must be a whole number")
-    if message_id <= 0:
-        return bad_request("id must be a whole number")
-
-    db = get_db()
-    row = db.execute(
-        "SELECT * FROM chat_messages WHERE id = ?", (message_id,)
-    ).fetchone()
-    if row is None:
-        return {"error": "Not Found", "message": "No such message."}, 404
-
-    # STAFF CANNOT DELETE ABOVE THEMSELVES. A mod taking down the owner's line
-    # is the same permission question as a mod banning the owner, and the same
-    # helper answers it. Deleting your own is allowed explicitly, because
-    # can_act_on() is strictly-greater and so refuses it.
-    author = _user_by_name(row["username"])
-    if author is not None and int(author["id"]) != int(g.user["id"]):
-        if not can_act_on(g.user, author):
-            return {"error": "Not Found", "message": "No such message."}, 404
-
-    db.execute("DELETE FROM chat_messages WHERE id = ?", (message_id,))
-
-    # AND TELL THE CLIENTS THAT ALREADY HAVE IT.
-    #
-    # Removing the row stops the message reaching anybody who has not read it
-    # yet, which is the half that was working. The other half is everyone who
-    # HAS: their feed is append-only, so the line stays on screen until a
-    # hundred more push it off. See the chat_deletions table for why this is a
-    # separate row rather than a column, and why it needs no second cursor.
-    now = int(time.time())
-    db.execute(
-        "INSERT OR REPLACE INTO chat_deletions"
-        " (message_id, channel, user_id, target_id, deleted_at)"
-        " VALUES (?, ?, ?, ?, ?)",
-        (message_id, str(row["channel"] or CHAT_DEFAULT_CHANNEL),
-         int(row["user_id"] or 0), int(row["target_id"] or 0), now),
-    )
-    # Pruned on write, like _prune_chat: past the window nobody can still be
-    # holding the line, so the row has nothing left to tell anyone.
-    db.execute("DELETE FROM chat_deletions WHERE deleted_at < ?",
-               (now - CHAT_DELETION_WINDOW_SECONDS,))
-
-    # AND THE PICTURE, IF NOTHING ELSE STILL SHOWS IT.
-    #
-    # Deleting the MESSAGE used to leave the image row in place, and that made
-    # this route the weaker half of a pair. /api/chat/image/<id> serves any row
-    # to any signed-in caller - which is sound, because the id is the SHA-256 of
-    # the bytes, so 256 unguessable bits ARE the permission and you cannot have
-    # one without having been shown it. What that argument cannot do is take a
-    # picture back: everyone who was in the channel when it was posted holds the
-    # id already, the response says Cache-Control: immutable with a one-year
-    # max-age, and the row was only ever removed by the 128MB eviction loop. So
-    # a mod deleted an offensive picture, the line vanished from the feed, and
-    # the bytes went on being served to everyone who had already seen it. The
-    # only thing that had actually happened was that it stopped being visible to
-    # the people who never saw it.
-    #
-    # REFERENCE COUNTED, and that is not optional. store_relayed_image() uses
-    # INSERT OR IGNORE on a content hash, so the same picture posted twice is ONE
-    # row addressed by two messages - deleting the row on the first message would
-    # blank the picture under a second, innocent line, possibly in another
-    # channel. Count what is left and only drop it at zero.
-    image_id = str(row["image_id"] or "")
-    image_dropped = False
-    if image_id != "":
-        still_shown = db.execute(
-            "SELECT COUNT(*) AS n FROM chat_messages WHERE image_id = ?", (image_id,)
-        ).fetchone()["n"]
-        if int(still_shown or 0) == 0:
-            _drop_image(db, image_id)
-            image_dropped = True
-
-    log_staff_action(g.user, "chat_delete", row["username"], row["user_id"],
-                     row["body"][:120])
-    # A DELETED LINE'S REPORTS ARE ANSWERED. Deleting it is what they asked for,
-    # and leaving them open would have the next mod look at a line that is gone.
-    db.execute("UPDATE chat_reports SET resolved_at = ?, resolved_by = ?, outcome = 'deleted'"
-               " WHERE message_id = ? AND resolved_at = 0",
-               (now, g.user["username"], message_id))
-    db.commit()
-
-    return {"id": message_id, "deleted": True, "image_dropped": image_dropped}, 200
+# =============================================================================
+# CHAT ROUTES - the chat/ package (see WORLD CHAT)
+# =============================================================================
+# /api/chat/send, /api/chat, the three picture routes (four paths), the
+# staff's /api/chat/delete and the three /api/ignores routes, as they were
+# here - endpoint names, docstrings, ranks, the write lock and every message
+# (routes.lock). Handed from here what they share with other areas, and handing
+# back what other areas ask of chat (_CHAT): post_chat() and a report's "could
+# they read it".
+_CHAT = chat.register(
+    app,
+    require_auth=require_auth,
+    require_role=require_role,
+    no_write_lock=no_write_lock,
+    get_db=get_db,
+    bad_request=bad_request,
+    find_user=_user_by_name,
+    clean_text=clean_player_text,
+    role_for=role_for,
+    name_hue_of=name_hue_of,
+    guild_tag=guild_tag,
+    role_at_least=role_at_least,
+    can_act_on=can_act_on,
+    has_owner_powers=has_owner_powers,
+    log_staff_action=log_staff_action,
+    mute_state=chat_mute_state,
+    describe_mute=describe_mute,
+    friend_ids=_friend_ids,
+    guild_membership=guild_membership,
+    party_membership=party_membership,
+    # ASKED ON EVERY USE: both are this file's tunables, and the suites turn
+    # them down (test_chatrooms.py, test_chatsafety.py).
+    keep_per_channel=lambda: CHAT_KEEP_PER_CHANNEL,
+    ignore_limit=lambda: IGNORE_LIMIT,
+    # LOOKED UP ON EACH CALL, so a suite's stand-in for the fetch is heard.
+    fetch_image=lambda url: _fetch_image_bytes(url),
+)
 
 
 # =============================================================================
-# IGNORE, REPORT, MUTE - the routes (the rules are above chat_write_check)
+# IGNORE, REPORT, MUTE - the routes (the rules are above, under IGNORE,
+# REPORT, MUTE; the ignore list's three routes are chat/'s)
 # =============================================================================
-
-@app.get("/api/ignores")
-@require_auth
-def list_ignores():
-    """
-    The players you have chosen not to hear
-    ---
-    tags:
-      - Chat
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-    responses:
-      200:
-        description: '{"ignored": [{"username", "since"}], "limit": 200}'
-    """
-    rows = get_db().execute(
-        "SELECT u.username, i.created_at FROM ignores i JOIN users u ON u.id = i.ignored_id"
-        " WHERE i.user_id = ? ORDER BY u.username COLLATE NOCASE", (g.user["id"],)).fetchall()
-    return {"ignored": [{"username": r["username"], "since": int(r["created_at"])} for r in rows],
-            "limit": IGNORE_LIMIT}, 200
-
-
-@app.post("/api/ignores")
-@require_auth
-def add_ignore():
-    """
-    Stop hearing a player
-    ---
-    tags:
-      - Chat
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [username]
-          properties:
-            username: {type: string}
-    responses:
-      200:
-        description: Ignored - their lines are gone from every chat read of yours
-      400:
-        description: No name, or your own
-      403:
-        description: Staff cannot be ignored
-      404:
-        description: No such account
-      409:
-        description: The ignore list is full
-    """
-    payload = request.get_json(silent=True) or {}
-    name = str(payload.get("username", "")).strip()
-    if not name:
-        return bad_request("username is required")
-    target = _user_by_name(name)
-    if target is None:
-        return {"error": "Not Found", "message": "No such account."}, 404
-    me = int(g.user["id"])
-    if int(target["id"]) == me:
-        return bad_request("You cannot ignore yourself.")
-    if role_at_least(target, "mod"):
-        return {"error": "Forbidden",
-                "message": "Staff cannot be ignored. If one of them is the problem, "
-                           "report the message."}, 403
-    db = get_db()
-    if ignores(db, me, target["id"]):
-        return {"username": target["username"], "ignored": True, "already": True}, 200
-    held = int(db.execute("SELECT COUNT(*) FROM ignores WHERE user_id = ?", (me,)).fetchone()[0])
-    if held >= IGNORE_LIMIT:
-        return {"error": "Conflict",
-                "message": "You are ignoring %d players, which is the most. "
-                           "Stop ignoring somebody first." % IGNORE_LIMIT}, 409
-    db.execute("INSERT INTO ignores (user_id, ignored_id, created_at) VALUES (?, ?, ?)",
-               (me, int(target["id"]), int(time.time())))
-    db.commit()
-    return {"username": target["username"], "ignored": True}, 200
-
-
-@app.post("/api/ignores/remove")
-@require_auth
-def remove_ignore():
-    """
-    Hear a player again
-    ---
-    tags:
-      - Chat
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [username]
-          properties:
-            username: {type: string}
-    responses:
-      200:
-        description: Not ignored any more (or never was - was_ignored says which)
-      404:
-        description: No such account
-    """
-    payload = request.get_json(silent=True) or {}
-    name = str(payload.get("username", "")).strip()
-    if not name:
-        return bad_request("username is required")
-    target = _user_by_name(name)
-    if target is None:
-        return {"error": "Not Found", "message": "No such account."}, 404
-    db = get_db()
-    gone = db.execute("DELETE FROM ignores WHERE user_id = ? AND ignored_id = ?",
-                      (int(g.user["id"]), int(target["id"]))).rowcount
-    db.commit()
-    return {"username": target["username"], "ignored": False, "was_ignored": gone > 0}, 200
-
 
 @app.post("/api/chat/report")
 @require_auth

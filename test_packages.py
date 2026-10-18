@@ -1,7 +1,7 @@
 """The feature packages stand on their own (game 0.50.0).
 
 Every feature package (ARCHITECTURE.md) - playerstats/, events/, insights/,
-and killrecord/, friends/, gathering/, loot/, guilds/ and parties/, taken out of app.py - is built the BE105 way: each has a
+and killrecord/, friends/, gathering/, loot/, guilds/, parties/ and chat/, taken out of app.py - is built the BE105 way: each has a
 register(app, ...) that is HANDED the app, its login checks and its database,
 and never imports app.py. The source of each is checked for that elsewhere
 (test_stats.py); this RUNS them without it - the "application factory"
@@ -40,6 +40,7 @@ import friends  # noqa: E402
 import gathering  # noqa: E402
 import guilds  # noqa: E402
 import parties  # noqa: E402
+import chat  # noqa: E402
 import loot  # noqa: E402
 import insights  # noqa: E402
 import killrecord  # noqa: E402
@@ -48,7 +49,8 @@ import playerstats  # noqa: E402
 # Found, not listed: what app.py imports that has a routes.py (codemap.py).
 PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
 # The ones this file registers on its bare apps, below.
-RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds", "parties")
+RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds", "parties",
+            "chat")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -115,7 +117,21 @@ def bare_app(name):
         os.remove(path)
     conn = sqlite3.connect(path)
     conn.executescript(
-        "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, role TEXT, created_at INTEGER, name_hue INTEGER);"
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, role TEXT, created_at INTEGER, name_hue INTEGER,"
+        " chat_tokens REAL NOT NULL DEFAULT 8.0, last_chat_at INTEGER NOT NULL DEFAULT 0,"
+        " last_image_at INTEGER NOT NULL DEFAULT 0, last_world_image_at INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE chat_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, role TEXT,"
+        " body TEXT, created_at INTEGER, channel TEXT, target_id INTEGER, image_id TEXT, guild TEXT, name_hue INTEGER);"
+        "CREATE TABLE chat_deletions (message_id INTEGER PRIMARY KEY, channel TEXT, user_id INTEGER, target_id INTEGER,"
+        " deleted_at INTEGER);"
+        "CREATE TABLE chat_images (id TEXT PRIMARY KEY, kind TEXT, width INTEGER, height INTEGER, frames INTEGER,"
+        " columns INTEGER, frame_ms INTEGER, bytes INTEGER, source TEXT, created_by TEXT, created_at INTEGER,"
+        " format TEXT, data BLOB);"
+        "CREATE TABLE chat_image_holders (image_id TEXT, user_id INTEGER, created_at INTEGER,"
+        " PRIMARY KEY (image_id, user_id));"
+        "CREATE TABLE ignores (user_id INTEGER, ignored_id INTEGER, created_at INTEGER);"
+        "CREATE TABLE chat_reports (message_id INTEGER, image_id TEXT, reported_id INTEGER, resolved_at INTEGER,"
+        " resolved_by TEXT, outcome TEXT);"
         "CREATE TABLE saves (user_id INTEGER, slot INTEGER, class_id TEXT, level INTEGER, area TEXT, updated_at INTEGER,"
         " last_cast_at INTEGER NOT NULL DEFAULT 0, cast_tokens REAL NOT NULL DEFAULT 6.0,"
         " gold INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL DEFAULT '', hp INTEGER NOT NULL DEFAULT 0,"
@@ -141,7 +157,8 @@ def bare_app(name):
         " created_at INTEGER, decided_at INTEGER);")
     now = int(time.time())
     for user in USERS.values():
-        conn.execute("INSERT INTO users VALUES (?, ?, ?, ?, NULL)", (user["id"], user["username"], user["role"], now - 3600))
+        conn.execute("INSERT INTO users (id, username, role, created_at) VALUES (?, ?, ?, ?)",
+                     (user["id"], user["username"], user["role"], now - 3600))
     conn.execute("INSERT INTO saves (user_id, slot, class_id, level, area, updated_at) VALUES (2, 0, 'warrior', 4, 'field', ?)",
                  (now,))
     for user_id, slot, enemy, kills in ((2, 0, "slime", 5), (2, 1, "slime", 2), (3, 0, "slime", 6), (2, 0, "bat", 1)):
@@ -351,6 +368,44 @@ def bare_app(name):
                      online_window=45,
                      voice_settings=lambda: (relay["mode"], "keyid", "token") if relay["mode"] else ("", "", ""),
                      turn_fetch=turn_fetch, voice_issued={}, voice_asks={}, voice_lock=threading.Lock())
+
+    # chat/: staff are the owner alone, as for guilds; who is muted, the ignore
+    # limit and the kept tail are app.config's, so a check can change them; a
+    # linked picture is a stand-in fetch handing back a small PNG it makes.
+    talk = app.config.setdefault("talk", {"muted": set(), "ignore_limit": 200, "keep": 3, "fetched": []})
+
+    def no_write_lock(view):
+        view._elusion_no_write_lock = True
+        return view
+
+    def fetch_image(url):
+        talk["fetched"].append(url)
+        if not chat.services.PILLOW_AVAILABLE:
+            return None, "no Pillow here"
+        import io
+        buffer = io.BytesIO()
+        chat.services.Image.new("RGBA", (4, 3), (200, 40, 40, 255)).save(buffer, format="PNG")
+        return buffer.getvalue(), None
+
+    app.config["chat"] = chat.register(
+        app, require_auth=require_auth, require_role=owner_only, no_write_lock=no_write_lock, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400), find_user=find_user,
+        clean_text=lambda raw, limit: " ".join(str(raw or "").split())[:limit],
+        role_for=lambda row: row["role"], guild_tag=lambda name: name.upper(),
+        name_hue_of=lambda row: row["name_hue"] if "name_hue" in row.keys() else None,
+        role_at_least=lambda row, _rank: row["username"] == OWNER,
+        can_act_on=lambda actor, _target: actor["username"] == OWNER,
+        has_owner_powers=lambda name: name == OWNER,
+        log_staff_action=lambda user, action, target, target_id=0, detail="": staff_log.append(
+            "%s %s %s: %s" % (user["username"], action, target, detail)),
+        mute_state=lambda row: ({"until": 1, "seconds_left": 60, "reason": "a test"}
+                                if row["username"] in talk["muted"] else None),
+        describe_mute=lambda state: "Muted: %s" % state["reason"],
+        friend_ids=lambda _db, _user_id: set(),
+        guild_membership=lambda user_id: guilds.membership(get_db(), user_id),
+        party_membership=parties.membership,
+        keep_per_channel=lambda: talk["keep"], ignore_limit=lambda: talk["ignore_limit"],
+        fetch_image=fetch_image)
     return app, said, logged, path
 
 
@@ -386,7 +441,10 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/guild", "/api/guild/create", "/api/guild/invite", "/api/guild/respond", "/api/guild/leave",
                        "/api/guild/kick", "/api/guild/rank", "/api/guild/disband", "/api/staff/guild",
                        "/api/guild/list", "/api/party", "/api/party/invite", "/api/party/respond",
-                       "/api/party/leave", "/api/party/kick", "/api/party/lead", "/api/party/voice"]), rules)
+                       "/api/party/leave", "/api/party/kick", "/api/party/lead", "/api/party/voice",
+                       "/api/chat/send", "/api/chat", "/api/chat/image", "/api/chat/upload", "/api/chat/image/upload",
+                       "/api/chat/image/<image_id>", "/api/chat/delete", "/api/ignores", "/api/ignores",
+                       "/api/ignores/remove"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -720,15 +778,96 @@ relay["mode"] = ""
 check("  and with no TURN key in the settings handed in, the 503 it was",
       client_a.get("/api/party/voice", headers=who("boss")).get_json()
       == {"error": "Service Unavailable", "message": "Voice is not set up on this server yet."})
+
+
+def say(as_who, body, **more):
+    res = client_a.post("/api/chat/send", headers=who(as_who), json=dict(body=body, **more))
+    return res.status_code, res.get_json() or {}
+
+
+def heard(as_who, channel="world", since=0, **more):
+    query = "&".join(["channel=%s" % channel, "since=%d" % since] + ["%s=%s" % kv for kv in more.items()])
+    return client_a.get("/api/chat?" + query, headers=who(as_who)).get_json() or {}
+
+
+talk = app_a.config["talk"]
+code, body = say("ann", "hello  world")
+check("chat: a line said in world, cleaned by the text rule handed in",
+      code == 200 and body.get("body") == "hello world" and body.get("channel") == "world", body)
+lines = heard("bo").get("messages", [])
+check("  and read back by another, in the shape every chat line has",
+      [(m["by"], m["body"], m["channel"]) for m in lines] == [("ann", "hello world", "world")], lines)
+talk["muted"].add("bo")
+check("  a muted account is the 403 it was, in the words handed in",
+      say("bo", "let me speak")[1].get("message") == "Muted: a test")
+talk["muted"].clear()
+conn = sqlite3.connect(path_a)
+conn.execute("UPDATE users SET chat_tokens = 0, last_chat_at = ? WHERE id = 3", (int(time.time() * 1000),))
+conn.commit()
+conn.close()
+check("  an empty flood bucket is the 429 it was",
+      say("bo", "too soon")[0] == 429)
+conn = sqlite3.connect(path_a)
+conn.execute("UPDATE users SET chat_tokens = 8 WHERE id = 3")
+conn.commit()
+conn.close()
+for n in range(4):
+    say("ann", "line %d" % n)
+check("  the tail kept per channel is the tunable handed in, asked on every line (%d here)" % talk["keep"],
+      [m["body"] for m in heard("bo").get("messages", [])] == ["line 1", "line 2", "line 3"],
+      heard("bo").get("messages"))
+code, body = client_a.post("/api/ignores", headers=who("bo"), json={"username": "ann"}).status_code, None
+check("ignores: bo stops hearing ann - in world, and her whispers to him are refused",
+      code == 200 and heard("bo").get("messages") == []
+      and say("ann", "psst", channel="private", to="bo")
+      == (403, {"error": "Forbidden", "message": "bo is not taking whispers from you."}))
+check("  and the ignore list says so",
+      [i["username"] for i in client_a.get("/api/ignores", headers=who("bo")).get_json().get("ignored", [])] == ["ann"])
+check("  staff cannot be ignored",
+      client_a.post("/api/ignores", headers=who("ann"), json={"username": "boss"}).status_code == 403)
+talk["ignore_limit"] = 0
+check("  and the limit is the tunable handed in, asked each time",
+      client_a.post("/api/ignores", headers=who("ann"), json={"username": "bo"}).status_code == 409)
+talk["ignore_limit"] = 200
+check("  heard again once taken back",
+      client_a.post("/api/ignores/remove", headers=who("bo"), json={"username": "ann"}).get_json().get("was_ignored") is True
+      and len(heard("bo").get("messages", [])) == 3)
+feed = heard("bo")
+doomed = feed["messages"][-1]["id"]
+res = client_a.post("/api/chat/delete", headers=who("boss"), json={"id": doomed})
+later = heard("bo", since=int(feed["latest_id"]))
+check("  staff take a line down: on the moderation log, and a reader past it is told",
+      res.status_code == 200 and doomed in later.get("removed", [])
+      and app_a.config["staff_log"][-1].startswith("boss chat_delete ann"), (res.get_json(), later))
+check("  and nobody else may", client_a.post("/api/chat/delete", headers=who("ann"), json={"id": 1}).status_code == 404)
+if chat.services.PILLOW_AVAILABLE:
+    res = client_a.post("/api/chat/image", headers=who("ann"), json={"url": "http://pictures.example/red.png"})
+    picture = res.get_json() or {}
+    check("pictures: a link is fetched by the call handed in, decoded and kept",
+          res.status_code == 200 and picture.get("kind") == "still" and picture.get("width") == 4
+          and talk["fetched"] == ["http://pictures.example/red.png"], picture)
+    image_path = "/api/chat/image/%s" % picture.get("id", "")
+    check("  its maker may load it, and somebody shown no line with it may not",
+          client_a.get(image_path, headers=who("ann")).status_code == 200
+          and client_a.get(image_path, headers=who("bo")).status_code == 404)
+    check("  a second within the cooldown is the 429 it was",
+          client_a.post("/api/chat/image", headers=who("ann"), json={"url": "http://pictures.example/again.png"})
+          .status_code == 429)
+    say("ann", "", image=picture.get("id", ""))
+    check("  once it is in a world line, everybody may load it",
+          client_a.get(image_path, headers=who("bo")).status_code == 200)
+else:
+    print("  skip  pictures: this machine has no Pillow")
 check("  and nobody without a login gets in anywhere",
       [client_a.get(path).status_code for path in ("/api/server/stats", "/api/world/events/active", "/api/server/insights",
                                                   "/api/kills?slot=0", "/api/kills/everyone", "/api/friends",
                                                   "/api/loot/bag?bag_id=%s" % bag, "/api/guild", "/api/guild/list",
-                                                  "/api/party", "/api/party/voice")]
+                                                  "/api/party", "/api/party/voice", "/api/chat", "/api/ignores")]
       + [client_a.post(path, json={"slot": 0}).status_code for path in ("/api/fishing/catch", "/api/cooking/cook",
                                                                          "/api/loot/take", "/api/guild/create",
-                                                                         "/api/staff/guild", "/api/party/invite")]
-      == [401] * 17)
+                                                                         "/api/staff/guild", "/api/party/invite",
+                                                                         "/api/chat/send", "/api/chat/image")]
+      == [401] * 21)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")
@@ -755,7 +894,7 @@ for path in (path_a, path_b):
 section("P-4  every package is here")
 check("the code map finds the packages app.py imports: %s" % ", ".join(PACKAGES),
       set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds",
-                        "parties"},
+                        "parties", "chat"},
       PACKAGES)
 check("  and every one of them runs on a bare app in this file", set(PACKAGES) == set(RUN_HERE),
       sorted(set(PACKAGES) ^ set(RUN_HERE)))
