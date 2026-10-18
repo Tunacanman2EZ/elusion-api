@@ -36,6 +36,7 @@ Beside it, **feature packages**: a folder per area, each in three layers.
 | `equipment/` | 18 Oct | **moved out** of app.py: wearing gear |
 | `consuming/` | 18 Oct | **moved out** of app.py: using a consumable |
 | `death/` | 18 Oct | **moved out** of app.py: reviving and respawning |
+| `bank/` | 18 Oct | **moved out** of app.py: the bank and the account |
 
 ## Where it is going
 
@@ -214,8 +215,15 @@ areas that hold money and items:
     ~~Reviving and respawning (`death/`)~~ (18 Oct): the death screen's two
     exits. Every coin and lusion they cost goes through app.py's ledgers,
     handed in; the account row is handed in as a lookup, because
-    test_concurrency slows `_ensure_account()`. Next: the bank; then the carry
-    itself, the grants with it; then saves and the status write.
+    test_concurrency slows `_ensure_account()`.
+    ~~The bank (`bank/`)~~ (18 Oct): `/api/account`, the bank's whole-array
+    write and the lusion read-back, a transfer of items and of gold, a move
+    and a discard - seven routes - and how a deposit is packed. **Registered
+    further down app.py than its old banner**, after the carry's sizes and
+    helpers it is handed. What it shares with the backpack - taking from cells,
+    a move, a discard - stays in app.py, handed in by name, and goes with the
+    carry. Next: the carry itself, the grants with it; then saves and the
+    status write.
 11. then the core itself (sessions, tokens, auth) into a package of its own,
     and each table's `CREATE` into its area - and app.py is the composition
     root it was meant to be.

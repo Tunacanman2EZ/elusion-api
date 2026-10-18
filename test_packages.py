@@ -2,7 +2,8 @@
 
 Every feature package (ARCHITECTURE.md) - playerstats/, events/, insights/,
 and killrecord/, friends/, gathering/, loot/, guilds/, parties/, chat/, trade/, kingdom/, world/, moderation/,
-staffdesk/, equipment/, consuming/ and death/, taken out of app.py - is built the BE105 way: each has a
+staffdesk/, equipment/, consuming/, death/ and bank/, taken out of app.py - is built the
+BE105 way: each has a
 register(app, ...) that is HANDED the app, its login checks and its database,
 and never imports app.py. The source of each is checked for that elsewhere
 (test_stats.py); this RUNS them without it - the "application factory"
@@ -43,6 +44,7 @@ import friends  # noqa: E402
 import gathering  # noqa: E402
 import guilds  # noqa: E402
 import parties  # noqa: E402
+import bank as bank_package  # noqa: E402
 import chat  # noqa: E402
 import consuming  # noqa: E402
 import death  # noqa: E402
@@ -62,7 +64,7 @@ PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
 # The ones this file registers on its bare apps, below.
 RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds", "parties",
             "chat", "trade", "kingdom", "world", "moderation", "staffdesk", "equipment", "consuming",
-            "death")
+            "death", "bank")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -188,7 +190,8 @@ def bare_app(name):
         " PRIMARY KEY (trade_id, side, item_id));"
         "CREATE TABLE trade_holds (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, item_id TEXT, created_at INTEGER,"
         " held_until INTEGER);"
-        "CREATE TABLE bank_items (user_id INTEGER, position INTEGER, item_id TEXT, quantity INTEGER);"
+        "CREATE TABLE bank_items (user_id INTEGER, position INTEGER, item_id TEXT, quantity INTEGER,"
+        " PRIMARY KEY (user_id, position));"
         "CREATE TABLE gold_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, user_id INTEGER, slot INTEGER,"
         " delta INTEGER, reason TEXT, detail TEXT NOT NULL DEFAULT '');"
         "CREATE TABLE lusion_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, user_id INTEGER, slot INTEGER,"
@@ -655,11 +658,100 @@ def bare_app(name):
         gold_delta=ledger_delta, bank_gold_delta=bank_delta_ledger, lusion_delta=lusion_delta_ledger,
         lusion_gold_value=1000, revive_grant_id="__revive__", respawn_grant_id="__respawn__",
         status_of=status_of)
+
+    # bank/: a four-cell bank. The grid helpers it shares with the backpack are
+    # app.py's, so here they are small stand-ins over either table - taking
+    # from the highest cell first, as app.py's do; a move onto an empty cell
+    # moves, onto anything else swaps.
+    def where_of(key_columns):
+        return " AND ".join("%s = ?" % column for column in key_columns)
+
+    def take_from_cells(rows, item_id, quantity, prefer=None):
+        held = sorted(((int(r["position"]), int(r["quantity"])) for r in rows if r["item_id"] == item_id),
+                      reverse=True)
+        if sum(q for _p, q in held) < quantity:
+            return None, sum(q for _p, q in held)
+        changes = []
+        for position, have in held:
+            if quantity <= 0:
+                break
+            gone = min(have, quantity)
+            changes.append((position, have - gone))
+            quantity -= gone
+        return changes, None
+
+    def apply_cell_changes(table, key_columns, key_values, changes):
+        for position, left in changes:
+            if left <= 0:
+                get_db().execute("DELETE FROM %s WHERE %s AND position = ?" % (table, where_of(key_columns)),
+                                 (*key_values, position))
+            else:
+                get_db().execute("UPDATE %s SET quantity = ? WHERE %s AND position = ?"
+                                 % (table, where_of(key_columns)), (left, *key_values, position))
+
+    def cell_of(table, key_columns, key_values, position):
+        return get_db().execute("SELECT item_id, quantity FROM %s WHERE %s AND position = ?"
+                                % (table, where_of(key_columns)), (*key_values, position)).fetchone()
+
+    def grid_move(table, key_columns, key_values, source, target, item_id):
+        moving = cell_of(table, key_columns, key_values, source)
+        if moving is None or moving["item_id"] != item_id:
+            return "stale"
+        there = cell_of(table, key_columns, key_values, target)
+        get_db().execute("UPDATE %s SET position = -1 WHERE %s AND position = ?" % (table, where_of(key_columns)),
+                         (*key_values, source))
+        if there is not None:
+            get_db().execute("UPDATE %s SET position = ? WHERE %s AND position = ?"
+                             % (table, where_of(key_columns)), (source, *key_values, target))
+        get_db().execute("UPDATE %s SET position = ? WHERE %s AND position = -1" % (table, where_of(key_columns)),
+                         (target, *key_values))
+        return "moved"
+
+    def grid_discard(table, key_columns, key_values, position, item_id):
+        held = cell_of(table, key_columns, key_values, position)
+        if held is None or held["item_id"] != item_id:
+            return "stale", None
+        get_db().execute("DELETE FROM %s WHERE %s AND position = ?" % (table, where_of(key_columns)),
+                         (*key_values, position))
+        return "discarded", (held["item_id"], int(held["quantity"]))
+
+    def grid_cell(payload, key, capacity):
+        raw = payload.get(key)
+        if isinstance(raw, int) and not isinstance(raw, bool) and 0 <= raw < capacity:
+            return raw, None
+        return None, ({"error": "Bad Request", "message": "%s must be an integer 0-%d" % (key, capacity - 1)}, 400)
+
+    def positional(cells, field):
+        return [(i, c["item_id"], int(c["quantity"])) for i, c in enumerate(cells) if c], None
+
+    app.config["bank_api"] = bank_package.register(
+        app, require_auth=require_auth, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+        parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None, max_slot=3,
+        parse_stat=parse_stat, parse_cell=cell, parse_grid_cell=grid_cell,
+        parse_item_id=lambda payload: (str(payload.get("item_id", "")), None),
+        parse_positional_items=positional,
+        slot_exists=lambda user_id, slot: get_db().execute(
+            "SELECT 1 FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone() is not None,
+        ensure_account=ensure_account, has_owner_powers=lambda name: name == OWNER, catalogue=BankCatalogue,
+        capacity=4, carry_capacity=GATHER_CELLS, backpack_capacity=GATHER_CELLS, quantity_ceiling=99,
+        take_from_cells=take_from_cells, apply_cell_changes=apply_cell_changes, grid_move=grid_move,
+        grid_discard=grid_discard, add_to_backpack=add,
+        inventory_of=lambda user_id, slot: [{"position": p, "item_id": i, "quantity": q}
+                                            for p, (i, q) in sorted(carried(user_id, slot).items())])
     return app, said, logged, path
 
 
 # A four-cell bag for gathering/'s stand-ins.
 GATHER_CELLS = 4
+
+
+class BankCatalogue:
+    """What bank/ asks of gamedata: how high an item stacks. Potions in fives,
+    anything else one to a cell."""
+    @staticmethod
+    def item_row(item_id):
+        return {"stackable": True, "max_stack": 5} if item_id.endswith("potion") else {}
 
 
 class DeathCatalogue:
@@ -776,7 +868,8 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/staff/users", "/api/staff/actions", "/api/staff/note",
                        "/api/staff/user/<username>", "/api/character/equip", "/api/character/unequip",
                        "/api/character/consume", "/api/character/revive",
-                       "/api/character/respawn"]), rules)
+                       "/api/character/respawn", "/api/account", "/api/account/bank", "/api/account/lusions",
+                       "/api/bank/items", "/api/bank/gold", "/api/bank/move", "/api/bank/discard"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -1750,6 +1843,64 @@ check("respawn: the carried gold through the ledger, the bag and every worn piec
 check("  and the living, or nobody, are the 409 and 404 they were",
       gear("/api/character/respawn", {})[0] == 409
       and gear("/api/character/respawn", {"slot": 1}) == (404, {"error": "Not Found", "message": "No character in slot 1."}))
+def banked():
+    return [(c["item_id"], c["quantity"]) if c else None
+            for c in client_a.get("/api/account", headers=who("ann")).get_json()["bank_inventory"]]
+
+
+conn = sqlite3.connect(path_a)
+conn.execute("DELETE FROM carry_items WHERE user_id = 2")
+conn.executemany("INSERT INTO carry_items VALUES (2, 0, ?, ?, ?)",
+                 [(0, "smallhealthpotion", 7), (1, "cobaltrobe", 1), (2, "ironsword", 1), (3, "ironsword", 1)])
+conn.execute("DELETE FROM bank_items WHERE user_id = 2")
+conn.execute("UPDATE saves SET gold = 500 WHERE user_id = 2 AND slot = 0")
+conn.execute("UPDATE accounts SET bank_gold = 0 WHERE user_id = 2")
+conn.commit()
+conn.close()
+code, view = desk("/api/account", as_who="ann")
+check("bank: the account - the bank's cells at the size handed in, empty, and the account row's balances",
+      code == 200 and view.get("bank_inventory") == [None] * 4 and view.get("capacity") == 4
+      and view.get("bank_gold") == 0 and view.get("lusions") == 5, view)
+code, body = gear("/api/bank/items", {"op": "deposit", "item_id": "smallhealthpotion", "quantity": 7})
+check("  seven potions in: packed by the catalogue handed in - a five and a two - and gone from the bag",
+      code == 200 and banked() == [("smallhealthpotion", 5), ("smallhealthpotion", 2), None, None]
+      and "smallhealthpotion" not in [c["item_id"] for c in body.get("inventory", [])], body)
+check("  more than she carries is the 400 it was, in its words",
+      gear("/api/bank/items", {"op": "deposit", "item_id": "cobaltrobe", "quantity": 3})[1].get("message")
+      == "Cannot move 3 cobaltrobe - only 1 carried.")
+gear("/api/bank/items", {"op": "deposit", "item_id": "cobaltrobe"})
+code, body = gear("/api/bank/items", {"op": "deposit", "item_id": "ironsword", "quantity": 2})
+check("  two swords and one free cell: the 409 it was, and both swords are still in her bag",
+      (code, body) == (409, {"error": "Conflict", "message": "The bank is full (4 slots)."})
+      and len([r for r in ann_says("SELECT item_id FROM carry_items WHERE user_id = 2") if r[0] == "ironsword"]) == 2,
+      body)
+code, body = gear("/api/bank/items", {"op": "withdraw", "item_id": "smallhealthpotion", "quantity": 3})
+check("  three back out: from the highest cell first, through the grant handed in",
+      code == 200 and banked()[:2] == [("smallhealthpotion", 4), None]
+      and ("smallhealthpotion", 3) in [(c["item_id"], c["quantity"]) for c in body.get("inventory", [])], body)
+code, body = gear("/api/bank/gold", {"op": "deposit", "amount": 200})
+check("gold: 200 banked - both sides in one go, the total the same",
+      code == 200 and body.get("carried_gold") == 300 and body.get("bank_gold") == 200
+      and ann_says("SELECT gold FROM saves WHERE user_id = 2 AND slot = 0") == [(300,)], body)
+check("  and no more out than is in, the 400 it was",
+      gear("/api/bank/gold", {"op": "withdraw", "amount": 500})[1].get("message")
+      == "Cannot withdraw 500 - only 200 banked.")
+code, body = gear("/api/bank/move", {"from": 0, "to": 3, "item_id": "smallhealthpotion"})
+check("a bank cell moved, through the grid's move handed in; a move of what is not there is the 409 with the bank",
+      code == 200 and [c and c["item_id"] for c in body["bank_inventory"]] == [None, None, "cobaltrobe",
+                                                                                 "smallhealthpotion"]
+      and gear("/api/bank/move", {"from": 0, "to": 1, "item_id": "smallhealthpotion"})[1].get("account", {})
+      .get("capacity") == 4, body)
+code, body = gear("/api/bank/discard", {"position": 2, "item_id": "cobaltrobe"})
+check("  and a stack destroyed, said so",
+      code == 200 and body.get("discarded") == {"item_id": "cobaltrobe", "quantity": 1} and banked()[2] is None, body)
+res = client_a.put("/api/account/bank", headers=who("ann"),
+                   json={"bank_inventory": [{"item_id": "crownhelm", "quantity": 1}, None, None, None]})
+check("a whole bank from a player is ignored, with the bank the server holds",
+      res.status_code == 200 and res.get_json().get("ignored") == ["bank_inventory"] and banked()[0] is None)
+res = client_a.put("/api/account/lusions", headers=who("ann"), json={"lusions": 9999})
+check("  and so is a lusion balance, read back from the account",
+      res.get_json().get("ignored") == ["lusions"] and res.get_json().get("lusions") == 5)
 check("and nobody without a login gets in anywhere",
       [client_a.get(path).status_code for path in ("/api/server/stats", "/api/world/events/active", "/api/server/insights",
                                                   "/api/kills?slot=0", "/api/kills/everyone", "/api/friends",
@@ -1757,7 +1908,8 @@ check("and nobody without a login gets in anywhere",
                                                   "/api/party", "/api/party/voice", "/api/chat", "/api/ignores",
                                                   "/api/trade", "/api/trade/history", "/api/staff/trades",
                                                   "/api/economy/kingdom", "/api/server/world", "/api/staff/reports",
-                                                  "/api/staff/users", "/api/staff/actions", "/api/staff/user/ann")]
+                                                  "/api/staff/users", "/api/staff/actions", "/api/staff/user/ann",
+                                                  "/api/account")]
       + [client_a.post(path, json={"slot": 0}).status_code for path in ("/api/fishing/catch", "/api/cooking/cook",
                                                                          "/api/loot/take", "/api/guild/create",
                                                                          "/api/staff/guild", "/api/party/invite",
@@ -1774,9 +1926,12 @@ check("and nobody without a login gets in anywhere",
                                                                          "/api/character/unequip",
                                                                          "/api/character/consume",
                                                                          "/api/character/revive",
-                                                                         "/api/character/respawn")]
-      + [client_a.put("/api/staff/role", json={}).status_code]
-      == [401] * 51)
+                                                                         "/api/character/respawn", "/api/bank/items",
+                                                                         "/api/bank/gold", "/api/bank/move",
+                                                                         "/api/bank/discard")]
+      + [client_a.put(path, json={}).status_code for path in ("/api/staff/role", "/api/account/bank",
+                                                              "/api/account/lusions")]
+      == [401] * 58)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")
@@ -1807,7 +1962,7 @@ section("P-4  every package is here")
 check("the code map finds the packages app.py imports: %s" % ", ".join(PACKAGES),
       set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds",
                         "parties", "chat", "trade", "kingdom", "world", "moderation", "staffdesk",
-                        "equipment", "consuming", "death"},
+                        "equipment", "consuming", "death", "bank"},
       PACKAGES)
 check("  and every one of them runs on a bare app in this file", set(PACKAGES) == set(RUN_HERE),
       sorted(set(PACKAGES) ^ set(RUN_HERE)))

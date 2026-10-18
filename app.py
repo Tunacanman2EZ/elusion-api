@@ -8678,6 +8678,12 @@ def status_payload(user_id, slot):
 # THE BANK AND THE ACCOUNT
 # =============================================================================
 #
+# THE ROUTES ARE bank/'s since 18 Oct, registered further down with the carry's
+# sizes they are handed (THE BANK AND THE ACCOUNT - the bank/ package). What is
+# here is what the backpack and the bank share - taking from cells, a move, a
+# discard - the ledgers, and the account row. The history below is the bank's,
+# and stays with the grids it explains.
+#
 # REWRITTEN. The bank was modelled per-CHARACTER and it is account-shared.
 #
 # characterdata.gd is unambiguous about this - bank_gold and bank_inventory
@@ -8734,70 +8740,6 @@ def status_payload(user_id, slot):
 # "unused" one and the bank silently shrank by ten cells, at which point every
 # save with an item in cells 40-49 starts failing validation.
 BANK_CAPACITY = int(gamedata.CONSTANTS.get("bank_capacity", 50))
-
-
-def _add_to_bank(user_id, item_id, quantity):
-    """
-    Put quantity of item_id into the bank and return the cells touched, or None
-    when it does not fit.
-
-    The bank's _add_to_backpack(). Same rules for the same reason: tops up an
-    existing stack before opening a cell, and writes NOTHING unless the whole
-    quantity fits. A half-completed deposit is the shape of bug that ends with
-    an item in neither the bag nor the bank.
-    """
-    definition = gamedata.item_row(item_id) or {}
-    stackable = bool(definition.get("stackable", False))
-    max_stack = int(definition.get("max_stack", 1)) if stackable else 1
-    if max_stack < 1:
-        max_stack = 1
-
-    rows = get_db().execute(
-        "SELECT position, item_id, quantity FROM bank_items WHERE user_id = ? ORDER BY position",
-        (user_id,),
-    ).fetchall()
-    occupied = {int(r["position"]): (r["item_id"], int(r["quantity"])) for r in rows}
-
-    remaining = int(quantity)
-    writes = []
-
-    if stackable:
-        for position in sorted(occupied):
-            if remaining <= 0:
-                break
-            held_id, held_qty = occupied[position]
-            if held_id != item_id or held_qty >= max_stack:
-                continue
-            room = max_stack - held_qty
-            moved = min(room, remaining)
-            writes.append((position, item_id, held_qty + moved))
-            remaining -= moved
-
-    for position in range(BANK_CAPACITY):
-        if remaining <= 0:
-            break
-        if position in occupied:
-            continue
-        moved = min(max_stack, remaining)
-        writes.append((position, item_id, moved))
-        occupied[position] = (item_id, moved)
-        remaining -= moved
-
-    if remaining > 0:
-        return None
-
-    db = get_db()
-    for position, written_id, written_qty in writes:
-        db.execute(
-            """
-            INSERT INTO bank_items (user_id, position, item_id, quantity)
-                 VALUES (?, ?, ?, ?)
-            ON CONFLICT(user_id, position)
-              DO UPDATE SET item_id = excluded.item_id, quantity = excluded.quantity
-            """,
-            (user_id, position, written_id, written_qty),
-        )
-    return [position for position, _, _ in writes]
 
 
 def _preferred_first(cells, prefer):
@@ -9077,32 +9019,6 @@ def _ensure_account(user_id):
     ).fetchone()
 
 
-def account_payload(user_id):
-    row = _ensure_account(user_id)
-    rows = get_db().execute(
-        "SELECT position, item_id, quantity FROM bank_items WHERE user_id = ? ORDER BY position",
-        (user_id,),
-    ).fetchall()
-
-    cells = [None] * BANK_CAPACITY
-    for item in rows:
-        position = int(item["position"])
-        if 0 <= position < BANK_CAPACITY:
-            cells[position] = {"item_id": item["item_id"], "quantity": int(item["quantity"])}
-
-    return {
-        "lusions": int(row["lusions"]),
-        "bank_gold": int(row["bank_gold"]),
-        # KEYED WITH .get() RATHER THAN row["score"], because a sqlite3.Row
-        # raises IndexError for a column the SELECT did not fetch, and
-        # _ensure_account() predates this one. The narrow-SELECT trap is how a
-        # correct refusal turned into a 500 once already - see E-11.
-        "score": int(row["score"]) if "score" in row.keys() else 0,
-        "bank_inventory": cells,
-        "capacity": BANK_CAPACITY,
-    }
-
-
 @app.put("/api/account/name-colour")
 @require_auth
 def set_name_colour():
@@ -9151,395 +9067,6 @@ def set_name_colour():
     return {"name_hue": hue}, 200
 
 
-@app.get("/api/account")
-@require_auth
-def read_account():
-    """
-    Account-shared state: lusions, bank gold, bank inventory
-    ---
-    tags:
-      - Account
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-    responses:
-      200:
-        description: Everything shared across this user's characters
-      401:
-        description: Missing, invalid or expired token
-    """
-    # NO slot parameter, deliberately. That absence is the fix.
-    return account_payload(g.user["id"]), 200
-
-
-@app.put("/api/account/bank")
-@require_auth
-def write_bank():
-    """
-    Replace the bank's contents
-    ---
-    tags:
-      - Account
-    consumes:
-      - application/json
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [bank_inventory]
-          properties:
-            bank_inventory:
-              type: array
-              description: "Positional; null for an empty cell. At most 50 entries."
-    responses:
-      200:
-        description: The account as stored
-      400:
-        description: Oversized array, or a malformed entry
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-    _ensure_account(user_id)
-
-    cells = payload.get("bank_inventory")
-    if not isinstance(cells, list):
-        return bad_request("bank_inventory must be an array")
-    if len(cells) > BANK_CAPACITY:
-        return bad_request("bank_inventory has %d entries, capacity is %d" % (len(cells), BANK_CAPACITY))
-
-    parsed, error = _parse_positional_items(cells, "bank_inventory")
-    if error is not None:
-        return error
-
-    # A PLAYER'S BANK IS NOT WRITTEN HERE ANY MORE, for the backpack's reasons
-    # - see ONE CELL AT A TIME and write_inventory(). Items come and go through
-    # POST /api/bank/items, and rearranging is POST /api/bank/move; a whole
-    # bank from the client was only ever trimmed to the record (E-1), never
-    # derived from it. Ignored rather than refused, with the bank the server
-    # holds in the answer; the owner still writes it whole, for tooling.
-    #
-    # THE OWNER, NOT "MOD AND UP". A whole write can hold any item, so it is an
-    # item grant by another name, and the grant itself is owner-only now - see
-    # staff_grant(). A mod's bank is ignored exactly like a player's.
-    if not has_owner_powers(g.user["username"]):
-        body = account_payload(user_id)
-        body["ignored"] = ["bank_inventory"]
-        return body, 200
-
-    db = get_db()
-    db.execute("DELETE FROM bank_items WHERE user_id = ?", (user_id,))
-    if parsed:
-        db.executemany(
-            "INSERT INTO bank_items (user_id, position, item_id, quantity) VALUES (?, ?, ?, ?)",
-            [(user_id, position, item_id, quantity) for position, item_id, quantity in parsed],
-        )
-    db.commit()
-
-    return account_payload(user_id), 200
-
-
-@app.put("/api/account/lusions")
-@require_auth
-def write_lusions():
-    """
-    Read the account's lusion balance (writes are ignored)
-    ---
-    tags:
-      - Account
-    consumes:
-      - application/json
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: false
-        schema:
-          type: object
-          properties:
-            lusions: {type: integer, example: 40}
-    responses:
-      200:
-        description: The account as the SERVER holds it; any lusions sent are ignored
-      401:
-        description: Missing, invalid or expired token
-    """
-    # THIS ENDPOINT USED TO STORE WHATEVER ARRIVED, and that was the finding.
-    #
-    #     lusions = parse_stat(payload.get("lusions"))
-    #     UPDATE accounts SET lusions = ? WHERE user_id = ?
-    #
-    # An absolute figure, from the client, with no check beyond "is it a
-    # non-negative integer". The same mistake as gold on the status endpoint
-    # (E-8), one endpoint over.
-    #
-    # WHY IT MATTERED MORE THAN THE NUMBER SUGGESTS. Lusions have exactly one
-    # sink in the game: reviving after death, at GameConstants.revive_cost a
-    # go. So the balance IS the death penalty, and a client that could write it
-    # could make dying free - which it did, because gameover.gd deducted the
-    # cost locally and restored the health itself too.
-    #
-    # NOTHING HONEST NEEDS TO WRITE THIS ANY MORE. Lusions are created by the
-    # server when a duplicate pet converts (see /api/loot/take) and spent by
-    # the server at /api/character/revive. Both ends are now inside the
-    # building.
-    #
-    # KEPT RATHER THAN DELETED, and answering 200. An un-updated client still
-    # PUTs its lusion figure on a routine sync, and a 404 or a 400 would turn
-    # an honest save into an error the player sees. It reads back the server's
-    # own number instead, which is also how the client learns it was corrected.
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-    _ensure_account(user_id)
-
-    body = account_payload(user_id)
-    if "lusions" in payload:
-        body["ignored"] = ["lusions"]
-    return body, 200
-
-
-@app.post("/api/bank/items")
-@require_auth
-def move_bank_items():
-    """
-    Move an item between a character's backpack and the shared bank
-    ---
-    tags:
-      - Account
-    consumes:
-      - application/json
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [slot, op, item_id]
-          properties:
-            slot:     {type: integer, example: 0}
-            op:       {type: string,  enum: [deposit, withdraw]}
-            item_id:  {type: string,  example: "tinyhealthpotion"}
-            quantity: {type: integer, example: 5}
-            position: {type: integer, example: 3, description: "The source cell dragged - a carried cell for a deposit, a bank cell for a withdrawal. Taken from first when it holds the item."}
-    responses:
-      200:
-        description: Both grids afterwards, plus the account
-      400:
-        description: Bad slot, op, item id or quantity, or not enough on the source side
-      404:
-        description: That slot is empty
-      409:
-        description: The destination is full
-      401:
-        description: Missing, invalid or expired token
-    """
-    # CONSERVES THE TOTAL, which a whole-array replace cannot.
-    #
-    # The server holds both sides of this - carry_items and bank_items are both
-    # its rows - so a transfer is the one shape where it can check that what left
-    # one side is exactly what arrived at the other. PUT /api/account/bank takes
-    # two arrays on trust and has no way to tell a legal pair from an invented
-    # one; two arrays that do not add up look exactly like two that do.
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-    if not _slot_exists(user_id, slot):
-        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
-
-    op = str(payload.get("op", "")).strip().lower()
-    if op not in ("deposit", "withdraw"):
-        return bad_request("op must be 'deposit' or 'withdraw'")
-
-    item_id = str(payload.get("item_id", "")).strip()
-    if not item_id or len(item_id) > 64:
-        return bad_request("item_id must be 1-64 characters")
-
-    raw_quantity = payload.get("quantity", 1)
-    if isinstance(raw_quantity, bool):
-        return bad_request("quantity must be a positive integer")
-    try:
-        quantity = int(raw_quantity)
-    except (TypeError, ValueError):
-        return bad_request("quantity must be a positive integer")
-    if quantity <= 0:
-        return bad_request("quantity must be a positive integer")
-    if quantity > QUANTITY_CEILING:
-        return bad_request("quantity must be at most %d" % QUANTITY_CEILING)
-
-    position, error = parse_cell(
-        payload, CARRY_CAPACITY if op == "deposit" else BANK_CAPACITY)
-    if error is not None:
-        return error
-
-    db = get_db()
-
-    if op == "deposit":
-        source_rows = db.execute(
-            "SELECT position, item_id, quantity FROM carry_items WHERE user_id = ? AND slot = ?",
-            (user_id, slot),
-        ).fetchall()
-    else:
-        source_rows = db.execute(
-            "SELECT position, item_id, quantity FROM bank_items WHERE user_id = ?",
-            (user_id,),
-        ).fetchall()
-
-    changes, available = _take_from_cells(source_rows, item_id, quantity, prefer=position)
-    if changes is None:
-        where = "carried" if op == "deposit" else "banked"
-        return bad_request(
-            "Cannot move %d %s - only %d %s." % (quantity, item_id, available, where)
-        )
-
-    # REMOVE FIRST, THEN ADD, THEN CHECK. The add is the half that can fail on
-    # capacity, and rolling back is how the item gets home - not an "if it fits"
-    # test beforehand, which would be a second implementation of the packing rule
-    # and would disagree with the real one the first time a stack was part-used.
-    if op == "deposit":
-        _apply_cell_changes("carry_items", ("user_id", "slot"), (user_id, slot), changes)
-        written = _add_to_bank(user_id, item_id, quantity)
-        full_message = "The bank is full (%d slots)." % BANK_CAPACITY
-    else:
-        _apply_cell_changes("bank_items", ("user_id",), (user_id,), changes)
-        written = _add_to_backpack(user_id, slot, item_id, quantity)
-        full_message = "Your backpack is full (%d slots)." % INVENTORY_CAPACITY
-
-    if written is None:
-        # Nothing was committed, so the rollback puts the source rows back
-        # exactly as they were. The item is never in neither place.
-        db.rollback()
-        return {"error": "Conflict", "message": full_message}, 409
-
-    db.commit()
-
-    result = account_payload(user_id)
-    result["slot"] = slot
-    result["op"] = op
-    result["item_id"] = item_id
-    result["quantity"] = quantity
-    result["inventory"] = inventory_payload(user_id, slot)
-    return result, 200
-
-
-@app.post("/api/bank/gold")
-@require_auth
-def move_bank_gold():
-    """
-    Move gold between a character's pocket and the shared bank
-    ---
-    tags:
-      - Account
-    consumes:
-      - application/json
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [slot, op, amount]
-          properties:
-            slot:   {type: integer, example: 0}
-            op:     {type: string,  enum: [deposit, withdraw]}
-            amount: {type: integer, example: 500}
-    responses:
-      200:
-        description: Carried gold and the account afterwards
-      400:
-        description: Bad slot, op or amount, or not enough gold on the relevant side
-      404:
-        description: That slot is empty
-      401:
-        description: Missing, invalid or expired token
-    """
-    # STILL TAKES A SLOT, and still an op rather than a replace.
-    #
-    # The slot is the CHARACTER whose pocket the gold comes out of - that half
-    # is genuinely per-character. The bank half is not, and now comes from
-    # accounts rather than from saves.bank_gold.
-    #
-    # It stays an op because this is the one operation on this whole server that
-    # can be verified: it holds both balances, so it can enforce that the total
-    # is conserved. Everything else here takes the client's word for what it has.
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-
-    op = str(payload.get("op", "")).strip().lower()
-    if op not in ("deposit", "withdraw"):
-        return bad_request("op must be 'deposit' or 'withdraw'")
-
-    amount = parse_stat(payload.get("amount"))
-    if amount is None or amount <= 0:
-        return bad_request("amount must be a positive integer")
-
-    db = get_db()
-    row = db.execute(
-        "SELECT gold FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)
-    ).fetchone()
-    if row is None:
-        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
-
-    account = _ensure_account(user_id)
-    carried = int(row["gold"])
-    banked = int(account["bank_gold"])
-
-    if op == "deposit":
-        if amount > carried:
-            return bad_request("Cannot deposit %d - only %d carried." % (amount, carried))
-        carried -= amount
-        banked += amount
-    else:
-        if amount > banked:
-            return bad_request("Cannot withdraw %d - only %d banked." % (amount, banked))
-        banked -= amount
-        carried += amount
-
-    # Two tables now, so one transaction rather than one statement. sqlite3
-    # opens a transaction on the first write and holds it until commit, so
-    # there is still no moment where the gold exists in neither place.
-    db.execute(
-        "UPDATE saves SET gold = ?, updated_at = ? WHERE user_id = ? AND slot = ?",
-        (carried, int(time.time()), user_id, slot),
-    )
-    db.execute("UPDATE accounts SET bank_gold = ? WHERE user_id = ?", (banked, user_id))
-    db.commit()
-
-    result = account_payload(user_id)
-    result["slot"] = slot
-    result["carried_gold"] = carried
-    return result, 200
 
 
 # =============================================================================
@@ -9642,119 +9169,6 @@ KILL_RESPAWN_FLOOR_SECONDS = 30.0
 
 
 
-def _bank_resync(user_id):
-    """The bank route's 409 for an out-of-date picture: the account as the
-    server holds it, under `account`, so the game reloads the grid."""
-    return {"error": "Conflict",
-            "message": "The bank changed on the server. It has been reloaded.",
-            "account": account_payload(user_id)}, 409
-
-
-@app.post("/api/bank/move")
-@require_auth
-def move_banked():
-    """
-    Move, merge or swap one bank cell onto another
-    ---
-    tags:
-      - Account
-    consumes:
-      - application/json
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [from, to, item_id]
-          properties:
-            from:    {type: integer, example: 0}
-            to:      {type: integer, example: 12}
-            item_id: {type: string, example: ironsword, description: "What the game saw in `from`"}
-    responses:
-      200:
-        description: The account afterwards, bank included. The same move, merge and swap rules as the backpack.
-      400:
-        description: Bad cell or item id
-      409:
-        description: "`from` does not hold that item. Carries the account under `account`; nothing moved."
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-    _ensure_account(user_id)
-    item_id, error = parse_item_id(payload)
-    if error is not None:
-        return error
-    source, error = parse_grid_cell(payload, "from", BANK_CAPACITY)
-    if error is not None:
-        return error
-    target, error = parse_grid_cell(payload, "to", BANK_CAPACITY)
-    if error is not None:
-        return error
-    if _grid_move("bank_items", ("user_id",), (user_id,), source, target, item_id) == "stale":
-        return _bank_resync(user_id)
-    get_db().commit()
-    return account_payload(user_id), 200
-
-
-@app.post("/api/bank/discard")
-@require_auth
-def discard_banked():
-    """
-    Destroy the whole stack in one bank cell
-    ---
-    tags:
-      - Account
-    consumes:
-      - application/json
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [position, item_id]
-          properties:
-            position: {type: integer, example: 9}
-            item_id:  {type: string, example: rawshrimp}
-    responses:
-      200:
-        description: The account afterwards, and what was destroyed
-      400:
-        description: Bad cell or item id
-      409:
-        description: "The cell does not hold that item. Carries the account; nothing was destroyed."
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-    _ensure_account(user_id)
-    item_id, error = parse_item_id(payload)
-    if error is not None:
-        return error
-    position, error = parse_grid_cell(payload, "position", BANK_CAPACITY)
-    if error is not None:
-        return error
-    outcome, held = _grid_discard("bank_items", ("user_id",), (user_id,), position, item_id)
-    if outcome == "stale":
-        return _bank_resync(user_id)
-    get_db().commit()
-    body = account_payload(user_id)
-    body["discarded"] = {"item_id": held[0], "quantity": held[1]}
-    return body, 200
 
 @app.post("/api/combat/kill")
 @require_auth
@@ -13032,6 +12446,53 @@ def skills_payload(user_id, slot):
         (user_id, slot),
     ).fetchall()
     return {row["skill_id"]: {"level": int(row["level"]), "xp": int(row["xp"])} for row in rows}
+
+
+# =============================================================================
+# THE BANK AND THE ACCOUNT - the bank/ package
+# =============================================================================
+# Registered here, after the carry's sizes and helpers it is handed, rather
+# than at THE BANK AND THE ACCOUNT above. The seven routes - the account, the
+# bank's whole-array write and the lusion read-back, a transfer of items and
+# of gold, a move and a discard - are bank/'s since 18 Oct; the grid helpers
+# they share with the backpack stay above, the carry's.
+import bank as bank_package  # noqa: E402
+
+_BANK = bank_package.register(
+    app,
+    require_auth=require_auth,
+    get_db=get_db,
+    bad_request=bad_request,
+    parse_slot=parse_slot,
+    max_slot=MAX_SLOT,
+    parse_stat=parse_stat,
+    parse_cell=parse_cell,
+    parse_grid_cell=parse_grid_cell,
+    parse_item_id=parse_item_id,
+    parse_positional_items=_parse_positional_items,
+    slot_exists=_slot_exists,
+    # ASKED ON EVERY CALL: test_concurrency slows _ensure_account() to hold two
+    # deposits of one purse open at once.
+    ensure_account=lambda user_id: _ensure_account(user_id),
+    has_owner_powers=has_owner_powers,
+    catalogue=gamedata,
+    capacity=BANK_CAPACITY,
+    carry_capacity=CARRY_CAPACITY,
+    backpack_capacity=INVENTORY_CAPACITY,
+    quantity_ceiling=QUANTITY_CEILING,
+    take_from_cells=_take_from_cells,
+    apply_cell_changes=_apply_cell_changes,
+    grid_move=_grid_move,
+    grid_discard=_grid_discard,
+    # Defined with the carry, further down, so asked for when a withdrawal lands.
+    add_to_backpack=lambda user_id, slot, item_id, quantity:
+        _add_to_backpack(user_id, slot, item_id, quantity),
+    inventory_of=inventory_payload,
+)
+# The account as GET /api/account answers it, by the name this file always
+# used: cashing a pile of lusions answers with it.
+account_payload = _BANK.account_of
+
 
 
 @app.post("/api/shop/buy")

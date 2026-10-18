@@ -212,7 +212,7 @@ player's whole-bag and whole-bank writes are answered with the server's grid
 and `ignored`; build 2 of the game does not send them. The `based_on` and
 trade-resync 409s are still in `write_inventory()` for a build-1 game. **A new
 route that changes a grid takes one cell and the item the game saw in it** -
-`_grid_move()` / `_grid_discard()`, and `_carry_resync()` / `_bank_resync()`
+`_grid_move()` / `_grid_discard()`, and `_carry_resync()` / bank/'s `resync()`
 for the 409 - and answers with the whole grid. `test_bagmoves.py`.
 
 ### A read before the first write is outside the transaction
@@ -1765,7 +1765,7 @@ item from nothing, and each was justified by the others:
 - `PUT /api/character/inventory` wrote a mod's whole bag, "because a mod can
   already self-grant". Now only the owner's (`write_inventory()`); a mod's is
   ignored with `"ignored": ["inventory"]`, exactly as a player's is.
-- `PUT /api/account/bank` the same (`write_bank()`).
+- `PUT /api/account/bank` the same (`write_bank()`, bank/routes.py).
 
 The skill-ceiling exemption in the skills route moved to the owner too, for
 symmetry; that route writes nothing, so it changed no behaviour.
@@ -2036,7 +2036,10 @@ only, `test_stats.py`.
   of the carry, ARCHITECTURE's step 10; the backpack grants, `_derived_stats()`
   and the skills stay in app.py and are handed in). And `death/` (18 Oct:
   revive and respawn; the three ledgers, the account row, `_derived_stats()`
-  and the grant ids the healing reconciler reads stay in app.py).
+  and the grant ids the healing reconciler reads stay in app.py). And `bank/` (18 Oct:
+  the account, the bank's seven routes and the bank's packing; the grid
+  helpers it shares with the backpack, the ledgers and the account row stay in
+  app.py, and it hands back `account_of()`, kept as `account_payload()`).
   **trade/ is handed gamedata whole, as `catalogue`**, so a rule checked by
   searching for `gamedata.` reads `catalogue.` too (test_quality Q-7).
   **A name a suite replaces on app.py**
