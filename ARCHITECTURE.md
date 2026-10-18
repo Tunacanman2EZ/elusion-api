@@ -30,6 +30,7 @@ Beside it, **feature packages**: a folder per area, each in three layers.
 | `chat/` | 18 Oct | **moved out** of app.py: chat, pictures, the ignore list |
 | `trade/` | 18 Oct | **moved out** of app.py: player trade and the kingdom tax |
 | `kingdom/` | 18 Oct | **moved out** of app.py: the Kingdom Tax board |
+| `world/` | 18 Oct | **moved out** of app.py: the stirring lands |
 
 ## Where it is going
 
@@ -164,7 +165,18 @@ areas that hold money and items:
    resync flag both clients re-read their bags by, which an owner's gift rides
    too. A rollback, a character delete and the poll still find an open trade
    by app.py's old names, which are the package's.
-8. the stirring lands (`world/`) - combat asks it what a kill pays
+8. ~~the stirring lands (`world/`)~~ (18 Oct): the owner's three routes, the
+   settings and the stir itself - which land, when the next begins, what a
+   kill of a stirring land's monster pays. **register() hands back what four
+   areas ask of the world**: the kill route what a kill pays, the poll what
+   the game is told, the events their guardrails, the insights the next
+   stir - and app.py keeps them under their old names. **And it is handed
+   the events and the insights as lookups** (`lambda: world_events`): both
+   are registered at the end of app.py, after the world, and are handed what
+   it hands back, so each is asked for when it is wanted - test_packages
+   hands one in after the world is registered and checks it is heard. What
+   stays in app.py: the server_settings store, the broadcasts, the kill
+   route and the poll themselves.
 9. moderation and the staff list
 10. the carry: saves, character, bank, equipment, consuming, reviving
 11. then the core itself (sessions, tokens, auth) into a package of its own,

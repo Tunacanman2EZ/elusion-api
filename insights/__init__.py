@@ -10,7 +10,7 @@ show it and accept or override.
                                 and why, and who is online by hour
 
 AND THE WORLD'S OWN PICK uses the same rule (InsightsAPI.choose(), asked by
-app.py's pick_land()): the least hunted land, never the one that just stirred
+world/'s pick_land()): the least hunted land, never the one that just stirred
 - and now never one where a new player is learning, while another will do. A
 stir makes its land's monsters hit harder and take more killing; that is for
 the players who are ready for it, not for somebody on their first evening.

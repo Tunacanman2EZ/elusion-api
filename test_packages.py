@@ -1,8 +1,8 @@
 """The feature packages stand on their own (game 0.50.0).
 
 Every feature package (ARCHITECTURE.md) - playerstats/, events/, insights/,
-and killrecord/, friends/, gathering/, loot/, guilds/, parties/, chat/, trade/ and kingdom/, taken out of app.py -
-is built the BE105 way: each has a
+and killrecord/, friends/, gathering/, loot/, guilds/, parties/, chat/, trade/, kingdom/ and world/, taken out of
+app.py - is built the BE105 way: each has a
 register(app, ...) that is HANDED the app, its login checks and its database,
 and never imports app.py. The source of each is checked for that elsewhere
 (test_stats.py); this RUNS them without it - the "application factory"
@@ -29,6 +29,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -48,12 +49,13 @@ import killrecord  # noqa: E402
 import kingdom  # noqa: E402
 import playerstats  # noqa: E402
 import trade  # noqa: E402
+import world  # noqa: E402
 
 # Found, not listed: what app.py imports that has a routes.py (codemap.py).
 PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
 # The ones this file registers on its bare apps, below.
 RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds", "parties",
-            "chat", "trade", "kingdom")
+            "chat", "trade", "kingdom", "world")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -171,7 +173,11 @@ def bare_app(name):
         "CREATE TABLE gold_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, user_id INTEGER, slot INTEGER,"
         " delta INTEGER, reason TEXT, detail TEXT NOT NULL DEFAULT '');"
         "CREATE TABLE lusion_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, user_id INTEGER, slot INTEGER,"
-        " delta INTEGER, reason TEXT, detail TEXT NOT NULL DEFAULT '');")
+        " delta INTEGER, reason TEXT, detail TEXT NOT NULL DEFAULT '');"
+        "CREATE TABLE world_ticks (tick INTEGER PRIMARY KEY, element INTEGER NOT NULL, started_at INTEGER NOT NULL,"
+        " ends_at INTEGER NOT NULL, chosen_by TEXT NOT NULL DEFAULT '');"
+        "CREATE TABLE kill_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, slot INTEGER, enemy_id TEXT,"
+        " xp INTEGER NOT NULL DEFAULT 0, at INTEGER);")
     now = int(time.time())
     for user in USERS.values():
         conn.execute("INSERT INTO users (id, username, role, created_at) VALUES (?, ?, ?, ?)",
@@ -192,6 +198,8 @@ def bare_app(name):
             g.db = sqlite3.connect(path)
             g.db.row_factory = sqlite3.Row
         return g.db
+
+    app.config["world_db"] = get_db
 
     @app.teardown_appcontext
     def close_db(_error):
@@ -482,6 +490,24 @@ def bare_app(name):
     # snapshot's cache_clear().
     app.config["kingdom"] = kingdom.register(app, require_auth=require_auth, get_db=get_db,
                                              guild_tag=lambda name: name.upper())
+
+    # world/: the settings row is a dict on the app, the world's voice a list
+    # of its own (the events' announcer is P-3's), the moderation log the one
+    # above. Monster "e1".."e7" is of land 1..7. The events and the insights
+    # are app.config's, None until a check hands one in - asked on every use.
+    stored = app.config.setdefault("settings", {})
+    world_said = app.config.setdefault("world_said", [])
+    app.config["world_events"] = None
+    app.config["world_insights"] = None
+    app.config["world"] = world.register(
+        app, require_auth=require_auth, require_owner=require_owner, require_fresh_password=require_fresh_password,
+        get_db=get_db, bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+        get_setting=stored.get, set_setting=lambda key, value, by="": stored.__setitem__(key, value),
+        announce=lambda body, by="": world_said.append(body),
+        log_staff_action=lambda user, action, target, target_id=0, detail="": staff_log.append(
+            "%s %s %s: %s" % (user["username"], action, target, detail)),
+        element_of=lambda enemy_id: int(enemy_id[1:]) if re.fullmatch(r"e[1-7]", enemy_id) else 0,
+        events=lambda: app.config["world_events"], insights=lambda: app.config["world_insights"])
     return app, said, logged, path
 
 
@@ -551,7 +577,8 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/chat/image/<image_id>", "/api/chat/delete", "/api/ignores", "/api/ignores",
                        "/api/ignores/remove", "/api/trade/offer", "/api/trade", "/api/trade/update",
                        "/api/trade/confirm", "/api/trade/cancel", "/api/staff/trades", "/api/trade/history",
-                       "/api/economy/kingdom"]), rules)
+                       "/api/economy/kingdom", "/api/server/world", "/api/server/world",
+                       "/api/server/world/stir"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -1118,20 +1145,98 @@ check("  the shared half is kept for %ds; the cache_clear() handed back drops it
       % kingdom.KINGDOM_BOARD_CACHE_SECONDS,
       again.get("total") == 23 and fresh.get("total") == 123
       and fresh.get("by_reason") == {"shop": 100, "kingdom_tax": 23}, (again.get("total"), fresh.get("total")))
+def world_view():
+    res = client_a.get("/api/server/world", headers=who("boss"))
+    return res.status_code, res.get_json() or {}
+
+
+def world_post(path, body):
+    res = client_a.post(path, headers=who("boss"), json=body)
+    return res.status_code, res.get_json() or {}
+
+
+def stir_for(enemy_id):
+    with app_a.app_context():
+        return app_a.config["world"].stir_for(app_a.config["world_db"](), enemy_id)
+
+
+WIND_TEXT = ("The wind lands stir for 3 hours: wind monsters hit 25% harder, have 50% more health, move 15% faster"
+             " and drop loot 1.5x as often, and wind resistance counts 1.5x.")
+# A day's hunting: one paid kill in every land but wind.
+conn = sqlite3.connect(path_a)
+conn.executemany("INSERT INTO kill_reports (user_id, slot, enemy_id, at) VALUES (2, 0, ?, ?)",
+                 [("e%d" % land, int(time.time()) - 60) for land in (1, 2, 3, 5, 6, 7)])
+conn.commit()
+conn.close()
+world_said = app_a.config["world_said"]
+code, view = world_view()
+check("world: the owner's view - the settings as shipped, with no row; the least hunted land stirs, and says so",
+      code == 200 and view.get("settings") == world.WORLD_DEFAULTS
+      and (view["state"]["tick"], view["state"]["element"], view["state"]["name"]) == (1, 4, "wind")
+      and view["state"]["ends_at"] - view["state"]["started_at"] == 3 * 3600 and world_said == [WIND_TEXT], (view, world_said))
+check("  each land's hunting from the kills handed in, the last stirs, the limits, and the next and why",
+      [land["kills"] for land in view.get("lands", [])] == [1, 1, 1, 0, 1, 1, 1]
+      and [r["tick"] for r in view.get("recent", [])] == [1] and view.get("limits", {}).get("health_percent") == [0, 200]
+      and view.get("next", {}).get("element") in (1, 2, 3, 5, 6, 7)
+      and view.get("next", {}).get("reason", "").endswith(": the least hunted in the last day."), view)
+check("  asked again inside the stir, the same stir - and nobody else sees it",
+      world_view()[1].get("state", {}).get("tick") == 1 and len(world_said) == 1
+      and client_a.get("/api/server/world", headers=who("ann")).status_code == 404)
+check("  a kill of the stirring land's monster drops 1.5x as often; any other is ordinary",
+      stir_for("e4") == (1.5, 1.0) and stir_for("e1") == (1.0, 1.0), (stir_for("e4"), stir_for("e1")))
+check("  a setting that is not one, or out of its range, is the 400 it was",
+      world_post("/api/server/world", {"hours": 0})
+      == (400, {"error": "Bad Request", "message": "hours is a whole number from 1 to 24"})
+      and world_post("/api/server/world", {"color": "red"})[1].get("message")
+      == "color is not a setting of the stirring lands")
+code, body = world_post("/api/server/world", {"on": False, "xp_on": True})
+check("  switched off: stored, still, on the moderation log handed in - and a kill is ordinary",
+      code == 200 and body.get("state") == {"on": False, "tick": 0, "element": 0}
+      and world_said[-1] == "The lands grow still." and app_a.config["staff_log"][-1] == "boss world server: on=False, xp_on=True"
+      and stir_for("e4") == (1.0, 1.0), (body.get("state"), world_said, app_a.config["staff_log"][-1:]))
+code, body = world_post("/api/server/world", {"on": True})
+check("  on again, the stir still running is said again, with the XP now on",
+      code == 200 and body["state"]["tick"] == 1 and world_said[-1].startswith("The wind lands stir for 3 hours:")
+      and "give 25% more XP" in world_said[-1] and stir_for("e4") == (1.5, 1.25), world_said[-1:])
+code, body = world_post("/api/server/world/stir", {"element": 6})
+check("  the owner stirs fire by hand: the wind's stir ends now, a whole fire stir begins, announced and logged",
+      code == 200 and (body["state"]["tick"], body["state"]["name"]) == (2, "fire")
+      and body["recent"][0]["chosen_by"] == "boss" and body["recent"][1]["ends_at"] <= int(time.time())
+      and world_said[-1].startswith("The fire lands stir for 3 hours:")
+      and app_a.config["staff_log"][-1] == "boss world server: stirred the fire lands", body.get("recent"))
+check("  not one of the seven lands is the 400 it was",
+      world_post("/api/server/world/stir", {"element": 9})[0] == 400)
+app_a.config["world_insights"] = types.SimpleNamespace(
+    choose=lambda _db, candidates, _hunts, _chooser, _now: (7, [], {}),
+    reason=lambda land, *_rest: "Water: the insights' choice.")
+check("  the insights handed in, asked when they are wanted, choose the next land and say why",
+      world_view()[1].get("next", {}).get("reason") == "Water: the insights' choice."
+      and world_view()[1]["next"]["element"] == 7, world_view()[1].get("next"))
+app_a.config["world_events"] = types.SimpleNamespace(
+    forced_stir=lambda _db, now=None: {"id": 7, "land": 2, "ends_at": int(time.time()) + 600, "name": "Light Week"},
+    kill_scales=lambda _db, element, stirring: (2.0, 1.0), ceiling=lambda bags, xp: (min(bags, 3.0), min(xp, 3.0)))
+code, view = world_view()
+check("  a stir event handed in wins: its land stirs until it ends, and a kill is paid its scale, held to the ceiling",
+      (view["state"]["tick"], view["state"]["name"]) == (3, "light") and view["recent"][0]["chosen_by"] == "event #7"
+      and view["next"]["reason"] == "Light: Light Week is on then."
+      and stir_for("e2") == (3.0, 1.25) and stir_for("e1") == (2.0, 1.0), (view.get("state"), stir_for("e2")))
+app_a.config["world_events"] = None
+app_a.config["world_insights"] = None
 check("and nobody without a login gets in anywhere",
       [client_a.get(path).status_code for path in ("/api/server/stats", "/api/world/events/active", "/api/server/insights",
                                                   "/api/kills?slot=0", "/api/kills/everyone", "/api/friends",
                                                   "/api/loot/bag?bag_id=%s" % bag, "/api/guild", "/api/guild/list",
                                                   "/api/party", "/api/party/voice", "/api/chat", "/api/ignores",
                                                   "/api/trade", "/api/trade/history", "/api/staff/trades",
-                                                  "/api/economy/kingdom")]
+                                                  "/api/economy/kingdom", "/api/server/world")]
       + [client_a.post(path, json={"slot": 0}).status_code for path in ("/api/fishing/catch", "/api/cooking/cook",
                                                                          "/api/loot/take", "/api/guild/create",
                                                                          "/api/staff/guild", "/api/party/invite",
                                                                          "/api/chat/send", "/api/chat/image",
                                                                          "/api/trade/offer", "/api/trade/update",
-                                                                         "/api/trade/confirm", "/api/trade/cancel")]
-      == [401] * 29)
+                                                                         "/api/trade/confirm", "/api/trade/cancel",
+                                                                         "/api/server/world", "/api/server/world/stir")]
+      == [401] * 32)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")
@@ -1161,7 +1266,7 @@ for path in (path_a, path_b):
 section("P-4  every package is here")
 check("the code map finds the packages app.py imports: %s" % ", ".join(PACKAGES),
       set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds",
-                        "parties", "chat", "trade", "kingdom"},
+                        "parties", "chat", "trade", "kingdom", "world"},
       PACKAGES)
 check("  and every one of them runs on a bare app in this file", set(PACKAGES) == set(RUN_HERE),
       sorted(set(PACKAGES) ^ set(RUN_HERE)))

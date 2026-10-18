@@ -73,7 +73,7 @@ HOLD_SECONDS = 1.0
 AGREED_LEFT = 0.02
 # THE STIRRING LANDS (game 0.46.0): a monster of a land that is stirring - or
 # stirred lately, for one born just before its stir ended - may be born with
-# up to this many times the catalogue's health (app.py WORLD_LIMITS, 200%
+# up to this many times the catalogue's health (world/ WORLD_LIMITS, 200%
 # more). The leader's word for it is taken, and counted: more health than the
 # catalogue's only ever makes a death harder to agree, never easier.
 STIRRED_MAX_TIMES = 3

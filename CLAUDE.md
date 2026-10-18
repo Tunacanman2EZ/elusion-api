@@ -1912,8 +1912,12 @@ with icons of the enemies". THE KILL RECORD in app.py, `test_killrecord.py`.
 ## The stirring lands (game 0.46.0)
 
 The owner, 15 Oct: "lets build it in my game if you think it will elavate
-it" - a world that changes on its own. THE STIRRING LANDS in app.py,
-`test_world.py`. Every few hours one of the seven lands (Element.Type 1-7:
+it" - a world that changes on its own. The world/ package (moved out of
+app.py's THE STIRRING LANDS on 18 Oct), `test_world.py`. The names below are
+the ones app.py still calls them by - `world_stir_for()`,
+`current_world_tick()`, `world_public()`, `pick_land()`, `world_next_stir()`
+- which are what world/'s register() hands back. Every few hours one of the
+seven lands (Element.Type 1-7:
 dark, light, ice, wind, earth, fire, water; 8 and 9 are not lands) stirs.
 
 - **Who decides what.** The server picks the land and pays what it pays at
@@ -2006,7 +2010,11 @@ only, `test_stats.py`.
   routes and every write to the three trade tables, then the Kingdom Tax
   board and its cache; the backpack grants, `gold_delta()`, the playing-slot
   rule and the resync flag stay in app.py and are handed in, and kingdom/
-  hands back `cache_clear()`, which app.py keeps as `_kingdom_cache_clear()`).
+  hands back `cache_clear()`, which app.py keeps as `_kingdom_cache_clear()`)
+  and `world/` (18 Oct: the stirring lands - the owner's three routes, the
+  settings and the stir itself; register() hands back what the kill route,
+  the poll, the events and the insights ask, and is handed the events and
+  insights as lookups, since they are registered after it).
   **trade/ is handed gamedata whole, as `catalogue`**, so a rule checked by
   searching for `gamedata.` reads `catalogue.` too (test_quality Q-7).
   **A name a suite replaces on app.py**
@@ -2157,7 +2165,7 @@ a second service: one server, one login, one deploy. `test_insights.py`.
   Plus `next` (below), `hours` (players online by UTC hour over 14 days,
   from online_samples, and how many days that is), `total_week` and `few`
   (under 30 kills in the week: a rough read).
-- **The world's own pick changed** (`pick_land()` -> `_pick_land_why()` ->
+- **The world's own pick changed** (`pick_land()` -> `pick_land_why()` ->
   `InsightsAPI.choose()` -> `services.choose()`): still the least hunted in
   the last day and never the land that just stirred, but now of the lands
   where no new player is learning - a stir makes a land's monsters hit

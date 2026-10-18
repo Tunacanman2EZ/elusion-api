@@ -21,9 +21,10 @@ Built like playerstats/, in three layers:
     data.py      the SQL: world_events, its schema included
 
 THE GAME APPLIES NO MULTIPLIER. More XP and more loot are paid by the server at
-the kill (app.py world_stir_for() asks EventsAPI.kill_scales()); a stir event
-is the stirring lands' own (current_world_tick() asks forced_stir()). The game
-is told so it can show them. And never too much at once (0.49.0): an event is
+the kill (world/'s stir_for(), app.py's world_stir_for(), asks
+EventsAPI.kill_scales()); a stir event is the stirring lands' own (world/'s
+current_tick() asks forced_stir()). The game is told so it
+can show them. And never too much at once (0.49.0): an event is
 refused when set if any land's monsters could pass the ceilings with
 everything else on, and a kill is held to them when paid (ceiling()). This package never imports app.py: register() is
 handed what it needs.
