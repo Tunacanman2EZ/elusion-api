@@ -2,7 +2,7 @@
 
 Every feature package (ARCHITECTURE.md) - playerstats/, events/, insights/,
 and killrecord/, friends/, gathering/, loot/, guilds/, parties/, chat/, trade/, kingdom/, world/, moderation/,
-staffdesk/, equipment/, consuming/, death/ and bank/, taken out of app.py - is built the
+staffdesk/, equipment/, consuming/, death/, bank/, carry/, skills/ and saves/, taken out of app.py - is built the
 BE105 way: each has a
 register(app, ...) that is HANDED the app, its login checks and its database,
 and never imports app.py. The source of each is checked for that elsewhere
@@ -45,6 +45,7 @@ import gathering  # noqa: E402
 import guilds  # noqa: E402
 import parties  # noqa: E402
 import bank as bank_package  # noqa: E402
+import carry as carry_package  # noqa: E402
 import chat  # noqa: E402
 import consuming  # noqa: E402
 import death  # noqa: E402
@@ -55,6 +56,8 @@ import insights  # noqa: E402
 import killrecord  # noqa: E402
 import kingdom  # noqa: E402
 import playerstats  # noqa: E402
+import saves as saves_package  # noqa: E402
+import skills as skills_package  # noqa: E402
 import staffdesk  # noqa: E402
 import trade  # noqa: E402
 import world  # noqa: E402
@@ -64,7 +67,7 @@ PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
 # The ones this file registers on its bare apps, below.
 RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds", "parties",
             "chat", "trade", "kingdom", "world", "moderation", "staffdesk", "equipment", "consuming",
-            "death", "bank")
+            "death", "bank", "carry", "skills", "saves")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -160,7 +163,15 @@ def bare_app(name):
         " gold INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL DEFAULT '', hp INTEGER NOT NULL DEFAULT 0,"
         " max_hp INTEGER NOT NULL DEFAULT 0, mana INTEGER NOT NULL DEFAULT 0, max_mana INTEGER NOT NULL DEFAULT 0,"
         " equipment TEXT NOT NULL DEFAULT '{}', stamina INTEGER NOT NULL DEFAULT 0,"
-        " max_stamina INTEGER NOT NULL DEFAULT 0, pools_at INTEGER NOT NULL DEFAULT 0);"
+        " max_stamina INTEGER NOT NULL DEFAULT 0, pools_at INTEGER NOT NULL DEFAULT 0,"
+        " last_train_at INTEGER NOT NULL DEFAULT 0, active_pet_id TEXT NOT NULL DEFAULT '',"
+        " explored TEXT NOT NULL DEFAULT '{}', xp INTEGER NOT NULL DEFAULT 0,"
+        " xp_to_next INTEGER NOT NULL DEFAULT 100, bank_gold INTEGER NOT NULL DEFAULT 0,"
+        " PRIMARY KEY (user_id, slot));"
+        "CREATE TABLE character_deletions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, slot INTEGER,"
+        " class_id TEXT, name TEXT, level INTEGER, gold INTEGER NOT NULL DEFAULT 0, deleted_at INTEGER,"
+        " snapshot TEXT);"
+        "CREATE TABLE save_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, slot INTEGER);"
         "CREATE TABLE consume_grants (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, slot INTEGER, item_id TEXT,"
         " target TEXT NOT NULL DEFAULT '', amount INTEGER NOT NULL DEFAULT 0, at INTEGER);"
         "CREATE TABLE parties (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER);"
@@ -174,8 +185,10 @@ def bare_app(name):
         " UNIQUE (guild_id, user_id));"
         "CREATE TABLE guild_events (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER, at INTEGER, kind TEXT,"
         " actor TEXT, target TEXT, detail TEXT);"
-        "CREATE TABLE carry_items (user_id INTEGER, slot INTEGER, position INTEGER, item_id TEXT, quantity INTEGER);"
-        "CREATE TABLE skills (user_id INTEGER, slot INTEGER, skill_id TEXT, level INTEGER, xp INTEGER);"
+        "CREATE TABLE carry_items (user_id INTEGER, slot INTEGER, position INTEGER, item_id TEXT, quantity INTEGER,"
+        " PRIMARY KEY (user_id, slot, position));"
+        "CREATE TABLE skills (user_id INTEGER, slot INTEGER, skill_id TEXT, level INTEGER, xp INTEGER,"
+        " PRIMARY KEY (user_id, slot, skill_id));"
         "CREATE TABLE loot_bags (bag_id TEXT PRIMARY KEY, user_id INTEGER, slot INTEGER, enemy_id TEXT, created_at INTEGER);"
         "CREATE TABLE loot_bag_items (bag_id TEXT, position INTEGER, item_id TEXT, quantity INTEGER);"
         "CREATE TABLE kill_tally (user_id INTEGER, slot INTEGER, enemy_id TEXT, kills INTEGER, first_at INTEGER,"
@@ -659,84 +672,92 @@ def bare_app(name):
         lusion_gold_value=1000, revive_grant_id="__revive__", respawn_grant_id="__respawn__",
         status_of=status_of)
 
-    # bank/: a four-cell bank. The grid helpers it shares with the backpack are
-    # app.py's, so here they are small stand-ins over either table - taking
-    # from the highest cell first, as app.py's do; a move onto an empty cell
-    # moves, onto anything else swaps.
-    def where_of(key_columns):
-        return " AND ".join("%s = ?" % column for column in key_columns)
-
-    def take_from_cells(rows, item_id, quantity, prefer=None):
-        held = sorted(((int(r["position"]), int(r["quantity"])) for r in rows if r["item_id"] == item_id),
-                      reverse=True)
-        if sum(q for _p, q in held) < quantity:
-            return None, sum(q for _p, q in held)
-        changes = []
-        for position, have in held:
-            if quantity <= 0:
-                break
-            gone = min(have, quantity)
-            changes.append((position, have - gone))
-            quantity -= gone
-        return changes, None
-
-    def apply_cell_changes(table, key_columns, key_values, changes):
-        for position, left in changes:
-            if left <= 0:
-                get_db().execute("DELETE FROM %s WHERE %s AND position = ?" % (table, where_of(key_columns)),
-                                 (*key_values, position))
-            else:
-                get_db().execute("UPDATE %s SET quantity = ? WHERE %s AND position = ?"
-                                 % (table, where_of(key_columns)), (left, *key_values, position))
-
-    def cell_of(table, key_columns, key_values, position):
-        return get_db().execute("SELECT item_id, quantity FROM %s WHERE %s AND position = ?"
-                                % (table, where_of(key_columns)), (*key_values, position)).fetchone()
-
-    def grid_move(table, key_columns, key_values, source, target, item_id):
-        moving = cell_of(table, key_columns, key_values, source)
-        if moving is None or moving["item_id"] != item_id:
-            return "stale"
-        there = cell_of(table, key_columns, key_values, target)
-        get_db().execute("UPDATE %s SET position = -1 WHERE %s AND position = ?" % (table, where_of(key_columns)),
-                         (*key_values, source))
-        if there is not None:
-            get_db().execute("UPDATE %s SET position = ? WHERE %s AND position = ?"
-                             % (table, where_of(key_columns)), (source, *key_values, target))
-        get_db().execute("UPDATE %s SET position = ? WHERE %s AND position = -1" % (table, where_of(key_columns)),
-                         (target, *key_values))
-        return "moved"
-
-    def grid_discard(table, key_columns, key_values, position, item_id):
-        held = cell_of(table, key_columns, key_values, position)
-        if held is None or held["item_id"] != item_id:
-            return "stale", None
-        get_db().execute("DELETE FROM %s WHERE %s AND position = ?" % (table, where_of(key_columns)),
-                         (*key_values, position))
-        return "discarded", (held["item_id"], int(held["quantity"]))
-
+    # carry/: four bag cells and two keys. A cell is named the way app.py's
+    # parse_grid_cell() does; the owners are app.config's, so a check can make
+    # ann one; a trade's resync is app.config's too, handed out once and gone.
+    # The pile's worth is ten gold a coin pile, one lusion a lusion; the money
+    # goes through the same ledgers death's does.
     def grid_cell(payload, key, capacity):
         raw = payload.get(key)
         if isinstance(raw, int) and not isinstance(raw, bool) and 0 <= raw < capacity:
             return raw, None
         return None, ({"error": "Bad Request", "message": "%s must be an integer 0-%d" % (key, capacity - 1)}, 400)
 
-    def positional(cells, field):
-        return [(i, c["item_id"], int(c["quantity"])) for i, c in enumerate(cells) if c], None
+    def item_named(payload):
+        item_id = str(payload.get("item_id", "")).strip()
+        if not item_id:
+            return None, ({"error": "Bad Request", "message": "item_id must be 1-64 characters"}, 400)
+        return item_id, None
 
+    owners = app.config.setdefault("owners", {OWNER})
+    trade_resyncs = app.config.setdefault("trade_resyncs", {})
+    app.config["carry"] = carry_package.register(
+        app, require_auth=require_auth, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+        parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None, max_slot=3,
+        slot_exists=lambda user_id, slot: get_db().execute(
+            "SELECT 1 FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone() is not None,
+        parse_grid_cell=grid_cell, parse_item_id=item_named, has_owner_powers=lambda name: name in owners,
+        catalogue=CarryCatalogue, bag_cells=GATHER_CELLS, carry_cells=GATHER_CELLS + 2, quantity_ceiling=99,
+        take_resync=lambda _db, user_id, slot: trade_resyncs.pop((user_id, slot), None),
+        money_item_worth=lambda item_id: {"goldpile": ("gold", 10), "lusions": ("lusions", 1)}.get(item_id, (None, 0)),
+        lusions_item_id=lambda: "lusions", ensure_account=ensure_account, gold_delta=ledger_delta,
+        lusion_delta=lusion_delta_ledger, account_of=lambda user_id: dict(ensure_account(user_id)))
+    carry = app.config["carry"]
+
+    # skills/: a level every ten XP, five at most; cooking is the one skill
+    # the client may still write here, so the write's clamp has something to
+    # hold; training is two agility, five defense and one magic a second, ten
+    # seconds a report at most, and a magic specialty that doubles it.
+    app.config["skills_api"] = skills_package.register(
+        app, require_auth=require_auth, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+        parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None, max_slot=3,
+        parse_stat=parse_stat,
+        slot_exists=lambda user_id, slot: get_db().execute(
+            "SELECT 1 FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone() is not None,
+        has_owner_powers=lambda name: name in owners, catalogue=SkillCatalogue,
+        valid_skills={"attack", "magic", "agility", "defense", "fishing", "cooking"},
+        server_owned={"attack", "magic", "agility", "defense", "fishing"}, trainable=("agility", "defense", "magic"),
+        max_level=5, max_xp=1000, max_train_seconds=10.0,
+        max_train_xp_per_sec={"agility": 2.0, "defense": 5.0, "magic": 1.0},
+        proficient_amount=lambda class_id, skill_id, raw: int(raw * (2 if skill_id == "magic" else 1)))
+
+    # saves/: names are one line of at most the limit; the first level costs
+    # 1250; the save history is a list on the app that keeps nothing; the
+    # carry, the skills and whether a pet is held are the packages' above,
+    # the open trade trade/'s own lookup, and an account keeps two deleted
+    # characters.
+    snapshots = app.config.setdefault("snapshots", [])
+    saves_package.register(
+        app, require_auth=require_auth, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+        parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None, max_slot=3,
+        clean_text=lambda raw, limit: " ".join(str(raw or "").split())[:limit],
+        owns_item=carry.owns_item, stored_json=lambda raw, fallback: json.loads(raw) if raw else fallback,
+        derived_stats=lambda row, class_id=None, level=None: maxima(row), catalogue=SavesCatalogue,
+        take_snapshot=lambda _db, user_id, slot, reason: snapshots.append((user_id, slot, reason)),
+        status_of=lambda user_id, slot: status_of(user_id, slot) if get_db().execute(
+            "SELECT 1 FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone() else None,
+        inventory_of=carry.inventory_of, skills_of=app.config["skills_api"].skills_of,
+        find_open_trade=trade.data.find_open, gold_delta=ledger_delta, deletions_kept=2,
+        delete_reason="character-deleted")
+
+    # bank/: a four-cell bank, handed the grid steps the carry hands back -
+    # as app.py hands them - and the bank's own catalogue.
     app.config["bank_api"] = bank_package.register(
         app, require_auth=require_auth, get_db=get_db,
         bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
         parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None, max_slot=3,
         parse_stat=parse_stat, parse_cell=cell, parse_grid_cell=grid_cell,
         parse_item_id=lambda payload: (str(payload.get("item_id", "")), None),
-        parse_positional_items=positional,
+        parse_positional_items=carry.parse_positional_items,
         slot_exists=lambda user_id, slot: get_db().execute(
             "SELECT 1 FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone() is not None,
         ensure_account=ensure_account, has_owner_powers=lambda name: name == OWNER, catalogue=BankCatalogue,
         capacity=4, carry_capacity=GATHER_CELLS, backpack_capacity=GATHER_CELLS, quantity_ceiling=99,
-        take_from_cells=take_from_cells, apply_cell_changes=apply_cell_changes, grid_move=grid_move,
-        grid_discard=grid_discard, add_to_backpack=add,
+        take_from_cells=carry.take_from_cells, apply_cell_changes=carry.apply_cell_changes,
+        grid_move=carry.grid_move, grid_discard=carry.grid_discard, add_to_backpack=add,
         inventory_of=lambda user_id, slot: [{"position": p, "item_id": i, "quantity": q}
                                             for p, (i, q) in sorted(carried(user_id, slot).items())])
     return app, said, logged, path
@@ -752,6 +773,47 @@ class BankCatalogue:
     @staticmethod
     def item_row(item_id):
         return {"stackable": True, "max_stack": 5} if item_id.endswith("potion") else {}
+
+
+class CarryCatalogue:
+    """What carry/ asks of gamedata: how high an item stacks - potions in
+    fives, as the bank's catalogue, piles in ninety-nines, a pebble and gear
+    one to a cell, anything else unknown - and no lusion pile id of its own,
+    so the one handed in is used."""
+    CONSTANTS = {}
+
+    @staticmethod
+    def item_row(item_id):
+        if item_id.endswith("potion"):
+            return {"stackable": True, "max_stack": 5}
+        if item_id in ("goldpile", "lusions"):
+            return {"stackable": True, "max_stack": 99}
+        return {"stackable": False} if item_id in ("pebble", "cobaltrobe", "ironsword", "crownhelm") else None
+
+
+class SavesCatalogue:
+    """What saves/ asks of gamedata: what the first level costs."""
+    @staticmethod
+    def xp_needed_for_level(_level):
+        return 1250
+
+
+class SkillCatalogue:
+    """What skills/ asks of gamedata: the curve, ten XP a level at every level,
+    and the level-up loop - the shape of gamedata.apply_xp()."""
+    @staticmethod
+    def xp_needed_for_skill_level(_skill_id, _level):
+        return 10
+
+    @staticmethod
+    def apply_xp(level, xp, _xp_to_next, gained, need=None):
+        xp += gained
+        levels = 0
+        while xp >= need(level):
+            xp -= need(level)
+            level += 1
+            levels += 1
+        return level, xp, need(level), levels
 
 
 class DeathCatalogue:
@@ -828,6 +890,10 @@ class TradeCatalogue:
         return int(value) // 10
 
 
+def snapshots_of(app):
+    return list(app.config["snapshots"])
+
+
 def who(name):
     return {"X-Test-User": name}
 
@@ -869,7 +935,11 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/staff/user/<username>", "/api/character/equip", "/api/character/unequip",
                        "/api/character/consume", "/api/character/revive",
                        "/api/character/respawn", "/api/account", "/api/account/bank", "/api/account/lusions",
-                       "/api/bank/items", "/api/bank/gold", "/api/bank/move", "/api/bank/discard"]), rules)
+                       "/api/bank/items", "/api/bank/gold", "/api/bank/move", "/api/bank/discard",
+                       "/api/character/inventory", "/api/character/inventory/move",
+                       "/api/character/inventory/discard", "/api/character/inventory/cash",
+                       "/api/character/skills", "/api/skill/train", "/api/save", "/api/save",
+                       "/api/character", "/api/character/delete"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -1765,7 +1835,7 @@ check("consuming: ann drinks one - taken by the grant handed in, and what it res
       code == 200 and body.get("remaining") == 1 and body.get("restores") == {"target": "hp", "amount": 25}
       and grants == [("smallhealthpotion", "hp", 25)] and app_a.config["preferred"][-1] == 1, (body, grants))
 conn = sqlite3.connect(path_a)
-conn.executemany("INSERT INTO carry_items VALUES (2, 0, ?, ?, 1)", [(0, "elixir"), (3, "chefsoup")])
+conn.executemany("INSERT INTO carry_items VALUES (2, 0, ?, ?, 1)", [(4, "elixir"), (5, "chefsoup")])
 conn.commit()
 conn.close()
 check("  the catalogue's no is the 403 it was - her level, and a skill from the levels handed in",
@@ -1901,6 +1971,262 @@ check("a whole bank from a player is ignored, with the bank the server holds",
 res = client_a.put("/api/account/lusions", headers=who("ann"), json={"lusions": 9999})
 check("  and so is a lusion balance, read back from the account",
       res.get_json().get("ignored") == ["lusions"] and res.get_json().get("lusions") == 5)
+def ann_carry(app=None):
+    """ann's slot 0 as the carry hands it back, (item_id, quantity) or None a
+    cell - read through the package's own inventory_of()."""
+    app = app or app_a
+    with app.app_context():
+        return [(c["item_id"], c["quantity"]) if c else None for c in app.config["carry"].inventory_of(2, 0)]
+
+
+def cells_of(body):
+    return [(c["item_id"], c["quantity"]) if c else None for c in body.get("inventory", [])]
+
+
+def handed_back(area, name, *args, **kwargs):
+    """Call one of what register() handed back, in a request's context, and
+    commit - as the routes that use them do."""
+    with app_a.app_context():
+        out = getattr(app_a.config[area], name)(*args, **kwargs)
+        app_a.config["world_db"]().commit()
+    return out
+
+
+conn = sqlite3.connect(path_a)
+conn.execute("DELETE FROM carry_items WHERE user_id = 2")
+conn.executemany("INSERT INTO carry_items VALUES (2, 0, ?, ?, ?)",
+                 [(0, "smallhealthpotion", 3), (1, "pebble", 1), (4, "smallhealthpotion", 4)])
+conn.commit()
+conn.close()
+code, body = gear("/api/character/inventory/move", {"from": 1, "to": 2, "item_id": "pebble"})
+check("carry: a drag onto an empty cell moves it - and the answer is every carried cell, the bag's four and two keys",
+      code == 200 and cells_of(body) == [("smallhealthpotion", 3), None, ("pebble", 1), None,
+                                         ("smallhealthpotion", 4), None], body)
+gear("/api/character/inventory/move", {"from": 4, "to": 0, "item_id": "smallhealthpotion"})
+check("  a key's potions onto the bag's merge up to the stack the catalogue handed in allows, the rest staying put",
+      ann_carry() == [("smallhealthpotion", 5), None, ("pebble", 1), None, ("smallhealthpotion", 2), None], ann_carry())
+gear("/api/character/inventory/move", {"from": 2, "to": 0, "item_id": "pebble"})
+check("  and onto anything else they swap",
+      ann_carry()[:3] == [("pebble", 1), None, ("smallhealthpotion", 5)], ann_carry())
+code, body = gear("/api/character/inventory/move", {"from": 1, "to": 3, "item_id": "pebble"})
+check("  a cell that does not hold what the game saw is the 409 it was, with the carry and the purse, and nothing moved",
+      code == 409 and body.get("message") == "Your backpack changed on the server. It has been reloaded."
+      and body.get("resync", {}).get("reason") == "stale_save" and body["resync"].get("gold") == ann_row("gold")
+      and cells_of(body["resync"]) == ann_carry() and ann_carry()[0] == ("pebble", 1), body)
+code, body = gear("/api/character/inventory/discard", {"position": 0, "item_id": "pebble"})
+check("  the bin destroys the stack, and says what it was",
+      code == 200 and body.get("discarded") == {"item_id": "pebble", "quantity": 1} and ann_carry()[0] is None, body)
+check("  and a cell off the carry is the 400 of the parser handed in",
+      gear("/api/character/inventory/discard", {"position": 6, "item_id": "pebble"})
+      == (400, {"error": "Bad Request", "message": "position must be an integer 0-5"}))
+conn = sqlite3.connect(path_a)
+conn.executemany("INSERT INTO carry_items VALUES (2, 0, ?, ?, ?)", [(1, "goldpile", 3), (3, "lusions", 4)])
+conn.commit()
+conn.close()
+gold_before, lusions_before = ann_row("gold"), ann_says("SELECT lusions FROM accounts WHERE user_id = 2")[0][0]
+code, body = gear("/api/character/inventory/cash", {"position": 1, "item_id": "goldpile"})
+check("  a coin pile cashed: worth what money_item_worth() handed in says, through the gold ledger handed in",
+      code == 200 and body.get("gold") == gold_before + 30 == ann_row("gold")
+      and body.get("cashed") == {"item_id": "goldpile", "quantity": 3, "currency": "gold", "amount": 30}
+      and ann_says("SELECT delta, detail FROM gold_ledger WHERE user_id = 2 AND reason = 'pile'") == [(30, "goldpile x3")]
+      and ann_carry()[1] is None, body)
+code, body = gear("/api/character/inventory/cash", {"position": 3, "item_id": "lusions"})
+check("  a lusion pile into lusions, by the pile id handed in, through the lusion ledger, the account read back",
+      code == 200 and body.get("lusions") == lusions_before + 4 and body["cashed"]["currency"] == "lusions"
+      and ann_says("SELECT delta, reason FROM lusion_ledger WHERE user_id = 2 AND reason = 'pile'") == [(4, "pile")], body)
+check("  and a potion is not money, the 409 it was",
+      gear("/api/character/inventory/cash", {"position": 2, "item_id": "smallhealthpotion"})
+      == (409, {"error": "Conflict", "message": "That is not money."}))
+
+
+def whole_carry(cells, **more):
+    res = client_a.put("/api/character/inventory", headers=who("ann"), json=dict({"slot": 0, "inventory": cells}, **more))
+    return res.status_code, res.get_json() or {}
+
+
+before = ann_carry()
+code, body = whole_carry([{"item_id": "crownhelm", "quantity": 1}])
+check("a whole carry from a player is ignored, with the carry the server holds",
+      code == 200 and body.get("ignored") == ["inventory"] and cells_of(body) == before == ann_carry(), body)
+check("  and still validated first, the 400s it was: too many cells, a stack past the catalogue's, an unknown past the ceiling",
+      whole_carry([None] * 7)[1].get("message") == "inventory has 7 entries, capacity is 6"
+      and whole_carry([{"item_id": "smallhealthpotion", "quantity": 6}])[1].get("message")
+      == "inventory[0].quantity is 6, the most smallhealthpotion stacks to is 5"
+      and whole_carry([{"item_id": "mystery", "quantity": 100}])[1].get("message")
+      == "inventory[0].quantity is 100, the most mystery stacks to is 99")
+app_a.config["trade_resyncs"][(2, 0)] = {"slot": 0, "reason": "trade"}
+first = whole_carry([])
+check("  a trade's resync, handed in, refuses the write once and is gone",
+      first == (409, {"error": "Conflict", "message": "Your backpack changed on the server - a trade finished. "
+                                                      "It has been reloaded.", "resync": {"slot": 0, "reason": "trade"}})
+      and whole_carry([])[0] == 200, first)
+code, body = whole_carry([], based_on="0" * 40)
+check("  a bag built on another is the 409 with the carry the server holds",
+      code == 409 and body["resync"]["reason"] == "stale_save" and cells_of(body["resync"]) == ann_carry(), body)
+app_a.config["owners"].add("ann")
+code, body = whole_carry([{"item_id": "crownhelm", "quantity": 1}, None])
+app_a.config["owners"].discard("ann")
+check("  an owner's is written - the whole bag, and a key past the end of the array left as it was",
+      code == 200 and ann_carry() == [("crownhelm", 1), None, None, None, ("smallhealthpotion", 2), None]
+      and cells_of(body) == ann_carry(), body)
+check("the grants: seven potions land in the bag's empty cells, in fives - never on the key already holding some",
+      handed_back("carry", "add_to_backpack", 2, 0, "smallhealthpotion", 7) == [1, 2]
+      and ann_carry() == [("crownhelm", 1), ("smallhealthpotion", 5), ("smallhealthpotion", 2), None,
+                          ("smallhealthpotion", 2), None], ann_carry())
+check("  three more top up the part-used stack first",
+      handed_back("carry", "add_to_backpack", 2, 0, "smallhealthpotion", 3) == [2]
+      and ann_carry()[2] == ("smallhealthpotion", 5), ann_carry())
+check("  and two pebbles for one free cell is None, and nothing written",
+      handed_back("carry", "add_to_backpack", 2, 0, "pebble", 2) is None and ann_carry()[3] is None, ann_carry())
+check("  a take the player did not point at spends the bag before the keys, the highest cell first",
+      handed_back("carry", "take_from_backpack", 2, 0, "smallhealthpotion", 6, keys_last=True) is True
+      and ann_carry()[1:5] == [("smallhealthpotion", 4), None, None, ("smallhealthpotion", 2)], ann_carry())
+check("  one the player did - a key - spends that cell first",
+      handed_back("carry", "take_from_backpack", 2, 0, "smallhealthpotion", 1, prefer=4) is True
+      and ann_carry()[4] == ("smallhealthpotion", 1) and ann_carry()[1] == ("smallhealthpotion", 4), ann_carry())
+check("  more than is carried is False, and nothing taken",
+      handed_back("carry", "take_from_backpack", 2, 0, "smallhealthpotion", 99) is False
+      and ann_carry()[1] == ("smallhealthpotion", 4), ann_carry())
+check("  and what an account holds is the carry or the bank: a potion banked counts for another slot, a helm does not",
+      handed_back("carry", "owns_item", 2, 0, "crownhelm") is True
+      and handed_back("carry", "owns_item", 2, 1, "smallhealthpotion") is True
+      and handed_back("carry", "owns_item", 2, 1, "crownhelm") is False)
+
+
+def trained(**report):
+    res = client_a.post("/api/skill/train", headers=who("ann"), json=dict({"slot": 0}, **report))
+    return res.status_code, res.get_json() or {}
+
+
+code, body = trained(agility=1000, defense=3, magic=4)
+check("skills: a training report held to the clock handed in - ten seconds at most - the specialty applied, by the curve",
+      code == 200 and body.get("skills") == {"agility": {"level": 3, "xp": 0, "levels_gained": 2},
+                                             "defense": {"level": 1, "xp": 3, "levels_gained": 0},
+                                             "magic": {"level": 1, "xp": 8, "levels_gained": 0}}
+      and ann_row("last_train_at") > 0, body)
+code, body = trained(agility=1000)
+check("  the same report again at once has no time left to cash",
+      code == 200 and body["skills"]["agility"] == {"level": 3, "xp": 0, "levels_gained": 0}, body)
+check("  and a bad amount, or nobody, the 400 and 404 they were",
+      trained(defense=-1) == (400, {"error": "Bad Request", "message": "defense must be a non-negative integer"})
+      and trained(slot=1) == (404, {"error": "Not Found", "message": "No character in slot 1."}))
+
+
+def skills_write(skills):
+    res = client_a.put("/api/character/skills", headers=who("ann"), json={"slot": 0, "skills": skills})
+    return res.status_code, res.get_json() or {}
+
+
+code, body = skills_write({"cooking": {"level": 40, "xp": 5}, "agility": {"level": 99, "xp": 0}})
+check("  a skills write: held to the ceiling handed in, the server's own dropped, the rest stored",
+      code == 200 and body["skills"].get("cooking") == {"level": 5, "xp": 5}
+      and body["skills"].get("agility") == {"level": 3, "xp": 0}, body)
+check("  and an unknown skill, or a level of nothing, the 400 it was",
+      skills_write({"cookery": {"level": 2}})
+      == (400, {"error": "Bad Request",
+                "message": "Unknown skill 'cookery'. Known skills: agility, attack, cooking, defense, fishing, magic"})
+      and skills_write({"cooking": {"level": 0}})[1].get("message") == "skills.cooking.level must be a positive integer")
+check("  the grant handed back: a thousand XP is a hundred levels on that curve, held to five",
+      handed_back("skills_api", "grant_xp", 2, 0, "attack", 1000) == (5, 0, 100)
+      and handed_back("skills_api", "skills_of", 2, 0).get("attack") == {"level": 5, "xp": 0}
+      and handed_back("skills_api", "grant_xp", 2, 0, "nothing", 0) == (1, 0, 0))
+def bo_saves(method, path, body=None):
+    res = client_a.open(path, method=method, headers=who("bo"), json=body)
+    return res.status_code, res.get_json() or {}
+
+
+def bo_row(slot, column):
+    return ann_says("SELECT %s FROM saves WHERE user_id = 3 AND slot = ?" % column, (slot,))[0][0]
+
+
+code, body = bo_saves("GET", "/api/save")
+check("saves: an account's slots - bo's one, its JSON columns read back",
+      code == 200 and body.get("username") == "bo" and [s["slot"] for s in body["slots"]] == [0]
+      and body["slots"][0]["equipment"] == {} and body["slots"][0]["explored"] == {}, body)
+made = bo_saves("PUT", "/api/save", {"slot": 1, "class_id": "Healer", "name": "  Bo   Two ", "level": 50,
+                                    "area": "town", "equipment": {"chest": "cobaltrobe"}, "hotbar": ["x"],
+                                    "active_pet_id": "petmage",
+                                    "explored": {"town": {"w": 2, "h": 2, "bits": "AA"}}})
+check("  a new one: the name by the text rule handed in, its level never the body's, full at the maxima handed in",
+      made[0] == 200 and bo_row(1, "name") == "Bo Two" and bo_row(1, "class_id") == "healer"
+      and bo_row(1, "level") == 1 and bo_row(1, "area") == "town" and bo_row(1, "hp") == 100
+      and bo_row(1, "max_mana") == 50 and bo_row(1, "xp_to_next") == 1250, made)
+check("  and the pet it does not hold, the equipment and the hotbar are said to be ignored, nothing worn",
+      made[1].get("ignored") == ["active_pet_id", "equipment", "hotbar"] and made[1].get("equipment") == {}
+      and made[1].get("active_pet_id") == "" and bo_row(1, "equipment") == "{}" and snapshots_of(app_a) == [], made)
+conn = sqlite3.connect(path_a)
+conn.execute("UPDATE saves SET hp = 10 WHERE user_id = 3 AND slot = 1")
+conn.execute("INSERT INTO carry_items VALUES (3, 1, 0, 'petmage', 1)")
+conn.commit()
+conn.close()
+code, body = bo_saves("PUT", "/api/save", {"slot": 1, "class_id": "healer", "name": "Bo Two", "active_pet_id": "petmage"})
+check("  saved again: what was not sent is kept, a held pet is out, the pools never refilled, a snapshot asked for",
+      code == 200 and body.get("active_pet_id") == "petmage" and "ignored" not in body
+      and bo_row(1, "area") == "town" and '"town"' in bo_row(1, "explored") and bo_row(1, "hp") == 10
+      and snapshots_of(app_a) == [(3, 1, "save")], body)
+conn = sqlite3.connect(path_a)
+conn.execute("UPDATE saves SET equipment = '{\"chest\": \"cobaltrobe\"}', max_hp = 120, hp = 120"
+             " WHERE user_id = 3 AND slot = 1")
+conn.commit()
+conn.close()
+bo_saves("PUT", "/api/save", {"slot": 1, "class_id": "healer", "name": "Bo Two"})
+conn = sqlite3.connect(path_a)
+conn.execute("UPDATE saves SET equipment = '{}' WHERE user_id = 3 AND slot = 1")
+conn.commit()
+conn.close()
+bo_saves("PUT", "/api/save", {"slot": 1, "class_id": "healer", "name": "Bo Two"})
+check("  and a ceiling that fell takes the pool down with it",
+      bo_row(1, "max_hp") == 100 and bo_row(1, "hp") == 100, (bo_row(1, "max_hp"), bo_row(1, "hp")))
+check("  the 400s it had: a class, a name too long, a map of the wrong shape, a pet id too long",
+      bo_saves("PUT", "/api/save", {"slot": 1, "class_id": "bard", "name": "x"})[1].get("message")
+      == "class_id must be one of: healer, mage, tank, warrior"
+      and bo_saves("PUT", "/api/save", {"slot": 1, "class_id": "mage", "name": "x" * 21})[1].get("message")
+      == "name must be 1-20 characters"
+      and bo_saves("PUT", "/api/save", {"slot": 1, "class_id": "mage", "name": "x", "explored": []})[1].get("message")
+      == "explored must be an object of {area: {w, h, ox, oy, bits}} and under 65536 bytes"
+      and bo_saves("PUT", "/api/save", {"slot": 1, "class_id": "mage", "name": "x",
+                                        "active_pet_id": "p" * 65})[1].get("message")
+      == "active_pet_id must be a string of at most 64 characters")
+code, body = bo_saves("GET", "/api/character?slot=1")
+check("  the whole character in one read: who, the vitals, the carry, what is worn, the skills",
+      code == 200 and body.get("class_id") == "healer" and body.get("name") == "Bo Two"
+      and body.get("active_pet_id") == "petmage" and body.get("status", {}).get("hp") == 100
+      and body.get("inventory", [None])[0] == {"item_id": "petmage", "quantity": 1} and len(body["inventory"]) == 6
+      and body.get("equipment") == {} and body.get("skills") == {}, body)
+check("  and an empty slot, or no slot, the 404 and 400 they were",
+      bo_saves("GET", "/api/character?slot=2") == (404, {"error": "Not Found", "message": "No character in slot 2."})
+      and bo_saves("GET", "/api/character?slot=9")[0] == 400)
+conn = sqlite3.connect(path_a)
+conn.execute("UPDATE trades SET state = 'cancelled' WHERE state = 'open'")
+conn.execute("INSERT INTO trades (trade_id, a_user, a_slot, b_user, b_slot, state, created_at, updated_at)"
+             " VALUES ('t-saves', 2, 0, 3, 1, 'open', 0, 0)")
+conn.execute("UPDATE saves SET gold = 70 WHERE user_id = 3 AND slot = 1")
+conn.commit()
+conn.close()
+check("deleting: the name not typed is the 400 it was, and a character in a trade the 409",
+      bo_saves("POST", "/api/character/delete", {"slot": 1, "confirm": "Bo"})
+      == (400, {"error": "Bad Request", "message": "Type the character's name to delete it."})
+      and bo_saves("POST", "/api/character/delete", {"slot": 1, "confirm": "bo two"})
+      == (409, {"error": "Conflict", "message": "This character is in a trade. Finish or cancel it first."}))
+conn = sqlite3.connect(path_a)
+conn.execute("UPDATE trades SET state = 'cancelled' WHERE trade_id = 't-saves'")
+conn.commit()
+conn.close()
+code, body = bo_saves("POST", "/api/character/delete", {"slot": 1, "confirm": " BO TWO "})
+kept = ann_says("SELECT class_id, name, gold, snapshot FROM character_deletions WHERE user_id = 3")
+check("  typed, it goes: the purse through the ledger handed in, its rows gone, and a copy kept",
+      body == {"slot": 1, "deleted": True, "gold_lost": 70, "items_lost": 1}
+      and ann_says("SELECT delta, reason FROM gold_ledger WHERE user_id = 3 AND reason = 'character-deleted'")
+      == [(-70, "character-deleted")]
+      and ann_says("SELECT COUNT(*) FROM saves WHERE user_id = 3 AND slot = 1") == [(0,)]
+      and ann_says("SELECT COUNT(*) FROM carry_items WHERE user_id = 3 AND slot = 1") == [(0,)]
+      and len(kept) == 1 and kept[0][:3] == ("healer", "Bo Two", 70)
+      and json.loads(kept[0][3])["carry_items"] == [{"position": 0, "item_id": "petmage", "quantity": 1}], (body, kept))
+for again in range(2):
+    bo_saves("PUT", "/api/save", {"slot": 1, "class_id": "tank", "name": "Again"})
+    bo_saves("POST", "/api/character/delete", {"slot": 1, "confirm": "again"})
+check("  and an account keeps only the deleted characters it is handed to keep, the newest",
+      ann_says("SELECT name FROM character_deletions WHERE user_id = 3 ORDER BY id") == [("Again",), ("Again",)])
 check("and nobody without a login gets in anywhere",
       [client_a.get(path).status_code for path in ("/api/server/stats", "/api/world/events/active", "/api/server/insights",
                                                   "/api/kills?slot=0", "/api/kills/everyone", "/api/friends",
@@ -1909,7 +2235,7 @@ check("and nobody without a login gets in anywhere",
                                                   "/api/trade", "/api/trade/history", "/api/staff/trades",
                                                   "/api/economy/kingdom", "/api/server/world", "/api/staff/reports",
                                                   "/api/staff/users", "/api/staff/actions", "/api/staff/user/ann",
-                                                  "/api/account")]
+                                                  "/api/account", "/api/save", "/api/character?slot=0")]
       + [client_a.post(path, json={"slot": 0}).status_code for path in ("/api/fishing/catch", "/api/cooking/cook",
                                                                          "/api/loot/take", "/api/guild/create",
                                                                          "/api/staff/guild", "/api/party/invite",
@@ -1928,10 +2254,16 @@ check("and nobody without a login gets in anywhere",
                                                                          "/api/character/revive",
                                                                          "/api/character/respawn", "/api/bank/items",
                                                                          "/api/bank/gold", "/api/bank/move",
-                                                                         "/api/bank/discard")]
+                                                                         "/api/bank/discard",
+                                                                         "/api/character/inventory/move",
+                                                                         "/api/character/inventory/discard",
+                                                                         "/api/character/inventory/cash",
+                                                                         "/api/skill/train",
+                                                                         "/api/character/delete")]
       + [client_a.put(path, json={}).status_code for path in ("/api/staff/role", "/api/account/bank",
-                                                              "/api/account/lusions")]
-      == [401] * 58)
+                                                              "/api/account/lusions", "/api/character/inventory",
+                                                              "/api/character/skills", "/api/save")]
+      == [401] * 68)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")
@@ -1953,6 +2285,8 @@ check("  and what it says - begun, when first asked; one set ahead, coming - is 
 board_b = app_b.test_client().get("/api/economy/kingdom", headers=who("ann")).get_json() or {}
 check("  and the kingdom board's snapshot is its own app's: the second, asked while the first's is fresh, has nothing",
       board_b.get("total") == 0 and board_b.get("top") == [] and fresh.get("total") == 123, board_b)
+check("  and the carry is its own app's: what the first one's grants put in ann's bag is not in the second's",
+      ann_carry(app_b) == [None] * 6 and ann_carry()[0] == ("crownhelm", 1), ann_carry(app_b))
 for path in (path_a, path_b):
     if os.path.exists(path):
         os.remove(path)
@@ -1962,7 +2296,7 @@ section("P-4  every package is here")
 check("the code map finds the packages app.py imports: %s" % ", ".join(PACKAGES),
       set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds",
                         "parties", "chat", "trade", "kingdom", "world", "moderation", "staffdesk",
-                        "equipment", "consuming", "death", "bank"},
+                        "equipment", "consuming", "death", "bank", "carry", "skills", "saves"},
       PACKAGES)
 check("  and every one of them runs on a bare app in this file", set(PACKAGES) == set(RUN_HERE),
       sorted(set(PACKAGES) ^ set(RUN_HERE)))

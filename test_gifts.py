@@ -337,10 +337,20 @@ sword_cell = one("SELECT position FROM carry_items WHERE user_id = ? AND slot = 
 r = client.post("/api/character/inventory/cash", headers=bearer(student_t),
                 json={"slot": 2, "position": sword_cell, "item_id": "ironsword"})
 check("  and a sword is still not money", r.status_code == 409, r.status_code)
+# WHEREVER THE CASH ROUTE LIVES: app.py's, or since 18 Oct carry/'s - a
+# function inside register(), found the code map's way. There the function is
+# HANDED IN, so it is one function only if app.py hands it this one, by name.
+import codemap  # noqa: E402
+_app_src = open(os.path.join(HERE, "app.py"), encoding="utf-8").read()
+_cash = [src.split("def cash_carried_pile")[1][:4000]
+         for src in [_app_src] + [open(os.path.join(HERE, _package, "routes.py"), encoding="utf-8").read()
+                                  for _package, _rows, _layers in codemap.feature_packages()]
+         if "def cash_carried_pile" in src]
 check("the cash route and the gifts ledger ask one function what money is worth",
       app_module.money_item_worth("goldpile") == ("gold", PILE) and app_module.money_item_worth("lusions") == ("lusions", 1)
       and app_module.money_item_worth("ironsword") == (None, 0)
-      and "money_item_worth(item_id)" in open(os.path.join(HERE, "app.py")).read().split("def cash_carried_pile")[1][:4000])
+      and len(_cash) == 1 and "money_item_worth(item_id)" in _cash[0]
+      and ("def cash_carried_pile" in _app_src or "money_item_worth=money_item_worth," in _app_src), len(_cash))
 
 # =========================================================================
 section("GL-8 giftwatch.py ON THE SERVER")

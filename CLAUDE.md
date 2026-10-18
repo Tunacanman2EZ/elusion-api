@@ -210,9 +210,10 @@ the server's now (ONE CELL AT A TIME in app.py): a drag is
 `.../cash`, and the bank has `/api/bank/move` and `/api/bank/discard`. A
 player's whole-bag and whole-bank writes are answered with the server's grid
 and `ignored`; build 2 of the game does not send them. The `based_on` and
-trade-resync 409s are still in `write_inventory()` for a build-1 game. **A new
-route that changes a grid takes one cell and the item the game saw in it** -
-`_grid_move()` / `_grid_discard()`, and `_carry_resync()` / bank/'s `resync()`
+trade-resync 409s are still in `write_inventory()` (carry/routes.py) for a
+build-1 game. **A new route that changes a grid takes one cell and the item
+the game saw in it** - `_grid_move()` / `_grid_discard()` (carry/'s since 18
+Oct, under the names they had), and `_carry_resync()` / bank/'s `resync()`
 for the 409 - and answers with the whole grid. `test_bagmoves.py`.
 
 ### A read before the first write is outside the transaction
@@ -2040,6 +2041,21 @@ only, `test_stats.py`.
   the account, the bank's seven routes and the bank's packing; the grid
   helpers it shares with the backpack, the ledgers and the account row stay in
   app.py, and it hands back `account_of()`, kept as `account_payload()`).
+  And `carry/` and `skills/` (18 Oct: the backpack's four routes and the
+  skills' two, and **the grants every other area pays with** - the item
+  grants, whether an account holds an item, the XP grant, and the grid steps
+  the bank and the shop's sale share. Both are registered ahead of the bank,
+  before anything they are handed to, and hand everything back; app.py keeps
+  each under its old name - `_add_to_backpack()`, `_take_from_backpack()`,
+  `_grant_skill_xp()`, `inventory_payload()`, `_grid_move()` and the rest).
+  **A package registered early is handed what is defined later as a lookup**
+  (`lambda: LUSIONS_ITEM_ID`, `lambda user_id: account_payload(user_id)`):
+  the name does not exist yet when register() runs. And `saves/` (18 Oct:
+  GET and PUT /api/save, GET /api/character and deleting a character;
+  registered late, after everything it is handed, so nothing is a lookup).
+  **Something noticed along the way that needs upgrading goes in
+  UPGRADES.md** (the owner asked to be kept told): checked first, then where
+  it is, why it matters, how big the fix is.
   **trade/ is handed gamedata whole, as `catalogue`**, so a rule checked by
   searching for `gamedata.` reads `catalogue.` too (test_quality Q-7).
   **A name a suite replaces on app.py**

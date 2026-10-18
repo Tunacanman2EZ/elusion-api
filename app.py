@@ -71,8 +71,9 @@ class _StrictJSONProvider(DefaultJSONProvider):
 app.json = _StrictJSONProvider(app)
 
 # HARD BODY-SIZE CAP. A save can carry ~64 KB per explored area (see
-# MAX_EXPLORED_BYTES), so this sits far above any legitimate request while
-# still refusing the multi-megabyte bodies whose only purpose is to exhaust
+# MAX_EXPLORED_BYTES, saves/services.py), so this sits far above any
+# legitimate request while still refusing the multi-megabyte bodies whose
+# only purpose is to exhaust
 # memory before the JSON is even parsed. Werkzeug returns a clean 413 on its
 # own once this is set - no handler ever sees an oversized body.
 #
@@ -7189,7 +7190,6 @@ def complete_recovery():
 # =============================================================================
 
 MAX_SLOT = 3
-VALID_CLASSES = {"warrior", "mage", "tank", "healer"}
 
 
 def parse_slot(raw):
@@ -7243,27 +7243,6 @@ def parse_cell(payload, capacity):
     if cell < 0 or cell >= capacity:
         return None, bad_request("position must be an integer 0-%d" % (capacity - 1))
     return cell, None
-
-
-def parse_pet_id(raw):
-    """
-    Validate an active_pet_id from a request body.
-
-    Same shape as a bank item_id - any string the client's item registry knows,
-    capped at 64 characters. Empty string is valid and means "no pet out".
-    Returns None if the value can't be one, so the caller can 400 rather than
-    store something meaningless.
-    """
-    if raw is None:
-        return ""
-    if isinstance(raw, bool):
-        return None
-    if not isinstance(raw, (str, int, float)):
-        return None
-    text = str(raw).strip()
-    if len(text) > 64:
-        return None
-    return text
 
 
 # THE SLOT NAMES COME OUT OF THE CATALOGUE. See gamedata.EQUIP_SLOTS.
@@ -7353,72 +7332,6 @@ def parse_equipment(raw, class_id="", character_level=0):
     return out
 
 
-# The ceiling on one character's explored map. Every area in the game together
-# is under 3 KB of bits before compression, and base64 of the deflated form is
-# a few hundred bytes an area - so 64 KB is roughly twenty times the largest
-# honest payload, and still small enough that a client cannot use the column as
-# free storage.
-MAX_EXPLORED_BYTES = 65536
-
-# Sanity bounds on one area's dimensions, mirroring WorldMap.MAX_AREA_TILES.
-MAX_EXPLORED_TILES = 262144
-
-
-def parse_explored(raw):
-    """
-    Validate an exploration map: {area_id: {w, h, ox, oy, bits}}.
-
-    Returns a dict, or None when the value cannot be one.
-
-    WHAT IS CHECKED IS THE SHAPE, NOT THE CONTENT. The bits are a compressed
-    bitmask this server has no reason to decompress: there is no claim being
-    made that anyone could benefit from. What matters is that the column
-    contains a bounded amount of JSON of a known shape, so it cannot be used
-    as a place to park arbitrary data and cannot make the save endpoint 500 on
-    read-back.
-    """
-    if raw is None:
-        return {}
-    if not isinstance(raw, dict):
-        return None
-
-    encoded = json.dumps(raw)
-    if len(encoded) > MAX_EXPLORED_BYTES:
-        return None
-
-    out = {}
-    for area, entry in raw.items():
-        if not isinstance(area, str) or len(area) > 64:
-            return None
-        if not isinstance(entry, dict):
-            return None
-
-        width = entry.get("w")
-        height = entry.get("h")
-        if not isinstance(width, int) or not isinstance(height, int):
-            return None
-        if isinstance(width, bool) or isinstance(height, bool):
-            return None
-        if width <= 0 or height <= 0 or width * height > MAX_EXPLORED_TILES:
-            return None
-
-        for key in ("ox", "oy"):
-            value = entry.get(key, 0)
-            if isinstance(value, bool) or not isinstance(value, int):
-                return None
-
-        bits = entry.get("bits", "")
-        if not isinstance(bits, str) or len(bits) > MAX_EXPLORED_BYTES:
-            return None
-
-        out[area] = {
-            "w": width, "h": height,
-            "ox": int(entry.get("ox", 0)), "oy": int(entry.get("oy", 0)),
-            "bits": bits,
-        }
-    return out
-
-
 def _stored_json(raw, fallback):
     """Read one of the JSON columns back, forgiving anything unreadable.
 
@@ -7453,356 +7366,11 @@ def _derived_stats(row, class_id=None, level=None):
     )
 
 
-def save_row_to_dict(row):
-    return {
-        "slot": row["slot"],
-        "class_id": row["class_id"],
-        "name": row["name"],
-        "level": row["level"],
-        "area": row["area"],
-        "active_pet_id": row["active_pet_id"],
-        "equipment": _stored_json(row["equipment"], {}),
-        "explored": _stored_json(row["explored"], {}),
-        "updated_at": row["updated_at"],
-    }
-
-
-@app.get("/api/save")
-@require_auth
-def list_saves():
-    """
-    List the account's character slots
-    ---
-    tags:
-      - Save
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-    responses:
-      200:
-        description: Occupied slots only; an empty account returns an empty list
-      401:
-        description: Missing, invalid or expired token
-    """
-    rows = get_db().execute(
-        "SELECT * FROM saves WHERE user_id = ? ORDER BY slot",
-        (g.user["id"],),
-    ).fetchall()
-
-    return {
-        "username": g.user["username"],
-        "slots": [save_row_to_dict(r) for r in rows],
-    }, 200
-
-
-@app.put("/api/save")
-@require_auth
-def write_save():
-    """
-    Create or overwrite one character slot
-    ---
-    tags:
-      - Save
-    consumes:
-      - application/json
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [slot, class_id, name]
-          properties:
-            slot:     {type: integer, example: 0}
-            class_id: {type: string,  example: warrior}
-            name:     {type: string,  example: Tunacan}
-            level:    {type: integer, example: 12}
-            area:     {type: string,  example: elusion}
-            active_pet_id:
-              type: string
-              example: petpoisonslimesmall
-              description: "Pet currently out, as the client's item_id. Empty string means none. Omitted leaves the stored value unchanged."
-    responses:
-      200:
-        description: Slot written
-      400:
-        description: Invalid slot, class, name or active_pet_id
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-
-    class_id = str(payload.get("class_id", "")).strip().lower()
-    if class_id not in VALID_CLASSES:
-        return bad_request("class_id must be one of: %s" % ", ".join(sorted(VALID_CLASSES)))
-
-    # Shown to other players - the online list, a guild's roster, a trade - so
-    # held to the same one-line rule as chat. The client names characters
-    # after their class; only a modified one could send anything else.
-    raw_name = str(payload.get("name", "")).strip()
-    name = clean_player_text(raw_name, 20)
-    if not name or len(raw_name) > 20:
-        return bad_request("name must be 1-20 characters")
-
-    # NOT from the payload. level is server-owned (see SERVER_OWNED_STATS): a
-    # new character starts at 1, and an existing one keeps whatever the server
-    # has. Taking it from the client here would have left an open door beside
-    # the one /api/player/status just closed.
-    level = 1
-    # OMITTED means "leave it alone", exactly like active_pet_id below.
-    #
-    # THIS USED TO DEFAULT TO "elusion" ON EVERY WRITE, which meant any caller
-    # that did not happen to send an area silently moved the character back to
-    # the starting zone. Nothing noticed for a long time because nothing on the
-    # client set the field at all - every character in the game just read
-    # "elusion" forever. The moment the client started reporting where it
-    # actually was, a single save from a slot loaded before the field existed
-    # would have yanked that character home.
-    #
-    # "elusion" now applies only to a brand new character, through VALUES.
-    area_key_sent = "area" in payload
-    area = str(payload.get("area", "")).strip() if area_key_sent else ""
-    if not area:
-        area = "elusion"
-        area_key_sent = False
-    if len(area) > 64:
-        return bad_request("area must be 64 characters or fewer")
-
-    # OMITTED means "leave it alone", not "clear it".
-    #
-    # The client writes this slot on character creation and again on every save,
-    # and not every one of those callers knows or cares which pet is out. If a
-    # missing key cleared the field, one save from a caller that doesn't send it
-    # would silently unequip the player's pet - and a pet is a 1-in-216 drop, so
-    # that is the last thing in the game that should vanish by omission.
-    #
-    # Sending "" explicitly is how you clear it. That's a deliberate act.
-    pet_key_sent = "active_pet_id" in payload
-    active_pet_id = parse_pet_id(payload.get("active_pet_id")) if pet_key_sent else ""
-    if pet_key_sent and active_pet_id is None:
-        return bad_request("active_pet_id must be a string of at most 64 characters")
-
-    # ONLY A PET YOU HOLD CAN BE OUT. This took any string, so a modified
-    # client could walk out a pet it had never won; decided on day 1 to close
-    # it. HELD means in this character's carry or the account's bank - the
-    # same _owns_item() the drop roll asks - and not "named in the catalogue":
-    # the server still keeps no list of pets, so a pet added to the game needs
-    # no server deploy before it can be summoned. A pet the player does not
-    # hold is not stored; the save clears it instead, and says so in `ignored`,
-    # the way gold and equipment are said.
-    pet_ignored = False
-    if pet_key_sent and active_pet_id and not _owns_item(g.user["id"], slot, active_pet_id):
-        active_pet_id = ""
-        pet_ignored = True
-
-    explored_key_sent = "explored" in payload
-    explored = parse_explored(payload.get("explored")) if explored_key_sent else {}
-    if explored_key_sent and explored is None:
-        return bad_request(
-            "explored must be an object of {area: {w, h, ox, oy, bits}} and "
-            "under %d bytes" % MAX_EXPLORED_BYTES)
-
-    # THE HOTBAR IS NOT A SAVE FIELD ANY MORE. It used to be a list of item ids,
-    # one per key, pointing into the backpack. Now each key holds the item
-    # itself, as a carry_items row past the bag (see CARRY_CAPACITY), and moves
-    # with PUT /api/character/inventory like any other cell. Ignored rather
-    # than refused, for the reason given for equipment below.
-    hotbar_ignored = "hotbar" in payload
-
-    now = int(time.time())
-
-    db = get_db()
-
-    # Read BEFORE the upsert, because afterwards there is no way to tell a
-    # character that was just created from one that already existed - and they
-    # need different treatment below. The level comes back with it: equipment
-    # is gated on it, and taking that number from the payload would hand the
-    # gate to the client. A character that does not exist yet is level 1,
-    # which is what the INSERT below is about to store.
-    existing = db.execute(
-        "SELECT level FROM saves WHERE user_id = ? AND slot = ?", (g.user["id"], slot)
-    ).fetchone()
-    is_new = existing is None
-    stored_level = 1 if is_new else int(existing["level"])
-
-    # SAME KEY-PRESENT RULE AS THE PET, for the same reason spelled out above.
-    # Several callers write this slot and not all of them know what the player
-    # is wearing; a missing key must keep what is stored, and an explicit
-    # empty one is how you take everything off.
-    #
-    # PARSED HERE RATHER THAN WITH THE REST OF THE BODY because it is the one
-    # field whose validity depends on the character, not just on the JSON - the
-    # slot has to suit the item, the class has to be allowed it and the level
-    # has to reach it. The SELECT above is the only thing between the two, and
-    # a read is not a write: every refusal below still happens before anything
-    # is stored.
-    # IGNORED, NOT REFUSED - and this is the line that makes equipment
-    # server-owned rather than merely server-moved.
-    #
-    # /api/character/equip and /unequip take the item OUT of the backpack and
-    # put it back, in one transaction, and the take IS the ownership check.
-    # All of that is worth nothing if a client can then PUT whatever equipment
-    # map it likes here: it would simply skip the endpoints and dress itself,
-    # in the column combat reads to decide what a hit is worth. That is E-1
-    # one column over, and E-8 one field over.
-    #
-    # IGNORED rather than 400, exactly like gold. An un-updated client still
-    # sends `equipment` on every save, and refusing an otherwise honest sync
-    # over a field it is no longer allowed to set would break saving for
-    # anyone who had not restarted their game. It is named in `ignored` so a
-    # client can see it is being dropped rather than silently disagreeing with
-    # the server forever.
-    #
-    # parse_equipment() is still used - by nothing on this path now, but it is
-    # what the equip endpoint's checks are made of, and it stays the one place
-    # that knows what a wearable map looks like.
-    equipment_ignored = "equipment" in payload
-
-    # ALWAYS 0, and that is the whole point rather than a leftover.
-    #
-    # The upsert below reads this as "did the caller supply equipment" and
-    # writes excluded.equipment when it is true. Setting it from the payload
-    # while forcing `equipment` to {} - which is what the first draft of this
-    # change did - would write an EMPTY map over the character's gear on every
-    # save. That is the same stripping bug this whole endpoint pair exists to
-    # fix, reintroduced by the fix.
-    #
-    # Zero means the CASE keeps saves.equipment, which is what the equip
-    # endpoints wrote and the only thing that should ever have written it.
-    equip_key_sent = 0
-    equipment = {}
-
-    # ON CONFLICT rather than DELETE-then-INSERT: an upsert is one statement,
-    # so there is no window where the slot exists in neither state.
-    #
-    # active_pet_id uses excluded.* only when the caller actually sent the key;
-    # otherwise it keeps whatever the row already holds. On a fresh INSERT there
-    # is nothing to keep, so it lands as the '' default.
-    db.execute(
-        """
-        INSERT INTO saves (user_id, slot, class_id, name, level, area, active_pet_id,
-                           equipment, explored, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, slot) DO UPDATE SET
-            class_id      = excluded.class_id,
-            name          = excluded.name,
-            -- level is NOT taken from excluded. The row keeps the level the
-            -- server granted through /api/combat/kill; the 1 in VALUES only
-            -- ever applies to a brand new character.
-            level         = saves.level,
-            area          = CASE WHEN ? THEN excluded.area
-                                 ELSE saves.area END,
-            active_pet_id = CASE WHEN ? THEN excluded.active_pet_id
-                                 ELSE saves.active_pet_id END,
-            equipment     = CASE WHEN ? THEN excluded.equipment
-                                 ELSE saves.equipment END,
-            explored      = CASE WHEN ? THEN excluded.explored
-                                 ELSE saves.explored END,
-            updated_at    = excluded.updated_at
-        """,
-        (g.user["id"], slot, class_id, name, level, area, active_pet_id,
-         json.dumps(equipment), json.dumps(explored), now,
-         1 if area_key_sent else 0,
-         1 if pet_key_sent else 0,
-         equip_key_sent,
-         1 if explored_key_sent else 0),
-    )
-    db.commit()
-
-    # DERIVED STATS BELONG ON A NEW CHARACTER TOO, not only on the next status
-    # write. Without this a freshly created warrior sat at the table's DEFAULT 10
-    # hp until something happened to push a status - and if the client had been
-    # trusted for max_hp, nobody would ever have noticed, because it would have
-    # overwritten the 10 on its first save.
-    #
-    # Recomputed on every save rather than only on creation: max_hp is a pure
-    # function of class and level, so there is no state where storing anything
-    # else is correct.
-    #
-    # AND OF WHAT IS WORN, read back from the row rather than the request -
-    # equipment is server-owned and this route never writes it.
-    stored = db.execute(
-        "SELECT class_id, level, equipment FROM saves WHERE user_id = ? AND slot = ?",
-        (g.user["id"], slot),
-    ).fetchone()
-    derived = _derived_stats(stored, class_id=class_id)
-
-    if derived is not None:
-        if is_new:
-            # A new character starts with full pools. Only on creation - doing it
-            # on every save would refill the player's health for free.
-            db.execute(
-                """
-                UPDATE saves
-                   SET max_hp = ?, hp = ?, max_mana = ?, mana = ?,
-                       max_stamina = ?, stamina = ?, xp_to_next = ?, pools_at = ?
-                 WHERE user_id = ? AND slot = ?
-                """,
-                (derived["max_hp"], derived["max_hp"],
-                 derived["max_mana"], derived["max_mana"],
-                 derived["max_stamina"], derived["max_stamina"],
-                 # The table's DEFAULT 100 is the old curve's first level; a
-                 # new character is told what the current curve says.
-                 gamedata.xp_needed_for_level(int(stored["level"])),
-                 int(time.time()), g.user["id"], slot),
-            )
-        else:
-            # THE POOLS COME DOWN WITH THE CEILING, never up. A maximum can fall
-            # now - an amulet came off - and a stored hp above it would be a
-            # character the status route then has to argue with.
-            db.execute(
-                "UPDATE saves SET max_hp = ?, max_mana = ?, max_stamina = ?, "
-                "hp = MIN(hp, ?), mana = MIN(mana, ?), stamina = MIN(stamina, ?) "
-                "WHERE user_id = ? AND slot = ?",
-                (derived["max_hp"], derived["max_mana"], derived["max_stamina"],
-                 derived["max_hp"], derived["max_mana"], derived["max_stamina"],
-                 g.user["id"], slot),
-            )
-        db.commit()
-
-    # THE SAVE HISTORY. At most one snapshot every SNAPSHOT_EVERY_SECONDS, and
-    # none when nothing has changed - see SAVE SNAPSHOTS AND ROLLBACK. Not for
-    # a character created by this very request: there is nothing to go back to.
-    if not is_new and take_snapshot(db, g.user["id"], slot, "save") is not None:
-        db.commit()
-
-    # active_pet_id is echoed back only when the caller actually set it, so a
-    # client can tell "you stored this" apart from "we left yours alone".
-    result = {"slot": slot, "updated_at": now}
-    if pet_key_sent:
-        result["active_pet_id"] = active_pet_id
-
-    # SAID OUT LOUD, the way gold is. A client that keeps sending `equipment`
-    # is not doing anything wrong - it simply predates the endpoints - but a
-    # field that is silently dropped is a client and a server disagreeing
-    # forever with nothing to notice it by.
-    ignored = []
-    if pet_ignored:
-        ignored.append("active_pet_id")
-    if equipment_ignored:
-        ignored.append("equipment")
-    if hotbar_ignored:
-        ignored.append("hotbar")
-    if ignored:
-        result["ignored"] = ignored
-    if equipment_ignored:
-        result["equipment"] = _stored_json(
-            get_db().execute(
-                "SELECT equipment FROM saves WHERE user_id = ? AND slot = ?",
-                (g.user["id"], slot)).fetchone()["equipment"], {})
-    return result, 200
+# GET AND PUT /api/save ARE saves/'s since 18 Oct, with GET /api/character and
+# deleting a character: registered at THE CHARACTER - the saves/ package,
+# further down, after everything it is handed. What stays here is what every
+# route shares: the slot, the 400, a cell, the JSON-column reader and
+# _derived_stats().
 
 
 # =============================================================================
@@ -8680,9 +8248,10 @@ def status_payload(user_id, slot):
 #
 # THE ROUTES ARE bank/'s since 18 Oct, registered further down with the carry's
 # sizes they are handed (THE BANK AND THE ACCOUNT - the bank/ package). What is
-# here is what the backpack and the bank share - taking from cells, a move, a
-# discard - the ledgers, and the account row. The history below is the bank's,
-# and stays with the grids it explains.
+# here: the ledgers, the account row, and how a request names a cell. What the
+# backpack and the bank share - taking from cells, a move, a discard - is
+# carry/'s since 18 Oct. The history below is the bank's, and stays with the
+# grids it explains.
 #
 # REWRITTEN. The bank was modelled per-CHARACTER and it is account-shared.
 #
@@ -8742,71 +8311,6 @@ def status_payload(user_id, slot):
 BANK_CAPACITY = int(gamedata.CONSTANTS.get("bank_capacity", 50))
 
 
-def _preferred_first(cells, prefer):
-    """cells - (position, ...) tuples already in take order - with the one at
-    `prefer` moved to the front. A stable sort, so the rest keep their order;
-    unchanged when prefer is None or names a cell not in the list."""
-    if prefer is None:
-        return list(cells)
-    return sorted(cells, key=lambda cell: int(cell[0]) != int(prefer))
-
-
-def _take_from_cells(rows, item_id, quantity, prefer=None):
-    """
-    Work out which cells to empty or reduce to remove quantity of item_id.
-
-    Returns (list of (position, new_quantity_or_zero), None) or (None, how many
-    were actually available) when there are not enough. Shared by the backpack
-    and the bank because "take 5 potions out of a positional grid" is one rule,
-    and the last time this project had that rule twice the two copies stopped
-    agreeing about the stack ceiling.
-
-    HIGHEST POSITION FIRST. Emptying the last cell of a split stack leaves the
-    player's grid looking like they expect - things disappear from the end, not
-    out of the middle.
-
-    EXCEPT THE CELL THE PLAYER USED, when the request names one. `prefer` is
-    that cell, and it is spent first when it holds the item. With the hotbar
-    in the same rows as the bag, the highest cell holding a potion is usually a
-    KEY - so without this, dragging the potions in your bag into the bank
-    emptied the ones on key 1 and left the bag stack you dragged. A `prefer`
-    that does not hold the item is ignored rather than refused: the request is
-    still "move five potions", and the client's picture may be a moment old.
-    """
-    held = [(int(r["position"]), int(r["quantity"]))
-            for r in rows if r["item_id"] == item_id]
-    available = sum(q for _, q in held)
-    if available < quantity:
-        return None, available
-
-    remaining = int(quantity)
-    changes = []
-    for position, held_qty in _preferred_first(sorted(held, reverse=True), prefer):
-        if remaining <= 0:
-            break
-        taken = min(held_qty, remaining)
-        changes.append((position, held_qty - taken))
-        remaining -= taken
-    return changes, None
-
-
-def _apply_cell_changes(table, key_columns, key_values, changes):
-    """Write back what _take_from_cells worked out. Zero means delete the row."""
-    db = get_db()
-    where = " AND ".join("%s = ?" % column for column in key_columns)
-    for position, new_quantity in changes:
-        if new_quantity <= 0:
-            db.execute(
-                "DELETE FROM %s WHERE %s AND position = ?" % (table, where),
-                (*key_values, position),
-            )
-        else:
-            db.execute(
-                "UPDATE %s SET quantity = ? WHERE %s AND position = ?" % (table, where),
-                (new_quantity, *key_values, position),
-            )
-
-
 # =============================================================================
 # ONE CELL AT A TIME - moving and discarding inside a grid
 # =============================================================================
@@ -8825,73 +8329,12 @@ def _apply_cell_changes(table, key_columns, key_values, changes):
 # carries the grid, so the game adopts it in the same breath, and nothing is
 # changed.
 
-def _grid_cells(table, key_columns, key_values, positions):
-    """{position: (item_id, quantity)} for the named cells that hold anything."""
-    where = " AND ".join("%s = ?" % column for column in key_columns)
-    marks = ", ".join("?" for _ in positions)
-    rows = get_db().execute(
-        "SELECT position, item_id, quantity FROM %s WHERE %s AND position IN (%s)"
-        % (table, where, marks),
-        (*key_values, *positions),
-    ).fetchall()
-    return {int(r["position"]): (r["item_id"], int(r["quantity"])) for r in rows}
-
-
-def _grid_rewrite(table, key_columns, key_values, positions, after):
-    """Replace the named cells with `after` ({position: (item_id, quantity)})."""
-    db = get_db()
-    where = " AND ".join("%s = ?" % column for column in key_columns)
-    marks = ", ".join("?" for _ in positions)
-    db.execute("DELETE FROM %s WHERE %s AND position IN (%s)" % (table, where, marks),
-               (*key_values, *positions))
-    columns = ", ".join(key_columns)
-    holes = ", ".join("?" for _ in key_columns)
-    for position, (item_id, quantity) in sorted(after.items()):
-        db.execute(
-            "INSERT INTO %s (%s, position, item_id, quantity) VALUES (%s, ?, ?, ?)"
-            % (table, columns, holes),
-            (*key_values, position, item_id, int(quantity)),
-        )
-
-
-def _grid_move(table, key_columns, key_values, source, target, item_id):
-    """
-    The drag the game has always drawn, done on the server's copy: onto an
-    empty cell it MOVES, onto the same stackable item it MERGES up to the stack
-    limit (the rest stays where it was), onto anything else it SWAPS.
-
-    Returns "moved", or "stale" when `source` does not hold `item_id` - see ONE
-    CELL AT A TIME. Nothing is written for a stale move.
-    """
-    cells = _grid_cells(table, key_columns, key_values, (source, target))
-    moving = cells.get(source)
-    if moving is None or moving[0] != item_id:
-        return "stale"
-    if source == target:
-        return "moved"
-    there = cells.get(target)
-    if there is None:
-        after = {target: moving}
-    elif there[0] == moving[0] and _stack_limit(item_id) > 1:
-        room = max(0, _stack_limit(item_id) - there[1])
-        shifted = min(room, moving[1])
-        after = {target: (item_id, there[1] + shifted)}
-        if moving[1] - shifted > 0:
-            after[source] = (item_id, moving[1] - shifted)
-    else:
-        after = {target: moving, source: there}
-    _grid_rewrite(table, key_columns, key_values, (source, target), after)
-    return "moved"
-
-
-def _grid_discard(table, key_columns, key_values, position, item_id):
-    """Destroy the whole stack in one cell. "discarded", or "stale" when the
-    cell does not hold `item_id`. Returns the stack it removed as well."""
-    held = _grid_cells(table, key_columns, key_values, (position,)).get(position)
-    if held is None or held[0] != item_id:
-        return "stale", None
-    _grid_rewrite(table, key_columns, key_values, (position,), {})
-    return "discarded", held
+# THE MOVE AND THE DISCARD ARE carry/'s since 18 Oct (carry/routes.py, the
+# SQL in carry/data.py), with taking from cells: one copy for both grids,
+# named by table, handed back at THE CARRY AND THE SKILLS and to the bank
+# under the names they had here - _grid_move(), _grid_discard(),
+# _take_from_cells(), _apply_cell_changes(). What stays is how a request
+# names a cell and an item.
 
 
 def parse_grid_cell(payload, key, capacity):
@@ -12311,68 +11754,6 @@ VALID_SKILLS = {"attack", "magic", "agility", "defense", "fishing", "cooking"}
 QUANTITY_CEILING = 9999
 
 
-def _stack_limit(item_id):
-    """How many of item_id may sit in one cell."""
-    definition = gamedata.item_row(item_id)
-    if definition is None:
-        return QUANTITY_CEILING
-    if not definition.get("stackable", False):
-        return 1
-    return max(1, min(int(definition.get("max_stack", 1)), QUANTITY_CEILING))
-
-
-def _parse_positional_items(cells, field):
-    """
-    Validate a positional item array - the backpack and the bank are the same
-    shape and this is the only place that shape is checked.
-
-    Returns (parsed, None) or (None, an error response). The WHOLE array is
-    validated before the caller writes any of it: a bad entry at index 17 must
-    not leave the first seventeen stored, because a half-saved bag with no error
-    is worse than a refused write.
-    """
-    parsed = []
-    for index, cell in enumerate(cells):
-        if cell is None:
-            continue
-        if not isinstance(cell, dict):
-            return None, bad_request("%s[%d] must be an object or null" % (field, index))
-
-        item_id = str(cell.get("item_id", "")).strip()
-        if not item_id or len(item_id) > 64:
-            return None, bad_request("%s[%d].item_id must be 1-64 characters" % (field, index))
-
-        raw_quantity = cell.get("quantity", 1)
-        if isinstance(raw_quantity, bool):
-            return None, bad_request("%s[%d].quantity must be a positive integer" % (field, index))
-        try:
-            quantity = int(raw_quantity)
-        except (TypeError, ValueError):
-            return None, bad_request("%s[%d].quantity must be a positive integer" % (field, index))
-        if quantity <= 0:
-            return None, bad_request("%s[%d].quantity must be a positive integer" % (field, index))
-
-        # The ceiling, which "positive integer" alone does not give you. Without
-        # it a client could declare a cell holding a billion potions and this
-        # would store it: the table only checks quantity > 0.
-        #
-        # A known item is capped at its own max_stack, which is the rule the
-        # game already plays by. An unknown one falls back to QUANTITY_CEILING,
-        # because item ids are deliberately NOT validated against a list here -
-        # that is what lets the game add an item without a matching server
-        # deploy, and it is worth keeping.
-        limit = _stack_limit(item_id)
-        if quantity > limit:
-            return None, bad_request(
-                "%s[%d].quantity is %d, the most %s stacks to is %d"
-                % (field, index, quantity, item_id, limit)
-            )
-
-        parsed.append((index, item_id, quantity))
-
-    return parsed, None
-
-
 # _reconcile_inventory() and _reconcile_bank() WERE HERE - the E-1 ledger that
 # trimmed a whole bag from the client to what the server had granted. Nothing
 # calls them now: a player's bag and bank are never written whole (see ONE
@@ -12388,64 +11769,83 @@ def _slot_exists(user_id, slot):
     return row is not None
 
 
-def bag_fingerprint(cells):
-    """
-    Which bag this is, as a short string: sha1 of "position:item_id:quantity"
-    for every filled cell, joined with "|", in position order.
+# =============================================================================
+# THE CARRY AND THE SKILLS - the carry/ and skills/ packages
+# =============================================================================
+# The backpack's four routes and the skills' two are the packages' since 18
+# Oct, and so is everything they share with the rest of this file: the item
+# grants and the XP grant, the carry as the game holds it, and the grid steps
+# the bank and the shop's sale share. Registered HERE - before the bank, the shop, trades, the
+# kill, loot, fishing and cooking, every area they are handed to - and kept
+# callable under the names they had in this file. What they are handed from
+# further down (the trade-resync flag, the lusion pile's id, the account view)
+# is asked for when a route runs.
+import carry as carry_package  # noqa: E402
+import skills as skills_package  # noqa: E402
 
-    `cells` is inventory_payload()'s positional array - the exact thing every
-    route that changes the carry answers with - so the client can work out the
-    same fingerprint from what it was handed, with no extra field on any answer.
-    CharacterData.bag_fingerprint() in the game is the other half, and both
-    test suites pin the same bag to the same string.
-    """
-    parts = []
-    for position, cell in enumerate(cells or []):
-        if isinstance(cell, dict) and cell.get("item_id"):
-            parts.append("%d:%s:%d" % (position, cell["item_id"], int(cell.get("quantity", 1))))
-    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
+_CARRY = carry_package.register(
+    app,
+    require_auth=require_auth,
+    get_db=get_db,
+    bad_request=bad_request,
+    parse_slot=parse_slot,
+    max_slot=MAX_SLOT,
+    slot_exists=_slot_exists,
+    parse_grid_cell=parse_grid_cell,
+    parse_item_id=parse_item_id,
+    has_owner_powers=has_owner_powers,
+    catalogue=gamedata,
+    bag_cells=INVENTORY_CAPACITY,
+    carry_cells=CARRY_CAPACITY,
+    quantity_ceiling=QUANTITY_CEILING,
+    take_resync=lambda db, user_id, slot: _take_resync(db, user_id, slot),
+    money_item_worth=money_item_worth,
+    lusions_item_id=lambda: LUSIONS_ITEM_ID,
+    # LOOKED UP ON EACH CASH: test_concurrency.py holds _ensure_account open,
+    # and a function handed in once would be the one it never slowed.
+    ensure_account=lambda user_id: _ensure_account(user_id),
+    gold_delta=gold_delta,
+    lusion_delta=lusion_delta,
+    account_of=lambda user_id: account_payload(user_id),
+)
+_stack_limit = _CARRY.stack_limit
+_parse_positional_items = _CARRY.parse_positional_items
+bag_fingerprint = _CARRY.fingerprint
+inventory_payload = _CARRY.inventory_of
+_owns_item = _CARRY.owns_item
+_take_from_backpack = _CARRY.take_from_backpack
+_add_to_backpack = _CARRY.add_to_backpack
+_take_from_cells = _CARRY.take_from_cells
+_apply_cell_changes = _CARRY.apply_cell_changes
+_grid_cells = _CARRY.grid_cells
+_grid_rewrite = _CARRY.grid_rewrite
+_grid_move = _CARRY.grid_move
+_grid_discard = _CARRY.grid_discard
+_carry_request = _CARRY.carry_request
+_carry_resync = _CARRY.resync
 
-
-def inventory_payload(user_id, slot):
-    """
-    Everything carried as a POSITIONAL ARRAY of length CARRY_CAPACITY, with
-    null in every empty cell - not as a list of the items that happen to exist.
-    The first INVENTORY_CAPACITY cells are the bag and the rest are the hotbar's
-    keys, in order.
-
-    The client's inventory is an array where index IS the cell, and returning a
-    packed list would make the client responsible for rebuilding the gaps. It
-    would get that right the first time and wrong the first time someone changed
-    the capacity.
-
-    THE HOTBAR RIDES IN THE SAME ARRAY on purpose. Every endpoint that changes
-    what a character carries answers with this, and the client applies it in one
-    place - so no response can update the bag and leave a key showing an item
-    the server has just taken off it.
-    """
-    rows = get_db().execute(
-        "SELECT position, item_id, quantity FROM carry_items WHERE user_id = ? AND slot = ? ORDER BY position",
-        (user_id, slot),
-    ).fetchall()
-
-    cells = [None] * CARRY_CAPACITY
-    for row in rows:
-        position = int(row["position"])
-        # Defensive: a row outside the current capacity means the capacity was
-        # reduced after it was written. Drop it from the view rather than
-        # crashing on the index - the next write prunes it for real.
-        if 0 <= position < CARRY_CAPACITY:
-            cells[position] = {"item_id": row["item_id"], "quantity": int(row["quantity"])}
-
-    return cells
-
-
-def skills_payload(user_id, slot):
-    rows = get_db().execute(
-        "SELECT skill_id, level, xp FROM skills WHERE user_id = ? AND slot = ? ORDER BY skill_id",
-        (user_id, slot),
-    ).fetchall()
-    return {row["skill_id"]: {"level": int(row["level"]), "xp": int(row["xp"])} for row in rows}
+_SKILLS = skills_package.register(
+    app,
+    require_auth=require_auth,
+    get_db=get_db,
+    bad_request=bad_request,
+    parse_slot=parse_slot,
+    max_slot=MAX_SLOT,
+    parse_stat=parse_stat,
+    slot_exists=_slot_exists,
+    has_owner_powers=has_owner_powers,
+    catalogue=gamedata,
+    valid_skills=VALID_SKILLS,
+    server_owned=SERVER_OWNED_SKILLS,
+    trainable=TRAINABLE_SKILLS,
+    max_level=MAX_SKILL_LEVEL,
+    max_xp=MAX_SKILL_XP,
+    max_train_seconds=MAX_TRAIN_ELAPSED_SECONDS,
+    max_train_xp_per_sec=MAX_TRAIN_XP_PER_SEC,
+    proficient_amount=proficient_amount,
+)
+skills_payload = _SKILLS.skills_of
+_grant_skill_xp = _SKILLS.grant_xp
 
 
 # =============================================================================
@@ -12454,8 +11854,8 @@ def skills_payload(user_id, slot):
 # Registered here, after the carry's sizes and helpers it is handed, rather
 # than at THE BANK AND THE ACCOUNT above. The seven routes - the account, the
 # bank's whole-array write and the lusion read-back, a transfer of items and
-# of gold, a move and a discard - are bank/'s since 18 Oct; the grid helpers
-# they share with the backpack stay above, the carry's.
+# of gold, a move and a discard - are bank/'s since 18 Oct; the grid steps
+# they share with the backpack are carry/'s, handed back just above.
 import bank as bank_package  # noqa: E402
 
 _BANK = bank_package.register(
@@ -13690,712 +13090,12 @@ def economy_supply():
     return gold_supply(get_db())
 
 
-@app.get("/api/character")
-@require_auth
-def read_character():
-    """
-    Everything one character is, in a single call
-    ---
-    tags:
-      - Character
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: query
-        name: slot
-        type: integer
-        required: true
-    responses:
-      200:
-        description: Identity, vitals, backpack and skills together
-      400:
-        description: Bad slot
-      404:
-        description: That slot is empty
-      401:
-        description: Missing, invalid or expired token
-    """
-    # ONE CALL, NOT FOUR. Loading a character used to mean status, then
-    # inventory, then skills, then bank - four round trips on a screen the
-    # player is staring at. They are all keyed on the same (user_id, slot) and
-    # none of them is useful without the others.
-    slot = parse_slot(request.args.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-
-    user_id = g.user["id"]
-    status = status_payload(user_id, slot)
-    if status is None:
-        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
-
-    row = get_db().execute(
-        # equipment IS IN THE SELECT. sqlite3.Row raises IndexError for a
-        # column the query did not fetch, so adding a key to the payload above
-        # without adding it here turns a read into a 500. Third time that trap
-        # has been stepped in today; it is always the same two lines apart.
-        "SELECT class_id, name, area, active_pet_id, bank_gold, equipment "
-        "FROM saves WHERE user_id = ? AND slot = ?",
-        (user_id, slot),
-    ).fetchone()
-
-    return {
-        "slot": slot,
-        "class_id": row["class_id"],
-        "name": row["name"],
-        "area": row["area"],
-        "active_pet_id": row["active_pet_id"],
-        "status": status,
-        "inventory": inventory_payload(user_id, slot),
-        # EQUIPMENT TRAVELS WITH THE BAG, and the two being split across
-        # endpoints is what cost a character its gear on every login.
-        #
-        # GET /api/save carried equipment and no inventory; this carried
-        # inventory and no equipment. The client merges both, and
-        # characterdata.gd::_sanitize_character_slot() reconciled the gear
-        # against the bag - so it ran with equipment from one response and an
-        # EMPTY inventory from the other, concluded the player owned none of
-        # what they were wearing, and cleared every slot. Two endpoints each
-        # correct on its own, and a reconciliation firing when only one half
-        # had arrived.
-        #
-        # The prune is going away with the move to server-owned equipment, but
-        # a read that answers half a question is worth fixing on its own terms:
-        # the next thing to ask this endpoint what a character is wearing
-        # should not have to know to ask somewhere else.
-        "equipment": _stored_json(row["equipment"], {}),
-        "skills": skills_payload(user_id, slot),
-    }, 200
-
-
-@app.put("/api/character/inventory")
-@require_auth
-def write_inventory():
-    """
-    Replace a character's backpack
-    ---
-    tags:
-      - Character
-    consumes:
-      - application/json
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [slot, inventory]
-          properties:
-            slot: {type: integer, example: 0}
-            inventory:
-              type: array
-              description: "Positional; null for an empty cell. Cells 0-19 are the bag, 20-29 the hotbar's keys. At most 30 entries. The bag is always replaced; a hotbar cell past the end of a shorter array is left as it is."
-            based_on:
-              type: string
-              description: "bag_fingerprint() of the bag the client last had from the server when it built this one. Optional; when it no longer matches, the write is refused with 409."
-    responses:
-      200:
-        description: The backpack as stored
-      409:
-        description: "The bag changed on the server since this was built (a trade, or any route that changes the carry). Carries resync: the bag and purse the server holds."
-      400:
-        description: Bad slot, oversized array, or a malformed entry
-      404:
-        description: That slot is empty
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-
-    if not _slot_exists(user_id, slot):
-        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
-
-    # A BAG BUILT BEFORE A TRADE MOVED THINGS IS NOT A BAG TO SAVE. This route
-    # replaces the whole backpack, so a client still showing what it had before
-    # a trade finished would delete what the trade just gave it - reproduced,
-    # not supposed: accept first, let the other side accept, drag a potion, and
-    # the sword you traded for was gone. See _mark_resync().
-    #
-    # REFUSED, AND THE REFUSAL CARRIES THE ANSWER. The 409 hands back the bag
-    # and purse the server holds so the client can adopt them in the same
-    # breath; the flag is cleared because the truth has now been delivered. A
-    # write that arrives after that is built on the new bag and goes through.
-    stale = _take_resync(get_db(), user_id, slot)
-    if stale is not None:
-        return {"error": "Conflict",
-                "message": "Your backpack changed on the server - a trade finished. "
-                           "It has been reloaded.",
-                "resync": stale}, 409
-    # A BAG BUILT BEFORE ANY OTHER CHANGE IS NOT A BAG TO SAVE EITHER. The same
-    # rule as the trade above, for every route that changes the carry: a loot
-    # take, a cook, a catch, a purchase, an equip. Day 1: cooking a stack of
-    # twelve, a save built after cook five and sent during cook six landed
-    # after it, deleted the fish cook six had made (a loss, so it went
-    # through), and the next save's copy of that fish was then trimmed as a
-    # gain. One cooked fish in every few was gone.
-    #
-    # `based_on` is the fingerprint of the bag the client last had from the
-    # server when it built this one (bag_fingerprint()). Anything else on the
-    # server since means this write would undo it, so it is refused with the
-    # bag the server holds, the same 409 the trade rule sends. A client from
-    # before the field sends none and is let through as before.
-    based_on = payload.get("based_on")
-    if based_on is not None:
-        if not isinstance(based_on, str) or len(based_on) > 64:
-            return bad_request("based_on must be a bag fingerprint")
-        held = inventory_payload(user_id, slot)
-        if based_on != bag_fingerprint(held):
-            purse = get_db().execute("SELECT gold FROM saves WHERE user_id = ? AND slot = ?",
-                                     (user_id, slot)).fetchone()
-            return {"error": "Conflict",
-                    "message": "Your backpack changed on the server since this was saved. "
-                               "It has been reloaded.",
-                    "resync": {"slot": slot, "gold": int(purse["gold"] or 0) if purse else 0,
-                               "inventory": held, "trade": None, "reason": "stale_save"}}, 409
-
-    cells = payload.get("inventory")
-    if not isinstance(cells, list):
-        return bad_request("inventory must be an array")
-    if len(cells) > CARRY_CAPACITY:
-        return bad_request("inventory has %d entries, capacity is %d" % (len(cells), CARRY_CAPACITY))
-
-    # THE HOTBAR IS REPLACED ONLY BY AN ARRAY THAT REACHES IT. The bag cells
-    # are always replaced, exactly as before the hotbar held items - a short
-    # array, [] included, still means "the bag holds this and nothing else".
-    # The hotbar's cells are replaced only as far as the array goes; past its
-    # end they are left as they are, and left out of the ledger the claim is
-    # checked against.
-    #
-    # A client that sends twenty cells - one written before the keys held
-    # items, or one whose hotbar was not attached when it saved - is not saying
-    # "empty my hotbar", it is saying nothing about it. Replacing every row
-    # would delete up to ten stacks the player can see on screen.
-    #
-    # AND THE LEDGER HAS TO SHRINK WITH IT, or the rule becomes a duplication
-    # bug: five potions on a key the write does not touch, plus a claim of five
-    # potions in the bag checked against a ledger that still counts the key's
-    # five, is ten potions. Counting only the covered cells means a write can
-    # rearrange what it covers and nothing else.
-    covered = max(len(cells), INVENTORY_CAPACITY)
-
-    # THE SHARED VALIDATOR, not a second copy of it. This loop used to be
-    # written out here as well as in _parse_positional_items(), twenty identical
-    # lines in two places - so a rule added to one of them (the stack ceiling
-    # was exactly that) would silently not apply to the other.
-    #
-    # It validates the whole array before the caller writes any of it: a bad
-    # entry at index 17 must not leave the first seventeen stored.
-    items, error = _parse_positional_items(cells, "inventory")
-    if error is not None:
-        return error
-
-    # A PLAYER'S BAG IS NOT WRITTEN HERE ANY MORE - see ONE CELL AT A TIME.
-    # Every change a player makes is its own request now (move, discard, use a
-    # pile, and the routes that always were: loot, the bank, the shop, trades,
-    # equip, consume, catches and cooking), so this array is never the truth
-    # about anything. It used to be trimmed to what the server had granted
-    # (E-1), which caught a gain and took the arrangement and every loss on
-    # the client's word.
-    #
-    # IGNORED, NOT REFUSED, like gold and lusions before it: a game from before
-    # the change still sends its whole bag on a routine save, and a 400 would
-    # turn that into an error on screen. It gets the bag the server holds, and
-    # `ignored` says why its own did not stick.
-    #
-    # THE OWNER STILL WRITES IT WHOLE, for tooling and tests. It used to be
-    # any staff rank, on the reasoning that a mod could already put anything
-    # in a bag with POST /api/staff/grant, so leaving this open closed no door.
-    # That held only while the grant was mod and up. The grant is owner-only
-    # now (6 Oct 2026), so this is too: otherwise a mod denied the grant would
-    # write the same Perfect mythic in here instead. A mod's bag is ignored
-    # exactly like a player's.
-    if not has_owner_powers(g.user["username"]):
-        return {"slot": slot, "inventory": inventory_payload(user_id, slot),
-                "ignored": ["inventory"]}, 200
-
-    parsed = [(user_id, slot, index, item_id, quantity)
-              for index, item_id, quantity in items]
-
-    db = get_db()
-    # DELETE then INSERT, in one transaction. A replace has no upsert form: cells
-    # the client cleared have to disappear, and an upsert would leave them.
-    # sqlite3 opens a transaction implicitly on the first write and holds it
-    # until commit, so the table is never observably empty.
-    db.execute("DELETE FROM carry_items WHERE user_id = ? AND slot = ? AND position < ?",
-               (user_id, slot, covered))
-    if parsed:
-        db.executemany(
-            "INSERT INTO carry_items (user_id, slot, position, item_id, quantity) VALUES (?, ?, ?, ?, ?)",
-            parsed,
-        )
-    db.commit()
-
-    return {"slot": slot, "inventory": inventory_payload(user_id, slot)}, 200
-
-
-def _carry_resync(user_id, slot, reason="stale_save"):
-    """The 409 a carry route sends when the client's picture is out of date:
-    the bag and purse the server holds, in the shape apply_server_carry()
-    already adopts from a stale save."""
-    purse = get_db().execute("SELECT gold FROM saves WHERE user_id = ? AND slot = ?",
-                             (user_id, slot)).fetchone()
-    return {"error": "Conflict",
-            "message": "Your backpack changed on the server. It has been reloaded.",
-            "resync": {"slot": slot, "gold": int(purse["gold"] or 0) if purse else 0,
-                       "inventory": inventory_payload(user_id, slot), "trade": None,
-                       "reason": reason}}, 409
-
-
-def _carry_request():
-    """slot and item_id, shared by every one-cell carry route: (payload, slot,
-    item_id, None) or (..., an error response)."""
-    payload = request.get_json(silent=True) or {}
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return payload, None, None, bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-    if not _slot_exists(g.user["id"], slot):
-        return payload, None, None, ({"error": "Not Found",
-                                      "message": "No character in slot %d." % slot}, 404)
-    item_id, error = parse_item_id(payload)
-    return payload, slot, item_id, error
-
-
-@app.post("/api/character/inventory/move")
-@require_auth
-def move_carried():
-    """
-    Move, merge or swap one carried cell onto another
-    ---
-    tags:
-      - Character
-    consumes:
-      - application/json
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [slot, from, to, item_id]
-          properties:
-            slot:    {type: integer, example: 0}
-            from:    {type: integer, example: 3, description: "The cell dragged (0-19 bag, 20-29 hotbar)"}
-            to:      {type: integer, example: 21, description: "The cell it was dropped on"}
-            item_id: {type: string, example: smallhealthpotion, description: "What the game saw in `from`"}
-    responses:
-      200:
-        description: "The carry afterwards: onto an empty cell it moved, onto the same stackable item it merged up to the stack limit, onto anything else it swapped"
-      400:
-        description: Bad slot, cell or item id
-      404:
-        description: That slot is empty
-      409:
-        description: "`from` does not hold that item - the game's picture is out of date. Carries resync: the bag the server holds. Nothing moved."
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload, slot, item_id, error = _carry_request()
-    if error is not None:
-        return error
-    source, error = parse_grid_cell(payload, "from", CARRY_CAPACITY)
-    if error is not None:
-        return error
-    target, error = parse_grid_cell(payload, "to", CARRY_CAPACITY)
-    if error is not None:
-        return error
-    user_id = g.user["id"]
-    if _grid_move("carry_items", ("user_id", "slot"), (user_id, slot),
-                  source, target, item_id) == "stale":
-        return _carry_resync(user_id, slot)
-    get_db().commit()
-    return {"slot": slot, "inventory": inventory_payload(user_id, slot)}, 200
-
-
-@app.post("/api/character/inventory/discard")
-@require_auth
-def discard_carried():
-    """
-    Destroy the whole stack in one carried cell
-    ---
-    tags:
-      - Character
-    consumes:
-      - application/json
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [slot, position, item_id]
-          properties:
-            slot:     {type: integer, example: 0}
-            position: {type: integer, example: 7}
-            item_id:  {type: string, example: rawshrimp, description: "What the game saw in that cell"}
-    responses:
-      200:
-        description: The carry afterwards, and what was destroyed
-      400:
-        description: Bad slot, cell or item id
-      404:
-        description: That slot is empty
-      409:
-        description: "The cell does not hold that item. Carries resync; nothing was destroyed."
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload, slot, item_id, error = _carry_request()
-    if error is not None:
-        return error
-    position, error = parse_grid_cell(payload, "position", CARRY_CAPACITY)
-    if error is not None:
-        return error
-    user_id = g.user["id"]
-    outcome, held = _grid_discard("carry_items", ("user_id", "slot"), (user_id, slot),
-                                  position, item_id)
-    if outcome == "stale":
-        return _carry_resync(user_id, slot)
-    get_db().commit()
-    return {"slot": slot, "inventory": inventory_payload(user_id, slot),
-            "discarded": {"item_id": held[0], "quantity": held[1]}}, 200
-
-
-@app.post("/api/character/inventory/cash")
-@require_auth
-def cash_carried_pile():
-    """
-    Turn a carried pile of gold coins, or of lusions, into the balance
-    ---
-    tags:
-      - Character
-    consumes:
-      - application/json
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [slot, position, item_id]
-          properties:
-            slot:     {type: integer, example: 0}
-            position: {type: integer, example: 4}
-            item_id:  {type: string, example: goldcoin}
-    responses:
-      200:
-        description: The carry, the purse and the lusions afterwards
-      400:
-        description: Bad slot, cell or item id
-      404:
-        description: That slot is empty
-      409:
-        description: "That is not money, or the cell does not hold it (then with resync)"
-      401:
-        description: Missing, invalid or expired token
-    """
-    # THE ONE CLIENT PATH THAT USED TO ADD GOLD LOCALLY. inventoryscreen.gd
-    # added the pile's worth to its own purse and emptied the cell; the server
-    # has ignored a client's gold since E-8, so the cell's loss was saved and
-    # the gold was not - using a pile destroyed it. Now the server empties the
-    # cell and credits the balance in one transaction, through the ledgers.
-    # Piles reach a bag only through a staff grant or a trade of one.
-    payload, slot, item_id, error = _carry_request()
-    if error is not None:
-        return error
-    position, error = parse_grid_cell(payload, "position", CARRY_CAPACITY)
-    if error is not None:
-        return error
-    premium = gamedata.CONSTANTS.get("lusions_item_id", LUSIONS_ITEM_ID)
-    currency, per = money_item_worth(item_id)
-    if currency is None:
-        return {"error": "Conflict", "message": "That is not money."}, 409
-
-    user_id = g.user["id"]
-    db = get_db()
-    outcome, held = _grid_discard("carry_items", ("user_id", "slot"), (user_id, slot),
-                                  position, item_id)
-    if outcome == "stale":
-        return _carry_resync(user_id, slot)
-    worth = int(held[1]) * per
-    detail = "%s x%d" % (item_id, held[1])
-    if item_id == premium:
-        _ensure_account(user_id)
-        lusion_delta(db, user_id, slot, worth, "pile", detail)
-    else:
-        gold_delta(db, user_id, slot, worth, "pile", detail)
-    db.commit()
-
-    purse = db.execute("SELECT gold FROM saves WHERE user_id = ? AND slot = ?",
-                       (user_id, slot)).fetchone()
-    account = account_payload(user_id)
-    return {"slot": slot, "inventory": inventory_payload(user_id, slot),
-            "gold": int(purse["gold"] or 0), "lusions": int(account.get("lusions", 0)),
-            "cashed": {"item_id": item_id, "quantity": held[1],
-                       "currency": "lusions" if item_id == premium else "gold",
-                       "amount": worth}}, 200
-
-
-@app.put("/api/character/skills")
-@require_auth
-def write_skills():
-    """
-    Replace a character's skills
-    ---
-    tags:
-      - Character
-    consumes:
-      - application/json
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [slot, skills]
-          properties:
-            slot: {type: integer, example: 0}
-            skills:
-              type: object
-              description: '{"attack": {"level": 12, "xp": 340}, ...}'
-    responses:
-      200:
-        description: The skills as stored
-      400:
-        description: Bad slot, unknown skill, or a malformed level/xp
-      404:
-        description: That slot is empty
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-
-    if not _slot_exists(user_id, slot):
-        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
-
-    skills = payload.get("skills")
-    if not isinstance(skills, dict):
-        return bad_request("skills must be an object")
-
-    parsed = []
-    for skill_id, values in skills.items():
-        name = str(skill_id).strip().lower()
-        if name not in VALID_SKILLS:
-            # Refused rather than ignored. A silently dropped skill is a level
-            # the player earned and cannot see, with nothing anywhere to say so.
-            return bad_request("Unknown skill '%s'. Known skills: %s" % (name, ", ".join(sorted(VALID_SKILLS))))
-
-        if not isinstance(values, dict):
-            return bad_request("skills.%s must be an object with level and xp" % name)
-
-        level = parse_stat(values.get("level", 1))
-        xp = parse_stat(values.get("xp", 0))
-        if level is None or level < 1:
-            return bad_request("skills.%s.level must be a positive integer" % name)
-        if xp is None:
-            return bad_request("skills.%s.xp must be a non-negative integer" % name)
-
-        parsed.append((user_id, slot, name, level, xp))
-
-    # SKILL CEILING. A claim over the cap is clamped rather than rejected, so a
-    # single over-cap skill never discards the whole (otherwise honest) sync.
-    # The owner is exempt, as with the backpack - and since 6 Oct 2026 only the
-    # owner, matching write_inventory(); a mod is clamped like a player.
-    #
-    # ITS OPENING LINE USED TO SAY "skills have no server-side grant path yet",
-    # AND THAT HAS NOT BEEN TRUE SINCE E-2 CLOSED. All six are granted
-    # server-side now, so nothing this clamp produces ever reaches the database -
-    # the drop filter below empties `parsed` unconditionally, because
-    # VALID_SKILLS and SERVER_OWNED_SKILLS are the same six.
-    #
-    # THE CLAMP STAYS ANYWAY, and the reasoning is worth keeping because the
-    # obvious move is to delete it. It is not wrong, it is not a duplicate of a
-    # rule that lives somewhere better, and it is not stale - it is GENERIC code
-    # with nothing to do today. The day a seventh skill is the client's to grant,
-    # the filter below stops catching everything and this clamp is the thing
-    # standing between a modified client and a level of 2^31. Deleting a
-    # guardrail because it currently has nothing to guard is how you find out
-    # what it was for.
-    #
-    # The ceiling that IS load-bearing today is in _grant_skill_xp(), which caps
-    # every server grant. That one is on the path everything actually takes.
-    if not has_owner_powers(g.user["username"]):
-        capped, hits = [], []
-        for (uid, s, name, level, xp) in parsed:
-            if level > MAX_SKILL_LEVEL or xp > MAX_SKILL_XP:
-                hits.append(name)
-                level = min(level, MAX_SKILL_LEVEL)
-                xp = min(xp, MAX_SKILL_XP)
-            capped.append((uid, s, name, level, xp))
-        if hits:
-            print("[SKILLS] capped over-ceiling skills for %s slot %d: %s"
-                  % (g.user["username"], slot, ", ".join(sorted(hits))))
-        parsed = capped
-
-    # THE SERVER OWNS ALL SIX NOW, so this line empties `parsed` every time and
-    # this route writes nothing at all.
-    #
-    # It said "fine for the four skills the client still grants" until somebody
-    # counted them. There are none: attack is granted at the kill, fishing and
-    # cooking against items the server consumed, defense/agility/magic through
-    # /api/skill/train. VALID_SKILLS and SERVER_OWNED_SKILLS are the same set.
-    #
-    # WHY THE ROUTE IS STILL HERE, doing a full parse and answering 200 for a
-    # body it throws away. An un-updated client still sends all six on every
-    # save, and 400-ing an otherwise honest sync over a field it may no longer
-    # set would break saving for that build entirely. Dropped silently is the
-    # same posture PUT /api/player/status takes with level and xp, and for the
-    # same reason. The Godot client stopped sending them (see
-    # serverstorage.gd::_push_slot), which removes the round trip for anyone on
-    # a current build without stranding anybody on an old one.
-    #
-    # The 400s below it are contract and are tested - an unknown skill name, a
-    # level of 0 and a non-object all still refuse. Validating a body and then
-    # discarding it looks odd and is correct: the shape of the request is still
-    # part of the promise even when its contents are not.
-    #
-    # THE DELETE AND THE INSERT BELOW ARE GENERIC, not dead. They are what makes
-    # this route work again, correctly, the day a skill becomes the client's to
-    # grant. See the clamp above for the same argument at more length.
-    parsed = [row for row in parsed if row[2] not in SERVER_OWNED_SKILLS]
-
-    db = get_db()
-    db.execute(
-        "DELETE FROM skills WHERE user_id = ? AND slot = ? AND skill_id NOT IN (%s)"
-        % ",".join("?" * len(SERVER_OWNED_SKILLS)),
-        (user_id, slot, *sorted(SERVER_OWNED_SKILLS)),
-    )
-    if parsed:
-        db.executemany(
-            "INSERT INTO skills (user_id, slot, skill_id, level, xp) VALUES (?, ?, ?, ?, ?)",
-            parsed,
-        )
-    db.commit()
-
-    return {"slot": slot, "skills": skills_payload(user_id, slot)}, 200
-
-
-@app.post("/api/skill/train")
-@require_auth
-def train_skills():
-    """
-    Report training activity for agility, defense and magic
-    ---
-    tags:
-      - Character
-    consumes:
-      - application/json
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [slot]
-          properties:
-            slot:    {type: integer, example: 0}
-            agility: {type: integer, description: "raw agility XP earned since the last report"}
-            defense: {type: integer, description: "raw defense XP earned since the last report"}
-            magic:   {type: integer, description: "raw magic XP earned since the last report"}
-    responses:
-      200:
-        description: The three trained skills as stored after the grant
-      400:
-        description: Bad slot or a malformed amount
-      404:
-        description: That slot is empty
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-
-    db = get_db()
-    row = db.execute(
-        "SELECT class_id, last_train_at FROM saves WHERE user_id = ? AND slot = ?",
-        (user_id, slot),
-    ).fetchone()
-    if row is None:
-        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
-
-    now_ms = int(time.time() * 1000)
-
-    # THE BUDGET. Time since the last report, capped: a fresh character
-    # (last_train_at 0) or one back from hours offline gets at most
-    # MAX_TRAIN_ELAPSED_SECONDS of budget, never the whole gap. This is what
-    # stops a single giant report from cashing an impossible amount at once.
-    elapsed_s = (now_ms - int(row["last_train_at"])) / 1000.0
-    elapsed_s = max(0.0, min(elapsed_s, MAX_TRAIN_ELAPSED_SECONDS))
-
-    results = {}
-    for skill in TRAINABLE_SKILLS:
-        reported = parse_stat(payload.get(skill, 0))
-        if reported is None:
-            return bad_request("%s must be a non-negative integer" % skill)
-        # Clamp the raw report to what is physically earnable in the elapsed
-        # budget, THEN apply proficiency. A client reporting a billion gets the
-        # ceiling; an honest one is never anywhere near it.
-        allowed = MAX_TRAIN_XP_PER_SEC[skill] * elapsed_s
-        raw = min(float(reported), allowed)
-        gained = proficient_amount(row["class_id"], skill, raw)
-        level, xp, levels_gained = _grant_skill_xp(user_id, slot, skill, gained)
-        results[skill] = {"level": level, "xp": xp, "levels_gained": levels_gained}
-
-    # Stamp the report time in the SAME transaction as the grants, so a crash
-    # cannot bank the XP and lose the timestamp - which would hand the next
-    # report a second helping of the same budget.
-    db.execute(
-        "UPDATE saves SET last_train_at = ?, updated_at = ? WHERE user_id = ? AND slot = ?",
-        (now_ms, int(time.time()), user_id, slot),
-    )
-    db.commit()
-
-    return {"slot": slot, "skills": results}, 200
+# THE CARRY'S ROUTES - PUT /api/character/inventory and the three one-cell
+# routes (move, discard, cash a pile) - are carry/'s since 18 Oct, and the
+# skills write and the training report (PUT /api/character/skills, POST
+# /api/skill/train) are skills/'s: both registered at THE CARRY AND THE
+# SKILLS, above. GET /api/character, the read that answers with all of them,
+# is saves/'s (THE CHARACTER, below).
 
 
 # =============================================================================
@@ -14405,8 +13105,9 @@ def train_skills():
 # putting gear on and taking it off. Both are the same shape - the client
 # asks, the server moves the item through the backpack grants, the client
 # renders the answer - and why each had to be a server route is in its
-# __init__.py. What stays here: the grants (the carry's, further down this
-# file, so asked for when a route runs), _derived_stats() - the one way to ask
+# __init__.py. What stays here: the grants (carry/'s, handed back at THE CARRY
+# AND THE SKILLS above, still asked for by name when a route runs),
+# _derived_stats() - the one way to ask
 # a character's maxima, which reads what is worn - and the catalogue, handed
 # in whole so a suite's stand-in for one of its functions is heard.
 import consuming as consuming_package  # noqa: E402
@@ -14481,129 +13182,52 @@ death_package.register(
 
 
 # =============================================================================
-# DELETING A CHARACTER
+# THE CHARACTER - the saves/ package (since 18 Oct)
 # =============================================================================
-# Asked for on day 1: four fixed slots, one per class, and no way to start a
-# class again. Deleting is the character's own rows - its save, its bag, its
-# skills, its loot bags and heal grants - and nothing of the account's: the
-# bank, the lusions, friends and guild all belong to the account and stay.
+# GET and PUT /api/save, GET /api/character and POST /api/character/delete, as
+# they were - endpoint names, docstrings and every message (routes.lock).
+# saves/__init__.py tells what a save still writes and what it ignores.
+# Registered here, after everything it is handed, rather than at SAVES above.
+#
+# DELETING A CHARACTER was asked for on day 1: four fixed slots, one per
+# class, and no way to start a class again. Deleting is the character's own
+# rows - its save, its bag, its skills, its loot bags and heal grants - and
+# nothing of the account's: the bank, the lusions, friends and guild all
+# belong to the account and stay.
 
 CHARACTER_DELETIONS_KEPT = 10
 CHARACTER_DELETE_REASON = "character-deleted"
 
 
-@app.post("/api/character/delete")
-@require_auth
-def character_delete():
-    """
-    Delete one of your characters, for good
-    ---
-    tags:
-      - Character
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [slot, confirm]
-          properties:
-            slot:    {type: integer, example: 0}
-            confirm: {type: string, example: warrior, description: "The character's name, typed by the player. Any case."}
-    responses:
-      200:
-        description: The character, its bag, its gold and its skills are gone; the account's bank is not
-      400:
-        description: Bad slot, or confirm is not the character's name
-      404:
-        description: No character in that slot
-      409:
-        description: An open trade names this character
-    """
-    payload = request.get_json(silent=True) or {}
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer between 0 and %d" % MAX_SLOT)
+import saves as saves_package  # noqa: E402
 
-    user_id = g.user["id"]
-    db = get_db()
-    row = db.execute(
-        "SELECT * FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot),
-    ).fetchone()
-    if row is None:
-        return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
+saves_package.register(
+    app,
+    require_auth=require_auth,
+    get_db=get_db,
+    bad_request=bad_request,
+    parse_slot=parse_slot,
+    max_slot=MAX_SLOT,
+    clean_text=clean_player_text,
+    owns_item=_owns_item,
+    stored_json=_stored_json,
+    derived_stats=_derived_stats,
+    catalogue=gamedata,
+    take_snapshot=take_snapshot,
+    status_of=status_payload,
+    inventory_of=inventory_payload,
+    skills_of=skills_payload,
+    find_open_trade=_trade_find_open,
+    gold_delta=gold_delta,
+    deletions_kept=CHARACTER_DELETIONS_KEPT,
+    delete_reason=CHARACTER_DELETE_REASON,
+)
 
-    # THE NAME, TYPED. The game asks for it before it sends this, and the
-    # server asks again, so a stray call - a stale button, a script, a replayed
-    # request - cannot take a character. A character's name is its class, so
-    # this is "type WARRIOR", which is exactly the deliberate act it should be.
-    typed = str(payload.get("confirm", "")).strip().lower()
-    if typed == "" or typed != str(row["name"]).strip().lower():
-        return bad_request("Type the character's name to delete it.")
-
-    # NOT IN THE MIDDLE OF A TRADE. An open trade holds items offered FROM this
-    # character's bag and names it as the one receiving; running it after the
-    # rows are gone would move things to and from a character that no longer
-    # exists. Finishing or cancelling it is one click; this is the one place it
-    # has to come first.
-    trade = _trade_find_open(db, user_id)
-    if trade is not None and (
-            (trade["a_user"] == user_id and trade["a_slot"] == slot)
-            or (trade["b_user"] == user_id and trade["b_slot"] == slot)):
-        return {"error": "Conflict",
-                "message": "This character is in a trade. Finish or cancel it first."}, 409
-
-    # ---- everything above this line is validation; everything below commits --
-
-    carry = [dict(r) for r in db.execute(
-        "SELECT position, item_id, quantity FROM carry_items"
-        " WHERE user_id = ? AND slot = ? ORDER BY position", (user_id, slot))]
-    skills = [dict(r) for r in db.execute(
-        "SELECT skill_id, level, xp FROM skills WHERE user_id = ? AND slot = ?"
-        " ORDER BY skill_id", (user_id, slot))]
-    now = int(time.time())
-    gold = int(row["gold"] or 0)
-    db.execute(
-        "INSERT INTO character_deletions"
-        " (user_id, slot, class_id, name, level, gold, deleted_at, snapshot)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (user_id, slot, row["class_id"], row["name"], int(row["level"] or 1), gold, now,
-         json.dumps({"save": dict(row), "carry_items": carry, "skills": skills})),
-    )
-    db.execute(
-        "DELETE FROM character_deletions WHERE user_id = ? AND id NOT IN ("
-        " SELECT id FROM character_deletions WHERE user_id = ?"
-        " ORDER BY deleted_at DESC, id DESC LIMIT ?)",
-        (user_id, user_id, CHARACTER_DELETIONS_KEPT),
-    )
-
-    # THROUGH THE LEDGER, before the row goes: the purse is in saves, and a
-    # bare DELETE would take the gold out of SUM(saves.gold) with no burn row,
-    # and the supply invariant would be off by it for ever. The note on
-    # gold_ledger in the schema says the same about deleting a user.
-    if gold > 0:
-        gold_delta(db, user_id, slot, -gold, CHARACTER_DELETE_REASON,
-                   "carried gold of a deleted %s in slot %d" % (row["class_id"], slot))
-
-    # AND ITS SAVE HISTORY: a snapshot names a slot, not a character, and the
-    # next character made in this slot is somebody else. The copy above is
-    # what is kept of this one.
-    # And its kill record: the next character in this slot starts its own.
-    for table in ("carry_items", "skills", "consume_grants", "save_snapshots", "kill_tally"):
-        db.execute("DELETE FROM %s WHERE user_id = ? AND slot = ?" % table, (user_id, slot))
-    # The items in its loot bags go with the bags: loot_bag_items cascades.
-    db.execute("DELETE FROM loot_bags WHERE user_id = ? AND slot = ?", (user_id, slot))
-    db.execute("DELETE FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot))
-    db.commit()
-
-    app.logger.info("character deleted: %s slot %d (%s, level %s, %d gold, %d cells)",
-                    g.user["username"], slot, row["class_id"], row["level"], gold, len(carry))
-    return {"slot": slot, "deleted": True, "gold_lost": gold, "items_lost": len(carry)}, 200
+# Named here as well, for anything that reads them off this module;
+# saves/services.py is where they are set.
+VALID_CLASSES = saves_package.VALID_CLASSES
+MAX_EXPLORED_BYTES = saves_package.MAX_EXPLORED_BYTES
+MAX_EXPLORED_TILES = saves_package.MAX_EXPLORED_TILES
 
 
 # =============================================================================
@@ -14616,9 +13240,10 @@ def character_delete():
 # money and the backpack the take pays into are this file's, handed in at
 # the take's old place under THE SERVER'S GRANTS.
 #
-# The other helpers under this banner were never the loot bag's: whether an
-# account holds an item (the save, the rollback and the presence socket ask
-# too), taking from the backpack (a grant), and the kill's own record.
+# The other helper under this banner was never the loot bag's: the kill's own
+# record. Whether an account holds an item (the save, the rollback and the
+# presence socket ask too) and taking from the backpack (a grant) were here as
+# well, and are carry/'s since 18 Oct (_owns_item(), _take_from_backpack()).
 import loot  # noqa: E402
 
 # Named here as well, for the suites and anything else that reads them off
@@ -14672,94 +13297,6 @@ def _create_loot_bag(user_id, slot, enemy_id, contents):
 
     db.commit()
     return bag_id, stored
-
-
-def _owns_item(user_id, slot, item_id):
-    """
-    True when this account already holds item_id in the backpack or the bank.
-
-    Only pets ask. The bank is account-scoped and the backpack is per-character,
-    which is deliberate: a pet is a collectible, and having caught one on your
-    warrior should stop it dropping again for your mage - which is exactly what
-    the bank half covers, since that is where a collection ends up.
-    """
-    if get_db().execute(
-        "SELECT 1 FROM carry_items WHERE user_id = ? AND slot = ? AND item_id = ? LIMIT 1",
-        (user_id, slot, item_id),
-    ).fetchone():
-        return True
-    return get_db().execute(
-        "SELECT 1 FROM bank_items WHERE user_id = ? AND item_id = ? LIMIT 1",
-        (user_id, item_id),
-    ).fetchone() is not None
-
-
-def _take_from_backpack(user_id, slot, item_id, quantity, prefer=None, keys_last=False):
-    """
-    Remove quantity of item_id from the backpack. Returns True, or False when
-    the player does not hold that many - in which case NOTHING is written.
-
-    `keys_last` spends the bag (cells below INVENTORY_CAPACITY) before the
-    hotbar's keys. For a take the player did not point at - a trade takes a
-    quantity, not a cell - so the potions on key 1 are the last to go rather
-    than the first. See trade/routes.py, execute().
-
-    The mirror of _add_to_backpack() below, and all-or-nothing for the same
-    reason: a half-completed consume is an ingredient that left the bag without
-    producing anything.
-
-    HIGHEST POSITION FIRST, so a partly-used stack is emptied before a full one
-    is broken into. That keeps the bag tidy across a long cooking run instead of
-    leaving a trail of one-item stacks.
-
-    `prefer` is the cell the player acted on - a potion drunk from key 3, a
-    sword equipped from bag cell 12 - and is spent first when it holds the item.
-    See _take_from_cells() for why, since the hotbar sits in these same rows.
-    """
-    quantity = int(quantity)
-    if quantity <= 0:
-        return True
-
-    db = get_db()
-    rows = db.execute(
-        "SELECT position, quantity FROM carry_items "
-        "WHERE user_id = ? AND slot = ? AND item_id = ? ORDER BY position DESC",
-        (user_id, slot, item_id),
-    ).fetchall()
-
-    held = sum(int(r["quantity"]) for r in rows)
-    if held < quantity:
-        return False
-
-    if keys_last:
-        # A stable sort, so within the bag and within the keys the order is
-        # still highest-first - a part-used stack still goes before a full one.
-        rows = sorted(rows, key=lambda r: int(r["position"]) >= INVENTORY_CAPACITY)
-
-    remaining = quantity
-    for row in _preferred_first(rows, prefer):
-        if remaining <= 0:
-            break
-        position = int(row["position"])
-        have = int(row["quantity"])
-        taken = min(have, remaining)
-        remaining -= taken
-
-        if taken >= have:
-            # The row is deleted rather than set to 0: carry_items carries a
-            # CHECK (quantity > 0) and an empty cell is an absent row.
-            db.execute(
-                "DELETE FROM carry_items WHERE user_id = ? AND slot = ? AND position = ?",
-                (user_id, slot, position),
-            )
-        else:
-            db.execute(
-                "UPDATE carry_items SET quantity = ? "
-                "WHERE user_id = ? AND slot = ? AND position = ?",
-                (have - taken, user_id, slot, position),
-            )
-
-    return True
 
 
 # How long a kill report is kept. Long enough to see a slow, patient cheat in
@@ -14819,145 +13356,16 @@ killrecord.register(app, require_auth=require_auth, get_db=get_db, parse_slot=pa
 # =============================================================================
 # THE SERVER'S GRANTS - a skill's XP, and items into the backpack
 # =============================================================================
-# What the loot bag below pays with, and fishing and cooking - the gathering/
-# package, handed these three at its banner below (18 Oct). They sat under THE
-# KILL RECORD's banner until it moved out (16 Oct); they never were it.
-
-def _grant_skill_xp(user_id, slot, skill_id, gained):
-    """
-    Add XP to one skill and return (level, xp, levels_gained).
-
-    THE FIRST SERVER-SIDE SKILL GRANT IN THIS FILE. Until now the skills table
-    was written only by PUT /api/character/skills, which replaces the whole set
-    with whatever the client sends - see the note there about why fishing and
-    cooking are now carved out of that.
-
-    AN UPSERT, NOT A DELETE-THEN-INSERT. write_skills() replaces every row
-    because it is given every row; this is given one skill and must leave the
-    rest of the character's progress exactly where it was.
-
-    THE THRESHOLD IS RECOMPUTED, NOT STORED. The skills table is (level, xp)
-    with no xp_to_next column, unlike saves. Deriving it each grant from the
-    same curve the client uses costs one exponent and removes a column that
-    could disagree with the level sitting next to it.
-    """
-    gained = max(int(gained), 0)
-    if gained <= 0:
-        row = get_db().execute(
-            "SELECT level, xp FROM skills WHERE user_id = ? AND slot = ? AND skill_id = ?",
-            (user_id, slot, skill_id),
-        ).fetchone()
-        return (int(row["level"]), int(row["xp"]), 0) if row else (1, 0, 0)
-
-    db = get_db()
-    row = db.execute(
-        "SELECT level, xp FROM skills WHERE user_id = ? AND slot = ? AND skill_id = ?",
-        (user_id, slot, skill_id),
-    ).fetchone()
-
-    level = int(row["level"]) if row else 1
-    xp = int(row["xp"]) if row else 0
-
-    level, xp, _next, levels_gained = gamedata.apply_xp(
-        level, xp, gamedata.xp_needed_for_skill_level(skill_id, level), gained,
-        need=lambda at: gamedata.xp_needed_for_skill_level(skill_id, at),
-    )
-
-    level = min(level, MAX_SKILL_LEVEL)
-    xp = min(xp, MAX_SKILL_XP)
-
-    db.execute(
-        """
-        INSERT INTO skills (user_id, slot, skill_id, level, xp)
-             VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, slot, skill_id)
-          DO UPDATE SET level = excluded.level, xp = excluded.xp
-        """,
-        (user_id, slot, skill_id, level, xp),
-    )
-
-    return level, xp, levels_gained
-
-
-def _add_to_backpack(user_id, slot, item_id, quantity):
-    """
-    Put quantity of item_id into the backpack the way the CLIENT would, and
-    return the cells touched - or None when it does not fit.
-
-    TOPS UP EXISTING STACKS FIRST, then fills empty cells. That is not a nicety:
-    the response hands `inventory` back as the authoritative layout, and the
-    client applies it. If this dropped every pickup into the lowest free cell
-    while InventoryContainer.add_stack_partial() merged onto a part-used stack,
-    the two would lay the same bag out differently and the player would watch
-    their potions split across cells on every loot.
-
-    Writes nothing unless the whole quantity fits. A half-completed pickup is
-    the shape of bug that ends with an item in neither the bag nor the bag.
-
-    THE BAG ONLY - never a hotbar key, not even to top up a stack already on
-    one. A key holds what the player put there; loot quietly growing the potion
-    stack on key 1 would be the server rearranging the one part of the carry
-    the player arranges by hand. See CARRY_CAPACITY.
-    """
-    definition = gamedata.item_row(item_id) or {}
-    stackable = bool(definition.get("stackable", False))
-    max_stack = int(definition.get("max_stack", 1)) if stackable else 1
-    if max_stack < 1:
-        max_stack = 1
-
-    rows = get_db().execute(
-        "SELECT position, item_id, quantity FROM carry_items WHERE user_id = ? AND slot = ? ORDER BY position",
-        (user_id, slot),
-    ).fetchall()
-
-    occupied = {int(r["position"]): (r["item_id"], int(r["quantity"])) for r in rows}
-
-    remaining = int(quantity)
-    writes = []  # (position, item_id, new_quantity)
-
-    if stackable:
-        for position in sorted(occupied):
-            if remaining <= 0 or position >= INVENTORY_CAPACITY:
-                break
-            held_id, held_qty = occupied[position]
-            if held_id != item_id or held_qty >= max_stack:
-                continue
-            room = max_stack - held_qty
-            moved = min(room, remaining)
-            writes.append((position, item_id, held_qty + moved))
-            remaining -= moved
-
-    for position in range(INVENTORY_CAPACITY):
-        if remaining <= 0:
-            break
-        if position in occupied:
-            continue
-        moved = min(max_stack, remaining)
-        writes.append((position, item_id, moved))
-        occupied[position] = (item_id, moved)
-        remaining -= moved
-
-    if remaining > 0:
-        return None
-
-    db = get_db()
-    for position, written_id, written_qty in writes:
-        db.execute(
-            """
-            INSERT INTO carry_items (user_id, slot, position, item_id, quantity)
-                 VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(user_id, slot, position)
-              DO UPDATE SET item_id = excluded.item_id, quantity = excluded.quantity
-            """,
-            (user_id, slot, position, written_id, written_qty),
-        )
-
-    return [position for position, _, _ in writes]
+# Since 18 Oct the grants are the packages' that own what they write: the XP
+# grant is skills/'s, the backpack's two are carry/'s, all three registered at
+# THE CARRY AND THE SKILLS above and kept callable here as _grant_skill_xp(),
+# _add_to_backpack() and _take_from_backpack(). The loot bag below and
+# fishing and cooking are handed them by those names.
 
 
 # THE LOOT BAG'S TWO ROUTES - the loot/ package (see LOOT BAGS). Handed the
-# money and the backpack from here: the gold and lusion ledgers, the grant
-# above, the trade hold, and whether a pet is already held.
+# money and the backpack from here: the gold and lusion ledgers, the backpack
+# grant, the trade hold, and whether a pet is already held.
 loot.register(
     app,
     require_auth=require_auth,
@@ -14990,9 +13398,9 @@ loot.register(
 # POST /api/fishing/catch and /api/cooking/cook, as they were here - endpoint
 # names, docstrings and every message (routes.lock). What a rod lands and what
 # a fire makes of it are the package's: the bait, the rod, the cast bucket.
-# What they pay with stays this file's and is handed in - _grant_skill_xp(),
-# _add_to_backpack() and _take_from_backpack() above, which the loot bag, the
-# shop, trades, the bank and gifts pay with too.
+# What they pay with is handed in - _grant_skill_xp(), _add_to_backpack() and
+# _take_from_backpack(), skills/'s and carry/'s since 18 Oct, which the loot
+# bag, the shop, trades, the bank and gifts pay with too.
 import gathering  # noqa: E402
 
 # Named here as well, for test_gathering.py and anything else that reads them

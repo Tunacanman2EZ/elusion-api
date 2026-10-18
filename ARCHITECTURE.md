@@ -37,6 +37,9 @@ Beside it, **feature packages**: a folder per area, each in three layers.
 | `consuming/` | 18 Oct | **moved out** of app.py: using a consumable |
 | `death/` | 18 Oct | **moved out** of app.py: reviving and respawning |
 | `bank/` | 18 Oct | **moved out** of app.py: the bank and the account |
+| `carry/` | 18 Oct | **moved out** of app.py: the backpack, and the item grants |
+| `skills/` | 18 Oct | **moved out** of app.py: the skills write, training, the XP grant |
+| `saves/` | 18 Oct | **moved out** of app.py: a character's slot, its read, deleting it |
 
 ## Where it is going
 
@@ -131,7 +134,9 @@ areas that hold money and items:
    cast bucket went with them. **The grants they pay with stayed in app.py and
    are handed in** - `_grant_skill_xp()`, `_add_to_backpack()`,
    `_take_from_backpack()` - because the loot bag, the shop, trades, the bank
-   and gifts pay with the same three. They go with the carry (10).
+   and gifts pay with the same three. They went with the carry (10, 18 Oct):
+   the item grants are carry/'s, the XP grant skills/'s, still handed in by
+   those names.
 3. ~~loot bags~~ (18 Oct): both routes, and every line of SQL on the two
    tables but character delete's. **A new bag is still made in app.py**
    (`_create_loot_bag()`, with the package's `stamped()` and `store_bag()`),
@@ -222,8 +227,32 @@ areas that hold money and items:
     further down app.py than its old banner**, after the carry's sizes and
     helpers it is handed. What it shares with the backpack - taking from cells,
     a move, a discard - stays in app.py, handed in by name, and goes with the
-    carry. Next: the carry itself, the grants with it; then saves and the
-    status write.
+    carry.
+    ~~The carry and the skills (`carry/`, `skills/`)~~ (18 Oct): the
+    backpack's four routes - the owner's whole-carry write, a move, a
+    discard, cashing a pile - and the skills' two, the write and the training
+    report; and with them **the grants every other area pays with**: an item
+    into the bag and out of it, whether an account holds one, the XP grant,
+    and the grid steps the bank and the shop's sale share. **Registered before
+    every area that is handed them** (THE CARRY AND THE SKILLS, ahead of the
+    bank), and both hand everything back; app.py keeps each under its old
+    name, so the shop, the kill, trades, loot and gathering are handed what
+    they always were. What they need from further down the file - the
+    trade-resync flag, the lusion pile's id, the account view - is handed in
+    as a lookup, since the name does not exist yet when register() runs.
+    test_gifts' "one function" check reads the cash route wherever it lives,
+    and that app.py hands it `money_item_worth` by name.
+    ~~The character itself (`saves/`)~~ (18 Oct): GET and PUT `/api/save`,
+    the one-call character read and deleting a character - four routes, and
+    every write to `character_deletions`. **Registered further down app.py
+    than its old banner**, after everything it is handed (the carry, the
+    skills, the trade lookup, the save history), so nothing is a lookup.
+    What every route shares stays at SAVES: the slot parser, the 400, a cell,
+    the JSON-column reader and `_derived_stats()`. Next: the status read and
+    write, with the healing reconciler; then the shop.
+
+Things noticed along the way that need upgrading, but are not part of a move,
+are kept in UPGRADES.md - checked before they are written there.
 11. then the core itself (sessions, tokens, auth) into a package of its own,
     and each table's `CREATE` into its area - and app.py is the composition
     root it was meant to be.
