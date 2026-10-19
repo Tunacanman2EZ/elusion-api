@@ -29,6 +29,8 @@ STAFF_ACTION_KINDS = (
     "world",
     # 0.48.0: an event scheduled or called off (events/).
     "event",
+    # 0.57.0: the kill receipts' switch (switches/).
+    "receipts",
 )
 
 # NAMED SETS OF KINDS the log can be asked for by one name (?action=moderation).

@@ -152,30 +152,6 @@
   ],
   [
    "table",
-   "kill_reports",
-   "kill_reports",
-   "CREATE TABLE kill_reports (\n            id         INTEGER PRIMARY KEY AUTOINCREMENT,\n            user_id    INTEGER NOT NULL,\n            slot       INTEGER NOT NULL,\n            enemy_id   TEXT    NOT NULL,\n            xp         INTEGER NOT NULL DEFAULT 0,\n            attack_xp  INTEGER NOT NULL DEFAULT 0,\n            level_at   INTEGER NOT NULL DEFAULT 0,\n            at         INTEGER NOT NULL,\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
-  ],
-  [
-   "table",
-   "kill_tally",
-   "kill_tally",
-   "CREATE TABLE kill_tally (\n            user_id    INTEGER NOT NULL,\n            slot       INTEGER NOT NULL,\n            enemy_id   TEXT    NOT NULL,\n            kills      INTEGER NOT NULL DEFAULT 0,\n            first_at   INTEGER NOT NULL,\n            last_at    INTEGER NOT NULL,\n            PRIMARY KEY (user_id, slot, enemy_id),\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
-  ],
-  [
-   "index",
-   "sqlite_autoindex_kill_tally_1",
-   "kill_tally",
-   null
-  ],
-  [
-   "index",
-   "idx_kill_tally_enemy",
-   "kill_tally",
-   "CREATE INDEX idx_kill_tally_enemy ON kill_tally(enemy_id, user_id)"
-  ],
-  [
-   "table",
    "combat_kills",
    "combat_kills",
    "CREATE TABLE combat_kills (\n            id         INTEGER PRIMARY KEY AUTOINCREMENT,\n            at         INTEGER NOT NULL,\n            area       TEXT    NOT NULL,\n            enemy_id   TEXT    NOT NULL,\n            origin     TEXT    NOT NULL DEFAULT '',\n            leader_id  INTEGER NOT NULL DEFAULT 0,\n            user_id    INTEGER NOT NULL,\n            slot       INTEGER NOT NULL DEFAULT -1,\n            verdict    TEXT    NOT NULL,\n            damage     INTEGER NOT NULL DEFAULT 0,\n            refused    INTEGER NOT NULL DEFAULT 0,\n            hp_left    INTEGER NOT NULL DEFAULT 0,\n            max_hp     INTEGER NOT NULL DEFAULT 0,\n            seconds    REAL    NOT NULL DEFAULT 0\n        )"
@@ -211,18 +187,6 @@
    "CREATE INDEX idx_combat_flags_at ON combat_flags(last_at)"
   ],
   [
-   "index",
-   "idx_kill_reports_user",
-   "kill_reports",
-   "CREATE INDEX idx_kill_reports_user ON kill_reports(user_id, at)"
-  ],
-  [
-   "index",
-   "idx_kill_reports_enemy",
-   "kill_reports",
-   "CREATE INDEX idx_kill_reports_enemy ON kill_reports(enemy_id, at)"
-  ],
-  [
    "table",
    "lusion_ledger",
    "lusion_ledger",
@@ -256,7 +220,7 @@
    "table",
    "saves",
    "saves",
-   "CREATE TABLE saves (\n            user_id     INTEGER NOT NULL,\n            slot        INTEGER NOT NULL,\n            class_id    TEXT    NOT NULL,\n            name        TEXT    NOT NULL,\n            level       INTEGER NOT NULL DEFAULT 1,\n            area        TEXT    NOT NULL DEFAULT 'elusion',\n            hp          INTEGER NOT NULL DEFAULT 10,\n            max_hp      INTEGER NOT NULL DEFAULT 10,\n            mana        INTEGER NOT NULL DEFAULT 10,\n            max_mana    INTEGER NOT NULL DEFAULT 10,\n            stamina     INTEGER NOT NULL DEFAULT 10,\n            max_stamina INTEGER NOT NULL DEFAULT 10,\n            gold        INTEGER NOT NULL DEFAULT 0,\n            xp          INTEGER NOT NULL DEFAULT 0,\n            xp_to_next  INTEGER NOT NULL DEFAULT 100,\n            bank_gold   INTEGER NOT NULL DEFAULT 0,\n            -- which pet this character currently has out, as the client's\n            -- item_id (e.g. 'petpoisonslimesmall'). Empty string means none.\n            -- Deliberately NOT validated against a list of known pets: the\n            -- server has no item registry and inventing one here would mean\n            -- every new pet the game adds needs a matching server deploy\n            -- before it could be equipped. Same reasoning as bank item_ids.\n            -- It IS checked against what the player holds: /api/save stores\n            -- a pet only when the carry or the bank has it (_owns_item).\n            active_pet_id TEXT NOT NULL DEFAULT '',\n            -- WHAT THIS CHARACTER IS WEARING, as a JSON object of item ids.\n            -- Here for the same reason active_pet_id is: a string the client\n            -- cannot keep for itself.\n            --\n            -- JSON IN A TEXT COLUMN, not eight columns. The server does not\n            -- query inside it; it stores it, hands it back, and refuses ids the\n            -- catalogue has never heard of. A column per equip slot would be a\n            -- schema change every time a slot is added, to buy a query nobody\n            -- writes.\n            --\n            -- There was a `hotbar` column beside this, holding which item id\n            -- each key pointed at. The hotbar holds real items now - they are\n            -- carry_items rows past the bag, see CARRY_CAPACITY - so the column\n            -- is gone from the schema. A database created before that still has\n            -- it, and nothing reads or writes it; it defaults to '[]'.\n            equipment     TEXT NOT NULL DEFAULT '{}',\n\n            -- WHERE THIS CHARACTER HAS BEEN, as WorldMap's compressed\n            -- exploration bitmask per area. Opaque to this server by design:\n            -- knowing which tiles somebody has walked past confers nothing on\n            -- anyone else, so there is nothing here to cheat and nothing worth\n            -- the cost of understanding the format.\n            --\n            -- It is SIZE-CAPPED all the same. An opaque blob in a column with\n            -- no ceiling is somewhere to put ten megabytes, and that is a\n            -- different problem from cheating.\n            explored      TEXT NOT NULL DEFAULT '{}',\n            updated_at  INTEGER NOT NULL, last_kill_at INTEGER NOT NULL DEFAULT 0, kill_tokens REAL NOT NULL DEFAULT 20.0, last_train_at INTEGER NOT NULL DEFAULT 0, pools_at INTEGER NOT NULL DEFAULT 0, last_cast_at INTEGER NOT NULL DEFAULT 0, cast_tokens REAL NOT NULL DEFAULT 6.0, resync_trade TEXT,\n            PRIMARY KEY (user_id, slot),\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
+   "CREATE TABLE saves (\n            user_id     INTEGER NOT NULL,\n            slot        INTEGER NOT NULL,\n            class_id    TEXT    NOT NULL,\n            name        TEXT    NOT NULL,\n            level       INTEGER NOT NULL DEFAULT 1,\n            area        TEXT    NOT NULL DEFAULT 'elusion',\n            hp          INTEGER NOT NULL DEFAULT 10,\n            max_hp      INTEGER NOT NULL DEFAULT 10,\n            mana        INTEGER NOT NULL DEFAULT 10,\n            max_mana    INTEGER NOT NULL DEFAULT 10,\n            stamina     INTEGER NOT NULL DEFAULT 10,\n            max_stamina INTEGER NOT NULL DEFAULT 10,\n            gold        INTEGER NOT NULL DEFAULT 0,\n            xp          INTEGER NOT NULL DEFAULT 0,\n            xp_to_next  INTEGER NOT NULL DEFAULT 100,\n            -- which pet this character currently has out, as the client's\n            -- item_id (e.g. 'petpoisonslimesmall'). Empty string means none.\n            -- Deliberately NOT validated against a list of known pets: the\n            -- server has no item registry and inventing one here would mean\n            -- every new pet the game adds needs a matching server deploy\n            -- before it could be equipped. Same reasoning as bank item_ids.\n            -- It IS checked against what the player holds: /api/save stores\n            -- a pet only when the carry or the bank has it (_owns_item).\n            active_pet_id TEXT NOT NULL DEFAULT '',\n            -- WHAT THIS CHARACTER IS WEARING, as a JSON object of item ids.\n            -- Here for the same reason active_pet_id is: a string the client\n            -- cannot keep for itself.\n            --\n            -- JSON IN A TEXT COLUMN, not eight columns. The server does not\n            -- query inside it; it stores it, hands it back, and refuses ids the\n            -- catalogue has never heard of. A column per equip slot would be a\n            -- schema change every time a slot is added, to buy a query nobody\n            -- writes.\n            --\n            -- There was a `hotbar` column beside this, holding which item id\n            -- each key pointed at. The hotbar holds real items now - they are\n            -- carry_items rows past the bag, see CARRY_CAPACITY - so the column\n            -- is gone from the schema. A database created before that still has\n            -- it, and nothing reads or writes it; it defaults to '[]'.\n            equipment     TEXT NOT NULL DEFAULT '{}',\n\n            -- WHERE THIS CHARACTER HAS BEEN, as WorldMap's compressed\n            -- exploration bitmask per area. Opaque to this server by design:\n            -- knowing which tiles somebody has walked past confers nothing on\n            -- anyone else, so there is nothing here to cheat and nothing worth\n            -- the cost of understanding the format.\n            --\n            -- It is SIZE-CAPPED all the same. An opaque blob in a column with\n            -- no ceiling is somewhere to put ten megabytes, and that is a\n            -- different problem from cheating.\n            explored      TEXT NOT NULL DEFAULT '{}',\n            updated_at  INTEGER NOT NULL, last_kill_at INTEGER NOT NULL DEFAULT 0, kill_tokens REAL NOT NULL DEFAULT 20.0, last_train_at INTEGER NOT NULL DEFAULT 0, pools_at INTEGER NOT NULL DEFAULT 0, last_cast_at INTEGER NOT NULL DEFAULT 0, cast_tokens REAL NOT NULL DEFAULT 6.0, resync_trade TEXT,\n            PRIMARY KEY (user_id, slot),\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
   ],
   [
    "index",
@@ -272,18 +236,6 @@
   ],
   [
    "table",
-   "bank_items",
-   "bank_items",
-   "CREATE TABLE bank_items (\n            user_id  INTEGER NOT NULL,\n            position INTEGER NOT NULL,\n            item_id  TEXT    NOT NULL,\n            quantity INTEGER NOT NULL CHECK (quantity > 0),\n            PRIMARY KEY (user_id, position),\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
-  ],
-  [
-   "index",
-   "sqlite_autoindex_bank_items_1",
-   "bank_items",
-   null
-  ],
-  [
-   "table",
    "carry_items",
    "carry_items",
    "CREATE TABLE carry_items (\n            user_id  INTEGER NOT NULL,\n            slot     INTEGER NOT NULL,\n            position INTEGER NOT NULL,\n            item_id  TEXT    NOT NULL,\n            quantity INTEGER NOT NULL CHECK (quantity > 0),\n            PRIMARY KEY (user_id, slot, position),\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
@@ -292,36 +244,6 @@
    "index",
    "sqlite_autoindex_carry_items_1",
    "carry_items",
-   null
-  ],
-  [
-   "table",
-   "loot_bags",
-   "loot_bags",
-   "CREATE TABLE loot_bags (\n            bag_id     TEXT    PRIMARY KEY,\n            user_id    INTEGER NOT NULL,\n            slot       INTEGER NOT NULL,\n            enemy_id   TEXT    NOT NULL,\n            created_at INTEGER NOT NULL,\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
-  ],
-  [
-   "index",
-   "sqlite_autoindex_loot_bags_1",
-   "loot_bags",
-   null
-  ],
-  [
-   "index",
-   "idx_loot_bags_created",
-   "loot_bags",
-   "CREATE INDEX idx_loot_bags_created ON loot_bags(created_at)"
-  ],
-  [
-   "table",
-   "loot_bag_items",
-   "loot_bag_items",
-   "CREATE TABLE loot_bag_items (\n            bag_id   TEXT    NOT NULL,\n            position INTEGER NOT NULL,\n            item_id  TEXT    NOT NULL,\n            quantity INTEGER NOT NULL CHECK (quantity > 0),\n            PRIMARY KEY (bag_id, position),\n            FOREIGN KEY (bag_id) REFERENCES loot_bags(bag_id) ON DELETE CASCADE\n        )"
-  ],
-  [
-   "index",
-   "sqlite_autoindex_loot_bag_items_1",
-   "loot_bag_items",
    null
   ],
   [
@@ -353,48 +275,6 @@
    "idx_trusted_devices_user",
    "trusted_devices",
    "CREATE INDEX idx_trusted_devices_user\n            ON trusted_devices(user_id, created_at)"
-  ],
-  [
-   "table",
-   "presence_tickets",
-   "presence_tickets",
-   "CREATE TABLE presence_tickets (\n            token_hash   TEXT    PRIMARY KEY,\n            session_hash TEXT    NOT NULL,\n            user_id      INTEGER NOT NULL,\n            slot         INTEGER NOT NULL,\n            identity     TEXT    NOT NULL,\n            issued_at    INTEGER NOT NULL,\n            expires_at   INTEGER NOT NULL,\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
-  ],
-  [
-   "index",
-   "sqlite_autoindex_presence_tickets_1",
-   "presence_tickets",
-   null
-  ],
-  [
-   "index",
-   "idx_presence_tickets_expiry",
-   "presence_tickets",
-   "CREATE INDEX idx_presence_tickets_expiry\n            ON presence_tickets(expires_at)"
-  ],
-  [
-   "table",
-   "trade_holds",
-   "trade_holds",
-   "CREATE TABLE trade_holds (\n            id          INTEGER PRIMARY KEY AUTOINCREMENT,\n            user_id     INTEGER NOT NULL,\n            item_id     TEXT    NOT NULL,\n            created_at  INTEGER NOT NULL,\n            held_until  INTEGER NOT NULL,\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
-  ],
-  [
-   "index",
-   "idx_trade_holds_user",
-   "trade_holds",
-   "CREATE INDEX idx_trade_holds_user\n            ON trade_holds(user_id, item_id, held_until)"
-  ],
-  [
-   "table",
-   "character_deletions",
-   "character_deletions",
-   "CREATE TABLE character_deletions (\n            id         INTEGER PRIMARY KEY AUTOINCREMENT,\n            user_id    INTEGER NOT NULL,\n            slot       INTEGER NOT NULL,\n            class_id   TEXT    NOT NULL,\n            name       TEXT    NOT NULL,\n            level      INTEGER NOT NULL,\n            gold       INTEGER NOT NULL DEFAULT 0,\n            deleted_at INTEGER NOT NULL,\n            snapshot   TEXT    NOT NULL,\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
-  ],
-  [
-   "index",
-   "idx_character_deletions_user",
-   "character_deletions",
-   "CREATE INDEX idx_character_deletions_user\n            ON character_deletions(user_id, deleted_at)"
   ],
   [
    "table",
@@ -458,6 +338,174 @@
   ],
   [
    "table",
+   "server_settings",
+   "server_settings",
+   "CREATE TABLE server_settings (\n            key        TEXT    PRIMARY KEY,\n            value      TEXT    NOT NULL,\n            updated_by TEXT    NOT NULL DEFAULT '',\n            updated_at INTEGER NOT NULL DEFAULT 0\n        )"
+  ],
+  [
+   "index",
+   "sqlite_autoindex_server_settings_1",
+   "server_settings",
+   null
+  ],
+  [
+   "table",
+   "broadcasts",
+   "broadcasts",
+   "CREATE TABLE broadcasts (\n            id         INTEGER PRIMARY KEY AUTOINCREMENT,\n            kind       TEXT    NOT NULL DEFAULT 'system',\n            body       TEXT    NOT NULL,\n            created_by TEXT    NOT NULL DEFAULT '',\n            created_at INTEGER NOT NULL\n        )"
+  ],
+  [
+   "index",
+   "idx_broadcasts_id",
+   "broadcasts",
+   "CREATE INDEX idx_broadcasts_id ON broadcasts(id)"
+  ],
+  [
+   "table",
+   "pending_teleports",
+   "pending_teleports",
+   "CREATE TABLE pending_teleports (\n            id         INTEGER NOT NULL,\n            user_id    INTEGER PRIMARY KEY,\n            area       TEXT    NOT NULL,\n            x          REAL    NOT NULL DEFAULT 0,\n            y          REAL    NOT NULL DEFAULT 0,\n            slot_index INTEGER NOT NULL DEFAULT 0,\n            group_size INTEGER NOT NULL DEFAULT 1,\n            issued_by  TEXT    NOT NULL DEFAULT '',\n            issued_at  INTEGER NOT NULL,\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
+  ],
+  [
+   "table",
+   "auth_codes",
+   "auth_codes",
+   "CREATE TABLE auth_codes (\n            user_id    INTEGER NOT NULL,\n            purpose    TEXT    NOT NULL,\n            code_hash  TEXT    NOT NULL,\n            target     TEXT    NOT NULL DEFAULT '',\n            expires_at INTEGER NOT NULL,\n            attempts   INTEGER NOT NULL DEFAULT 0,\n            created_at INTEGER NOT NULL,\n            PRIMARY KEY (user_id, purpose),\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
+  ],
+  [
+   "index",
+   "sqlite_autoindex_auth_codes_1",
+   "auth_codes",
+   null
+  ],
+  [
+   "trigger",
+   "trg_saves_gold_nonneg",
+   "saves",
+   "CREATE TRIGGER trg_saves_gold_nonneg\n        BEFORE UPDATE OF gold ON saves\n        WHEN NEW.gold < 0\n        BEGIN\n            SELECT RAISE(ABORT, 'gold cannot go below zero');\n        END"
+  ],
+  [
+   "table",
+   "kill_reports",
+   "kill_reports",
+   "CREATE TABLE kill_reports (\n            id         INTEGER PRIMARY KEY AUTOINCREMENT,\n            user_id    INTEGER NOT NULL,\n            slot       INTEGER NOT NULL,\n            enemy_id   TEXT    NOT NULL,\n            xp         INTEGER NOT NULL DEFAULT 0,\n            attack_xp  INTEGER NOT NULL DEFAULT 0,\n            level_at   INTEGER NOT NULL DEFAULT 0,\n            at         INTEGER NOT NULL,\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
+  ],
+  [
+   "table",
+   "kill_tally",
+   "kill_tally",
+   "CREATE TABLE kill_tally (\n            user_id    INTEGER NOT NULL,\n            slot       INTEGER NOT NULL,\n            enemy_id   TEXT    NOT NULL,\n            kills      INTEGER NOT NULL DEFAULT 0,\n            first_at   INTEGER NOT NULL,\n            last_at    INTEGER NOT NULL,\n            PRIMARY KEY (user_id, slot, enemy_id),\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
+  ],
+  [
+   "index",
+   "sqlite_autoindex_kill_tally_1",
+   "kill_tally",
+   null
+  ],
+  [
+   "index",
+   "idx_kill_tally_enemy",
+   "kill_tally",
+   "CREATE INDEX idx_kill_tally_enemy ON kill_tally(enemy_id, user_id)"
+  ],
+  [
+   "index",
+   "idx_kill_reports_user",
+   "kill_reports",
+   "CREATE INDEX idx_kill_reports_user ON kill_reports(user_id, at)"
+  ],
+  [
+   "index",
+   "idx_kill_reports_enemy",
+   "kill_reports",
+   "CREATE INDEX idx_kill_reports_enemy ON kill_reports(enemy_id, at)"
+  ],
+  [
+   "table",
+   "kill_receipts",
+   "kill_receipts",
+   "CREATE TABLE kill_receipts (\n            combat_kill_id INTEGER PRIMARY KEY,\n            user_id        INTEGER NOT NULL,\n            slot           INTEGER NOT NULL,\n            at             INTEGER NOT NULL\n        )"
+  ],
+  [
+   "index",
+   "idx_kill_receipts_at",
+   "kill_receipts",
+   "CREATE INDEX idx_kill_receipts_at ON kill_receipts(at)"
+  ],
+  [
+   "table",
+   "bank_items",
+   "bank_items",
+   "CREATE TABLE bank_items (\n            user_id  INTEGER NOT NULL,\n            position INTEGER NOT NULL,\n            item_id  TEXT    NOT NULL,\n            quantity INTEGER NOT NULL CHECK (quantity > 0),\n            PRIMARY KEY (user_id, position),\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
+  ],
+  [
+   "index",
+   "sqlite_autoindex_bank_items_1",
+   "bank_items",
+   null
+  ],
+  [
+   "table",
+   "loot_bags",
+   "loot_bags",
+   "CREATE TABLE loot_bags (\n            bag_id     TEXT    PRIMARY KEY,\n            user_id    INTEGER NOT NULL,\n            slot       INTEGER NOT NULL,\n            enemy_id   TEXT    NOT NULL,\n            created_at INTEGER NOT NULL,\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
+  ],
+  [
+   "index",
+   "sqlite_autoindex_loot_bags_1",
+   "loot_bags",
+   null
+  ],
+  [
+   "index",
+   "idx_loot_bags_created",
+   "loot_bags",
+   "CREATE INDEX idx_loot_bags_created ON loot_bags(created_at)"
+  ],
+  [
+   "table",
+   "loot_bag_items",
+   "loot_bag_items",
+   "CREATE TABLE loot_bag_items (\n            bag_id   TEXT    NOT NULL,\n            position INTEGER NOT NULL,\n            item_id  TEXT    NOT NULL,\n            quantity INTEGER NOT NULL CHECK (quantity > 0),\n            PRIMARY KEY (bag_id, position),\n            FOREIGN KEY (bag_id) REFERENCES loot_bags(bag_id) ON DELETE CASCADE\n        )"
+  ],
+  [
+   "index",
+   "sqlite_autoindex_loot_bag_items_1",
+   "loot_bag_items",
+   null
+  ],
+  [
+   "table",
+   "presence_tickets",
+   "presence_tickets",
+   "CREATE TABLE presence_tickets (\n            token_hash   TEXT    PRIMARY KEY,\n            session_hash TEXT    NOT NULL,\n            user_id      INTEGER NOT NULL,\n            slot         INTEGER NOT NULL,\n            identity     TEXT    NOT NULL,\n            issued_at    INTEGER NOT NULL,\n            expires_at   INTEGER NOT NULL,\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
+  ],
+  [
+   "index",
+   "sqlite_autoindex_presence_tickets_1",
+   "presence_tickets",
+   null
+  ],
+  [
+   "index",
+   "idx_presence_tickets_expiry",
+   "presence_tickets",
+   "CREATE INDEX idx_presence_tickets_expiry\n            ON presence_tickets(expires_at)"
+  ],
+  [
+   "table",
+   "trade_holds",
+   "trade_holds",
+   "CREATE TABLE trade_holds (\n            id          INTEGER PRIMARY KEY AUTOINCREMENT,\n            user_id     INTEGER NOT NULL,\n            item_id     TEXT    NOT NULL,\n            created_at  INTEGER NOT NULL,\n            held_until  INTEGER NOT NULL,\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
+  ],
+  [
+   "index",
+   "idx_trade_holds_user",
+   "trade_holds",
+   "CREATE INDEX idx_trade_holds_user\n            ON trade_holds(user_id, item_id, held_until)"
+  ],
+  [
+   "table",
    "trades",
    "trades",
    "CREATE TABLE trades (\n            trade_id    TEXT PRIMARY KEY,\n            a_user      INTEGER NOT NULL,\n            a_slot      INTEGER NOT NULL,\n            a_gold      INTEGER NOT NULL DEFAULT 0 CHECK (a_gold >= 0),\n            a_confirmed INTEGER NOT NULL DEFAULT 0,\n            b_user      INTEGER NOT NULL,\n            b_slot      INTEGER NOT NULL,\n            b_gold      INTEGER NOT NULL DEFAULT 0 CHECK (b_gold >= 0),\n            b_confirmed INTEGER NOT NULL DEFAULT 0,\n            state       TEXT    NOT NULL DEFAULT 'open',\n            created_at  INTEGER NOT NULL,\n            updated_at  INTEGER NOT NULL, revision INTEGER NOT NULL DEFAULT 0, a_tax INTEGER NOT NULL DEFAULT 0, b_tax INTEGER NOT NULL DEFAULT 0,\n            FOREIGN KEY (a_user) REFERENCES users(id) ON DELETE CASCADE,\n            FOREIGN KEY (b_user) REFERENCES users(id) ON DELETE CASCADE\n        )"
@@ -500,33 +548,21 @@
   ],
   [
    "table",
-   "server_settings",
-   "server_settings",
-   "CREATE TABLE server_settings (\n            key        TEXT    PRIMARY KEY,\n            value      TEXT    NOT NULL,\n            updated_by TEXT    NOT NULL DEFAULT '',\n            updated_at INTEGER NOT NULL DEFAULT 0\n        )"
+   "character_deletions",
+   "character_deletions",
+   "CREATE TABLE character_deletions (\n            id         INTEGER PRIMARY KEY AUTOINCREMENT,\n            user_id    INTEGER NOT NULL,\n            slot       INTEGER NOT NULL,\n            class_id   TEXT    NOT NULL,\n            name       TEXT    NOT NULL,\n            level      INTEGER NOT NULL,\n            gold       INTEGER NOT NULL DEFAULT 0,\n            deleted_at INTEGER NOT NULL,\n            snapshot   TEXT    NOT NULL,\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
   ],
   [
    "index",
-   "sqlite_autoindex_server_settings_1",
-   "server_settings",
-   null
+   "idx_character_deletions_user",
+   "character_deletions",
+   "CREATE INDEX idx_character_deletions_user\n            ON character_deletions(user_id, deleted_at)"
   ],
   [
    "table",
    "world_ticks",
    "world_ticks",
    "CREATE TABLE world_ticks (\n            tick       INTEGER PRIMARY KEY,\n            element    INTEGER NOT NULL,\n            started_at INTEGER NOT NULL,\n            ends_at    INTEGER NOT NULL,\n            chosen_by  TEXT    NOT NULL DEFAULT ''\n        )"
-  ],
-  [
-   "table",
-   "broadcasts",
-   "broadcasts",
-   "CREATE TABLE broadcasts (\n            id         INTEGER PRIMARY KEY AUTOINCREMENT,\n            kind       TEXT    NOT NULL DEFAULT 'system',\n            body       TEXT    NOT NULL,\n            created_by TEXT    NOT NULL DEFAULT '',\n            created_at INTEGER NOT NULL\n        )"
-  ],
-  [
-   "index",
-   "idx_broadcasts_id",
-   "broadcasts",
-   "CREATE INDEX idx_broadcasts_id ON broadcasts(id)"
   ],
   [
    "table",
@@ -749,30 +785,6 @@
    "idx_party_invites_from",
    "party_invites",
    "CREATE INDEX idx_party_invites_from\n            ON party_invites(from_id)"
-  ],
-  [
-   "table",
-   "pending_teleports",
-   "pending_teleports",
-   "CREATE TABLE pending_teleports (\n            id         INTEGER NOT NULL,\n            user_id    INTEGER PRIMARY KEY,\n            area       TEXT    NOT NULL,\n            x          REAL    NOT NULL DEFAULT 0,\n            y          REAL    NOT NULL DEFAULT 0,\n            slot_index INTEGER NOT NULL DEFAULT 0,\n            group_size INTEGER NOT NULL DEFAULT 1,\n            issued_by  TEXT    NOT NULL DEFAULT '',\n            issued_at  INTEGER NOT NULL,\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
-  ],
-  [
-   "table",
-   "auth_codes",
-   "auth_codes",
-   "CREATE TABLE auth_codes (\n            user_id    INTEGER NOT NULL,\n            purpose    TEXT    NOT NULL,\n            code_hash  TEXT    NOT NULL,\n            target     TEXT    NOT NULL DEFAULT '',\n            expires_at INTEGER NOT NULL,\n            attempts   INTEGER NOT NULL DEFAULT 0,\n            created_at INTEGER NOT NULL,\n            PRIMARY KEY (user_id, purpose),\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
-  ],
-  [
-   "index",
-   "sqlite_autoindex_auth_codes_1",
-   "auth_codes",
-   null
-  ],
-  [
-   "trigger",
-   "trg_saves_gold_nonneg",
-   "saves",
-   "CREATE TRIGGER trg_saves_gold_nonneg\n        BEFORE UPDATE OF gold ON saves\n        WHEN NEW.gold < 0\n        BEGIN\n            SELECT RAISE(ABORT, 'gold cannot go below zero');\n        END"
   ],
   [
    "index",
@@ -3149,6 +3161,60 @@
     ]
    ]
   },
+  "kill_receipts": {
+   "columns": [
+    [
+     0,
+     "combat_kill_id",
+     "INTEGER",
+     0,
+     null,
+     1
+    ],
+    [
+     1,
+     "user_id",
+     "INTEGER",
+     1,
+     null,
+     0
+    ],
+    [
+     2,
+     "slot",
+     "INTEGER",
+     1,
+     null,
+     0
+    ],
+    [
+     3,
+     "at",
+     "INTEGER",
+     1,
+     null,
+     0
+    ]
+   ],
+   "foreign_keys": [],
+   "index_info": {
+    "idx_kill_receipts_at": [
+     [
+      0,
+      3,
+      "at"
+     ]
+    ]
+   },
+   "indexes": [
+    [
+     "idx_kill_receipts_at",
+     0,
+     "c",
+     0
+    ]
+   ]
+  },
   "kill_reports": {
    "columns": [
     [
@@ -4589,14 +4655,6 @@
     ],
     [
      15,
-     "bank_gold",
-     "INTEGER",
-     1,
-     "0",
-     0
-    ],
-    [
-     16,
      "active_pet_id",
      "TEXT",
      1,
@@ -4604,7 +4662,7 @@
      0
     ],
     [
-     17,
+     16,
      "equipment",
      "TEXT",
      1,
@@ -4612,7 +4670,7 @@
      0
     ],
     [
-     18,
+     17,
      "explored",
      "TEXT",
      1,
@@ -4620,7 +4678,7 @@
      0
     ],
     [
-     19,
+     18,
      "updated_at",
      "INTEGER",
      1,
@@ -4628,7 +4686,7 @@
      0
     ],
     [
-     20,
+     19,
      "last_kill_at",
      "INTEGER",
      1,
@@ -4636,7 +4694,7 @@
      0
     ],
     [
-     21,
+     20,
      "kill_tokens",
      "REAL",
      1,
@@ -4644,7 +4702,7 @@
      0
     ],
     [
-     22,
+     21,
      "last_train_at",
      "INTEGER",
      1,
@@ -4652,7 +4710,7 @@
      0
     ],
     [
-     23,
+     22,
      "pools_at",
      "INTEGER",
      1,
@@ -4660,7 +4718,7 @@
      0
     ],
     [
-     24,
+     23,
      "last_cast_at",
      "INTEGER",
      1,
@@ -4668,7 +4726,7 @@
      0
     ],
     [
-     25,
+     24,
      "cast_tokens",
      "REAL",
      1,
@@ -4676,7 +4734,7 @@
      0
     ],
     [
-     26,
+     25,
      "resync_trade",
      "TEXT",
      0,

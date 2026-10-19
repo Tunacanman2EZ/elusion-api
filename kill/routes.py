@@ -26,6 +26,10 @@ register() is handed app.py's own pieces - it never imports app.py:
     create_loot_bag    (user_id, slot, enemy_id, contents) -> (bag_id, stored):
                        the bag stored and committed (loot/'s create_bag(),
                        registered later)
+    receipts_on        () -> whether a kill needs the books' receipt (the
+                       owner's switch, app.py's RECEIPTS_KEY) - asked on every
+                       call
+    client_build       () -> the build of the game that sent this request
 
 THE ENDPOINT NAME IS app.py's - combat_kill - and routes.lock holds it.
 """
@@ -38,7 +42,7 @@ from . import data, services
 
 def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, catalogue, stir_for, derived_stats,
              levelup_grant_id, proficient_amount, grant_skill_xp, post_broadcast, create_loot_bag,
-             note_refill):
+             note_refill, receipts_on, client_build):
 
     def combat_kill():
         """
@@ -66,10 +70,14 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, ca
         responses:
           200:
             description: XP granted, level-ups applied, and whatever the loot roll produced
+          202:
+            description: "Receipts on, and the server has not counted that death yet: nothing paid; ask again after retry_after_ms"
           400:
             description: Bad slot, unknown enemy_id, or an enemy that awards nothing
           404:
             description: That slot is empty
+          409:
+            description: Receipts on, no receipt yet, and the game is too old to ask again
           429:
             description: Kills are arriving faster than the cooldown allows
           401:
@@ -106,6 +114,26 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, ca
         row = data.character(db, user_id, slot)
         if row is None:
             return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
+
+        # THE SERVER'S RECEIPT (0.57.0), with the owner's switch on: a kill is
+        # paid only against the books' own count of that monster reaching zero
+        # for this account - services.RECEIPT_SECONDS has why. Asked before the
+        # bucket, so a "not yet" spends nothing.
+        receipt = None
+        if receipts_on():
+            receipt = data.receipt_for(db, user_id, slot, enemy_id,
+                                       int(time.time()) - services.RECEIPT_SECONDS)
+            if receipt is None:
+                if client_build() < services.RECEIPT_BUILD:
+                    return {
+                        "error": "Conflict",
+                        "message": "This copy of the game is too old to be paid for kills - update it.",
+                    }, 409
+                return {
+                    "pending": True,
+                    "retry_after_ms": services.RECEIPT_RETRY_MS,
+                    "message": "The server has not finished counting that fight yet.",
+                }, 202
 
         now_ms = int(time.time() * 1000)
 
@@ -154,6 +182,16 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, ca
                 }, 429
 
         # ---- everything above this line is validation; everything below commits --
+
+        # THE RECEIPT IS TAKEN FIRST, before anything is written: a death pays
+        # one kill. Another request that got there first means this one has no
+        # receipt after all - "not yet", and nothing was written to undo.
+        if receipt is not None and not data.use_receipt(db, receipt, user_id, slot, int(time.time())):
+            return {
+                "pending": True,
+                "retry_after_ms": services.RECEIPT_RETRY_MS,
+                "message": "The server has not finished counting that fight yet.",
+            }, 202
 
         # The killer's class goes in for the mythic roll: a win is their own
         # class's piece. See gamedata.roll_mythic().

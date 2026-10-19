@@ -68,6 +68,13 @@ play trips them at all. A game from before 0.10.0, or one whose link to the
 presence server is down, is never seen by the books; expect "never saw" rows
 from those until everyone has updated.
 
+THE RECEIPTS LINE (0.57.0) is the one to read before the owner's receipts
+switch goes on: of the kills paid in the last --days days, how many the books
+would have backed (receipts_backing(), the same rule as kill/data.py's
+receipt_for()), and which monsters the books never saw die. Near 100% backed,
+and nothing never seen for a whole kind of monster, means honest play would be
+paid exactly as it is now.
+
 READ-ONLY BY CONSTRUCTION. Opens the database mode=ro, the same discipline as
 canary.py: a watcher must never be able to become the thing it is watching.
 
@@ -169,6 +176,16 @@ MIN_BOSS_KILLERS_FOR_MEDIAN = 5
 # can be checked against what the server saw: a kill report matches a books
 # row for the same account and monster within this many seconds of it.
 BOOKS_MATCH_SECONDS = 30
+
+# THE RECEIPTS (0.57.0): what switching them on would have done to the kills
+# paid lately. A kill is paid then only against an AGREED books row for that
+# account and monster (and that character, or a row that could not say), at
+# most RECEIPT_SECONDS before the claim (kill/services.py) - and the game asks
+# again for RECEIPT_WAIT_SECONDS (combat.gd), so a death written that long
+# after the claim still pays. Mirrors receipt_for() in kill/data.py.
+RECEIPT_SECONDS = 60
+RECEIPT_WAIT_SECONDS = 8
+RECEIPTS_DAYS = 7
 
 
 # -- a finding is (tier, signal, detail); tier is "IMPOSSIBLE", "SUSPICIOUS" or
@@ -456,6 +473,59 @@ def books_summary(con):
         counts.get("agreed", 0), counts.get("short", 0), counts.get("not_due", 0))
 
 
+def receipts_backing(con, days=RECEIPTS_DAYS, now=None):
+    """
+    The kills paid in the last `days` days (since the books began, if later),
+    each put to the books as the receipts switch would: {"paid", "backed",
+    "short", "not_due", "never", "since", "never_by_enemy": {enemy: n}} -
+    "backed" would have been paid, the rest not. None before the books began.
+    One books row backs one kill, the oldest first, as in kill/data.py.
+    """
+    if not _has_table(con, "combat_kills"):
+        return None
+    first = con.execute("SELECT MIN(at) FROM combat_kills").fetchone()[0]
+    if first is None:
+        return None
+    import time as _time
+    since = max(int(first), int((now if now is not None else _time.time()) - days * 86400))
+    rows = {}
+    for at, user_id, slot, enemy_id, verdict in con.execute(
+            "SELECT at, user_id, slot, enemy_id, verdict FROM combat_kills WHERE at >= ? ORDER BY at, id",
+            (since - RECEIPT_SECONDS,)):
+        rows.setdefault((user_id, enemy_id), []).append([at, slot, verdict, False])
+    out = {"paid": 0, "backed": 0, "short": 0, "not_due": 0, "never": 0, "since": since,
+           "never_by_enemy": {}}
+    for user_id, slot, enemy_id, at in con.execute(
+            "SELECT user_id, slot, enemy_id, at FROM kill_reports WHERE at >= ? ORDER BY at, id", (since,)):
+        out["paid"] += 1
+        near = [r for r in rows.get((user_id, enemy_id), ())
+                if not r[3] and at - RECEIPT_SECONDS <= r[0] <= at + RECEIPT_WAIT_SECONDS and r[1] in (slot, -1)]
+        agreed = [r for r in near if r[2] == "agreed"]
+        if agreed:
+            agreed[0][3] = True
+            out["backed"] += 1
+        elif near:
+            out["not_due" if near[0][2] == "not_due" else "short"] += 1
+        else:
+            out["never"] += 1
+            out["never_by_enemy"][enemy_id] = out["never_by_enemy"].get(enemy_id, 0) + 1
+    return out
+
+
+def receipts_line(backing, days=RECEIPTS_DAYS):
+    """The one line killwatch prints about switching the receipts on."""
+    if backing is None:
+        return None
+    if backing["paid"] == 0:
+        return "receipts: no kills paid in the last %d days to measure them by" % days
+    worst = sorted(backing["never_by_enemy"].items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+    return ("receipts: of %d kills paid in the last %d days, %d (%.1f%%) had the books' receipt; "
+            "%d short, %d not due, %d never seen%s" % (
+                backing["paid"], days, backing["backed"], 100.0 * backing["backed"] / backing["paid"],
+                backing["short"], backing["not_due"], backing["never"],
+                (" (%s)" % ", ".join("%s %d" % kv for kv in worst)) if worst else ""))
+
+
 def _rank(dossier):
     """Worst first: any IMPOSSIBLE outranks all SUSPICIOUS, and SUSPICIOUS all
     WATCHED; then more findings before fewer. So the account a defence broke on
@@ -481,6 +551,8 @@ def main():
                     help="how many flagged accounts to print (0 = all)")
     ap.add_argument("--quiet", action="store_true",
                     help="print nothing unless an IMPOSSIBLE (alarm) finding exists")
+    ap.add_argument("--days", type=int, default=RECEIPTS_DAYS,
+                    help="how many days the receipts line measures (default %d)" % RECEIPTS_DAYS)
     args = ap.parse_args()
 
     if not os.path.exists(args.db):
@@ -491,6 +563,7 @@ def main():
     try:
         dossier = analyze(con, window=args.window, respawn=args.respawn)
         books_line = books_summary(con)
+        receipt_line = receipts_line(receipts_backing(con, days=args.days), days=args.days)
     except sqlite3.Error as exc:
         print("[KILLWATCH] FAIL: could not read the database: %s" % exc, file=sys.stderr)
         sys.exit(2)
@@ -515,6 +588,8 @@ def main():
         print("  !! IMPOSSIBLE checks are DARK; only behavioural review ran.")
     if books_line:
         print("  %s" % books_line)
+    if receipt_line:
+        print("  %s" % receipt_line)
     print("=" * 68)
 
     if not dossier:

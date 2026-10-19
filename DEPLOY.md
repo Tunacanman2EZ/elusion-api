@@ -802,6 +802,27 @@ scream about. So it splits into two schedules, an alarm and a digest:
 0 9 * * 1 cd /srv/elusion && python3 killwatch.py --db elusion.db | mail -s "Elusion weekly kill review" you@example.com
 ```
 
+### Kill receipts (0.57.0)
+
+Since 0.57.0 the server can pay a kill only when its own count of the fight
+agrees it happened - **the receipts switch**, "Kills need the server's count"
+in the GM panel's Testing tab (`POST /api/server/receipts`). It ships **off**.
+Before switching it on, read the `receipts:` line killwatch.py prints under
+`books:`:
+
+```
+sudo -u elusion /opt/elusion/venv/bin/python /opt/elusion/api/killwatch.py --db /var/lib/elusion/elusion.db --limit 0
+```
+
+`receipts: of 412 kills paid in the last 7 days, 405 (98.3%) had the books'
+receipt; 2 short, 0 not due, 5 never seen (...)` says what switching on would
+have done to the last week (`--days` to change it): the backed kills would be
+paid as now, the rest refused. Near 100%, and no monster in the "never seen"
+list with many kills, is the moment. Then **set "Old versions must update" to
+7 first** - a game older than 0.57.0 cannot wait for the server's count - and
+switch it on. Off again is one click, and safe at any time: kills are paid on
+the game's word, as before.
+
 `--window` and `--respawn` must match the server's spawn-ceiling constants; the
 defaults already do. This is the standing watch over **E-3** (below): combat is
 server-observed since 0.10.0, and the weekly digest's WATCHED pile is what

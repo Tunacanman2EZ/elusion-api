@@ -107,6 +107,7 @@ POST /api/server/coowners  set_co_owners  auth  rank=owner  fresh=-  lock=yes  d
 POST /api/server/maintenance  set_maintenance  auth  rank=coowner  fresh=yes  lock=yes  doc=yes
 POST /api/server/minbuild  set_min_build  auth  rank=coowner  fresh=yes  lock=yes  doc=yes
 POST /api/server/pvp  set_pvp  auth  rank=coowner  fresh=yes  lock=yes  doc=yes
+POST /api/server/receipts  set_receipts  auth  rank=coowner  fresh=yes  lock=yes  doc=yes
 POST /api/server/trade  set_trade  auth  rank=coowner  fresh=yes  lock=yes  doc=yes
 POST /api/server/world  set_world  auth  rank=coowner  fresh=yes  lock=yes  doc=yes
 POST /api/server/world/stir  stir_world  auth  rank=coowner  fresh=yes  lock=yes  doc=yes

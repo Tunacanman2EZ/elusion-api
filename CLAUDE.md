@@ -1746,6 +1746,45 @@ gamedata.json's `xp_base` / `xp_growth`.
 
 `test_pacing.py` holds all of it, including the eight hours.
 
+## Kill receipts: the books decide what is paid (0.57.0)
+
+E3_SCOPE.md, option C, STEP 2. Since 0.10.0 the books (above) judged every
+death and nothing read them. With the owner's **receipts switch** on
+(`RECEIPTS_KEY`, `POST /api/server/receipts`, "Kills need the server's count"
+in the GM panel's Testing tab), `POST /api/combat/kill` pays a kill only
+against the books' own count of it. **It ships off**: switch it on once
+killwatch.py's `receipts:` line shows honest play backed (DEPLOY.md, "Kill
+receipts"). `test_receipts.py` holds it; test_packages and test_killwatch the
+pieces.
+
+- **A receipt is an AGREED combat_kills row** for this account, this character
+  (or `slot` -1, a row the books could not put a character to) and this
+  monster, at most `RECEIPT_SECONDS` (60) old, not yet in `kill_receipts`
+  (kill/data.py `receipt_for()`). SHORT and NOT DUE never pay. Each row pays
+  ONE kill, the oldest first: `kill_receipts` is its used mark, a table of
+  kill/'s own because combat_kills is presence.py's alone to write, and its
+  primary key is what makes two requests reaching for one death take it once
+  (`use_receipt()`, INSERT OR IGNORE, the first write below the line).
+- **Not yet is not no.** No receipt yet is a **202** `{"pending": true,
+  "retry_after_ms": 400}` and nothing else: no token, no receipt, no record.
+  The game asks again for up to eight seconds (game combat.gd,
+  `RECEIPT_WAIT_SECONDS`) and then says the server did not see the fight. The
+  books hold a death `HOLD_SECONDS` (1.0) for late hits, and presence.py now
+  writes judged deaths every `KILLS_FLUSH_SECONDS` (0.25), the flags still
+  every two - so a kill is paid about 1.3 seconds after it, and the bag lands
+  that much later.
+- **A game too old to ask again** (below `RECEIPT_BUILD`, 7, the build this
+  came with) gets a **409** "update it" instead of a 202 it would read as a
+  kill paid nothing. With a receipt there it is paid like anyone. Set the
+  minimum build to 7 with the switch.
+- **Off reads off**: no row, or a row that cannot be read - unlike trade's,
+  because off is how every kill was paid until now, and a corrupt row must not
+  stop everybody being paid. Not announced; the staff log has it.
+- **What it does not do yet**: hold a player's health (E-9) or run the
+  monsters (step 3). A game with its presence link down earns nothing while
+  the switch is on, by design - the server cannot count a fight it was not
+  told about.
+
 ## Attack XP: banked at the kill, with the class specialty
 
 Attack trains only at `/api/combat/kill`. `proficient_amount(class_id, skill,

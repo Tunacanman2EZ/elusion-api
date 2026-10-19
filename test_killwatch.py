@@ -265,6 +265,34 @@ plain = fresh()
 check("books: a database from before them is no error", killwatch.books_matches(plain) == {}
       and killwatch.books_flags(plain) == {} and killwatch.books_summary(plain) is None)
 
+# THE RECEIPTS LINE (0.57.0): what switching the receipts on would have done to
+# those same paid kills - the rule kill/data.py's receipt_for() pays by.
+backing = killwatch.receipts_backing(con, days=1, now=1000700)
+check("receipts: each paid kill put to the books as the switch would",
+      backing is not None and (backing["paid"], backing["backed"], backing["short"], backing["not_due"],
+                               backing["never"]) == (16, 11, 1, 0, 4)
+      and backing["never_by_enemy"] == {"bushmage": 3, "firesprite": 1}, backing)
+check("receipts: the line says how many would have been paid, and which monsters the books never saw",
+      killwatch.receipts_line(backing, days=1)
+      == "receipts: of 16 kills paid in the last 1 days, 11 (68.8%) had the books' receipt; "
+         "1 short, 0 not due, 4 never seen (bushmage 3, firesprite 1)", killwatch.receipts_line(backing, days=1))
+edge = fresh(); books_tables(edge)
+add_user(edge, 30, "edges")
+judged(edge, 99, "bushmage", 2000000)
+kill(edge, 30, "bushmage", 2000100); judged(edge, 30, "bushmage", 2000100 + killwatch.RECEIPT_WAIT_SECONDS + 1)
+kill(edge, 30, "bushmage", 2000300); judged(edge, 30, "bushmage", 2000300 + killwatch.RECEIPT_WAIT_SECONDS - 3)
+kill(edge, 30, "bushmage", 2000600); judged(edge, 30, "bushmage", 2000600 - killwatch.RECEIPT_SECONDS - 1)
+kill(edge, 30, "bushmage", 2000900, slot=0)
+edge.execute("INSERT INTO combat_kills (at, area, enemy_id, user_id, slot, verdict, damage)"
+             " VALUES (2000899, 'field', 'bushmage', 30, 1, 'agreed', 100)")
+edged = killwatch.receipts_backing(edge, days=1, now=2001000)
+check("receipts: a death written while the game still asks pays; one after it gave up, or a minute before, "
+      "or another character's, does not", (edged["paid"], edged["backed"], edged["never"]) == (4, 1, 3), edged)
+check("receipts: no books, no line; no kills lately, a line that says so",
+      killwatch.receipts_backing(plain) is None and killwatch.receipts_line(None) is None
+      and killwatch.receipts_line(killwatch.receipts_backing(con, days=1, now=5000000), days=1)
+      == "receipts: no kills paid in the last 1 days to measure them by")
+
 fd, path = tempfile.mkstemp(suffix=".db"); os.close(fd)
 disk = sqlite3.connect(path)
 for statement in con.iterdump():
@@ -275,11 +303,15 @@ r = subprocess.run([sys.executable, os.path.join(HERE, "killwatch.py"), "--db", 
                    capture_output=True, text=True)
 rq = subprocess.run([sys.executable, os.path.join(HERE, "killwatch.py"), "--db", path, "--quiet"],
                     capture_output=True, text=True)
+rd = subprocess.run([sys.executable, os.path.join(HERE, "killwatch.py"), "--db", path, "--days", "30000"],
+                    capture_output=True, text=True)
 os.remove(path)
 check("books: CLI shows WATCHED and the books' line, and exits 0 - never an alarm",
       r.returncode == 0 and "WATCHED" in r.stdout and "books: 13 kill rows" in r.stdout, r.stdout[-400:])
 check("books: --quiet stays silent on WATCHED alone", rq.returncode == 0 and rq.stdout.strip() == "",
       rq.stdout[:200])
+check("receipts: the CLI prints the line, over the days asked for",
+      "receipts: of 16 kills paid in the last 30000 days" in rd.stdout, rd.stdout[:600])
 
 # --------------------------------------------------------------------------- #
 # EXIT-CODE CONTRACT (the cron promise), run end-to-end through the CLI.

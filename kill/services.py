@@ -73,6 +73,33 @@ KILL_RESPAWN_FLOOR_SECONDS = 30.0
 # same reasoning and the same self-pruning shape as LOGIN_LOG_RETENTION_SECONDS.
 KILL_LOG_RETENTION_SECONDS = 60 * 60 * 24 * 14
 
+# THE SERVER'S RECEIPT FOR A KILL (0.57.0; E3_SCOPE.md option C, step 2).
+#
+# Since 0.10.0 presence.py has kept its own count of every monster's health
+# (combatbook.py) and judged every death into combat_kills - AGREED, SHORT or
+# NOT DUE, one row per player who hit it - and nothing read it to decide
+# anything. With the owner's switch on (RECEIPTS_KEY in app.py), a kill is paid
+# only against an AGREED row for this account, this character (or a row that
+# could not say which) and this monster, no older than RECEIPT_SECONDS, that
+# has not paid a kill already (kill_receipts).
+#
+# NOT YET IS NOT NO. The books hold a death HOLD_SECONDS for its late hits and
+# then write it within a quarter of a second, so the game's claim usually
+# arrives first: the route answers 202 with RECEIPT_RETRY_MS, and the game asks
+# again (combat.gd, up to eight seconds). Nothing is spent on a 202 - not a
+# token, not a receipt - so asking again costs nothing but the request.
+#
+# A GAME TOO OLD TO ASK AGAIN (below RECEIPT_BUILD) would read the 202 as a
+# kill paid nothing and say nothing. It is told to update instead (409).
+#
+# SIXTY SECONDS, not the thirty killwatch.py matches by: the game asks again
+# for at most eight, and a slow link or a long death animation must not turn a
+# fight the server saw into a refusal. A receipt older than that belongs to
+# some other kill.
+RECEIPT_SECONDS = 60
+RECEIPT_RETRY_MS = 400
+RECEIPT_BUILD = 7
+
 
 def tokens_now(stored, last_kill_ms, now_ms):
     """The bucket as it stands at `now_ms`: what it held at the last paid kill,

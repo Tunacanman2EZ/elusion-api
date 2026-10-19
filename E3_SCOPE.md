@@ -213,6 +213,14 @@ account, character and monster (the receipt), checked by `/api/combat/kill`;
 a game not connected to presence earns no kill rewards and says so. The bounds
 lose their slack where the week showed honest play never needs it.
 
+**Built 19 October 2026 (0.57.0), behind a switch, off.** The owner: "2 and 3
+or you best advice" - step 2 now, step 3 after it has run. The receipts switch
+(api/CLAUDE.md, "Kill receipts"); a kill with no receipt yet is a 202 the game
+asks again for eight seconds; presence.py writes judged deaths every quarter
+second; killwatch.py's `receipts:` line says what switching on would have done
+to the last week, and is what decides when it goes on. The bounds keep their
+slack for now: tightening them is its own decision, from the same numbers.
+
 **Step 3 - the rest of the list above:** the player's hp on the server (E-9),
 then server-side monster AI, which is what the world boss needs.
 

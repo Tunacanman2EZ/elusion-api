@@ -393,9 +393,11 @@ No comforting lies. These are known, named and open.
   token bucket and caps kills at what the world's respawners can physically
   produce — that is a rate and content bound, not a proof. Since 0.10.0 the
   server **watches** the fight (invariant 30) and writes down every kill its
-  own count does not back up, but it still **pays** on the game's word: refusing
-  waits for a week of evidence that honest play never trips the books (step 2).
-  Until then what a cheat mints is kept from spreading: the owner can switch
+  own count does not back up. Since 0.57.0 it can **refuse** them too - the
+  owner's receipts switch pays a kill only against the books' own count of
+  that death (step 2, `test_receipts.py`) - and the switch ships off, until
+  killwatch.py's `receipts:` line shows honest play backed by the books. While
+  it is off, what a cheat mints is kept from spreading: the owner can switch
   trading off in one request, and a fresh mythic or Perfect find cannot be
   traded for 48 hours (`test_tradegates.py`). A game from before 0.10.0, or one
   whose presence link is down, is not seen by the books at all.

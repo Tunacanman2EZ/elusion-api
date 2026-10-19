@@ -1,6 +1,8 @@
 """kill/schema.py - kill/'s tables:
-kill_reports, every kill a client claims (kept two weeks), and
-kill_tally, the kill record (kept for good), with their indexes.
+kill_reports, every kill a client claims (kept two weeks),
+kill_tally, the kill record (kept for good), and
+kill_receipts, which of the books' deaths have paid a kill (0.57.0, kept two
+weeks), with their indexes.
 
 Until 19 Oct these were in app.py's init_db(), and they moved word for word.
 
@@ -77,6 +79,22 @@ SCHEMA = """
         CREATE INDEX IF NOT EXISTS idx_kill_reports_user ON kill_reports(user_id, at);
         -- "who is reporting this enemy most" - the other one.
         CREATE INDEX IF NOT EXISTS idx_kill_reports_enemy ON kill_reports(enemy_id, at);
+
+        -- THE RECEIPTS A KILL WAS PAID WITH (0.57.0; E3_SCOPE.md option C,
+        -- step 2). With the owner's receipts switch on, a kill is paid only
+        -- against an AGREED row in combat_kills - the books' own count of that
+        -- monster reaching zero, for this account - and each row pays ONE kill.
+        -- This is the "used" mark: its own table, because combat_kills is
+        -- presence.py's alone to write. The primary key is what makes a second
+        -- claim on the same death fail, in either worker. Pruned with
+        -- kill_reports, two weeks.
+        CREATE TABLE IF NOT EXISTS kill_receipts (
+            combat_kill_id INTEGER PRIMARY KEY,
+            user_id        INTEGER NOT NULL,
+            slot           INTEGER NOT NULL,
+            at             INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_kill_receipts_at ON kill_receipts(at);
 """
 
 

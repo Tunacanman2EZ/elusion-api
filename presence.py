@@ -260,6 +260,12 @@ BOOKS = (combatbook is not None and bool(gamedata.AREAS) and gamedata.COMBAT_EXP
 # How often what the books found is written down, and how long it is kept.
 FLUSH_SECONDS = 2.0
 BOOKS_KEPT_SECONDS = 14 * 86400
+# A DEATH IS WRITTEN SOONER (0.57.0): with the owner's receipts switch on, a
+# kill is paid only once its death is in combat_kills (kill/services.py,
+# RECEIPT_SECONDS), and the game is waiting for it, asking again. So the
+# deaths judged are written every KILLS_FLUSH_SECONDS; the flags, the stirring
+# lands and the pruning keep FLUSH_SECONDS.
+KILLS_FLUSH_SECONDS = 0.25
 # THE STIRRING LANDS (game 0.46.0): how often the books learn which lands are
 # stirring (stirred_lands()), and how long after a stir ends its land still
 # counts - a monster born in its last minute lives on after it.
@@ -783,6 +789,7 @@ class PresenceServer:
         self.sweep_seconds = SWEEP_SECONDS if sweep_seconds is None else sweep_seconds
         self.tick_seconds = TICK_SECONDS if tick_seconds is None else tick_seconds
         self.flush_seconds = FLUSH_SECONDS
+        self.kills_flush_seconds = KILLS_FLUSH_SECONDS
         self._tasks = []
         self._closing = set()
         # THE BOOKS: one per area that has a map, kept while the process runs.
@@ -1340,9 +1347,27 @@ class PresenceServer:
         return kills, flags
 
     async def flush_loop(self):
+        # THE DEATHS EVERY QUARTER SECOND, everything every two (FLUSH_SECONDS):
+        # a game is waiting on a death to be paid for, and on nothing else.
+        since_all = 0.0
         while True:
-            await asyncio.sleep(self.flush_seconds)
-            await self.flush_books()
+            await asyncio.sleep(self.kills_flush_seconds)
+            since_all += self.kills_flush_seconds
+            if since_all >= self.flush_seconds:
+                since_all = 0.0
+                await self.flush_books()
+            else:
+                await self.flush_kills()
+
+    async def flush_kills(self):
+        """Write the deaths judged since the last write, and nothing else."""
+        kills, self._kills = self._kills, []
+        if not kills:
+            return
+        try:
+            await asyncio.to_thread(write_books, kills, [], None)
+        except Exception as exc:  # noqa: BLE001
+            print("[PRESENCE] could not write the books: %r" % exc, flush=True)
 
     async def flush_books(self):
         kills, flags = self.take_books()

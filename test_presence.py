@@ -1066,7 +1066,29 @@ async def run(port, server):
     check("an empty area is forgotten", not server.rooms, server.rooms)
 
 
+async def kills_written_soon():
+    """A DEATH IS WRITTEN SOONER (0.57.0): a game waits on it to be paid."""
+    calls = []
+    real = presence.write_books
+    presence.write_books = lambda kills, flags, prune=None: calls.append((len(kills), len(flags), prune))
+    try:
+        quick = presence.PresenceServer(sweep_seconds=5, tick_seconds=5)
+        quick.flush_seconds = 5.0
+        quick.kills_flush_seconds = 0.05
+        quick._kills = [{"at": 1}]
+        quick._flags = {(1, "field", "too_fast"): [1, "x", 1, 1]}
+        task = asyncio.create_task(quick.flush_loop())
+        await asyncio.sleep(0.3)
+        task.cancel()
+        flags_left = len(quick._flags)
+    finally:
+        presence.write_books = real
+    check("a death the books judged is written within KILLS_FLUSH_SECONDS, the flags kept for the full flush",
+          calls == [(1, 0, None)] and flags_left == 1 and presence.KILLS_FLUSH_SECONDS <= 0.25, (calls, flags_left))
+
+
 async def main():
+    await kills_written_soon()
     presence.HELLO_SECONDS = 0.5
     combatbook.HOLD_SECONDS = 0.2
     combatbook.PENDING_SECONDS = 0.3

@@ -14,6 +14,9 @@ they were in app.py).
     POST /api/server/pvp          player-versus-player on or off
     POST /api/server/trade        new trades allowed, or not (open ones may
                                   finish)
+    POST /api/server/receipts     kills paid only against the server's own
+                                  count of the fight, or on the game's word
+                                  (0.57.0)
     GET  /api/server/coowners     whether the co-owners are in, and who they are
     POST /api/server/coowners     let them in or take them out - the owner alone
     POST /api/server/broadcast    say something to everyone playing
@@ -21,8 +24,8 @@ they were in app.py).
 EACH SWITCH IS ONE ROW IN server_settings, written with who threw it and when -
 even when it does not change, so the table keeps that record. The owner's:
 every route here but the status read is behind an owner check, which answers
-a 404 rather than a 403; the four that change the world (maintenance,
-the build, PvP, trading) ask for the password again; and the co-owners'
+a 404 rather than a 403; the five that change the world (maintenance,
+the build, PvP, trading, the kill receipts) ask for the password again; and the co-owners'
 switch is THE owner's (require_the_owner), since a co-owner who could throw it
 could keep it on.
 
@@ -30,7 +33,8 @@ SAID OUT LOUD, or not, on purpose. Closing and opening, PvP and trading are
 announced in the world (post_broadcast()), because a rule nobody was told is
 discovered the hard way; the build gate is not, because the people it refuses
 cannot hear the world - they read it off /api/status, the one route the gate
-never refuses.
+never refuses. Nor are the kill receipts: nothing a player does changes, and
+a kill they refuse says why in the game.
 
 Built like players/ (ARCHITECTURE.md): routes.py (the edge), services.py (the
 rules, pure), data.py (the SQL). It never imports app.py; register() is handed

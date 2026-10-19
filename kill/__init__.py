@@ -19,7 +19,10 @@ token bucket on the RATE of kills, and a ceiling on the COUNT of one monster
 that could have respawned lately (services.py has the arithmetic for both) -
 and a monster that cannot be killed for profit (the large poison slime, which
 splits) pays nothing. The fuller answer is presence.py's books, which watch a
-fight instead of taking its word (SECURITY.md).
+fight instead of taking its word (SECURITY.md) - and since 0.57.0, with the
+owner's receipts switch on, a kill is paid only against the books' own count
+of that death (services.RECEIPT_SECONDS): until the books have it, the answer
+is 202, "not yet", and the game asks again.
 
 ONE TRANSACTION, on purpose, for everything a kill pays: the level, the XP and
 the bucket in one statement, the attack XP through the skills' grant, the
@@ -39,4 +42,5 @@ in through app.py.
 from .routes import register  # noqa: F401
 from .data import record_kill  # noqa: F401
 from .services import (KILL_BUCKET_CAPACITY, KILL_LOG_RETENTION_SECONDS, KILL_RESPAWN_FLOOR_SECONDS,  # noqa: F401
-                       KILL_TOKENS_PER_SECOND, KILL_WINDOW_SECONDS, MYTHIC_BROADCAST_KIND, mythic_find_text)
+                       KILL_TOKENS_PER_SECOND, KILL_WINDOW_SECONDS, MYTHIC_BROADCAST_KIND, RECEIPT_BUILD,
+                       RECEIPT_RETRY_MS, RECEIPT_SECONDS, mythic_find_text)

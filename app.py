@@ -3730,6 +3730,20 @@ TRADE_KEY = "trade"
 # that cannot be read reads OFF. Thrown by THE owner only (require_the_owner).
 CO_OWNERS_KEY = "coowners"
 
+# KILL RECEIPTS (0.57.0; E3_SCOPE.md option C, step 2), the same shape: {"on":
+# true}. On, POST /api/combat/kill pays a kill only against an AGREED row in
+# combat_kills - the books' own count of that death (kill/services.py,
+# RECEIPT_SECONDS) - and answers "not yet" until there is one. The owner's,
+# asking the password again like PvP and trade, and not announced: a player
+# whose kill was refused is told by the game.
+#
+# NO ROW READS OFF - it ships off, to be switched on once killwatch.py's
+# receipts line shows honest play backed by the books (DEPLOY.md, "Kill
+# receipts") - and A ROW THAT CANNOT BE READ READS OFF too, unlike trade's:
+# off is how every kill was paid until now, and a corrupt row must not stop
+# everybody being paid at all.
+RECEIPTS_KEY = "kill_receipts"
+
 # THE CLIENT BUILD GATE. Third row in server_settings, same shape as the two
 # above, and here for a reason neither of them has: this one cannot be added
 # later without leaving a permanent hole.
@@ -3791,7 +3805,13 @@ CLIENT_BUILD_HEADER = "X-Elusion-Build"
 # LIFECYCLE). A build-5 game plays on with the old, unbound logins. Set the
 # minimum to 6 once 0.44.0 is on the site: that is the switch that binds every
 # login, ends every old one, and asks staff for the password again.
-CURRENT_CLIENT_BUILD = 6
+#
+# 7 (game 0.57.0): a kill waits for the server's receipt - a 202 from
+# /api/combat/kill is "not yet", asked again (combat.gd), rather than a kill
+# paid nothing. A build-6 game plays on, and is paid as before while the
+# receipts switch is off; with it on, a kill the books have not counted yet is
+# a 409 telling it to update. Set the minimum to 7 before switching receipts on.
+CURRENT_CLIENT_BUILD = 7
 
 MAINTENANCE_DEFAULT_MESSAGE = "Update in progress - please come back later."
 
@@ -3859,6 +3879,18 @@ def trades_enabled():
     except (ValueError, TypeError):
         return False
     return bool(isinstance(stored, dict) and stored.get("on"))
+
+
+def kill_receipts_on():
+    """True while the owner's receipts switch is on. See RECEIPTS_KEY."""
+    raw = get_server_setting(RECEIPTS_KEY)
+    if raw is None:
+        return False
+    try:
+        stored = json.loads(raw)
+    except (ValueError, TypeError):
+        return False
+    return bool(isinstance(stored, dict) and stored.get("on") is True)
 
 
 def client_build():
@@ -6146,6 +6178,8 @@ kill_package.register(
     post_broadcast=post_broadcast,
     create_loot_bag=lambda user_id, slot, enemy_id, contents: _create_loot_bag(user_id, slot, enemy_id, contents),
     note_refill=_note_refill,
+    receipts_on=kill_receipts_on,
+    client_build=client_build,
 )
 
 # Named here as well, for the suites and the notes that read them off this
@@ -6797,11 +6831,13 @@ switches_package.register(
     pvp_key=PVP_KEY,
     trade_key=TRADE_KEY,
     co_owners_key=CO_OWNERS_KEY,
+    receipts_key=RECEIPTS_KEY,
     maintenance_state=maintenance_state,
     seconds_left=maintenance_seconds_left,
     default_message=MAINTENANCE_DEFAULT_MESSAGE,
     pvp_enabled=pvp_enabled,
     trades_enabled=trades_enabled,
+    receipts_on=kill_receipts_on,
     min_client_build=min_client_build,
     current_build=CURRENT_CLIENT_BUILD,
     co_owners_on=co_owners_on,

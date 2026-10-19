@@ -235,6 +235,9 @@ def bare_app(name):
         "CREATE TABLE kill_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, slot INTEGER, enemy_id TEXT,"
         " xp INTEGER NOT NULL DEFAULT 0, attack_xp INTEGER NOT NULL DEFAULT 0, level_at INTEGER NOT NULL DEFAULT 0,"
         " at INTEGER);"
+        "CREATE TABLE combat_kills (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, enemy_id TEXT, user_id INTEGER,"
+        " slot INTEGER NOT NULL DEFAULT -1, verdict TEXT);"
+        "CREATE TABLE kill_receipts (combat_kill_id INTEGER PRIMARY KEY, user_id INTEGER, slot INTEGER, at INTEGER);"
         "CREATE TABLE presence_tickets (token_hash TEXT PRIMARY KEY, session_hash TEXT NOT NULL, user_id INTEGER NOT NULL,"
         " slot INTEGER NOT NULL, identity TEXT NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);"
         "CREATE TABLE server_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_by TEXT NOT NULL DEFAULT '',"
@@ -904,10 +907,11 @@ def bare_app(name):
         require_fresh_password=asks_again, get_db=get_db,
         bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400), catalogue=SwitchCatalogue,
         get_setting=setting, set_setting=put_setting, maintenance_key="maintenance", min_build_key="min_client_build",
-        pvp_key="pvp", trade_key="trade", co_owners_key="coowners", maintenance_state=closed,
+        pvp_key="pvp", trade_key="trade", co_owners_key="coowners", receipts_key="kill_receipts",
+        maintenance_state=closed,
         seconds_left=lambda state: max(0, state["kick_at"] - int(time.time())) if state["on"] else 0,
         default_message="Closed for a bit.", pvp_enabled=lambda: switch_on("pvp"),
-        trades_enabled=lambda: switch_on("trade", True),
+        trades_enabled=lambda: switch_on("trade", True), receipts_on=lambda: switch_on("kill_receipts"),
         min_client_build=lambda: int(json.loads(setting("min_client_build") or "{}").get("build", 0)),
         current_build=6, co_owners_on=lambda: switch_on("coowners"), co_owners_changed=co_changed,
         co_owner_names=lambda: app.config["co_names"],
@@ -938,7 +942,8 @@ def bare_app(name):
         else raw,
         grant_skill_xp=app.config["skills_api"].grant_xp,
         post_broadcast=lambda body, kind="system", by="": told.append((kind, body[:60], by)) or len(told),
-        create_loot_bag=app.config["loot"].create_bag, note_refill=refill_for("kill"))
+        create_loot_bag=app.config["loot"].create_bag, note_refill=refill_for("kill"),
+        receipts_on=lambda: switch_on("kill_receipts"), client_build=lambda: app.config.get("client_build", 7))
 
     # ownertools/: the owner's gate lets in the carry's owners, so a check can
     # make ann a co-owner; the password asked again is the switches' header;
@@ -1512,7 +1517,7 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/player/status", "/api/shop/buy", "/api/shop/sell", "/api/shop/<shop_id>",
                        "/api/players/online", "/api/presence/ticket", "/api/players/nearby", "/api/status",
                        "/api/server/maintenance", "/api/server/minbuild", "/api/server/pvp", "/api/server/trade",
-                       "/api/server/coowners", "/api/server/coowners", "/api/server/broadcast",
+                       "/api/server/receipts", "/api/server/coowners", "/api/server/coowners", "/api/server/broadcast",
                        "/api/combat/kill", "/api/staff/gold", "/api/staff/level", "/api/staff/skill", "/api/staff/grant", "/api/staff/gifts", "/api/staff/snapshots", "/api/staff/rollback", "/api/staff/teleport", "/api/teleport/ack", "/api/account/email", "/api/account/email", "/api/account/email/verify", "/api/account/name-colour", "/api/auth/register", "/api/auth/login", "/api/auth/session", "/api/auth/resume", "/api/auth/confirm", "/api/auth/logout", "/api/auth/logout-all", "/api/auth/password", "/api/auth/recover", "/api/auth/reset"]), rules)
 
 # =============================================================================
@@ -3088,8 +3093,8 @@ log = app_a.config["staff_log"]
 st = stood()
 check("switches: /api/status answers with no login at all - the catalogue's counts and every switch as it stands",
       st == {"online": True, "gamedata_schema": 9, "items": 2, "enemies": 1, "maintenance": False, "message": "",
-             "back_at": None, "seconds_left": 0, "pvp": False, "trade": True, "min_client_build": 0,
-             "current_client_build": 6}, st)
+             "back_at": None, "seconds_left": 0, "pvp": False, "trade": True, "kill_receipts": False,
+             "min_client_build": 0, "current_client_build": 6}, st)
 check("  a switch is the owner's - a player is told it does not exist - and one that changes the world asks for",
       switch("/api/server/pvp", {"on": True}, "ann")[0] == 404
       and switch("/api/server/pvp", {"on": True}, again=False)[0] == 403 and stood()["pvp"] is False)
@@ -3258,6 +3263,27 @@ check("loot's own bag-maker, handed back: nothing dropped is no bag; a roll past
 check("  and any other monster with its article",
       kill_package.mythic_find_text(KillCatalogue([]), "ann", "meteorite", "icebat") == "ann found the Meteorite on an Ice Bat!"
       and kill_package.mythic_find_text(KillCatalogue([]), "ann", "rock", "bat") == "ann found the rock on a Bat!")
+# THE RECEIPTS (0.57.0), handed in: with the switch on, a kill is paid only
+# against the books' own agreed death for it, and once.
+code, body = switch("/api/server/receipts", {"on": True})
+check("receipts: the owner's switch, said on the status read, logged - not announced - and its build said back",
+      (code, body) == (200, {"kill_receipts": True, "min_client_build": 0}) and stood()["kill_receipts"] is True
+      and log[-1] == "boss receipts server: on" and switch("/api/server/receipts", {"on": "yes"})[0] == 400, body)
+paid = len(ann_says("SELECT id FROM kill_reports WHERE user_id = 2"))
+check("  on: a kill the books have not counted is 'not yet', paid nothing",
+      slay("slime") == (202, {"pending": True, "retry_after_ms": kill_package.RECEIPT_RETRY_MS,
+                              "message": "The server has not finished counting that fight yet."})
+      and len(ann_says("SELECT id FROM kill_reports WHERE user_id = 2")) == paid)
+app_a.config["client_build"] = kill_package.RECEIPT_BUILD - 1
+check("  and an old game is told to update", slay("slime")[0] == 409)
+app_a.config["client_build"] = kill_package.RECEIPT_BUILD
+around("INSERT INTO combat_kills (at, enemy_id, user_id, slot, verdict) VALUES (?, 'slime', 2, 0, 'agreed')",
+       [(int(time.time()),)])
+code, body = slay("slime")
+check("  with the books' agreed death it is paid, the death used, and a second claim waits",
+      code == 200 and ann_says("SELECT user_id, slot FROM kill_receipts") == [(2, 0)] and slay("slime")[0] == 202, body)
+switch("/api/server/receipts", {"on": False})
+check("  off again, paid on the game's word", slay("slime")[0] == 200 and stood()["kill_receipts"] is False)
 def tool(path, body, as_who="boss", again=True):
     return switch(path, body, as_who, again)
 
@@ -3848,13 +3874,13 @@ check("and nobody without a login gets in anywhere",
                                                                          "/api/server/maintenance",
                                                                          "/api/server/minbuild", "/api/server/pvp",
                                                                          "/api/server/trade", "/api/server/coowners",
-                                                                         "/api/server/broadcast",
+                                                                         "/api/server/broadcast", "/api/server/receipts",
                                                                          "/api/combat/kill", "/api/staff/gold", "/api/staff/level", "/api/staff/skill", "/api/staff/grant", "/api/staff/rollback", "/api/staff/teleport", "/api/teleport/ack", "/api/account/email", "/api/account/email/verify", "/api/auth/resume", "/api/auth/confirm", "/api/auth/logout", "/api/auth/logout-all", "/api/auth/password")]
       + [client_a.put(path, json={}).status_code for path in ("/api/staff/role", "/api/account/bank",
                                                               "/api/account/lusions", "/api/character/inventory",
                                                               "/api/character/skills", "/api/save",
                                                               "/api/player/status", "/api/account/name-colour")]
-      == [401] * 103)
+      == [401] * 104)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")

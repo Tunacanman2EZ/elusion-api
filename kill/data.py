@@ -1,7 +1,7 @@
 """kill/data.py - the SQL: the character a kill is claimed for, how many of one
-monster it was paid for lately, the level, the XP and the bucket banked in one
-statement, and the kill's two records - kill_reports, kept two weeks, and
-kill_tally, kept for good. (The level-up's refill is noted through status/'s
+monster it was paid for lately, the books' receipt for it and its use (0.57.0),
+the level, the XP and the bucket banked in one statement, and the kill's two
+records - kill_reports, kept two weeks, and kill_tally, kept for good. (The level-up's refill is noted through status/'s
 note_refill(), handed in.) The tables are this package's (schema.py). A paid
 kill is the only thing that adds to either (a deleted character takes its
 tally with it, in saves/, and the tally was seeded once at boot); many areas
@@ -64,6 +64,39 @@ def bank(db, user_id, slot, level, xp, xp_to_next, derived, now_ms, tokens, now)
         )
 
 
+def receipt_for(db, user_id, slot, enemy_id, since):
+    """The oldest AGREED death in the books for this account and monster since
+    `since` that has not paid a kill yet - this character's, or one the books
+    could not put a character to - as its combat_kills id, or None.
+
+    None as well on a database with no books at all, which is a server that
+    cannot pay a kill this way; the route says so as "not yet"."""
+    try:
+        row = db.execute(
+            "SELECT id FROM combat_kills"
+            " WHERE user_id = ? AND enemy_id = ? AND verdict = 'agreed' AND at >= ?"
+            "   AND slot IN (?, -1)"
+            "   AND id NOT IN (SELECT combat_kill_id FROM kill_receipts WHERE at >= ?)"
+            " ORDER BY at, id LIMIT 1",
+            (user_id, str(enemy_id)[:64], since, slot, since - services.RECEIPT_SECONDS),
+        ).fetchone()
+    except Exception as exc:  # noqa: BLE001 - sqlite3.OperationalError: no such table
+        if "no such table" in str(exc):
+            return None
+        raise
+    return None if row is None else int(row["id"])
+
+
+def use_receipt(db, combat_kill_id, user_id, slot, now):
+    """Mark one of the books' deaths as having paid a kill. False when it had
+    already - another request took it first - and nothing is written."""
+    cur = db.execute(
+        "INSERT OR IGNORE INTO kill_receipts (combat_kill_id, user_id, slot, at) VALUES (?, ?, ?, ?)",
+        (int(combat_kill_id), int(user_id), int(slot), int(now)),
+    )
+    return cur.rowcount == 1
+
+
 def record_kill(db, user_id, slot, enemy_id, rewards, level_at, now):
     """Write one row for this claimed kill, and prune the old ones - and count
     it on the kill record, which is never pruned.
@@ -79,6 +112,8 @@ def record_kill(db, user_id, slot, enemy_id, rewards, level_at, now):
          int(rewards.get("attack_xp", 0)), int(level_at), now),
     )
     db.execute("DELETE FROM kill_reports WHERE at < ?",
+               (now - services.KILL_LOG_RETENTION_SECONDS,))
+    db.execute("DELETE FROM kill_receipts WHERE at < ?",
                (now - services.KILL_LOG_RETENTION_SECONDS,))
     db.execute(
         "INSERT INTO kill_tally (user_id, slot, enemy_id, kills, first_at, last_at)"

@@ -1,5 +1,6 @@
-"""switches/routes.py - the edge: the status read, the owner's five switches
-and the owner's announcement, as they were in app.py.
+"""switches/routes.py - the edge: the status read, the owner's six switches
+and the owner's announcement, as they were in app.py (the sixth, the kill
+receipts, since 0.57.0).
 
 register() is handed app.py's own pieces - it never imports app.py:
 
@@ -17,14 +18,15 @@ register() is handed app.py's own pieces - it never imports app.py:
                             get_server_setting())
     set_setting             (key, value, by) - one switch written, with who
                             and when; no commit (set_server_setting())
-    maintenance_key, min_build_key, pvp_key, trade_key, co_owners_key
-                            the rows the five switches live in
+    maintenance_key, min_build_key, pvp_key, trade_key, co_owners_key,
+    receipts_key            the rows the six switches live in
     maintenance_state       () -> the maintenance switch, read and normalised
     seconds_left            (state) -> seconds until sessions start ending
     default_message         what a closed server says when the owner said
                             nothing (MAINTENANCE_DEFAULT_MESSAGE)
     pvp_enabled             () -> whether PvP is on
     trades_enabled          () -> whether new trades are allowed
+    receipts_on             () -> whether a kill needs the books' receipt
     min_client_build        () -> the oldest build allowed in, 0 for any
     current_build           CURRENT_CLIENT_BUILD: the newest build there is
     co_owners_on            () -> whether the co-owners are in right now
@@ -44,8 +46,8 @@ register() is handed app.py's own pieces - it never imports app.py:
 
 THE ENDPOINT NAMES ARE app.py's - server_status, set_maintenance,
 set_min_build, set_pvp, set_trade, read_co_owners, set_co_owners and
-send_broadcast - and routes.lock holds them, with each one's rank and its
-asking for the password again.
+send_broadcast - and set_receipts, new with its switch; routes.lock holds
+them, with each one's rank and its asking for the password again.
 """
 import json
 import time
@@ -57,7 +59,8 @@ from . import data, services
 
 def register(app, *, require_auth, require_owner, require_the_owner, require_fresh_password, get_db, bad_request,
              catalogue, get_setting, set_setting, maintenance_key, min_build_key, pvp_key, trade_key, co_owners_key,
-             maintenance_state, seconds_left, default_message, pvp_enabled, trades_enabled, min_client_build,
+             receipts_key, maintenance_state, seconds_left, default_message, pvp_enabled, trades_enabled,
+             receipts_on, min_client_build,
              current_build, co_owners_on, co_owners_changed, co_owner_names, post_broadcast, broadcast_limit,
              log_staff_action, online_window, end_player_sessions, open_trades):
 
@@ -105,6 +108,9 @@ def register(app, *, require_auth, require_owner, require_the_owner, require_fre
             # Whether players may open a trade. The trade window asks before it
             # offers anything, and a player on the login screen can know too.
             "trade": trades_enabled(),
+            # Whether a kill needs the server's own count of the fight (0.57.0).
+            # The GM panel shows it; a game asks again on a 202 either way.
+            "kill_receipts": receipts_on(),
             # THE BUILD GATE, ON THE ONE ROUTE IT DOES NOT GATE. An outdated client
             # is refused everywhere else, so this is where it finds out what it
             # needs - and a client that is merely BEHIND, with the gate still
@@ -431,6 +437,52 @@ def register(app, *, require_auth, require_owner, require_the_owner, require_fre
         still_open = open_trades(db)
         return {"trade": wanted, "open_trades": int(still_open)}, 200
 
+    def set_receipts():
+        """
+        Pay kills only against the server's count of the fight, or not (owner only)
+        ---
+        tags:
+          - Status
+        parameters:
+          - in: header
+            name: Authorization
+            type: string
+            required: true
+            description: "Bearer <token>"
+          - in: body
+            name: switch
+            schema:
+              type: object
+              required: [on]
+              properties:
+                "on": {type: boolean, description: "true pays a kill only with an agreed death in the books"}
+        responses:
+          200:
+            description: The switch, as it now stands, and the oldest build allowed in
+          400:
+            description: No 'on' field
+          401:
+            description: Missing, invalid or expired token
+          404:
+            description: Not the owner
+        """
+        # OWNER, like PvP and trade: a rule about every kill in the world. See
+        # RECEIPTS_KEY in app.py. NOT ANNOUNCED: it changes nothing a player
+        # does, and a kill it refuses says why in the game.
+        payload = request.get_json(silent=True) or {}
+        if "on" not in payload or not isinstance(payload.get("on"), bool):
+            return bad_request('send {"on": true} or {"on": false}')
+
+        wanted = payload["on"]
+        db = get_db()
+        set_setting(receipts_key, json.dumps({"on": wanted}), g.user["username"])
+        log_staff_action(g.user, "receipts", "server", None, "on" if wanted else "off")
+        db.commit()
+        # THE BUILD GATE, said back: a game older than the receipts' build is
+        # told to update on every kill the books have not counted yet, so the
+        # GM panel says when the minimum is still below it.
+        return {"kill_receipts": wanted, "min_client_build": int(min_client_build())}, 200
+
     def co_owners_payload():
         """The co-owners' switch as the owner's panel shows it: whether they are
         in, who it lets in, who threw it and when, and what the row says."""
@@ -590,6 +642,8 @@ def register(app, *, require_auth, require_owner, require_the_owner, require_fre
                      view_func=owner_asked_again(set_pvp), methods=["POST"])
     app.add_url_rule("/api/server/trade", endpoint="set_trade",
                      view_func=owner_asked_again(set_trade), methods=["POST"])
+    app.add_url_rule("/api/server/receipts", endpoint="set_receipts",
+                     view_func=owner_asked_again(set_receipts), methods=["POST"])
     app.add_url_rule("/api/server/coowners", endpoint="read_co_owners",
                      view_func=owner(read_co_owners), methods=["GET"])
     app.add_url_rule("/api/server/coowners", endpoint="set_co_owners",

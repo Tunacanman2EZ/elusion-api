@@ -684,6 +684,8 @@ SWEEPS_ALLOWED = [
     # retention and housekeeping - the server acting on its own clock
     ("loot_bags", "created_at <", "retention: bags past the pickup window"),
     ("kill_reports", "at <", "retention: the killwatch window"),
+    # the kill receipts (0.57.0), pruned with the kill reports they paid.
+    ("kill_receipts", "at <", "retention: with the kill reports"),
     ("chat_messages", "created_at <", "retention: the chat window"),
     # ADDED BECAUSE THIS CHECK CAUGHT IT. chat_deletions carries the deleted
     # line's user_id so the poll can filter deletions with the read's own WHERE
