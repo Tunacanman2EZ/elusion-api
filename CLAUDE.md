@@ -146,8 +146,10 @@ was noticed:
 living character (409, same as revive), burns the carry gold through
 `gold_delta()` under the reason `death`, empties `carry_items`, takes off and
 destroys everything worn (`saves.equipment` becomes `{}`, named in `gear_lost`),
-refills the three pools to the **bare** class curve, and writes a
-`consume_grants` row so the client's next sync is explained instead of clamped.
+puts the pet away unless the bank holds one (`active_pet_id` becomes `''`,
+`pet_lost`; 0.56.2 - before, only the game cleared it), refills the three pools
+to the **bare** class curve, and writes a `consume_grants` row so the client's
+next sync is explained instead of clamped.
 
 **Worn gear is lost with the bag** since day 2. The owner, after dying: "gear
 is not dropping on full death" - it never had. Nothing is exempt, mythic weapons

@@ -1282,6 +1282,57 @@ check("the respawn explains the rise instead of it being clamped",
       % (synced["hp"], after["max_hp"]))
 
 
+# THE PET GOES WITH THE BAG (0.56.2), unless the bank holds one. The game put
+# it away on its own side since 0.56.0; the server kept it out, so a game
+# closed before its next save came back with the pet out and no item to put
+# it away with. Let out the honest way: the item in the bag, then the save.
+def pet_row(username):
+    conn = db_conn()
+    row = conn.execute(
+        "SELECT saves.active_pet_id FROM saves JOIN users ON users.id = saves.user_id "
+        "WHERE users.username = ? AND saves.slot = 0", (username,)).fetchone()
+    conn.close()
+    return str(row[0])
+
+
+def pet_in(username, where):
+    conn = db_conn()
+    user_id = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()[0]
+    if where == "bag":
+        conn.execute("INSERT OR REPLACE INTO carry_items (user_id, slot, position, item_id, quantity)"
+                     " VALUES (?, 0, 0, 'petmage', 1)", (user_id,))
+    else:
+        conn.execute("INSERT OR REPLACE INTO bank_items (user_id, position, item_id, quantity)"
+                     " VALUES (?, 0, 'petmage', 1)", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+P = account("petkeeper")
+status("a character with a pet", client.put(
+    "/api/save", headers=P, json={"slot": 0, "class_id": "mage", "name": "Keeper"}), 200)
+pet_in("petkeeper", "bag")
+status("the pet is let out", client.put(
+    "/api/save", headers=P, json={"slot": 0, "class_id": "mage", "name": "Keeper",
+                                   "active_pet_id": "petmage"}), 200)
+check("and it is out", pet_row("petkeeper") == "petmage", pet_row("petkeeper"))
+status("the character dies", die(P), 200)
+res = status("and accepts it", respawn(P), 200) or {}
+check("the pet went with the bag: put away on the server, and the answer says so",
+      pet_row("petkeeper") == "" and res.get("pet_lost") is True and res.get("active_pet_id") == "",
+      [pet_row("petkeeper"), res.get("pet_lost"), res.get("active_pet_id")])
+pet_in("petkeeper", "bag")
+pet_in("petkeeper", "bank")
+status("let out again, with one in the bank", client.put(
+    "/api/save", headers=P, json={"slot": 0, "class_id": "mage", "name": "Keeper",
+                                   "active_pet_id": "petmage"}), 200)
+status("dies again", die(P), 200)
+res = status("and accepts it", respawn(P), 200) or {}
+check("one the bank holds stays out",
+      pet_row("petkeeper") == "petmage" and res.get("pet_lost") is False and res.get("active_pet_id") == "petmage",
+      [pet_row("petkeeper"), res.get("pet_lost"), res.get("active_pet_id")])
+
+
 # =============================================================================
 # GIVEN AND LOST ARE DIFFERENT VERBS
 # =============================================================================

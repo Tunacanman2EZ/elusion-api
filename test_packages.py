@@ -710,7 +710,8 @@ def bare_app(name):
         ensure_account=ensure_account, catalogue=DeathCatalogue, derived_stats=maxima,
         gold_delta=ledger_delta, bank_gold_delta=bank_delta_ledger, lusion_delta=lusion_delta_ledger,
         lusion_gold_value=1000, revive_grant_id="__revive__", respawn_grant_id="__respawn__",
-        status_of=status_of, note_refill=refill_for("death"))
+        status_of=status_of, note_refill=refill_for("death"),
+        owns_item=lambda user_id, slot, item_id: carry_package.data.owns(get_db(), user_id, slot, item_id))
 
     # carry/: four bag cells and two keys. A cell is named the way app.py's
     # parse_grid_cell() does; the owners are app.config's, so a check can make
@@ -2486,6 +2487,37 @@ check("respawn: the carried gold through the ledger, the bag and every worn piec
 check("  and the living, or nobody, are the 409 and 404 they were",
       gear("/api/character/respawn", {})[0] == 409
       and gear("/api/character/respawn", {"slot": 1}) == (404, {"error": "Not Found", "message": "No character in slot 1."}))
+
+
+# THE PET GOES WITH THE BAG (0.56.2), unless the bank holds one: the rule a pet
+# is let out by, asked after the bag is gone. Only the game cleared it before.
+def pet_out(banked):
+    conn = sqlite3.connect(path_a)
+    conn.execute("DELETE FROM bank_items WHERE user_id = 2")
+    conn.execute("INSERT INTO carry_items VALUES (2, 0, 0, 'petmage', 1)")
+    if banked:
+        conn.execute("INSERT INTO bank_items VALUES (2, 0, 'petmage', 1)")
+    conn.execute("UPDATE saves SET active_pet_id = 'petmage' WHERE user_id = 2 AND slot = 0")
+    conn.commit()
+    conn.close()
+    died(gold=0)
+
+
+pet_out(banked=False)
+code, body = gear("/api/character/respawn", {})
+check("  the pet that was out goes with the bag it was in: put away, and the answer says so",
+      code == 200 and body.get("pet_lost") is True and body.get("active_pet_id") == ""
+      and ann_says("SELECT active_pet_id FROM saves WHERE user_id = 2 AND slot = 0") == [("",)], body)
+pet_out(banked=True)
+code, body = gear("/api/character/respawn", {})
+check("  and one the bank holds stays out",
+      code == 200 and body.get("pet_lost") is False and body.get("active_pet_id") == "petmage"
+      and ann_says("SELECT active_pet_id FROM saves WHERE user_id = 2 AND slot = 0") == [("petmage",)], body)
+conn = sqlite3.connect(path_a)
+conn.execute("DELETE FROM bank_items WHERE user_id = 2")
+conn.execute("UPDATE saves SET active_pet_id = '' WHERE user_id = 2 AND slot = 0")
+conn.commit()
+conn.close()
 def banked():
     return [(c["item_id"], c["quantity"]) if c else None
             for c in client_a.get("/api/account", headers=who("ann")).get_json()["bank_inventory"]]

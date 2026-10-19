@@ -1,16 +1,17 @@
 """death/data.py - the SQL. saves, carry_items and accounts are app.py's tables
 (init_db()). The money a death costs moves through app.py's
 ledgers, handed in - never a bare UPDATE on a balance. What is written here: the
-refilled pools, a full death's lost bag and gear, and the death score. The
+refilled pools, a full death's lost bag, gear and pet, and the death score. The
 grant the healing check reads is written through status/'s note_refill(),
 handed in. No commits: the routes make them."""
 
 
 def the_dead(db, user_id, slot):
     """class_id, level and equipment (what the maxima are derived from), hp
-    (dead or not) and the carried gold - or None for no such character."""
+    (dead or not), the carried gold and the pet that is out - or None for no
+    such character."""
     return db.execute(
-        "SELECT class_id, level, equipment, hp, gold FROM saves WHERE user_id = ? AND slot = ?",
+        "SELECT class_id, level, equipment, hp, gold, active_pet_id FROM saves WHERE user_id = ? AND slot = ?",
         (user_id, slot),
     ).fetchone()
 
@@ -41,5 +42,10 @@ def refill(db, user_id, slot, derived, now, strip_gear=False):
 def drop_carry(db, user_id, slot):
     """THE CARRY BAG, SERVER SIDE - every cell of it, hotbar included."""
     db.execute("DELETE FROM carry_items WHERE user_id = ? AND slot = ?", (user_id, slot))
+
+
+def put_pet_away(db, user_id, slot):
+    """No pet out: the one it was went with the bag."""
+    db.execute("UPDATE saves SET active_pet_id = '' WHERE user_id = ? AND slot = ?", (user_id, slot))
 
 

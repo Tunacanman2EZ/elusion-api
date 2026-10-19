@@ -8093,6 +8093,7 @@ death_package.register(
     respawn_grant_id=RESPAWN_GRANT_ID,
     status_of=status_payload,
     note_refill=_note_refill,
+    owns_item=_owns_item,
 )
 
 

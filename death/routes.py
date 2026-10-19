@@ -26,6 +26,9 @@ register() is handed app.py's own pieces - it never imports app.py:
     note_refill         (db, user_id, slot, item_id, at, target=, amount=) - a
                         rise the server authorised, written where the healing
                         check reads it (status/'s, the one writer)
+    owns_item           (user_id, slot, item_id) -> whether the bag or the
+                        bank holds it (carry/'s) - a respawn's pet stays out
+                        only if the bank still has one
 
 THE ENDPOINT NAMES ARE app.py's - character_revive, character_respawn - and
 routes.lock holds them.
@@ -40,7 +43,7 @@ from .services import PAY_WITH
 
 def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, ensure_account, catalogue,
              derived_stats, gold_delta, bank_gold_delta, lusion_delta, lusion_gold_value, revive_grant_id,
-             respawn_grant_id, status_of, note_refill):
+             respawn_grant_id, status_of, note_refill, owns_item):
 
     def character_revive():
         """
@@ -211,7 +214,7 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, en
                 slot: {type: integer, example: 0}
         responses:
           200:
-            description: Carry gold, carry items and worn gear destroyed, the three pools refilled to the bare maxima
+            description: Carry gold, carry items and worn gear destroyed, the pet put away unless the bank holds one, the three pools refilled to the bare maxima
           404:
             description: No character in that slot
           409:
@@ -280,6 +283,17 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, en
         # crash between the two cannot take one and not the other.
         data.drop_carry(db, user_id, slot)
 
+        # THE PET GOES WITH THE BAG, unless the bank holds one (0.56.2) - the
+        # rule a pet is let out by (carry/'s owns_item()), asked after the bag
+        # is gone and in the same transaction. The game cleared it on its own
+        # side since 0.56.0 and the server kept it: a game closed before its
+        # next save came back with the pet out and no item to put it away
+        # with, and everyone else was shown it until then.
+        pet = str(row["active_pet_id"] or "")
+        pet_lost = pet != "" and not owns_item(user_id, slot, pet)
+        if pet_lost:
+            data.put_pet_away(db, user_id, slot)
+
         now = int(time.time())
         data.refill(db, user_id, slot, derived, now, strip_gear=True)
 
@@ -295,6 +309,8 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, en
             "gold_lost": burned,
             "gear_lost": gear_lost,
             "equipment": {},
+            "pet_lost": pet_lost,
+            "active_pet_id": "" if pet_lost else pet,
             "status": status_of(user_id, slot),
         }, 200
 
