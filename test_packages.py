@@ -657,6 +657,19 @@ def bare_app(name):
         catalogue=GearCatalogue, derived_stats=maxima, take_from_backpack=take_from, add_to_backpack=add,
         inventory_of=lambda user_id, slot: [{"position": p, "item_id": i, "quantity": q}
                                             for p, (i, q) in sorted(carried(user_id, slot).items())])
+    # THE ONE WRITER OF A REFILL'S NOTE is status/'s, handed back by its
+    # register() below: consuming/, death/, kill/ and ownertools/ are handed
+    # it as app.py hands it, each through a tag of its own so a check sees
+    # whose rows went through it - asked for at the call, since status/ is
+    # registered after the first two.
+    app.config["refills"] = []
+
+    def refill_for(caller):
+        def note(db, user_id, slot, item_id, at, target="", amount=0):
+            app.config["refills"].append((caller, item_id, target, amount))
+            app.config["status"].note_refill(db, user_id, slot, item_id, at, target=target, amount=amount)
+        return note
+
     consuming.register(
         app, require_auth=require_auth, get_db=get_db,
         bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
@@ -665,7 +678,8 @@ def bare_app(name):
         skills_of=lambda user_id, slot: {"cooking": {"level": 2, "xp": 0}}, valid_skills={"cooking"},
         take_from_backpack=take_from,
         inventory_of=lambda user_id, slot: [{"position": p, "item_id": i, "quantity": q}
-                                            for p, (i, q) in sorted(carried(user_id, slot).items())])
+                                            for p, (i, q) in sorted(carried(user_id, slot).items())],
+        note_refill=refill_for("consuming"))
 
     # death/: the account row, the bank and the lusions are the accounts
     # table, and every burn writes its ledger, as app.py's do; the carried gold
@@ -696,7 +710,7 @@ def bare_app(name):
         ensure_account=ensure_account, catalogue=DeathCatalogue, derived_stats=maxima,
         gold_delta=ledger_delta, bank_gold_delta=bank_delta_ledger, lusion_delta=lusion_delta_ledger,
         lusion_gold_value=1000, revive_grant_id="__revive__", respawn_grant_id="__respawn__",
-        status_of=status_of)
+        status_of=status_of, note_refill=refill_for("death"))
 
     # carry/: four bag cells and two keys. A cell is named the way app.py's
     # parse_grid_cell() does; the owners are app.config's, so a check can make
@@ -923,7 +937,7 @@ def bare_app(name):
         else raw,
         grant_skill_xp=app.config["skills_api"].grant_xp,
         post_broadcast=lambda body, kind="system", by="": told.append((kind, body[:60], by)) or len(told),
-        create_loot_bag=app.config["loot"].create_bag)
+        create_loot_bag=app.config["loot"].create_bag, note_refill=refill_for("kill"))
 
     # ownertools/: the owner's gate lets in the carry's owners, so a check can
     # make ann a co-owner; the password asked again is the switches' header;
@@ -1022,7 +1036,7 @@ def bare_app(name):
         find_open_trade=trade.data.find_open, carry_cells=GATHER_CELLS + 2, owns_item=carry.owns_item,
         has_owner_powers=lambda name: name in owners, queue_teleport=owner_teleport, teleport_spacing=48,
         post_broadcast=lambda body, kind="system", by="": told.append((kind, body[:60], by)) or len(told),
-        moderation_target=within_reach)
+        moderation_target=within_reach, note_refill=refill_for("ownertools"))
 
     # accountsettings/: the mail is app.config's - whether it can go out, and
     # a list of what went - and a code is the same six digits every time, kept
@@ -3730,6 +3744,27 @@ check("  the right code: the new password, every session and trusted computer go
       and newest_login()[1:3] == (1, "password-reset"), body)
 for _key in ("expires_at", "name_hue", "email_verified"):
     USERS["bo"].pop(_key)
+# ONE WRITER FOR A REFILL'S NOTE (status/, 19 Oct): every row the four areas
+# above wrote went through what status/ handed back, each with what it used to
+# write for itself - a potion's pool and amount (the catalogue's "hp", 25), and
+# for a refill of every pool none (the columns' own '' and 0, which death/'s
+# INSERT took by leaving them out) - and the row the writer makes of it is that
+# row, the amount whole as consuming/'s int() made it.
+refilled = app_a.config["refills"]
+check("refills: a potion's, a revive's, a respawn's, a kill's level and the owner's - each through status/'s writer",
+      {("consuming", "smallhealthpotion", "hp", 25), ("death", "__revive__", "", 0),
+       ("death", "__respawn__", "", 0), ("kill", "__levelup__", "", 0),
+       ("ownertools", "__levelup__", "", 0)} <= set(refilled), refilled)
+conn = sqlite3.connect(path_a)
+app_a.config["status"].note_refill(conn, 3, 1, "probepotion", 777, target="MANA", amount=9.7)
+app_a.config["status"].note_refill(conn, 3, 1, "__probe__", 778)
+probes = conn.execute("SELECT user_id, slot, item_id, target, amount, at FROM consume_grants"
+                      " WHERE item_id IN ('probepotion', '__probe__') ORDER BY at").fetchall()
+conn.execute("DELETE FROM consume_grants WHERE item_id IN ('probepotion', '__probe__')")
+conn.commit()
+conn.close()
+check("  and the row it writes: the pool and a whole amount for a potion, none for a refill of every pool",
+      probes == [(3, 1, "probepotion", "MANA", 9, 777), (3, 1, "__probe__", "", 0, 778)], probes)
 code, body = switch("/api/server/broadcast", {"body": "  Mind the slimes  ", "kind": "Shout"}, again=False)
 check("the owner's voice: said in the world as sent, trimmed, its kind in lower case, its id handed back",
       (code, body) == (200, {"id": len(told), "kind": "shout", "body": "Mind the slimes", "by": "boss"})

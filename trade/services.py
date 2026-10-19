@@ -22,7 +22,7 @@ TRADE_EXPIRY_SECONDS = 600
 TRADE_CANCELLED_KEPT_SECONDS = 7 * 24 * 60 * 60
 
 # HOW LONG A FRESH MYTHIC OR PERFECT WAITS BEFORE IT CAN BE TRADED. See
-# trade_holds in init_db(). Long enough for killwatch.py's daily look and a
+# trade_holds in schema.py. Long enough for killwatch.py's daily look and a
 # person to read it; short enough that an honest find is tradeable the day
 # after tomorrow. The owner chose the two days, 6 Oct.
 TRADE_HOLD_SECONDS = 48 * 60 * 60

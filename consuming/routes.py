@@ -18,6 +18,9 @@ register() is handed app.py's own pieces - it never imports app.py:
     take_from_backpack  (user_id, slot, item_id, quantity, prefer=) -> True,
                         or False having written nothing
     inventory_of        (user_id, slot) -> the carry, cell by cell
+    note_refill         (db, user_id, slot, item_id, at, target=, amount=) - a
+                        rise the server authorised, written where the healing
+                        check reads it (status/'s, the one writer)
 
 THE ENDPOINT NAME IS app.py's - character_consume - and routes.lock holds it.
 """
@@ -29,7 +32,7 @@ from . import data, services
 
 
 def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, parse_cell, carry_capacity,
-             catalogue, skills_of, valid_skills, take_from_backpack, inventory_of):
+             catalogue, skills_of, valid_skills, take_from_backpack, inventory_of, note_refill):
 
     def character_consume():
         """
@@ -133,7 +136,9 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, pa
         # The amount comes from the server's own catalogue, never from the
         # request.
         target, amount = catalogue.restore_for(item_id)
-        data.grant(db, user_id, slot, item_id, target, amount, int(time.time()))
+        # WHAT THIS AUTHORISED, not merely that it happened: the pool and how
+        # much, read by the healing check (status/'s note_refill()).
+        note_refill(db, user_id, slot, item_id, int(time.time()), target=target, amount=amount)
         db.commit()
 
         return {

@@ -1,8 +1,9 @@
 """saves/data.py - the SQL. saves is the table a character is (app.py's
-init_db()); character_deletions keeps what a deletion took. Deleting a
-character also clears its rows in the tables other areas own - its carry,
-skills, heal grants, save history, kill record and loot bags - because none of
-them means anything without the character. No commits: the routes make them."""
+init_db()); character_deletions (schema.py) keeps what a deletion took.
+Deleting a character also clears its rows in the tables other areas own - its
+carry, skills, heal grants, save history, kill record and loot bags - because
+none of them means anything without the character. No commits: the routes
+make them."""
 
 
 def all_of(db, user_id):

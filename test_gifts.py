@@ -26,7 +26,9 @@ much did i inflate my server". THE GIFTS LEDGER in app.py.
         ledger, and a given pile still mints its gold through gold_delta when
         it is used - the cash route and the ledger ask one function.
   GL-8  giftwatch.py ON THE SERVER: the same answer from the database, read
-        only, and a plain sentence when the table is not there yet.
+        only, and a plain sentence when the table is not there yet - and the
+        same numbers BY CONSTRUCTION: it asks ownertools/data.py's
+        gift_report(), the function the route answers with (19 Oct).
 """
 import importlib.util, os, sqlite3, subprocess, sys
 
@@ -372,6 +374,28 @@ check("  one player's alone with --player", out.returncode == 0 and "friend" in 
 source = open(os.path.join(HERE, "giftwatch.py")).read()
 check("  read only: opened mode=ro, so it cannot write", "mode=ro" in source and "INSERT" not in source
       and "UPDATE" not in source and "DELETE" not in source)
+# THE ROUTE'S OWN FUNCTION, not a copy of its SQL (19 Oct). giftwatch.py is
+# loaded as the server's plain python3 would load it - from its file - and must
+# hold ownertools/data.py's gift_report(), asked with app.py's setting; what
+# that hands it on a read-only connection is what the owner's panel is answered.
+_gw_spec = importlib.util.spec_from_file_location("giftwatch_under_test", os.path.join(HERE, "giftwatch.py"))
+giftwatch = importlib.util.module_from_spec(_gw_spec)
+_gw_spec.loader.exec_module(giftwatch)
+_gw_report = getattr(giftwatch, "gift_report", None)
+_gw_file = getattr(getattr(_gw_report, "__code__", None), "co_filename", "")
+check("  its numbers are the route's: ownertools/data.py's gift_report(), asked with app.py's setting",
+      os.path.realpath(_gw_file) == os.path.realpath(os.path.join(HERE, "ownertools", "data.py"))
+      and getattr(giftwatch, "GIFTS_SINCE_KEY", None) == app_module.OWNER_GIFTS_SINCE_KEY
+      and "FROM owner_gifts" not in source,
+      _gw_file)
+_ro = sqlite3.connect("file:%s?mode=ro" % DB_PATH, uri=True)
+_watched = _gw_report(_ro, getattr(giftwatch, "GIFTS_SINCE_KEY", ""), None, 20) if callable(_gw_report) else {}
+_ro.close()
+_answered = report(owner_t).get_json() or {}
+_answered.pop("username", None)
+check("  and what it is handed, read only, is what GET /api/staff/gifts answers the owner",
+      _watched == _answered and (_watched.get("totals") or {}).get("gold") == total_gold,
+      (_watched.get("totals"), _answered.get("totals")))
 bare = os.path.join(testdir.PATH, "elusion_gifts_bare.db")
 if os.path.exists(bare):
     os.remove(bare)

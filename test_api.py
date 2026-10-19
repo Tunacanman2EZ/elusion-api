@@ -2386,8 +2386,11 @@ check("nothing was lost in the merge (6 + 4 = 10)",
 
 _account = _db.execute("SELECT lusions, bank_gold FROM accounts WHERE user_id = 1").fetchone()
 check("banked gold pooled onto the account (400 + 150)", _account and _account[1] == 550, _account)
-check("the old per-character column was zeroed",
-      _db.execute("SELECT SUM(bank_gold) FROM saves").fetchone()[0] == 0)
+# AND THEN THE COLUMN GOES (UPGRADES.md item 7): once its gold is on the
+# account, nothing is left for it to hold. test_schema.py has the build that
+# cannot drop a column, which keeps it zeroed instead.
+check("the old per-character column was dropped once its gold had moved",
+      "bank_gold" not in [r[1] for r in _db.execute("PRAGMA table_info(saves)")])
 check("the legacy table was dropped",
       not _db.execute("SELECT 1 FROM sqlite_master WHERE name='bank_items_legacy'").fetchall())
 

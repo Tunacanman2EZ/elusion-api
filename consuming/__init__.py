@@ -26,7 +26,8 @@ PUT /api/player/status still accepts any hp up to the server's derived maximum
 - a patched client heals without drinking anything. That is a separate and
 larger finding, and this endpoint is what makes it addressable: once healing
 has an authorised source, an unexplained rise becomes a question the server
-can ask - the healing reconciler reads consume_grants, which this writes.
+can ask - the healing reconciler reads consume_grants, which this writes
+through status/'s note_refill().
 
 THE EFFECT IS STILL THE CLIENT'S, but the size of it is the server's: the
 catalogue's restore_for() is written into the grant and handed back, so the two
@@ -35,7 +36,8 @@ cannot disagree about it.
 Built like equipment/ (ARCHITECTURE.md): routes.py (the edge), services.py (the
 rules, pure), data.py (the SQL). It never imports app.py; register() is handed
 what it needs. WHAT STAYS IN app.py: the backpack grant the potion leaves
-through (the carry's), the skills it is checked against (skills_payload(),
-VALID_SKILLS), and the healing reconciler that reads what this writes.
+through (the carry's) and the skills it is checked against (skills_payload(),
+VALID_SKILLS). The healing check that reads what a potion authorised is
+status/'s, and so is the one writer of it (note_refill()), handed in.
 """
 from .routes import register  # noqa: F401

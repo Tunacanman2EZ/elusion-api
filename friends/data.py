@@ -1,4 +1,4 @@
-"""friends/data.py - the SQL. The friends table is app.py's (init_db());
+"""friends/data.py - the SQL. The friends table is this package's (schema.py);
 other readers there: the broadcast poll's "asks" and the ignore list."""
 
 

@@ -31,7 +31,9 @@ it open.
 
 Built like saves/ (ARCHITECTURE.md): routes.py (the edge), services.py (the
 rules, pure), data.py (the SQL). It never imports app.py; register() is handed
-what it needs and hands back status_of(), kept in app.py as status_payload().
+what it needs and hands back status_of(), kept in app.py as status_payload(),
+and note_refill(), the one writer of a refill's note, handed to every area
+that authorises a pool to rise.
 WHAT STAYS IN app.py: the healing tunables and the grant ids every refill
 writes, the stat parser and its ceiling, _derived_stats(), and the boot check
 that says which catalogue-gated protections are not armed.

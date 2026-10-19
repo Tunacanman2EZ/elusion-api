@@ -1,8 +1,9 @@
-"""death/data.py - the SQL. saves, carry_items, accounts and consume_grants are
-app.py's tables (init_db()). The money a death costs moves through app.py's
+"""death/data.py - the SQL. saves, carry_items and accounts are app.py's tables
+(init_db()). The money a death costs moves through app.py's
 ledgers, handed in - never a bare UPDATE on a balance. What is written here: the
-refilled pools, a full death's lost bag and gear, the death score, and the
-grant the healing reconciler reads. No commits: the routes make them."""
+refilled pools, a full death's lost bag and gear, and the death score. The
+grant the healing check reads is written through status/'s note_refill(),
+handed in. No commits: the routes make them."""
 
 
 def the_dead(db, user_id, slot):
@@ -42,11 +43,3 @@ def drop_carry(db, user_id, slot):
     db.execute("DELETE FROM carry_items WHERE user_id = ? AND slot = ?", (user_id, slot))
 
 
-def grant(db, user_id, slot, grant_id, now):
-    """The marker the healing reconciler reads. Same table as a potion,
-    because it answers the same question - "did the server authorise this
-    rise" - and a second table would be a second place to forget to look."""
-    db.execute(
-        "INSERT INTO consume_grants (user_id, slot, item_id, at) VALUES (?, ?, ?, ?)",
-        (user_id, slot, grant_id, now),
-    )

@@ -28,6 +28,16 @@ any one of them does. **The exit code is the source of truth**; the total it
 prints is scraped from each suite's own summary line, and it says so when a
 scrape misses rather than reporting a confident zero.
 
+**It runs several suites at once** (19 Oct): `-Jobs N`, by default one per
+CPU and at most 6; `-Jobs 1` is the old one-at-a-time loop, for when anything
+looks odd. Same discovery, one process per suite, the transcript in name
+order, the same exit code - and a suite that could not even be started, or a
+run that missed one, now fails the run instead of passing it with nothing
+run. **A new suite must keep its databases in testdir.PATH and its servers
+on port 0**, or it cannot run beside the others; and a check that waits on
+a clock has to survive a busy machine (test_presence's renewal raced its own
+sweep until the order was fixed).
+
 One suite on its own:
 
 ```
@@ -170,6 +180,14 @@ why. A route that 404s despite existing is either this or a stale process.
 Helpers defined further down the file do not exist yet when it runs. Table
 creation belongs in the schema block, not in a function called from it. This
 produced a `NameError` on startup once.
+
+**A package's tables are in its `schema.py`** (19 Oct), imported above
+init_db(), which calls each `create(db)` once, after the core's own block and
+before the first migration - a create() is an executescript, which commits,
+so never call one among the migrations. A new column on a package's table
+goes in its CREATE (new databases) and its `upgrade()` (old ones). After any
+schema change you mean, run `python test_schema.py --write-fixture` and read
+the fixture's diff before committing it: that diff is the schema change.
 
 ### A setting read before the .env is a setting the .env cannot set
 
@@ -1898,9 +1916,11 @@ much did i inflate my server". THE GIFTS LEDGER in app.py, `test_gifts.py`.
   game can say "999 x Pile of Gold, 24,975,000 gold" at the moment it is
   given.
 - **`giftwatch.py`** prints the same report from the database on the
-  server, read only (`mode=ro`), `--player NAME` for one account. Its SQL is
-  written out again rather than imported: importing app.py runs the start-up,
-  and the start-up writes. GL-8 holds the two to the same numbers.
+  server, read only (`mode=ro`), `--player NAME` for one account. It loads
+  ownertools/data.py's `gift_report()` from its file and prints what that
+  answers (19 Oct; that file imports nothing, so no Flask and no app.py
+  start-up). **Keep ownertools/data.py free of imports** for that reason;
+  GL-8 checks giftwatch's report is the route's.
 
 ## The kill record
 
@@ -2099,6 +2119,11 @@ only, `test_stats.py`.
   lookup**, and test_accounts A-6 replaces only send_mail_async to prove it
   is reached - a route handed the real one once still lands in SENT, through
   the real one's own lookup of send_mail.
+  **One writer for a refill's note** (19 Oct): status/ hands back
+  `note_refill()` - every row consume_grants gets from the API (a potion, a
+  revive, a respawn, a level-up) goes through it, and app.py hands it to
+  consuming/, death/, kill/ and ownertools/ as `_note_refill`. presence.py's
+  spell-heal rows are written in its own process, the same six columns.
   **Something noticed along the way that needs upgrading goes in
   UPGRADES.md** (the owner asked to be kept told): checked first, then where
   it is, why it matters, how big the fix is.
@@ -2309,7 +2334,7 @@ summon - stepping through is the consent, and it sorts the audience for free.
 ## Layout
 
 ```
-app.py          every route, the schema, the migrations
+app.py          the core: its tables, every migration, the gates, one register() per area
 envfile.py      reads a .env beside the code; first thing app.py and wsgi.py do
 wsgi.py         what gunicorn serves: a preflight of the settings, then app
 gamedata.py     loot rolls, XP curve, stat curves - the game's rules

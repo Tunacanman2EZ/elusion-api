@@ -1,6 +1,7 @@
-"""moderation/data.py - the SQL. chat_reports and the users and sessions
-tables are app.py's (init_db()). Every write to chat_reports is here, and the
-sanctions' writes to users (the ban, mute and rank columns) and to sessions
+"""moderation/data.py - the SQL. chat_reports is this package's table
+(schema.py); the users and sessions tables are app.py's (init_db()). Every
+write to chat_reports is here, and the sanctions' writes to users (the ban,
+mute and rank columns) and to sessions
 (a ban or a kick ends them all). Other readers: the broadcast poll's open
 counts (through the two counts below, handed back by register()), the staff
 account view, and chat's ignore list (chat/). No commits: the routes make

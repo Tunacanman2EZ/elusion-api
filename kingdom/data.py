@@ -1,5 +1,6 @@
-"""kingdom/data.py - the SQL. Reads only: gold_ledger, lusion_ledger, users and
-the guild tables are app.py's (init_db()), and the board writes nothing - it is
+"""kingdom/data.py - the SQL. Reads only: gold_ledger, lusion_ledger and users
+are app.py's (init_db()), the guild tables guilds/'s (guilds/schema.py), and
+the board writes nothing - it is
 DERIVED, NEVER COUNTED (see routes.economy_kingdom)."""
 
 

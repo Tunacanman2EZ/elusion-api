@@ -3,6 +3,9 @@
 # It runs run_tests.ps1 - the same runner, the same discovery (test_*.py), the
 # same exit code - so a green tick here means what a green run on the PC means.
 # The transcript (test_results.txt) is kept with the run, for when it is red.
+# Four suites at a time (-Jobs 4, the runner's CPUs): every suite keeps its
+# databases in a folder of its own (testdir.py) and its servers on port 0, so
+# they cannot touch each other, and the transcript is still in name order.
 #
 # A pull request from a fork gets no secrets and needs none: every suite builds
 # its own throwaway database, and nothing here talks to the live server.
@@ -50,7 +53,7 @@ jobs:
 
       - name: Run every suite
         shell: pwsh
-        run: ./run_tests.ps1 -Python (Get-Command python).Source
+        run: ./run_tests.ps1 -Python (Get-Command python).Source -Jobs 4
 
       - name: Keep the transcript
         if: always()

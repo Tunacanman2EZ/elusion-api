@@ -19,7 +19,7 @@ who you are and what rank you hold on the server, and guild rank is a
 separate ladder that means nothing outside the guild.
 
 ONE GUILD PER PLAYER, enforced by guild_members' primary key rather than by a
-check in a route - see the note over the table in app.py's init_db().
+check in a route - see the note over the table in guilds/schema.py.
 
 INVITED AND ACCEPTED, never simply added. Same argument as the friends list:
 joining a guild attaches somebody's chosen name to yours and puts you in a

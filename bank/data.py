@@ -1,7 +1,8 @@
-"""bank/data.py - the SQL. bank_items, accounts and saves are app.py's tables
-(init_db()). Every write to bank_items is here, but for the shared grid
-helpers' (a move, a discard, taking from cells), which app.py hands in and
-which serve the backpack too; and the two balances a gold transfer moves.
+"""bank/data.py - the SQL. bank_items is this package's table (schema.py);
+accounts and saves are app.py's (init_db()). Every write to bank_items is
+here, but for the shared grid helpers' (a move, a discard, taking from
+cells), which app.py hands in and which serve the backpack too; and the two
+balances a gold transfer moves.
 No commits: the routes make them."""
 
 

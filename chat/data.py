@@ -1,8 +1,8 @@
 """chat/data.py - the SQL. chat_messages, chat_deletions, chat_images,
-chat_image_holders and ignores are app.py's tables (init_db()), as are the
+chat_image_holders and ignores are this package's tables (schema.py); the
 users columns the two buckets live in (chat_tokens, last_chat_at,
-last_image_at, last_world_image_at). Every write to them is here. The
-reports (chat_reports) are the moderation routes'; this file only closes a
+last_image_at, last_world_image_at) are app.py's. Every write to them is here.
+The reports (chat_reports) are the moderation routes'; this file only closes a
 deleted line's reports and asks whether a report carries a picture. Other
 areas READ chat in app.py: the poll's news, a report, the staff panels. No
 commits: the routes make them."""

@@ -641,8 +641,17 @@ section("O-5  THE CONVENTION IS ENFORCED ON THE SOURCE")
 # with a user_id joins the check by existing.
 
 source = trade_src
+# AND THE PACKAGES'. Since 19 Oct a table whose rows one area adds is created
+# in that package's schema.py, so the schema is app.py's block and theirs -
+# read app.py alone and every table that moved would drop out of this check
+# without a word. Found the code map's way, like the writes below.
+packages_src = ""
+for package, _rows, _layers in codemap.feature_packages():
+    for name in sorted(os.listdir(os.path.join(HERE, package))):
+        if name.endswith(".py"):
+            packages_src += "\n" + open(os.path.join(HERE, package, name), encoding="utf-8").read()
 OWNED_TABLES = {}
-for m in re.finditer(r'CREATE TABLE IF NOT EXISTS (\w+)\s*\((.*?)\n\s*\)', source, re.S):
+for m in re.finditer(r'CREATE TABLE IF NOT EXISTS (\w+)\s*\((.*?)\n\s*\)', source + packages_src, re.S):
     name, cols = m.group(1), m.group(2)
     if re.search(r'\buser_id\b', cols):
         OWNED_TABLES[name] = True
@@ -727,16 +736,11 @@ SWEEPS_ALLOWED = [
     ("party_invites", "from_id =", "the invitations you sent, as you leave"),
 ]
 
-# THE PACKAGES' WRITES TOO. The tables are app.py's (the schema above), but
-# since 16 Oct the areas moving out of app.py take their writes with them -
-# loot's, guilds', parties' - and a scan of app.py alone stopped seeing them.
-# Found the code map's way, so a package added later is read without a change
-# here.
-written_src = source
-for package, _rows, _layers in codemap.feature_packages():
-    for name in sorted(os.listdir(os.path.join(HERE, package))):
-        if name.endswith(".py"):
-            written_src += "\n" + open(os.path.join(HERE, package, name), encoding="utf-8").read()
+# THE PACKAGES' WRITES TOO. Since 16 Oct the areas moving out of app.py take
+# their writes with them - loot's, guilds', parties' - and a scan of app.py
+# alone stopped seeing them. The same files as the schema above, found the
+# code map's way, so a package added later is read without a change here.
+written_src = source + packages_src
 
 unscoped = []
 for text in sql_statements(written_src):

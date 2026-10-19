@@ -1,6 +1,7 @@
 """players/data.py - the SQL: who is online, who shares an area, what a
 character holds for its ticket, and the ticket. The tables are app.py's
-(init_db()); the one written here is presence_tickets, which presence.py reads.
+(init_db()) but the one written here: presence_tickets, this package's
+(schema.py), which presence.py reads.
 
 `playing_slot_sql` is app.py's PLAYING_SLOT_SQL, handed in: which character an
 account is playing, as one SQL expression that takes two parameters in order,

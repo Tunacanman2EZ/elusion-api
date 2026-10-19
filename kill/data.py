@@ -1,12 +1,13 @@
 """kill/data.py - the SQL: the character a kill is claimed for, how many of one
 monster it was paid for lately, the level, the XP and the bucket banked in one
-statement, the level-up's refill noted for the healing check, and the kill's
-two records - kill_reports, kept two weeks, and kill_tally, kept for good. The
-tables are app.py's (init_db()). A paid kill is the only thing that adds to
-either (a deleted character takes its tally with it, in saves/, and the tally
-was seeded once at boot); many areas read them - the kill record, the stats,
-the stirring lands, the events, the insights, the staff desk, killwatch.py.
-No commits: the route makes one, for the whole kill."""
+statement, and the kill's two records - kill_reports, kept two weeks, and
+kill_tally, kept for good. (The level-up's refill is noted through status/'s
+note_refill(), handed in.) The tables are this package's (schema.py). A paid
+kill is the only thing that adds to either (a deleted character takes its
+tally with it, in saves/, and the tally was seeded once at boot); many areas
+read them - the kill record, the stats, the stirring lands, the events, the
+insights, the staff desk, killwatch.py. No commits: the route makes one, for
+the whole kill."""
 from . import services
 
 
@@ -30,16 +31,6 @@ def paid_recently(db, user_id, enemy_id, since):
         (user_id, enemy_id, since),
     ).fetchone()
     return int(recent["n"] or 0)
-
-
-def note_level_refill(db, user_id, slot, grant_id, now):
-    """The refill a level-up brings, written where the healing check reads its
-    grants (consume_grants), so the jump to full is not read as a cheat."""
-    db.execute(
-        "INSERT INTO consume_grants (user_id, slot, item_id, target, amount, at) "
-        "VALUES (?, ?, ?, '', 0, ?)",
-        (user_id, slot, grant_id, now),
-    )
 
 
 def bank(db, user_id, slot, level, xp, xp_to_next, derived, now_ms, tokens, now):

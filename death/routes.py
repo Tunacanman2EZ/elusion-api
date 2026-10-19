@@ -23,6 +23,9 @@ register() is handed app.py's own pieces - it never imports app.py:
     respawn_grant_id    and a respawn - both read by the healing reconciler
     status_of           (user_id, slot) -> the character's status, as the
                         status read answers it
+    note_refill         (db, user_id, slot, item_id, at, target=, amount=) - a
+                        rise the server authorised, written where the healing
+                        check reads it (status/'s, the one writer)
 
 THE ENDPOINT NAMES ARE app.py's - character_revive, character_respawn - and
 routes.lock holds them.
@@ -37,7 +40,7 @@ from .services import PAY_WITH
 
 def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, ensure_account, catalogue,
              derived_stats, gold_delta, bank_gold_delta, lusion_delta, lusion_gold_value, revive_grant_id,
-             respawn_grant_id, status_of):
+             respawn_grant_id, status_of, note_refill):
 
     def character_revive():
         """
@@ -170,7 +173,9 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, en
         # The marker the healing reconciler reads - an honest revive is a jump
         # from 0 to full in no time at all, and without it every legitimate
         # one would land in the log as a false positive.
-        data.grant(db, user_id, slot, revive_grant_id, now)
+        # The marker the healing check reads (status/'s note_refill()): a
+        # revive fills every pool, so it names no pool and no amount.
+        note_refill(db, user_id, slot, revive_grant_id, now)
         db.commit()
 
         account_after = ensure_account(user_id)
@@ -281,7 +286,7 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, en
         # The marker the healing reconciler reads, exactly as the revive writes
         # one. Its absence is what turned an honest respawn into a clamped one,
         # and the log line said so in as many words: "granted 0".
-        data.grant(db, user_id, slot, respawn_grant_id, now)
+        note_refill(db, user_id, slot, respawn_grant_id, now)
         db.commit()
 
         return {

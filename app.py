@@ -1020,6 +1020,24 @@ def close_db(exception):
         db.close()
 
 
+# THE PACKAGES' TABLES (19 Oct). A table whose rows one area adds keeps its
+# CREATE in that package's schema.py, and init_db() calls each create(), in
+# the order it writes out. Imported here, above it, because init_db() runs at
+# import time (below) - long before the register() calls further down.
+import kill.schema as kill_schema  # noqa: E402
+import bank.schema as bank_schema  # noqa: E402
+import loot.schema as loot_schema  # noqa: E402
+import players.schema as players_schema  # noqa: E402
+import trade.schema as trade_schema  # noqa: E402
+import saves.schema as saves_schema  # noqa: E402
+import world.schema as world_schema  # noqa: E402
+import chat.schema as chat_schema  # noqa: E402
+import moderation.schema as moderation_schema  # noqa: E402
+import friends.schema as friends_schema  # noqa: E402
+import guilds.schema as guilds_schema  # noqa: E402
+import parties.schema as parties_schema  # noqa: E402
+
+
 def init_db():
     """Create tables if they don't exist. Safe to call on every boot."""
     db = sqlite3.connect(DB_PATH)
@@ -1027,6 +1045,10 @@ def init_db():
     # Before the schema block, not after - see the docstring.
     _migrate_rename_admin_actions(db)
 
+    # THE CORE'S TABLES: what app.py writes itself, and what more than one
+    # area adds rows to - accounts and sessions, the characters, the two
+    # ledgers, the carry, the skills, the heal grants. Each package's own
+    # tables are in its schema.py, called just below this.
     db.executescript(
         """
         -- `role` is the rank system. It replaced a boolean called is_admin,
@@ -1217,61 +1239,6 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_login_attempts_at ON login_attempts(at);
         CREATE INDEX IF NOT EXISTS idx_login_attempts_user ON login_attempts(username, at);
 
-        -- EVERY KILL A CLIENT CLAIMS.
-        --
-        -- E-3 says the kill EVENT is asserted rather than verified: the server
-        -- rolls the rewards itself, refuses reward-less enemies and rate-limits
-        -- with a token bucket, but never confirms a fight happened. The note
-        -- that matters is "the rate limit caps the SPEED of the fraud, not its
-        -- existence" - and until this table, it did not even cap the
-        -- INVISIBILITY of it. Nothing recorded a kill. A client reporting one
-        -- boss an hour, forever, looked exactly like a player who enjoys the
-        -- boss.
-        --
-        -- THIS DOES NOT CLOSE E-3 AND IS NOT PRETENDING TO. Verification needs
-        -- the server to know what spawned, which needs the client to register
-        -- spawns - a change on both sides of the wire. What this does is make
-        -- the thing measurable, which is the step before any check worth
-        -- enforcing: you cannot detect an anomaly you never wrote down, and a
-        -- threshold picked without data is how honest players get clamped.
-        --
-        -- REWARDS ARE STORED AS PAID, not recomputed later. The enemy's profile
-        -- can be retuned tomorrow; what this account was actually given is a
-        -- fact about that moment and has to survive the retune, exactly like
-        -- staff_actions storing names alongside ids.
-        CREATE TABLE IF NOT EXISTS kill_reports (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id    INTEGER NOT NULL,
-            slot       INTEGER NOT NULL,
-            enemy_id   TEXT    NOT NULL,
-            xp         INTEGER NOT NULL DEFAULT 0,
-            attack_xp  INTEGER NOT NULL DEFAULT 0,
-            level_at   INTEGER NOT NULL DEFAULT 0,
-            at         INTEGER NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-
-        -- THE KILL RECORD (7 Oct, the owner: "a button in game that records
-        -- all players kills with icons of the enemies"). One row per character
-        -- per kind of monster, counted at every paid kill in combat_kill's own
-        -- transaction and KEPT FOR GOOD - kill_reports above is pruned after
-        -- two weeks, so it can say how fast, never how many. A TALLY, so it has
-        -- a birthday: kill_tally_since in server_settings, written when it was
-        -- first filled from what kill_reports still held. See THE KILL RECORD.
-        CREATE TABLE IF NOT EXISTS kill_tally (
-            user_id    INTEGER NOT NULL,
-            slot       INTEGER NOT NULL,
-            enemy_id   TEXT    NOT NULL,
-            kills      INTEGER NOT NULL DEFAULT 0,
-            first_at   INTEGER NOT NULL,
-            last_at    INTEGER NOT NULL,
-            PRIMARY KEY (user_id, slot, enemy_id),
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-        -- "everyone's kills of each monster" reads the whole table grouped by
-        -- enemy; this is that grouping's index.
-        CREATE INDEX IF NOT EXISTS idx_kill_tally_enemy ON kill_tally(enemy_id, user_id);
-
         -- THE BOOKS ON EVERY MONSTER (0.10.0; E3_SCOPE.md option C, step 1).
         -- presence.py keeps its own count of every monster's health from what
         -- the area's leader says and every hit any game sends (combatbook.py),
@@ -1318,11 +1285,6 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_combat_flags_user ON combat_flags(user_id, last_at);
         CREATE INDEX IF NOT EXISTS idx_combat_flags_at ON combat_flags(last_at);
-
-        -- "what has this account been killing, and how fast" - one query.
-        CREATE INDEX IF NOT EXISTS idx_kill_reports_user ON kill_reports(user_id, at);
-        -- "who is reporting this enemy most" - the other one.
-        CREATE INDEX IF NOT EXISTS idx_kill_reports_enemy ON kill_reports(enemy_id, at);
 
         -- EVERY CONSUMABLE THE SERVER AUTHORISED, one row each.
         --
@@ -1416,7 +1378,6 @@ def init_db():
             gold        INTEGER NOT NULL DEFAULT 0,
             xp          INTEGER NOT NULL DEFAULT 0,
             xp_to_next  INTEGER NOT NULL DEFAULT 100,
-            bank_gold   INTEGER NOT NULL DEFAULT 0,
             -- which pet this character currently has out, as the client's
             -- item_id (e.g. 'petpoisonslimesmall'). Empty string means none.
             -- Deliberately NOT validated against a list of known pets: the
@@ -1458,11 +1419,6 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
 
-        -- the anti-duplication design is the composite primary key. one row
-        -- per item per slot means a deposit can only ever UPDATE a quantity,
-        -- never insert a second row for the same item. the database refuses
-        -- to represent the duplicated state, so no application bug can
-        -- create it.
         -- Account-shared game state. Separate from `users`, which is auth:
         -- a password hash and a rank have nothing to do with a lusion
         -- balance, and keeping them apart means the auth table stays the thing
@@ -1478,29 +1434,11 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
 
-        -- THE BANK IS ACCOUNT-SHARED, NOT PER-CHARACTER. characterdata.gd puts
-        -- bank_gold and bank_inventory in account_data, commented "account-
-        -- shared, safe from death" - that is the whole point of the feature.
-        -- This table used to carry a `slot` column, which would have made
-        -- anything your warrior banked invisible to your mage.
-        --
-        -- Positional for the same reason carry_items is: the client holds it as
-        -- an array of cells with nulls for the empty ones, and the player
-        -- expects things to stay where they put them.
-        CREATE TABLE IF NOT EXISTS bank_items (
-            user_id  INTEGER NOT NULL,
-            position INTEGER NOT NULL,
-            item_id  TEXT    NOT NULL,
-            quantity INTEGER NOT NULL CHECK (quantity > 0),
-            PRIMARY KEY (user_id, position),
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-
-        -- The backpack. Keyed on POSITION, not item_id, unlike bank_items
-        -- above: the bank is a set of stacks where order does not matter, but
-        -- the backpack is a grid where the player expects a potion to stay in
-        -- the cell they dragged it to, and two stacks of the same item in two
-        -- different cells is an ordinary legal state. Keying on item_id would
+        -- The backpack. Keyed on POSITION, not item_id (as the bank's cells
+        -- are, in bank/schema.py): the backpack is a grid where the player
+        -- expects a potion to stay in the cell they dragged it to, and two
+        -- stacks of the same item in two different cells is an ordinary
+        -- legal state. Keying on item_id would
         -- silently merge them and reshuffle the bag on every login.
         CREATE TABLE IF NOT EXISTS carry_items (
             user_id  INTEGER NOT NULL,
@@ -1510,34 +1448,6 @@ def init_db():
             quantity INTEGER NOT NULL CHECK (quantity > 0),
             PRIMARY KEY (user_id, slot, position),
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-
-        -- A loot bag the server rolled and still owns. The client renders a
-        -- copy; taking anything out of it is a request, checked against these
-        -- rows. That is what takes `gold` off the list of things a client can
-        -- simply declare.
-        CREATE TABLE IF NOT EXISTS loot_bags (
-            bag_id     TEXT    PRIMARY KEY,
-            user_id    INTEGER NOT NULL,
-            slot       INTEGER NOT NULL,
-            enemy_id   TEXT    NOT NULL,
-            created_at INTEGER NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_loot_bags_created ON loot_bags(created_at);
-
-        -- Position-keyed like every other container here. "Take slot 2" is a
-        -- request the server can answer exactly once; "take a healthpotion" is
-        -- ambiguous when the bag holds two stacks, and a client sending it twice
-        -- would be asking for a duplication bug.
-        CREATE TABLE IF NOT EXISTS loot_bag_items (
-            bag_id   TEXT    NOT NULL,
-            position INTEGER NOT NULL,
-            item_id  TEXT    NOT NULL,
-            quantity INTEGER NOT NULL CHECK (quantity > 0),
-            PRIMARY KEY (bag_id, position),
-            FOREIGN KEY (bag_id) REFERENCES loot_bags(bag_id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS skills (
@@ -1567,74 +1477,6 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_trusted_devices_user
             ON trusted_devices(user_id, created_at);
-
-        -- A TICKET TO THE PRESENCE SERVER (presence.py), which shows players to
-        -- each other over a WebSocket. The game asks for one with its login
-        -- (POST /api/presence/ticket) and hands it to the socket, so the socket
-        -- never sees a login and every rule about who may sign in stays here.
-        -- token_hash, not the ticket. `identity` is who the player is on other
-        -- people's screens - name, rank, colour, guild, class, level and the
-        -- pets they hold - written by this server from its own rows, as JSON.
-        -- session_hash is the login that asked: presence.py drops a connection
-        -- whose login is gone (logout, ban, kick, a login elsewhere) by joining
-        -- on sessions, so none of those routes has to know the socket exists.
-        CREATE TABLE IF NOT EXISTS presence_tickets (
-            token_hash   TEXT    PRIMARY KEY,
-            session_hash TEXT    NOT NULL,
-            user_id      INTEGER NOT NULL,
-            slot         INTEGER NOT NULL,
-            identity     TEXT    NOT NULL,
-            issued_at    INTEGER NOT NULL,
-            expires_at   INTEGER NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_presence_tickets_expiry
-            ON presence_tickets(expires_at);
-
-        -- A FRESH FIND THAT CANNOT BE TRADED YET. One row per mythic or Perfect
-        -- piece as it enters an account - taken from a loot bag or bought from
-        -- the shop - lasting TRADE_HOLD_SECONDS. The server does not watch the
-        -- fight (E-3), so a cheated kill can mint a mythic; the hold keeps it
-        -- in the account that found it long enough for killwatch.py and staff
-        -- to see it first. Counted per account and item id, not per cell:
-        -- the item may move between characters through the bank.
-        CREATE TABLE IF NOT EXISTS trade_holds (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id     INTEGER NOT NULL,
-            item_id     TEXT    NOT NULL,
-            created_at  INTEGER NOT NULL,
-            held_until  INTEGER NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_trade_holds_user
-            ON trade_holds(user_id, item_id, held_until);
-
-        -- A DELETED CHARACTER, KEPT FOR A WHILE. POST /api/character/delete
-        -- removes the character's rows; this keeps a copy of what it was - the
-        -- save row, its bag and its skills, as JSON - so "I did not delete
-        -- that" or "I clicked the wrong one" can be answered, and the character
-        -- put back by hand if it should be. Nothing reads it back
-        -- automatically: a restore is a decision, not a route.
-        --
-        -- The newest CHARACTER_DELETIONS_KEPT per account, pruned on write, so
-        -- creating and deleting in a loop cannot grow it without bound.
-        CREATE TABLE IF NOT EXISTS character_deletions (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id    INTEGER NOT NULL,
-            slot       INTEGER NOT NULL,
-            class_id   TEXT    NOT NULL,
-            name       TEXT    NOT NULL,
-            level      INTEGER NOT NULL,
-            gold       INTEGER NOT NULL DEFAULT 0,
-            deleted_at INTEGER NOT NULL,
-            snapshot   TEXT    NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_character_deletions_user
-            ON character_deletions(user_id, deleted_at);
 
         -- A CHARACTER AS IT WAS, a few times over, so the owner can put it
         -- back. See SAVE SNAPSHOTS AND ROLLBACK. One row is everything about a
@@ -1770,77 +1612,6 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_gold_ledger_spent_reason
             ON gold_ledger(reason, delta) WHERE delta < 0;
 
-        -- A TRADE IN PROGRESS. Two characters, what each is putting up, and
-        -- whether each has said yes to what the other is showing.
-        --
-        -- NOTHING IS HELD IN ESCROW, and that is deliberate. The obvious design
-        -- takes both sides' items out of their bags when they are offered and
-        -- holds them here - but then a disconnect, a crash or an abandoned
-        -- window leaves real items owned by a row instead of a player, and
-        -- every one of those needs a sweeper to give them back. This table
-        -- records INTENT; the items never leave the bag until the single
-        -- transaction that crosses them, and that transaction re-checks that
-        -- both sides still hold what they promised. The worst case is a trade
-        -- that fails at the last moment, which is a refusal, not a lost sword.
-        --
-        -- state is the concurrency guard. Execution flips 'open' to 'done' with
-        -- a conditional UPDATE and checks it changed a row, so two confirms
-        -- arriving together can only fire once - see trade/routes.py, execute().
-        CREATE TABLE IF NOT EXISTS trades (
-            trade_id    TEXT PRIMARY KEY,
-            a_user      INTEGER NOT NULL,
-            a_slot      INTEGER NOT NULL,
-            a_gold      INTEGER NOT NULL DEFAULT 0 CHECK (a_gold >= 0),
-            a_confirmed INTEGER NOT NULL DEFAULT 0,
-            b_user      INTEGER NOT NULL,
-            b_slot      INTEGER NOT NULL,
-            b_gold      INTEGER NOT NULL DEFAULT 0 CHECK (b_gold >= 0),
-            b_confirmed INTEGER NOT NULL DEFAULT 0,
-            state       TEXT    NOT NULL DEFAULT 'open',
-            created_at  INTEGER NOT NULL,
-            updated_at  INTEGER NOT NULL,
-            FOREIGN KEY (a_user) REFERENCES users(id) ON DELETE CASCADE,
-            FOREIGN KEY (b_user) REFERENCES users(id) ON DELETE CASCADE
-        );
-
-        -- Finding a player's open trade is the single most common read here
-        -- (the panel polls it), and it is asked from both directions.
-        --
-        -- updated_at ON THE END, so the same two indexes also answer "your
-        -- last ten trades" in order instead of sorting every trade somebody
-        -- has ever made. They replace idx_trades_a and idx_trades_b, which
-        -- were these without the last column - see the MIGRATION section.
-        CREATE INDEX IF NOT EXISTS idx_trades_a_recent ON trades(a_user, state, updated_at);
-        CREATE INDEX IF NOT EXISTS idx_trades_b_recent ON trades(b_user, state, updated_at);
-
-        -- The prune of old cancelled trades asks by state and age and nothing
-        -- else. Without this it read every trade ever made, on every offer.
-        --
-        -- PARTIAL, ON PURPOSE, and the first version was not. A plain
-        -- (state, updated_at) index was picked by the planner for "find my
-        -- OPEN trade" - the read every trade window polls - because it
-        -- matches state = 'open' with an equality and the planner has no
-        -- statistics saying that is most of the table. That read went from
-        -- two index lookups by player to a scan of every open trade in the
-        -- world. test_trades.py caught it in the query plan. An index that
-        -- only holds cancelled rows cannot be chosen for anything but the
-        -- prune it exists for, and is smaller besides.
-        CREATE INDEX IF NOT EXISTS idx_trades_cancelled ON trades(updated_at)
-            WHERE state = 'cancelled';
-
-        -- ONE ROW PER ITEM TYPE PER SIDE, not per backpack cell. The primary
-        -- key does the merging: offering five arrows twice is one row of ten,
-        -- not two rows that have to be summed before anything can be checked.
-        -- Positions are the client's business; what crosses is a quantity.
-        CREATE TABLE IF NOT EXISTS trade_items (
-            trade_id TEXT    NOT NULL,
-            side     TEXT    NOT NULL CHECK (side IN ('a', 'b')),
-            item_id  TEXT    NOT NULL,
-            quantity INTEGER NOT NULL CHECK (quantity > 0),
-            PRIMARY KEY (trade_id, side, item_id),
-            FOREIGN KEY (trade_id) REFERENCES trades(trade_id) ON DELETE CASCADE
-        );
-
         -- SERVER-WIDE SETTINGS THAT OUTLIVE A RESTART.
         --
         -- WHY A TABLE AND NOT A CONSTANT: the maintenance switch is thrown
@@ -1858,17 +1629,6 @@ def init_db():
             value      TEXT    NOT NULL,
             updated_by TEXT    NOT NULL DEFAULT '',
             updated_at INTEGER NOT NULL DEFAULT 0
-        );
-
-        -- THE STIRRING LANDS (game 0.46.0): one row per stir, numbered from 1.
-        -- element is Element.Type 1-7; chosen_by '' when the world picked it,
-        -- the owner's name when they stirred it by hand.
-        CREATE TABLE IF NOT EXISTS world_ticks (
-            tick       INTEGER PRIMARY KEY,
-            element    INTEGER NOT NULL,
-            started_at INTEGER NOT NULL,
-            ends_at    INTEGER NOT NULL,
-            chosen_by  TEXT    NOT NULL DEFAULT ''
         );
 
         -- WHAT THE SERVER SAYS TO EVERYONE.
@@ -1891,359 +1651,6 @@ def init_db():
         );
 
         CREATE INDEX IF NOT EXISTS idx_broadcasts_id ON broadcasts(id);
-
-        -- WHAT THE PLAYERS SAY TO EACH OTHER.
-        --
-        -- The sibling the broadcasts comment above predicted. It is a separate
-        -- table rather than an author column on broadcasts because the two are
-        -- not the same kind of thing: a broadcast is the server speaking and
-        -- can never be wrong, while this is a public surface that needs a
-        -- length cap, a flood bucket and a way for a mod to take a line back
-        -- down. Keeping them apart also keeps the kill switch's notice out of
-        -- reach of anything a player can do to the chat table.
-        --
-        -- USERNAME AND ROLE ARE COPIED IN, not joined. A message is a record of
-        -- what was said and who said it AT THAT MOMENT: promoting someone to
-        -- dev should not retroactively re-badge every line they have ever
-        -- written, and renaming an account should not rewrite its history. It
-        -- also keeps the hottest poll in the game off a join.
-        --
-        -- Same AUTOINCREMENT cursor as broadcasts, for the same reason.
-        CREATE TABLE IF NOT EXISTS chat_messages (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id    INTEGER NOT NULL,
-            username   TEXT    NOT NULL,
-            role       TEXT    NOT NULL DEFAULT 'player',
-            body       TEXT    NOT NULL,
-            created_at INTEGER NOT NULL,
-            -- WHICH CONVERSATION THIS LINE BELONGS TO.
-            --
-            -- ONE TABLE, NOT ONE PER CHANNEL. Every channel wants the same
-            -- columns, the same flood bucket, the same "take that line down"
-            -- and the same cursor; four tables would be four copies of all of
-            -- it, and the fourth would be the one that forgot the moderation.
-            --
-            -- target_id IS READ DIFFERENTLY PER CHANNEL, which is the only
-            -- awkward part of that choice and is worth the trade:
-            --   world     unused, 0
-            --   private   the account this was said TO
-            --   friends   unused, 0 - the audience is the author's friend list
-            --   guild     the guild, once guilds exist
-            channel    TEXT    NOT NULL DEFAULT 'world',
-            target_id  INTEGER NOT NULL DEFAULT 0,
-            -- A RELAYED PICTURE, by id into chat_images. Empty for a line that
-            -- is only words, which is nearly all of them.
-            image_id   TEXT    NOT NULL DEFAULT '',
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_chat_id ON chat_messages(id);
-
-        -- Every read is "this channel, after this id", and for a private
-        -- conversation it is also "between these two accounts".
-        CREATE INDEX IF NOT EXISTS idx_chat_channel ON chat_messages(channel, id);
-        CREATE INDEX IF NOT EXISTS idx_chat_private
-            ON chat_messages(channel, user_id, target_id, id);
-        -- "What was said TO me": the newest whisper to an account, and the
-        -- newest line in a guild, both asked on every broadcast poll.
-        CREATE INDEX IF NOT EXISTS idx_chat_to
-            ON chat_messages(channel, target_id, id);
-
-        -- PICTURES, FETCHED BY THE SERVER AND RE-SERVED BY IT.
-        --
-        -- WHY THE SERVER HOLDS THE BYTES instead of clients loading the URL a
-        -- player pasted. A link in a chat window is a fetch every client in
-        -- the channel performs on command: whoever posted it learns the IP of
-        -- everyone who saw it, and can change what is behind the link after
-        -- it has been moderated. Relaying costs one fetch, by the server,
-        -- once - and what players receive is a picture this server has
-        -- already decoded and knows is a picture.
-        --
-        -- KEYED BY THE HASH OF THE BYTES, so the same image posted twice is
-        -- stored once and the id is not guessable from the URL.
-        --
-        -- ANIMATION IS FLATTENED TO A SPRITESHEET on the way in. Godot has no
-        -- GIF decoder; it does have AnimatedTexture and has been drawing
-        -- spritesheets since the first enemy. Decoding where Pillow already
-        -- lives and shipping the client something it can already play is the
-        -- difference between animated pictures working and not.
-        CREATE TABLE IF NOT EXISTS chat_images (
-            id         TEXT    PRIMARY KEY,
-            kind       TEXT    NOT NULL DEFAULT 'still',
-            width      INTEGER NOT NULL,
-            height     INTEGER NOT NULL,
-            frames     INTEGER NOT NULL DEFAULT 1,
-            columns    INTEGER NOT NULL DEFAULT 1,
-            frame_ms   INTEGER NOT NULL DEFAULT 0,
-            bytes      INTEGER NOT NULL,
-            source     TEXT    NOT NULL DEFAULT '',
-            created_by TEXT    NOT NULL DEFAULT '',
-            created_at INTEGER NOT NULL,
-            format     TEXT    NOT NULL DEFAULT 'png',
-            data       BLOB    NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_chat_images_age
-            ON chat_images(created_at);
-
-        -- WHO PUT EACH PICTURE ON THE SERVER, one row per account. Not a column
-        -- on chat_images, because the store deduplicates on the content hash:
-        -- when two players upload the same file it is ONE row, and created_by
-        -- only remembers the first. The second uploader still has to be able
-        -- to see and send what they uploaded - see WHO MAY SEE A PICTURE.
-        -- Removed with the picture (eviction, or a mod deleting its last line).
-        CREATE TABLE IF NOT EXISTS chat_image_holders (
-            image_id   TEXT    NOT NULL,
-            user_id    INTEGER NOT NULL,
-            created_at INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (image_id, user_id)
-        );
-
-        -- A DELETION IS AN EVENT, AND THE FEED HAD NO WAY TO CARRY ONE.
-        --
-        -- GET /api/chat answers "messages with id greater than `since`", which is
-        -- the right question for a growing log and cannot express the opposite
-        -- one: something you were already given is no longer true. So deleting a
-        -- message removed the row, the message stopped appearing in FUTURE polls,
-        -- and every client already holding it kept it - on screen, and with the
-        -- picture decoded in memory. A mod took a line down and it stayed on
-        -- every screen that had already seen it, which is precisely the set of
-        -- people the deletion was for.
-        --
-        -- WHY A SEPARATE TABLE RATHER THAN A deleted_at COLUMN. A tombstone in
-        -- chat_messages would mean every existing read has to learn to say
-        -- "AND deleted_at = 0" - a dozen places to forget one, and forgetting it
-        -- shows the deleted line again. This table is additive: nothing that
-        -- reads chat_messages needs to change, because the row really is gone.
-        --
-        -- WHY IT STORES THE DELETED MESSAGE'S OWN channel, user_id AND target_id
-        -- RATHER THAN JUST THE ID. Those are the three columns GET /api/chat
-        -- builds its "who may read what" clause out of, so the poll can filter
-        -- deletions with THE VERY SAME CLAUSE it filters messages with. One rule,
-        -- one copy of it, and the property falls out for free: a message you were
-        -- never allowed to see cannot produce a deletion you are told about.
-        --
-        -- Without that, world chat would carry the ids of deleted whispers to
-        -- everybody. No content in an id, but still the fact that a line existed
-        -- between two people and was taken down. Three columns is the whole cost.
-        --
-        -- WHY THERE IS NO SECOND CURSOR, which is the part that makes this
-        -- small. `since` cannot find a deletion below a client's cursor, so the
-        -- poll reports deletions by WHEN THEY HAPPENED instead - anything in the
-        -- last CHAT_DELETION_WINDOW_SECONDS. That is only sufficient because of
-        -- something the client already does: chatpanel.gd starts from the TAIL
-        -- rather than from a stored cursor when the window opens, so a client
-        -- that was away longer than the window cannot be holding the line
-        -- anyway. The window covers exactly the clients that were watching.
-        CREATE TABLE IF NOT EXISTS chat_deletions (
-            message_id INTEGER PRIMARY KEY,
-            channel    TEXT    NOT NULL DEFAULT 'world',
-            user_id    INTEGER NOT NULL DEFAULT 0,
-            target_id  INTEGER NOT NULL DEFAULT 0,
-            deleted_at INTEGER NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_chat_deletions_age
-            ON chat_deletions(deleted_at);
-
-        -- WHO A PLAYER HAS CHOSEN NOT TO HEAR. See IGNORE, REPORT, MUTE. One row
-        -- per pair, directional: user_id is the one who ignores. Their lines
-        -- are left out of every read of mine; their whispers, friend requests
-        -- and trades to me are refused.
-        CREATE TABLE IF NOT EXISTS ignores (
-            user_id    INTEGER NOT NULL,
-            ignored_id INTEGER NOT NULL,
-            created_at INTEGER NOT NULL,
-            PRIMARY KEY (user_id, ignored_id)
-        );
-
-        -- A LINE A PLAYER TOLD STAFF ABOUT. The line is COPIED - who said it,
-        -- where, what it said - because the report has to outlive the line: a
-        -- mod deletes it, the ring buffer trims it, and the evidence would go
-        -- with it. One per reporter per line; a second press is not a second
-        -- report. Resolving closes every report on the same line together.
-        CREATE TABLE IF NOT EXISTS chat_reports (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_id    INTEGER NOT NULL,
-            reporter_id   INTEGER NOT NULL,
-            reporter_name TEXT    NOT NULL,
-            reported_id   INTEGER NOT NULL,
-            reported_name TEXT    NOT NULL,
-            channel       TEXT    NOT NULL,
-            body          TEXT    NOT NULL DEFAULT '',
-            image_id      TEXT    NOT NULL DEFAULT '',
-            said_at       INTEGER NOT NULL DEFAULT 0,
-            reason        TEXT    NOT NULL,
-            created_at    INTEGER NOT NULL,
-            resolved_at   INTEGER NOT NULL DEFAULT 0,
-            resolved_by   TEXT    NOT NULL DEFAULT '',
-            outcome       TEXT    NOT NULL DEFAULT '',
-            UNIQUE (message_id, reporter_id)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_chat_reports_open
-            ON chat_reports(resolved_at, created_at);
-        CREATE INDEX IF NOT EXISTS idx_chat_reports_by
-            ON chat_reports(reporter_id, created_at);
-
-        -- WHO KNOWS WHO.
-        --
-        -- ONE ROW PER PAIR, and the key is directional on purpose: which way
-        -- round it is stored is the record of who asked. A friendship is an
-        -- accepted row read from either side, so the answer to "are we
-        -- friends" is one lookup in each direction and never two rows that can
-        -- disagree with each other.
-        --
-        -- WHY 'pending' IS A STATE AND NOT A SEPARATE TABLE. A request and a
-        -- friendship are the same relationship at two moments in its life.
-        -- Split across two tables, accepting means a delete and an insert that
-        -- have to succeed together, and the pair can exist in both at once.
-        --
-        -- A DECLINE DELETES THE ROW rather than recording a refusal. Storing
-        -- 'declined' would be a list of everyone who ever said no to you, kept
-        -- on the server, readable by whoever eventually breaks in - and it
-        -- would have to expire anyway, because a no today is not a no forever.
-        -- Re-asking is instead policed by MAX_PENDING_SENT.
-        CREATE TABLE IF NOT EXISTS friends (
-            requester_id INTEGER NOT NULL,
-            addressee_id INTEGER NOT NULL,
-            state        TEXT    NOT NULL DEFAULT 'pending'
-                         CHECK (state IN ('pending', 'accepted')),
-            created_at   INTEGER NOT NULL,
-            decided_at   INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (requester_id, addressee_id),
-            FOREIGN KEY (requester_id) REFERENCES users(id) ON DELETE CASCADE,
-            FOREIGN KEY (addressee_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-
-        -- Both directions are queried on every /api/friends call, and the
-        -- primary key only covers one of them.
-        CREATE INDEX IF NOT EXISTS idx_friends_addressee
-            ON friends(addressee_id, state);
-        CREATE INDEX IF NOT EXISTS idx_friends_requester
-            ON friends(requester_id, state);
-
-        -- A GUILD, AND WHO IS IN IT.
-        --
-        -- THREE TABLES, AND THE SHAPE IS THE RULE. guild_members has user_id
-        -- as its PRIMARY KEY, which is not a detail - it is how "one guild per
-        -- player" is enforced. Expressed as a column with a uniqueness check
-        -- in Python instead, the second guild somebody joined would depend on
-        -- two requests not overlapping, and they eventually do.
-        --
-        -- `folded` is the name lowercased, with its own unique index, so
-        -- "The Crowned" and "the crowned" cannot both exist. The display name
-        -- keeps whatever capitals the founder typed.
-        CREATE TABLE IF NOT EXISTS guilds (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            name       TEXT    NOT NULL,
-            folded     TEXT    NOT NULL,
-            founded_by TEXT    NOT NULL DEFAULT '',
-            created_at INTEGER NOT NULL
-        );
-
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_guilds_folded
-            ON guilds(folded);
-
-        CREATE TABLE IF NOT EXISTS guild_members (
-            user_id   INTEGER PRIMARY KEY,
-            guild_id  INTEGER NOT NULL,
-            rank      TEXT    NOT NULL DEFAULT 'member'
-                      CHECK (rank IN ('leader', 'officer', 'member')),
-            joined_at INTEGER NOT NULL,
-            FOREIGN KEY (user_id)  REFERENCES users(id)  ON DELETE CASCADE,
-            FOREIGN KEY (guild_id) REFERENCES guilds(id) ON DELETE CASCADE
-        );
-
-        -- The roster read is "everyone in guild N", which the primary key on
-        -- user_id does not answer.
-        CREATE INDEX IF NOT EXISTS idx_guild_members_guild
-            ON guild_members(guild_id, rank);
-
-        -- AN INVITATION WAITING FOR AN ANSWER, exactly like a friend request
-        -- and for the same reason: being put in a guild without being asked
-        -- means being given a rank, a chat channel and a name beside yours
-        -- that somebody else chose.
-        CREATE TABLE IF NOT EXISTS guild_invites (
-            guild_id   INTEGER NOT NULL,
-            user_id    INTEGER NOT NULL,
-            invited_by TEXT    NOT NULL DEFAULT '',
-            created_at INTEGER NOT NULL,
-            PRIMARY KEY (guild_id, user_id),
-            FOREIGN KEY (guild_id) REFERENCES guilds(id) ON DELETE CASCADE,
-            FOREIGN KEY (user_id)  REFERENCES users(id)  ON DELETE CASCADE
-        );
-
-        -- "What have I been invited to" is the common read, and the primary
-        -- key leads with guild_id.
-        CREATE INDEX IF NOT EXISTS idx_guild_invites_user
-            ON guild_invites(user_id);
-
-        -- WHAT HAPPENED IN A GUILD, for its own members: founded, joined,
-        -- left, invited, promoted, demoted, handed on, removed, renamed.
-        --
-        -- NAMES, NOT IDS, for the reason staff_actions gives: the line has to
-        -- read the same after somebody has left the guild or deleted their
-        -- account. It is the guild's history, not a join against who is in it
-        -- now.
-        --
-        -- NOT THE MODERATION LOG. staff_actions is what staff did and is read
-        -- by staff; this is what members did and is read by members. Staff
-        -- renaming a guild appears in both, because both audiences need it.
-        --
-        -- Bounded per guild - see GUILD_EVENTS_KEPT - and gone with the guild.
-        CREATE TABLE IF NOT EXISTS guild_events (
-            id       INTEGER PRIMARY KEY AUTOINCREMENT,
-            guild_id INTEGER NOT NULL,
-            at       INTEGER NOT NULL,
-            kind     TEXT    NOT NULL,
-            actor    TEXT    NOT NULL DEFAULT '',
-            target   TEXT    NOT NULL DEFAULT '',
-            detail   TEXT    NOT NULL DEFAULT '',
-            FOREIGN KEY (guild_id) REFERENCES guilds(id) ON DELETE CASCADE
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_guild_events_guild
-            ON guild_events(guild_id, id);
-
-        -- PARTIES (game 0.42.0). A few players together for a while: a Party
-        -- window, a party chat and each other on the map. Not a guild - no
-        -- name, no ranks, no cost, gone when it is down to one.
-        --
-        -- ONE PARTY PER PLAYER, enforced by party_members' primary key, as
-        -- guild_members' is. is_leader marks the one who may invite, remove
-        -- and hand it on; party_fix() keeps exactly one while two remain.
-        CREATE TABLE IF NOT EXISTS parties (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS party_members (
-            user_id   INTEGER PRIMARY KEY,
-            party_id  INTEGER NOT NULL,
-            is_leader INTEGER NOT NULL DEFAULT 0,
-            joined_at INTEGER NOT NULL,
-            FOREIGN KEY (user_id)  REFERENCES users(id)   ON DELETE CASCADE,
-            FOREIGN KEY (party_id) REFERENCES parties(id) ON DELETE CASCADE
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_party_members_party
-            ON party_members(party_id, joined_at);
-
-        -- AN INVITATION FROM A PERSON, not from a party: somebody with no
-        -- party yet asks somebody else, and the party is made when it is
-        -- accepted. Waits PARTY_INVITE_SECONDS for an answer.
-        CREATE TABLE IF NOT EXISTS party_invites (
-            user_id    INTEGER NOT NULL,
-            from_id    INTEGER NOT NULL,
-            created_at INTEGER NOT NULL,
-            PRIMARY KEY (user_id, from_id),
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-            FOREIGN KEY (from_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_party_invites_from
-            ON party_invites(from_id);
 
         -- A MOVE WAITING TO BE COLLECTED.
         --
@@ -2318,6 +1725,38 @@ def init_db():
         END;
         """
     )
+
+    # THE PACKAGES' TABLES, IN ONE ORDER, AND ALL OF THEM HERE - after the
+    # core's and before the first migration below. What the order has to hold:
+    #
+    #   * EVERY CREATE BEFORE EVERY MIGRATION. Each create() is an
+    #     executescript, and executescript commits whatever is pending first.
+    #     Here nothing is; below, the migrations share one transaction that
+    #     the db.commit() at the end closes, and _migrate_hash_session_tokens
+    #     counts on that.
+    #   * A TABLE BEFORE ANY INDEX ON IT. Each schema.py writes its tables
+    #     above their indexes, and no package indexes another's table.
+    #   * A TABLE BEFORE ANYTHING THAT READS IT AT BOOT: kill/'s before
+    #     _migrate_seed_kill_tally, bank/'s before _migrate_bank_to_account,
+    #     chat/'s and trade/'s before their own upgrade() further down.
+    #
+    # NOT FOREIGN KEYS. SQLite does not need a REFERENCES target to exist when
+    # the table naming it is created - it checks the reference when a row is
+    # written - so the core going first is a reading order, not a requirement.
+    # Among the packages nothing depends on the order; it is where each one's
+    # first table stood in the single block they came out of.
+    kill_schema.create(db)
+    bank_schema.create(db)
+    loot_schema.create(db)
+    players_schema.create(db)
+    trade_schema.create(db)
+    saves_schema.create(db)
+    world_schema.create(db)
+    chat_schema.create(db)
+    moderation_schema.create(db)
+    friends_schema.create(db)
+    guilds_schema.create(db)
+    parties_schema.create(db)
 
     _migrate_bank_to_account(db)
 
@@ -2453,25 +1892,6 @@ def init_db():
     _migrate_add_column(db, "users", "last_chat_at", "INTEGER NOT NULL DEFAULT 0")
     _migrate_add_column(db, "users", "chat_tokens", "REAL NOT NULL DEFAULT 8.0")
 
-    # CHANNELS. World chat shipped before there was more than one channel, so
-    # every line already in the table was said in the world one - which is
-    # exactly what the default says, so the existing history stays readable
-    # rather than becoming a pile of messages belonging to nowhere.
-    _migrate_add_column(db, "chat_messages", "channel", "TEXT NOT NULL DEFAULT 'world'")
-    _migrate_add_column(db, "chat_messages", "target_id", "INTEGER NOT NULL DEFAULT 0")
-    _migrate_add_column(db, "chat_messages", "image_id", "TEXT NOT NULL DEFAULT ''")
-    # Which lines show a picture: chat/'s may_see_image() asks it on every picture
-    # fetched. After the column it indexes, for the same reason as
-    # idx_sessions_seen - in the schema block it would stop an old database
-    # from booting.
-    db.execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_image ON chat_messages(image_id)")
-
-    # DEFAULTS TO png, WHICH IS WHAT EVERY EXISTING ROW REALLY IS. Stills are
-    # now kept as WebP when WebP is smaller, and it usually is by a lot - a
-    # photograph that arrives as 265 KB was being stored and re-served as a
-    # 1.7 MB PNG, which every single person in the channel then downloaded.
-    _migrate_add_column(db, "chat_images", "format", "TEXT NOT NULL DEFAULT 'png'")
-
     # SEPARATE FROM last_image_at, which every upload stamps whatever channel
     # it ends up in. This one only moves when a picture actually reaches world
     # chat, so whispering a picture to a friend does not spend the half hour.
@@ -2492,9 +1912,6 @@ def init_db():
     # a character cannot reset it - which it could if the count lived with the
     # character that earned it.
     _migrate_add_column(db, "users", "deaths", "INTEGER NOT NULL DEFAULT 0")
-    # The guild a line was said from. Old rows get "", which reads as "no
-    # guild" - correct, because before this column there was nothing to show.
-    _migrate_add_column(db, "chat_messages", "guild", "TEXT NOT NULL DEFAULT ''")
 
     # THE NAME COLOUR A PLAYER CHOSE, as a hue on the wheel, 0-359. NULL means
     # they never chose one, and the client draws its default - which keeps the
@@ -2505,23 +1922,13 @@ def init_db():
     # chat, the friends list, the players menu and the guild roster all painted
     # names by rank. Stored here, it travels with every name the server sends.
     #
-    # AND ON EACH CHAT LINE, as a snapshot, for the reason the `guild` column
-    # beside it gives: the read is a poll every three seconds and must not grow
-    # a join, and a line is what somebody looked like when they said it.
+    # AND ON EACH CHAT LINE, as a snapshot: chat/schema.py's upgrade() adds
+    # that one, beside the line's `guild`.
     _migrate_add_column(db, "users", "name_hue", "INTEGER")
-    _migrate_add_column(db, "chat_messages", "name_hue", "INTEGER")
 
-    # TRADES, FOUR COLUMNS. See the PLAYER TRADE section for each in full.
+    # A TRADE'S FOURTH COLUMN, on the character (trade/schema.py's upgrade()
+    # adds the other three, on the trade).
     #
-    # revision: bumped by every change to either side's offer. A confirm names
-    # the revision it saw, so "accept" can only ever mean the offer that was on
-    # the screen - not one that was swapped underneath the button.
-    _migrate_add_column(db, "trades", "revision", "INTEGER NOT NULL DEFAULT 0")
-    # What each side paid the kingdom, kept on the row. The ledger has it too,
-    # but only as text in a detail column; a history panel should not be
-    # parsing prose.
-    _migrate_add_column(db, "trades", "a_tax", "INTEGER NOT NULL DEFAULT 0")
-    _migrate_add_column(db, "trades", "b_tax", "INTEGER NOT NULL DEFAULT 0")
     # The trade whose result this character's client has not been shown yet.
     # NULL means in step. While it is set, a whole-bag write from that client
     # is refused - it was built before the trade moved things.
@@ -2532,11 +1939,6 @@ def init_db():
     # After every other sessions migration: it renames the key column, and the
     # ones above add columns beside it.
     _migrate_hash_session_tokens(db)
-    # SUPERSEDED by idx_trades_a_recent / idx_trades_b_recent, which are these
-    # with updated_at on the end. A prefix index beside its own extension is
-    # a second write on every trade for nothing.
-    db.execute("DROP INDEX IF EXISTS idx_trades_a")
-    db.execute("DROP INDEX IF EXISTS idx_trades_b")
 
     # RELAYING A PICTURE IS NOT SENDING A MESSAGE. It costs the server an
     # outbound fetch of up to IMAGE_MAX_BYTES and a decode, so it gets a
@@ -2556,6 +1958,12 @@ def init_db():
     _migrate_add_column(db, "users", "chat_muted_until", "INTEGER NOT NULL DEFAULT 0")
     _migrate_add_column(db, "users", "chat_mute_reason", "TEXT NOT NULL DEFAULT ''")
     _migrate_add_column(db, "users", "chat_muted_by", "TEXT NOT NULL DEFAULT ''")
+
+    # THE PACKAGES' OWN COLUMNS, for a database made before them - each after
+    # its create() above, inside this one transaction (db.execute only), and
+    # handed the helper every column here goes through.
+    chat_schema.upgrade(db, add_column=_migrate_add_column)
+    trade_schema.upgrade(db, add_column=_migrate_add_column)
 
     _migrate_seed_gold_ledger(db)
     _migrate_seed_lusion_ledger(db)
@@ -2646,7 +2054,7 @@ def _migrate_bank_to_account(db):
     to be rebuilt.
 
     WHY IT IS NEEDED AT ALL: CREATE TABLE IF NOT EXISTS does nothing to a table
-    that already exists, so the corrected schema above reaches a fresh database
+    that already exists, so bank/'s corrected schema reaches a fresh database
     and no other. elusion.db still had the old shape, and every bank request
     against it failed with "no such column: position" - while the test suite
     passed, because it builds its database from scratch every run.
@@ -2703,6 +2111,13 @@ def _migrate_bank_to_account(db):
     # Banked GOLD was a column on `saves`, so it was per-character too. Pool it
     # into the account and zero the old column - which is also what makes this
     # half idempotent: a second run finds nothing left to move.
+    #
+    # AND THEN THE COLUMN GOES (UPGRADES.md item 7, 19 Oct). A fresh database
+    # never has it - init_db()'s CREATE TABLE saves no longer names it - and an
+    # old one loses it here, once its gold is on the account. DROP COLUMN
+    # needs SQLite 3.35; an older build keeps the column, zeroed, which costs
+    # nothing because no query names it. The zeroing stays for that build: it
+    # is what keeps the next boot from pooling the same gold twice.
     save_columns = {row[1] for row in db.execute("PRAGMA table_info(saves)")}
     if "bank_gold" in save_columns:
         pooled = db.execute(
@@ -2715,6 +2130,10 @@ def _migrate_bank_to_account(db):
                 (total, user_id),
             )
             db.execute("UPDATE saves SET bank_gold = 0 WHERE user_id = ?", (user_id,))
+        try:
+            db.execute("ALTER TABLE saves DROP COLUMN bank_gold")
+        except sqlite3.OperationalError as exc:
+            print(f"[migrate] saves.bank_gold left in place, zeroed ({exc}); nothing reads it")
 
 
 def _migrate_role_column(db):
@@ -6431,6 +5850,11 @@ _STATUS = status_package.register(
 )
 status_payload = _STATUS.status_of
 _reconcile_heals = _STATUS.reconcile_heals
+# THE ONE WRITER OF A REFILL'S NOTE - a potion's, a revive's, a respawn's, a
+# level-up's - which the healing check reads (status/data.py, note_refill()).
+# Every area that authorises a pool to rise is handed it, below: consuming/,
+# death/, kill/ and ownertools/, each registered after this.
+_note_refill = _STATUS.note_refill
 
 # Named here as well, for anything that reads them off this module;
 # status/services.py is where they are set.
@@ -6721,6 +6145,7 @@ kill_package.register(
     grant_skill_xp=lambda user_id, slot, skill_id, gained: _grant_skill_xp(user_id, slot, skill_id, gained),
     post_broadcast=post_broadcast,
     create_loot_bag=lambda user_id, slot, enemy_id, contents: _create_loot_bag(user_id, slot, enemy_id, contents),
+    note_refill=_note_refill,
 )
 
 # Named here as well, for the suites and the notes that read them off this
@@ -8305,6 +7730,7 @@ ownertools_package.register(
     teleport_spacing=TELEPORT_SPACING,
     post_broadcast=post_broadcast,
     moderation_target=_moderation_target,
+    note_refill=_note_refill,
 )
 
 # Named here as well, for the suites that read them off this module;
@@ -8614,6 +8040,7 @@ consuming_package.register(
     take_from_backpack=lambda user_id, slot, item_id, quantity, prefer=None:
         _take_from_backpack(user_id, slot, item_id, quantity, prefer=prefer),
     inventory_of=inventory_payload,
+    note_refill=_note_refill,
 )
 
 equipment_package.register(
@@ -8644,7 +8071,8 @@ equipment_package.register(
 # why both had to move onto the server (death/__init__.py). What stays here:
 # the three ledgers a death pays through, the account row - asked for on every
 # call, because test_concurrency slows it - _derived_stats(), and the grant ids
-# the healing reconciler reads.
+# the healing reconciler reads. The grant itself is written through status/'s
+# note_refill() (_note_refill), as a potion's and a level-up's are.
 import death as death_package  # noqa: E402
 
 death_package.register(
@@ -8664,6 +8092,7 @@ death_package.register(
     revive_grant_id=REVIVE_GRANT_ID,
     respawn_grant_id=RESPAWN_GRANT_ID,
     status_of=status_payload,
+    note_refill=_note_refill,
 )
 
 

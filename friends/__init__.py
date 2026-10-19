@@ -10,7 +10,7 @@ A request has to be accepted before either side appears on the other's
 list. The alternative - adding someone the moment you type their name -
 means anyone who knows your name can watch when you are online, and there is
 no point in a friends list you cannot refuse entry to. ONE ROW PER PAIR, in
-the friends table (app.py's init_db() says why it is one table, not two),
+the friends table (friends/schema.py says why it is one table, not two),
 stored in the direction it was asked; a decline deletes the row, and re-asking
 is policed by how many can be outstanding at once.
 

@@ -27,10 +27,14 @@ totals, to players and to the givers themselves apart, who gave it (the owner,
 and since 0.21.0 a co-owner), by player, the biggest gifts, the newest, and the
 gold in every purse and bank now beside it.
 
-The SQL is gift_report()'s (ownertools/data.py since 19 Oct), written out
-again here rather than imported: this predates the package, when importing it
-meant importing app.py, whose start-up writes. If one changes, change the
-other - test_gifts.py GL-8 holds them to the same numbers.
+THE NUMBERS ARE THE ROUTE'S OWN, not a copy of them: it asks
+ownertools/data.py's gift_report() - the function GET /api/staff/gifts answers
+with - on a read-only connection, and only prints. It used to carry its own
+copy of that SQL, because the report lived in app.py and importing app.py runs
+its start-up, which writes; since 19 Oct the report is a package's, and its
+data.py imports nothing, so it is loaded from its file alone (not through the
+package, whose routes need Flask - this runs on the server's plain python3).
+test_gifts.py GL-8 checks it is that function, and the numbers it prints.
 
 READ ONLY, opened mode=ro so it cannot be anything else. It prints usernames,
 item names, amounts and dates - no passwords, tokens or email addresses - so
@@ -39,6 +43,7 @@ its output is safe to paste.
 
 import argparse
 import datetime
+import importlib.util
 import os
 import sqlite3
 import sys
@@ -51,6 +56,23 @@ try:
     import gamedata
 except Exception:                     # a missing catalogue only costs the names
     gamedata = None
+
+# app.py's OWNER_GIFTS_SINCE_KEY: the setting that says when the ledger began
+# (the boot backfill writes it). test_gifts.py GL-8 holds the two the same.
+GIFTS_SINCE_KEY = "owner_gifts_since"
+
+
+def _report_function():
+    """ownertools/data.py's gift_report(), loaded from that one file: it
+    imports nothing, so loading it runs nothing and needs nothing installed."""
+    spec = importlib.util.spec_from_file_location(
+        "_giftwatch_ownertools_data", os.path.join(_HERE, "ownertools", "data.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.gift_report
+
+
+gift_report = _report_function()
 
 
 def number(n):
@@ -84,16 +106,6 @@ def worth(gold, lusions, value):
     return ", ".join(parts) if parts else "nothing"
 
 
-def sums(con, where, params):
-    row = con.execute(
-        "SELECT COUNT(*), COALESCE(SUM(gold), 0), COALESCE(SUM(lusions), 0),"
-        " COALESCE(SUM(value), 0), COALESCE(SUM(sells_for), 0), MIN(at), MAX(at)"
-        " FROM owner_gifts" + where, params).fetchone()
-    return {"gifts": int(row[0]), "gold": int(row[1]), "lusions": int(row[2]),
-            "item_value": int(row[3]), "item_sells_for": int(row[4]),
-            "first_at": row[5], "last_at": row[6]}
-
-
 def line(label, s):
     return "  %-13s %s   (%s %s)" % (label, worth(s["gold"], s["lusions"], s["item_value"]),
                                      number(s["gifts"]), "gift" if s["gifts"] == 1 else "gifts")
@@ -121,43 +133,42 @@ def main():
                   " with the version that has it: pull, restart elusion-api, then ask again.")
             return 2
 
-        where, params, who = "", (), None
+        user_id, who = None, None
         if args.player.strip():
             found = con.execute("SELECT id, username FROM users WHERE username = ? COLLATE NOCASE",
                                 (args.player.strip(),)).fetchone()
             if found is None:
                 print("There is no account called %s." % args.player.strip())
                 return 2
-            where, params, who = " WHERE user_id = ?", (int(found[0]),), str(found[1])
-        joiner = " AND " if where else " WHERE "
+            user_id, who = int(found[0]), str(found[1])
 
-        since = con.execute("SELECT value FROM server_settings WHERE key = 'owner_gifts_since'").fetchone()
-        totals = sums(con, where, params)
-        to_players = sums(con, where + joiner + "(actor_id IS NULL OR user_id IS NOT actor_id)", params)
-        to_yourself = sums(con, where + joiner + "user_id IS actor_id", params)
+        # EVERY NUMBER BELOW IS THE ROUTE'S: one call to the function GET
+        # /api/staff/gifts answers with, on this read-only connection.
+        report = gift_report(con, GIFTS_SINCE_KEY, user_id, max(1, min(100, int(args.recent))))
+        totals = report["totals"]
 
         print()
         print("THE GIFTS LEDGER" + (" - WHAT %s WAS GIVEN" % who.upper() if who else ""))
-        if since is not None and str(since[0]).isdigit():
-            print("  counted from %s, the first gift the logs remember" % when(since[0]))
+        if report["ledger_since"] is not None:
+            print("  counted from %s, the first gift the logs remember" % when(report["ledger_since"]))
         print(line("everything", totals))
-        print(line("to players", to_players))
-        print(line("to themselves", to_yourself))
+        print(line("to players", report["to_players"]))
+        print(line("to themselves", report["to_yourself"]))
         if totals["item_value"]:
             print("  the items would sell to the shop for %s gold" % number(totals["item_sells_for"]))
 
         # -- the economy now, to set it beside ---------------------------------
+        # The report gives the gold in purses and banks together; the purses
+        # alone are read here, so the line can say how it splits.
+        economy = report["economy"]
+        gold_now = economy["gold_now"]
         purses = int(con.execute("SELECT COALESCE(SUM(gold), 0) FROM saves").fetchone()[0])
-        banks = con.execute("SELECT COALESCE(SUM(bank_gold), 0), COALESCE(SUM(lusions), 0)"
-                            " FROM accounts").fetchone()
-        made = int(con.execute("SELECT COALESCE(SUM(delta), 0) FROM gold_ledger WHERE delta > 0").fetchone()[0])
-        gold_now = purses + int(banks[0])
         print()
         print("THE GOLD IN THE GAME NOW")
         print("  %s gold in purses and banks (%s carried, %s banked)"
-              % (number(gold_now), number(purses), number(banks[0])))
-        print("  %s lusions in accounts" % number(banks[1]))
-        print("  %s gold made, ever, by everything (loot, sales, piles used)" % number(made))
+              % (number(gold_now), number(purses), number(gold_now - purses)))
+        print("  %s lusions in accounts" % number(economy["lusions_now"]))
+        print("  %s gold made, ever, by everything (loot, sales, piles used)" % number(economy["gold_ever_made"]))
         if gold_now > 0 and totals["gold"] > gold_now:
             print("  the gifts%s come to more than all of it: a pile still in a bag is"
                   " counted as given, and is in nobody's purse until it is used" % (" to %s" % who if who else ""))
@@ -167,60 +178,49 @@ def main():
             print("  (a pile still in a bag is counted as given, but is not in a purse until it is used)")
 
         # -- who gave it -------------------------------------------------------
-        givers = con.execute(
-            "SELECT actor_name, COUNT(*), SUM(gold), SUM(lusions), SUM(value)"
-            " FROM owner_gifts" + where + " GROUP BY COALESCE(actor_id, -1), actor_name"
-            " ORDER BY SUM(gold) DESC, SUM(value) DESC, actor_name LIMIT 20", params).fetchall()
+        givers = report["by_giver"]
         if len(givers) > 1:
             print()
             print("WHO GAVE IT")
             for p in givers:
                 print("  %-20s %s   (%s %s)"
-                      % (p[0], worth(p[2], p[3], p[4]), number(p[1]), "gift" if p[1] == 1 else "gifts"))
+                      % (p["username"], worth(p["gold"], p["lusions"], p["item_value"]), number(p["gifts"]),
+                         "gift" if p["gifts"] == 1 else "gifts"))
 
         # -- by player ---------------------------------------------------------
         if not who:
-            people = con.execute(
-                "SELECT username, COUNT(*), SUM(gold), SUM(lusions), SUM(value), MAX(at)"
-                " FROM owner_gifts GROUP BY COALESCE(user_id, -1), username"
-                " ORDER BY SUM(gold) DESC, SUM(value) DESC, username LIMIT 50").fetchall()
+            people = report["by_player"]
             print()
             print("WHO GOT IT, THE MOST GOLD FIRST")
             if not people:
                 print("  (nobody yet)")
             for p in people:
                 print("  %-20s %s   (%s %s, last %s)"
-                      % (p[0], worth(p[2], p[3], p[4]), number(p[1]), "gift" if p[1] == 1 else "gifts",
-                         when(p[5])))
+                      % (p["username"], worth(p["gold"], p["lusions"], p["item_value"]), number(p["gifts"]),
+                         "gift" if p["gifts"] == 1 else "gifts", when(p["last_at"])))
 
         # -- by item -----------------------------------------------------------
-        items = con.execute(
-            "SELECT item_id, SUM(quantity), SUM(gold), SUM(lusions), SUM(value)"
-            " FROM owner_gifts" + where + " GROUP BY item_id, kind"
-            " ORDER BY SUM(gold) + SUM(value) + SUM(lusions) DESC LIMIT 15", params).fetchall()
+        items = report["by_item"]
         print()
         print("BY ITEM, THE BIGGEST FIRST")
         if not items:
             print("  (nothing yet)")
         for i in items:
-            label = item_name(i[0]) if i[0] else "gold straight in"
-            amount = "" if not i[0] else "%s x " % number(i[1])
-            print("  %-34s %s" % (amount + label, worth(i[2], i[3], i[4])))
+            label = item_name(i["item_id"]) if i["item_id"] else "gold straight in"
+            amount = "" if not i["item_id"] else "%s x " % number(i["quantity"])
+            print("  %-34s %s" % (amount + label, worth(i["gold"], i["lusions"], i["item_value"])))
 
         # -- the newest --------------------------------------------------------
-        recent = con.execute(
-            "SELECT at, actor_name, username, item_id, quantity, gold, lusions, value, source"
-            " FROM owner_gifts" + where + " ORDER BY at DESC, id DESC LIMIT ?",
-            params + (max(1, min(100, int(args.recent))),)).fetchall()
+        recent = report["recent"]
         print()
         print("THE NEWEST")
         if not recent:
             print("  (nothing yet)")
         for g in recent:
-            what = ("%s x %s" % (number(g[4]), item_name(g[3]))) if g[3] else "gold"
+            what = ("%s x %s" % (number(g["quantity"]), item_name(g["item_id"]))) if g["item_id"] else "gold"
             print("  %s  %s -> %-16s %-30s %s%s"
-                  % (when(g[0]), g[1], g[2], what, worth(g[5], g[6], g[7]),
-                     "   (from the logs)" if g[8] == "log" else ""))
+                  % (when(g["at"]), g["by"], g["username"], what, worth(g["gold"], g["lusions"], g["item_value"]),
+                     "   (from the logs)" if g["source"] == "log" else ""))
         print()
         return 0
     finally:

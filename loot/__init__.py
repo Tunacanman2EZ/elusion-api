@@ -29,7 +29,7 @@ client that sends it twice would be asking for a duplication bug.
 
 Built like friends/ and gathering/ (ARCHITECTURE.md): routes.py (the edge),
 services.py (the rules, pure), data.py (the SQL - loot_bags and
-loot_bag_items, app.py's init_db() tables). It
+loot_bag_items, this package's tables, in schema.py). It
 never imports app.py; register() is handed what it needs. THE MONEY AND THE
 BACKPACK ARE app.py's AND ARE HANDED IN - the gold and lusion ledgers, the
 grant into the backpack, the trade hold, "does this account hold that pet" -

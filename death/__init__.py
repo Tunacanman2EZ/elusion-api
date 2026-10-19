@@ -22,7 +22,8 @@ game.
 ALSO THE OTHER HALF OF THE HEALING RECONCILER. app.py's _reconcile_heals()
 flags a rise that regeneration and consumables cannot account for, and an
 honest revive is exactly such a rise - a jump from 0 to full in no time at all.
-Both exits leave a row in consume_grants like a potion does.
+Both exits leave a row in consume_grants like a potion does, through the same
+writer (status/'s note_refill(), handed in).
 
 THE RESPAWN WAS THE OTHER HALF OF A MIGRATION THAT ONLY EVER GOT DONE ONCE.
 The revive moved onto the server and the exit next to it, the one that pays

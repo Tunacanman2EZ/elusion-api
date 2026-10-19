@@ -399,10 +399,15 @@ async def run(port, server):
     await collect(a)
     client.put("/api/account/name-colour", headers=BOB, json={"hue": 200})
     fresh, _ = ticket(BOB)
-    sql("UPDATE presence_tickets SET expires_at = ? WHERE user_id = ? AND token_hash != ?",
-        (int(time.time()) - 1, uid("presb"), presence._hash(fresh)))
+    # RENEWED FIRST, THEN THE OLD ONE RUNS OUT - the order a game does it in
+    # (it renews a minute into a two-minute ticket). The other way round, a
+    # sweep landing between the two lines found an expired ticket the renewal
+    # had not reached yet, and dropped the socket: a race of the test's own,
+    # which suites run side by side (run_tests.ps1 -Jobs) made show.
     await b.send(json.dumps({"t": "renew", "ticket": fresh}))
     got_a = await collect(a)
+    sql("UPDATE presence_tickets SET expires_at = ? WHERE user_id = ? AND token_hash != ?",
+        (int(time.time()) - 1, uid("presb"), presence._hash(fresh)))
     got_b = await collect(b, server.sweep_seconds + 0.6)
     check("a renewed ticket keeps the socket past the old one's end", not byes(got_b), got_b)
     check("  and a changed colour reaches everyone in the area",

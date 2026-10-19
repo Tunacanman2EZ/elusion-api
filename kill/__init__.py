@@ -33,7 +33,8 @@ rules, pure), data.py (the SQL). It never imports app.py; register() is handed
 what it needs. WHAT STAYS IN app.py, and is handed in: the character's maxima
 (_derived_stats()), the skills' XP grant, the stirring lands' multipliers and
 the broadcast line, each shared with other areas. The loot bag's making is
-loot/'s, handed in through app.py.
+loot/'s, and the level-up's refill note status/'s (note_refill()), both handed
+in through app.py.
 """
 from .routes import register  # noqa: F401
 from .data import record_kill  # noqa: F401

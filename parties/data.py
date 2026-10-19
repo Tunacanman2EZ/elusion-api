@@ -1,6 +1,6 @@
 """parties/data.py - the SQL. parties, party_members and party_invites are
-app.py's tables (init_db()). Every write to them is here. Other areas READ them
-through app.py's party_membership(), party_member_rows() and
+this package's tables (schema.py). Every write to them is here. Other areas
+READ them through app.py's party_membership(), party_member_rows() and
 _party_invites_to(), which are membership(), member_rows() and invites_to()
 below - party chat, the broadcast poll, the players menu - and presence.py
 reads party_members for who may call whom. No commits: each route makes its

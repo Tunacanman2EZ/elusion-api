@@ -1,4 +1,4 @@
-"""world/data.py - the SQL. world_ticks is app.py's table (init_db()): one row
+"""world/data.py - the SQL. world_ticks is this package's (schema.py): one row
 per stir, numbered from 1, and every write to it is here. kill_reports (every
 paid kill) is read for how hunted each land has been; it is the kill route's
 to write. Other readers of world_ticks: the land insights (insights/), and the

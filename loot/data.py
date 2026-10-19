@@ -1,5 +1,5 @@
-"""loot/data.py - the SQL. loot_bags and loot_bag_items are app.py's tables
-(init_db()). Everything that reads or writes them is here, but for one
+"""loot/data.py - the SQL. loot_bags and loot_bag_items are this package's
+tables (schema.py). Everything that reads or writes them is here, but for one
 delete: app.py's character_delete() clears a character's bags with the rest of
 it. No commits: the take's commit is its route's, a new bag's is the kill's."""
 

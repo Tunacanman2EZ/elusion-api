@@ -1,5 +1,6 @@
 """guilds/data.py - the SQL. guilds, guild_members, guild_invites and
-guild_events are app.py's tables (init_db()). Every write to them is here.
+guild_events are this package's tables (schema.py). Every write to them is
+here.
 Other areas READ them in app.py - a chat line's guild, the broadcast poll's
 invitations, the players list, the kingdom board - and who is in which guild
 is asked through app.py's guild_membership(), which is membership() below.

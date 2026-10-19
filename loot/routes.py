@@ -194,7 +194,7 @@ def register(app, *, require_auth, get_db, bad_request, parse_stat, item_row, ow
             result["credited"] = "inventory"
             result["carry_positions"] = written
             # A MYTHIC OR A PERFECT IS HELD FROM TRADE for TRADE_HOLD_SECONDS
-            # from the moment it lands - see trade_holds in init_db().
+            # from the moment it lands - see trade_holds in trade/schema.py.
             place_trade_hold(db, user_id, granted_id, granted_qty)
 
         result["granted_item_id"] = granted_id

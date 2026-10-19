@@ -32,6 +32,8 @@ would be a second switch that the first one no longer moves.
 
 register() hands back status_of(); app.py keeps it callable as
 status_payload(), the name every area that answers with the vitals is handed.
+And note_refill() (data.py), the one writer of what a pool was authorised to
+rise by, which consuming/, death/, kill/ and ownertools/ are handed.
 
 THE ENDPOINT NAMES ARE app.py's - player_status, write_player_status - and
 routes.lock holds them.
@@ -453,4 +455,4 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, pa
     app.add_url_rule("/api/player/status", endpoint="write_player_status",
                      view_func=require_auth(write_player_status), methods=["PUT"])
 
-    return SimpleNamespace(status_of=status_of, reconcile_heals=reconcile_heals)
+    return SimpleNamespace(status_of=status_of, reconcile_heals=reconcile_heals, note_refill=data.note_refill)

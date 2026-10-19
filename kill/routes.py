@@ -15,6 +15,9 @@ register() is handed app.py's own pieces - it never imports app.py:
                        lands (world/'s, registered later - a lookup)
     derived_stats      (row, level=) -> the maxima a level brings
     levelup_grant_id   the id the level-up's refill is noted under
+    note_refill        (db, user_id, slot, item_id, at) - the refill written
+                       where the healing check reads it (status/'s, the one
+                       writer); no commit
     proficient_amount  (class_id, skill_id, raw) -> the XP with the class's
                        specialty applied
     grant_skill_xp     (user_id, slot, skill_id, gained) -> (level, xp, levels
@@ -34,7 +37,8 @@ from . import data, services
 
 
 def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, catalogue, stir_for, derived_stats,
-             levelup_grant_id, proficient_amount, grant_skill_xp, post_broadcast, create_loot_bag):
+             levelup_grant_id, proficient_amount, grant_skill_xp, post_broadcast, create_loot_bag,
+             note_refill):
 
     def combat_kill():
         """
@@ -184,7 +188,7 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, ca
             # Written here rather than where the client syncs, because this is the
             # moment the server DECIDED the level-up happened. Same table and same
             # reasoning as the revive grant.
-            data.note_level_refill(db, user_id, slot, levelup_grant_id, int(time.time()))
+            note_refill(db, user_id, slot, levelup_grant_id, int(time.time()))
 
         # ONE UPDATE. The XP, the level and the cooldown stamp move together or not
         # at all - the same reasoning as the bank gold transfer. Two statements

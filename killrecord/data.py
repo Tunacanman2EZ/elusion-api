@@ -1,5 +1,5 @@
-"""killrecord/data.py - the SQL, reads only. kill_tally is app.py's table
-(init_db(), and _record_kill() writes it)."""
+"""killrecord/data.py - the SQL, reads only. kill_tally is kill/'s table
+(kill/schema.py, and kill/'s record_kill() writes it)."""
 
 
 def mine(db, user_id, slot):

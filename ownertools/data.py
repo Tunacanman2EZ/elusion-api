@@ -37,15 +37,6 @@ def set_level(db, user_id, slot, level, xp_to_next, derived, now):
     )
 
 
-def note_level_refill(db, user_id, slot, grant_id, now):
-    """The refill a level brings, where the healing check reads its grants."""
-    db.execute(
-        "INSERT INTO consume_grants (user_id, slot, item_id, target, amount, at) "
-        "VALUES (?, ?, ?, '', 0, ?)",
-        (user_id, slot, grant_id, now),
-    )
-
-
 def end_sessions(db, user_id, now):
     """Sign the account out everywhere, so its game reloads what the server
     holds; how many sessions were still live, counted first, like a kick."""

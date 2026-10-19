@@ -1,8 +1,8 @@
-"""trade/data.py - the SQL. trades, trade_items and trade_holds are app.py's
-tables (init_db()). Every write to them is here, and so is what other areas
-ask of them: the owner's trade switch (switches/) counts the open ones with
-open_count(), and a rollback and a character delete each refuse a character
-with one open (find_open()). A trade also writes
+"""trade/data.py - the SQL. trades, trade_items and trade_holds are this
+package's tables (schema.py). Every write to them is here, and so is what
+other areas ask of them: the owner's trade switch (switches/) counts the
+open ones with open_count(), and a rollback and a character delete each
+refuse a character with one open (find_open()). A trade also writes
 the saves it moves gold between and the carry it moves items between, but
 through app.py's own grants (handed in), and the gold through gold_delta()
 only for the tax. No commits: the routes make them."""

@@ -34,6 +34,8 @@ register() is handed app.py's own pieces - it never imports app.py:
     stored_json          (raw, fallback) -> a JSON column, read safely
     derived_stats        (row, level=) -> the maxima a level and the gear give
     levelup_grant_id     the id a level's refill is noted under
+    note_refill          (db, user_id, slot, item_id, at) - that refill, written
+                         where the healing check reads it (status/'s); no commit
     log_staff_action     the moderation log's writer
     valid_skills         every skill the game has
     max_skill_level      the highest level any grant sets
@@ -80,7 +82,7 @@ def register(app, *, require_auth, require_owner, require_role, require_fresh_pa
              levelup_grant_id, log_staff_action, valid_skills, max_skill_level, stack_limit, add_to_backpack,
              bag_cells, inventory_of, mark_gift, online_window, gifts_since_key, snapshots_kept, snapshot_every,
              find_open_trade, carry_cells, owns_item, has_owner_powers, queue_teleport, teleport_spacing,
-             post_broadcast, moderation_target):
+             post_broadcast, moderation_target, note_refill):
 
     def staff_gold():
         """
@@ -295,7 +297,7 @@ def register(app, *, require_auth, require_owner, require_role, require_fresh_pa
         xp_to_next = int(catalogue.xp_needed_for_level(level))
 
         data.set_level(db, user_id, slot, level, xp_to_next, derived, int(time.time()))
-        data.note_level_refill(db, user_id, slot, levelup_grant_id, int(time.time()))
+        note_refill(db, user_id, slot, levelup_grant_id, int(time.time()))
         if target is not None:
             # THEIR GAME RELOADS, as after a rollback: counted first, like a kick.
             ended = data.end_sessions(db, user_id, int(time.time()))

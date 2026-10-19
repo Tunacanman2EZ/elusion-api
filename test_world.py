@@ -293,10 +293,13 @@ sql("DROP TABLE world_ticks")
 res = poll(player)
 check("the table gone: no land, and the poll - the heartbeat - still answers",
       res.status_code == 200 and (res.get_json() or {}).get("world", {}).get("element") == 0, res.status_code)
+# PUT BACK BY world/'s OWN CREATE (world/schema.py, since 19 Oct), not a copy
+# of it here: a copy is a second table definition that can drift from the one
+# a server builds.
+import world.schema  # noqa: E402
+
 with app_module.app.app_context():
-    app_module.get_db().executescript(
-        "CREATE TABLE IF NOT EXISTS world_ticks (tick INTEGER PRIMARY KEY, element INTEGER NOT NULL,"
-        " started_at INTEGER NOT NULL, ends_at INTEGER NOT NULL, chosen_by TEXT NOT NULL DEFAULT '')")
+    world.schema.create(app_module.get_db())
 
 # =============================================================================
 section("W-4  kills")

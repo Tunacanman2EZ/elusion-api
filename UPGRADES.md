@@ -11,51 +11,7 @@ go at the end of **Open**.
 
 ## Open
 
-### 6. The test runs could now go in parallel
-
-- **Where:** run_tests.ps1, and the CI workflow in the API repo's .github
-  folder. Both run the suites one after another.
-- **What changed:** since item 2 every suite keeps its databases in a private
-  folder (testdir.py), so two suites - or two copies of one - can run at the
-  same time without touching each other.
-- **Why it matters:** the full API run is about ten minutes one at a time; four
-  or so at once would take a few.
-- **Fix:** small, but in two files this session has not been able to run (a
-  PowerShell script, and CI). Worth doing with a run on the PC to watch it.
-
-### 7. `saves.bank_gold` is a leftover column
-
-- **Where:** the saves table in init_db().
-- **What happens:** the bank moved to `accounts` long ago. The only thing that
-  still touches this column is the boot migration that moved its gold across
-  (and finds nothing left to move); item 5's read was the last other one.
-- **Fix:** tiny, but a schema change: it goes with each table's CREATE moving
-  into its package (ARCHITECTURE.md step 11), where the order of creation is
-  checked once.
-
-### 10. Four packages write a refill's note the same way
-
-- **Where:** consuming/data.py, death/data.py, kill/data.py and
-  ownertools/data.py each have their own `INSERT INTO consume_grants`: a
-  potion's grant, a revive's and a respawn's, a level-up's.
-- **Why it matters:** the healing check (status/) reads those rows to tell an
-  earned refill from a claimed one, so they must agree on the shape. Today
-  they do, and test_healing drives all of them; a column added to
-  consume_grants would have to be added in four places.
-- **Fix:** small - status/ hands back one `note_refill()` from register(), and
-  the four are handed it. Worth doing with the table batch (step 12), when
-  consume_grants' CREATE moves to its owner anyway.
-
-### 11. giftwatch.py keeps its own copy of the gifts report's SQL
-
-- **Where:** giftwatch.py, beside ownertools/data.py's `gift_report()`.
-- **What it is:** it was copied because importing it meant importing app.py,
-  whose start-up writes. It is a package's now, and importing that runs
-  nothing. test_gifts.py GL-8 holds the two copies to the same numbers.
-- **Fix:** small - giftwatch prints what `ownertools.data.gift_report()`
-  answers instead of summing it again itself (its own sums and the route's
-  report are shaped differently, so its printing changes too); GL-8 already
-  checks the numbers it prints, and would hold the change.
+Nothing open (19 Oct). New ones go here.
 
 ## Done
 
@@ -191,3 +147,67 @@ fail a check.
   either package the real one by value fails it.
 - **CLAUDE.md named `_give_to_player()`** in three places; it is ownertools/'s
   `give_to_player()`, and `gift_report()` is ownertools/data.py's.
+
+### 6. The test runs went one at a time - fixed 19 Oct
+
+`run_tests.ps1 -Jobs N` runs N suites at once - by default one per CPU, at
+most 6; `-Jobs 1` is the old loop itself. Same discovery, one process per
+suite (Start-Job, the one way in both Windows PowerShell 5.1 and 7 that keeps
+a suite's errors in line with its output), the transcript in name order, the
+same exit code. Here, all 61 suites: 316 s one at a time, 156 s four at a
+time, the same 5,829 checks either way; CI passes `-Jobs 4`. Proved on
+PowerShell 7 (what CI runs); 5.1 is checked by syntax - no 7-only feature is
+used - but was not run.
+
+Found with it, and fixed:
+- **A runner that could not start a suite passed.** If the interpreter could
+  not run at all, the old loop stopped, said "0 failed" and exited 0 - a
+  green gate with nothing run. Now a suite that cannot start fails, and a run
+  that misses a suite exits 1 and names it.
+- **test_presence raced its own sweep.** "A renewed ticket keeps the socket"
+  expired the old ticket first and renewed second; on a busy machine a sweep
+  landed between the two and dropped the socket. It renews first now, as a
+  game does; the check still fails if renewal is ignored, and three copies at
+  once passed twice.
+
+### 7. `saves.bank_gold` was a leftover column - fixed 19 Oct
+
+A new database's saves table has no bank_gold. On an old one the boot
+migration moves what is left into accounts, as it did, zeroes it, then drops
+the column (SQLite 3.35+; where the drop cannot run it says so in the log and
+leaves the column zeroed, so nothing is moved twice). test_schema.py boots two
+old databases full of rows - one as the live server has it, one from before
+the ledger - and checks the gold arrives, the ledger balances, and nothing
+else changes; and that no statement anywhere reads the column. (Character
+deletions saved before the drop carry `"bank_gold": 0` in their JSON copy: a
+hand restore leaves that key out.)
+
+### 10. Four packages wrote a refill's note their own way - fixed 19 Oct
+
+status/ hands back `note_refill()`, the one writer of consume_grants in the
+API, and consuming/, death/, kill/ and ownertools/ are handed it. Every row is
+what it was, column for column (death's took the defaults by leaving two
+columns out; it names them now). On the bare app each of the four is handed a
+tagged writer, and one check needs all five kinds of row to have come through
+it.
+
+### 11. giftwatch.py kept its own copy of the gifts report's SQL - fixed 19 Oct
+
+It loads ownertools/data.py's `gift_report()` from its file - that file
+imports nothing, so no Flask on the server and no app.py start-up - and
+prints what it answers. Its output is byte for byte what it was. GL-8 checks
+it uses the package's function and that its numbers are the route's.
+
+### Found and fixed with the tables move, 19 Oct
+
+- **The backpack's table comment said the bank was "a set of stacks"**, keyed
+  differently; the bank is keyed by cell too, and lives in bank/ now. And a
+  comment from the bank's old key sat orphaned above `accounts`. Both fixed.
+- **Nineteen package docstrings still said a moved table was app.py's**
+  (and killrecord's named the gone `_record_kill()`). They name the package's
+  schema.py now.
+- **test_world rebuilt world_ticks from a copy of its CREATE.** It calls
+  `world.schema.create()` now, so there is one definition.
+- **test_ownership's per-user table list read app.py only**, so fifteen moved
+  tables would have dropped out of its write scan. It reads the packages'
+  schema.py too, and finds the same 33 tables it did.

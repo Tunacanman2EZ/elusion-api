@@ -7,13 +7,16 @@ it follows the same road.
 
 ## Where it stands
 
-`app.py` was about 20,000 lines when this was written (16 Oct), and is about
-9,000 with every area out but the core's own pages (19 Oct): the shared core (config, the database and
-its write lock, sessions and tokens, the auth decorators, rate limiting,
-request timing) and the areas not yet moved, one after another. It works, and every
-area is covered by its own suite, but one file that size has a cost that grows:
-a change to one area means reading around all the others, and nothing stops
-one area reaching into another's tables.
+`app.py` was about 20,000 lines when this was written (16 Oct). **The plan
+below is done (19 Oct)**: app.py is about 8,500 lines, and what is in it is
+the shared core - config, the database and its write lock, the core's own
+tables and every boot migration, sessions and tokens, the auth decorators and
+gates, rate limiting, request timing, the ledgers - the four pages that read
+every area (the staff powers page, the broadcast poll, the metrics, the
+supply audit), and one `register()` call per area. When this was written it
+was the core and every area, one after another: a change to one area meant
+reading around all the others, and nothing stopped one area reaching into
+another's tables.
 
 Beside it, **feature packages**: a folder per area, each in three layers.
 
@@ -85,9 +88,13 @@ area, handing each package what it needs. Every area in a package of its own.
 - **A moved route keeps its endpoint name** (`add_url_rule(..., endpoint=...)`)
   - rate limiting, request timing and `/api/staff/powers` key on it - **and its
   docstring**, which is its page in `/apidocs`.
-- **Tables stay in `init_db()` for now.** A package's `data.py` reads and
-  writes them; moving each table's `CREATE` into its package comes after the
-  areas are out, in one batch, when the order of creation can be checked once.
+- **A table lives with the one area that adds its rows** (19 Oct): its
+  `CREATE` and its indexes in that package's `schema.py`, word for word, with
+  a `create(db)` (and an `upgrade(db, add_column)` for columns added since).
+  What the core writes, or what several areas add rows to (consume_grants,
+  carry_items, skills), stays in `init_db()`. init_db() calls every create()
+  once, after the core's tables and before the first migration, in one
+  commented order; test_schema.py holds the whole schema to a fixture.
 
 ## The guards
 
@@ -107,6 +114,11 @@ checked, not hoped:
   added without a bare-app run of its own fails it.
 - **`test_deploy.py`** copies every package it finds by the same rule, so a new
   one cannot be forgotten in the deployed copy.
+- **`test_schema.py`** (19 Oct): the database a server builds, held to a
+  fixture - every table, column, index, constraint, foreign key and trigger,
+  and which file creates it. A schema change meant is written with
+  `python test_schema.py --write-fixture`, and the fixture's diff in the
+  commit says what changed.
 - **The area's own suite**, unchanged: it still drives the real app.py.
 
 ## Moving an area out - the checklist
@@ -338,9 +350,20 @@ areas that hold money and items:
     hardening, ending others, theft), the throttles and the login log, bans
     and their evasion checks, the install binding, the presence stamp, the
     maintenance gate, the staff-code switch and the mail - each handed in,
-    the suites' stand-ins as lookups. Left: **each table's CREATE into its
-    package**, in one batch where the order of creation is checked once
-    (UPGRADES.md item 7 goes with it).
+    the suites' stand-ins as lookups.
+    ~~Each table's CREATE into its package~~ (19 Oct): twelve packages own
+    their tables now, in `schema.py` - kill, bank, loot, players, trade,
+    saves, world, chat, moderation, friends, guilds, parties (events/ already
+    made its own). The core keeps 23: users and sessions and the rest of the
+    login, the ledgers and accounts, saves and their history, server
+    settings, broadcasts, and the shared ones. **test_schema.py** builds a
+    fresh database and holds every table, column, index, constraint, foreign
+    key and trigger to a fixture taken from the code before the move; boots
+    two old databases full of rows and checks they come out with nothing
+    changed but what was meant; runs init_db() twice; and checks every table
+    has exactly one owner. `saves.bank_gold` went with it (UPGRADES.md item
+    7). **That finishes the plan**: app.py is the composition root it was
+    meant to be.
 
 Things noticed along the way that need upgrading, but are not part of a move,
 are kept in UPGRADES.md - checked before they are written there.
