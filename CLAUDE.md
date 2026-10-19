@@ -1826,7 +1826,7 @@ SNAPSHOTS AND ROLLBACK in app.py, `test_rollback.py`. All of it is
   owner rolling back their own character is signed out the same way.
 - **`POST /api/staff/grant` takes `username`** (staff_grant, TO SOMEBODY ELSE).
   Your own name, any case, is your own grant as before (and needs `slot`).
-  Another name goes to `_give_to_player()`: the character they are PLAYING,
+  Another name goes to ownertools/'s `give_to_player()`: the character they are PLAYING,
   never a slot from the request; a `before-give` snapshot; the item; the flag;
   a `give` line about them; 409 naming them when the bag is full, with the
   snapshot rolled back too. Offline is fine - their last save's character -
@@ -1864,7 +1864,7 @@ ledger for anthing i give to players so its accounted for if i ever ask how
 much did i inflate my server". THE GIFTS LEDGER in app.py, `test_gifts.py`.
 
 - **`owner_gifts`, one row a gift**, written in the gift's own transaction:
-  a give to a player (`_give_to_player()`, source `give`), a grant to the
+  a give to a player (ownertools/'s `give_to_player()`, source `give`), a grant to the
   owner himself (`staff_grant`, `grant`), and the owner's own gold
   (`staff_gold`, purse or bank - bank is `slot` NULL - and gold taken back is
   a negative row). A refused gift (full bag, gold below zero, not the owner)
@@ -1890,7 +1890,7 @@ much did i inflate my server". THE GIFTS LEDGER in app.py, `test_gifts.py`.
   app.py, not in `init_db()`**: it needs `gold_item_value()`, which is defined
   below `init_db()`'s call (see "init_db() runs at import time"). It runs
   under `BEGIN IMMEDIATE`, so two workers starting together read it once.
-- **`GET /api/staff/gifts?username=&recent=`** (`gift_report()`, owner only,
+- **`GET /api/staff/gifts?username=&recent=`** (ownertools/'s `gift_report()`, owner only,
   the same bare 404 to everybody else): totals, `to_players` and
   `to_yourself` apart, `by_player`, `by_item`, the newest, the economy now
   (`gold_now`, `lusions_now`, `gold_ever_made`), `share_of_gold_now` and
@@ -2081,7 +2081,24 @@ only, `test_stats.py`.
   transaction. gamedata is handed whole as `catalogue`, so a suite that
   seeds `gamedata._rng` or holds `roll_kill_rewards` is heard. killwatch.py
   keeps its own copy of the window and respawn floor; test_killwatch holds it
-  to kill/services.py's.)
+  to kill/services.py's.) And `ownertools/` (19 Oct: gold, level, skill,
+  grant, the gifts report, save history, rollback, teleport and its ack;
+  registered late, after trade; what the save route, the poll and the boot
+  backfill share - snapshots, the gift marker, the gifts ledger's writers, the
+  teleport queue - stays in app.py). And `accountsettings/` (19 Oct: GET and
+  POST /api/account/email, its /verify, PUT /api/account/name-colour;
+  everything it uses is handed in as a lookup, because test_accounts replaces
+  `send_mail_async` and `mail_can_send` on app.py and the codes are shared
+  with recovery and the staff login). And `auth/` (19 Oct: the ten
+  /api/auth routes - ARCHITECTURE's step 12. **The gate every request passes
+  stays in app.py**: the decorators, the session lookup, the token lifecycle,
+  the throttles, bans, the install binding, the staff-code switch, the mail.
+  `send_mail_async`, `ip_window`, `lockout_seconds` and `bad_request` are
+  lookups; STAFF_LOGIN_CODE_* and TRUSTED_DEVICE* are set in auth/services.py
+  and named again in app.py.) **Mail the suites stand in for is handed as a
+  lookup**, and test_accounts A-6 replaces only send_mail_async to prove it
+  is reached - a route handed the real one once still lands in SENT, through
+  the real one's own lookup of send_mail.
   **Something noticed along the way that needs upgrading goes in
   UPGRADES.md** (the owner asked to be kept told): checked first, then where
   it is, why it matters, how big the fix is.

@@ -5483,244 +5483,15 @@ def metrics():
 
 
 # =============================================================================
-# AUTH
+# AUTH - the auth/ package (since 19 Oct)
 # =============================================================================
-
-@app.post("/api/auth/register")
-@no_write_lock
-def register():
-    """
-    Create a new account
-    ---
-    tags:
-      - Auth
-    consumes:
-      - application/json
-    parameters:
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          properties:
-            username:
-              type: string
-            password:
-              type: string
-            install:
-              type: string
-              description: "This copy of the game's install id (64 hex). Optional; see INSTALL IDS"
-    responses:
-      201:
-        description: Account created, returns a session token
-        schema:
-          type: object
-          properties:
-            user_id:
-              type: integer
-            username:
-              type: string
-            token:
-              type: string
-            expires_at:
-              type: integer
-      400:
-        description: Validation error
-        schema:
-          type: object
-          properties:
-            error:
-              type: string
-            message:
-              type: array
-              items:
-                type: string
-      409:
-        description: Username already taken
-        schema:
-          type: object
-          properties:
-            error:
-              type: string
-            message:
-              type: string
-    """
-    data = request.get_json(silent=True)
-
-    is_valid, errors = validate_credentials(data)
-    if not is_valid:
-        return {"error": "Bad Request", "message": errors}, 400
-
-    username = data["username"]
-
-    # A CLOSED SERVER TAKES NO NEW ACCOUNTS EITHER. Registering is a login
-    # that creates its own account first - letting it through would be a
-    # way in while the front door is shut.
-    closed = maintenance_refusal(username)
-    if closed is not None:
-        return closed
-
-    db = get_db()
-    ip = client_ip()
-    now = int(time.time())
-
-    # THE GATES COME BEFORE THE HASH, and that ordering is the point of both of
-    # them. See /login for the same arrangement and the same reasoning.
-    #
-    # WHY /register NEEDED THIS AT ALL. /login is careful never to say whether
-    # a username exists: one message for both failures, and the same cost on
-    # both paths. /register answers the identical question outright and has to
-    # — you cannot ask someone to choose a name and refuse to say it is taken.
-    # What it must not do is answer that question an unlimited number of times.
-    # Unthrottled, the 409/201 split is a clean oracle for the whole user table,
-    # and it made the care taken on /login pointless: an attacker enumerates
-    # here instead, then brings the list back to the login throttle.
-    #
-    # AND THE HASH WAS THE SECOND PROBLEM. generate_password_hash ran BEFORE
-    # the INSERT, so every probe — including every one that was about to be
-    # refused as a duplicate — cost a full scrypt: 32MB and about 100ms of work
-    # done on the attacker's behalf, at their chosen rate. That is exactly the
-    # denial-of-service lever the per-IP gate on /login exists to avoid, and it
-    # was sitting wide open one endpoint over. Nothing is hashed now until the
-    # request has passed both gates.
-    _prune_login_attempts(db, now)
-
-    # The login gate first: an address already spraying passwords does not get
-    # to switch endpoints and carry on. This direction only — a clumsy signup
-    # must not lock anyone out of logging in, which is why the register count
-    # below is kept separate.
-    ip_state = _ip_throttle_state(db, ip, now)
-    if ip_state is not None:
-        reason, retry = ip_state
-        _record_login_attempt(db, username, ip, False, reason)
-        return {
-            "error": "Too Many Requests",
-            "message": "Too many failed attempts from this address. Try again in %s." % _wait_words(retry),
-        }, 429
-
-    probe_state = _register_throttle_state(db, ip, now)
-    if probe_state is not None:
-        reason, retry = probe_state
-        _record_login_attempt(db, username, ip, False, reason)
-        return {
-            "error": "Too Many Requests",
-            "message": "Too many registration attempts from this address. Try again in %s." % _wait_words(retry),
-        }, 429
-
-    # BAN EVASION. The pattern this catches is the ordinary one: banned, makes
-    # a new account, same connection, same minute.
-    #
-    # REGISTRATION ONLY - logins from this address are untouched, so the
-    # sibling, the roommate and everyone behind the same mobile carrier keep
-    # playing. Blocking their logins too would be the version that takes out a
-    # household to stop one person, which is the trade _ip_throttle_state's
-    # comment already refuses to make.
-    #
-    # 403, NOT 429. This is not "slow down", it is "not from here", and a retry
-    # timer would invite exactly the retrying it is trying to stop. The banned
-    # account's name is NOT returned: whoever is reading this either already
-    # knows it, or is a stranger who should not be told who was banned on a
-    # shared address.
-    evader = _ban_evasion_state(db, ip, now)
-    if evader is not None:
-        # ONE LOG LINE, NOT TWO. _record_login_attempt() already writes the row
-        # and warns, and a second dedicated warning here would double the noise
-        # for the one event most likely to repeat - an evader retrying is
-        # precisely what this refuses. The name of the banned account it
-        # matched is not in the line because it does not need to be: the link
-        # lives in account_ips permanently, where the staff view reads it, and
-        # a log that rotates is the worse place to keep it.
-        _record_login_attempt(db, username, ip, False, "register-ban-evasion")
-        return {
-            "error": "Forbidden",
-            "message": "New accounts cannot be created from this connection.",
-        }, 403
-
-    # AND FROM THE SAME COMPUTER, whatever its address - see INSTALL IDS. The
-    # VPN half of the same check, refused the same way and logged under its
-    # own reason, so staff can tell which of the two caught somebody.
-    install_hash = _install_hash((data or {}).get("install"))
-    evader = _install_evasion_state(db, install_hash)
-    if evader is not None:
-        _record_login_attempt(db, username, ip, False, "register-ban-evasion-install")
-        return {
-            "error": "Forbidden",
-            "message": "New accounts cannot be created from this computer.",
-        }, 403
-
-    password_hash = generate_password_hash(data["password"])
-
-    try:
-        cursor = db.execute(
-            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
-            (username, password_hash, int(time.time())),
-        )
-        db.commit()
-    except sqlite3.IntegrityError:
-        # RECORDED, because a conflict is the only observable this endpoint
-        # emits and a run of them is the signature of enumeration. The reason
-        # is prefixed so _ip_throttle_state() can exclude it — see the note
-        # there about why a name-picker must not trip the login spray gate.
-        _record_login_attempt(db, username, ip, False, "register-conflict")
-        return {
-            "error": "Conflict",
-            "message": "That username is already taken.",
-        }, 409
-
-    user_id = cursor.lastrowid
-    # THE SIGNUP'S OWN FAILED LOGIN IS NOT EVIDENCE. The game has no separate
-    # "create account" form: it logs in first and registers only after a 401,
-    # so every new account begins with a 'no-such-user' row - which is on the
-    # spray gate's allowlist. Six people signing up behind one address inside
-    # ten minutes (a household, a school, a carrier's NAT, or EVERYONE behind a
-    # proxy with ELUSION_TRUSTED_PROXIES at 0) tripped IP_MAX_USERNAMES and
-    # locked that address out of logging in for a quarter of an hour.
-    #
-    # RELABELLED, NOT DELETED: the log keeps what happened, and only the rows
-    # for THIS name, from THIS address, inside the window stop counting. That
-    # name did not exist when it failed, so it guessed at nobody's password;
-    # a spray against real accounts leaves 'bad-password' rows, untouched here.
-    db.execute(
-        "UPDATE login_attempts SET reason = 'signup-first-login'"
-        " WHERE ip = ? AND lower(username) = lower(?) AND reason = 'no-such-user' AND at >= ?",
-        (ip, username, now - IP_WINDOW_SECONDS),
-    )
-    db.commit()
-    hardened, bound_to = login_hardening()
-    token, expires_at = issue_token(user_id, install_hash=bound_to, hardened=hardened, confirmed=True)
-    # The account's first address. Recorded here as well as on login, so an
-    # account that registers and is banned before it ever logs in still carries
-    # the link that makes its next sibling visible.
-    _record_account_ip(db, user_id, ip, now)
-    _record_account_install(db, user_id, install_hash, now)
-
-    # THE SAME SHAPE AS LOGIN AND SESSION. This used to omit keys that those
-    # two returned, so a client that read the response after registering got a
-    # different object than the one it got after logging in - and the
-    # difference was a missing key rather than a false value, which is the kind
-    # that surfaces as a crash somewhere else entirely.
-    #
-    # A new account is always a player, but it can be the owner: registering
-    # the account named by ELUSION_OWNER is exactly how a fresh server gets one.
-    # IS_OWNER IS "HAS THE OWNER'S POWERS" (0.21.0): true for a co-owner while
-    # the switch is on, and `role` says which of the two.
-    return {
-        "user_id": user_id,
-        "username": username,
-        "role": role_for({"username": username, "role": DEFAULT_ROLE}),
-        "is_owner": has_owner_powers(username),
-        # A new account has chosen nothing yet; the client draws its default.
-        "name_hue": None,
-        "token": token,
-        "expires_at": expires_at,
-        # An account one second old cannot have confirmed an address yet, so
-        # this is true - unless the server cannot send mail at all, in which
-        # case there is nothing to ask for (see needs_recovery_email()).
-        # Sent rather than left out, so the client reads the same key on
-        # register as it does on login.
-        "email_verified": False,
-        "needs_email": needs_recovery_email(None),
-    }, 201
+# The ten /api/auth routes - register, login, the heartbeat, resume, confirm,
+# logout, logout-all, password, recover and reset - are auth/'s, registered
+# below the code helpers and the mail they are handed (AUTH - THE ROUTES).
+# What every request passes through stays in this file: the token check and
+# the sessions it reads, issue_token() and the token lifecycle, the throttles
+# and the login log, bans, the evasion checks and the install binding, the
+# staff login code's switch (below), and the mail.
 
 
 # =============================================================================
@@ -5750,76 +5521,19 @@ def register():
 # - At most one new code a minute, so a leaked password cannot flood the inbox.
 # - ELUSION_STAFF_LOGIN_CODES=off turns the step off. It is the way back in if
 #   mail breaks after launch; see DEPLOY.md.
-STAFF_LOGIN_CODE_PURPOSE = "staff-login"
-STAFF_LOGIN_CODE_RESEND_SECONDS = 60
+#
+# THE STEP ITSELF IS auth/'s (since 19 Oct): the code's purpose, the resend
+# minute, the trusted computers and the login's second step. What stays here
+# is the switch and whether an account's logins take a code at all
+# (staff_login_protected(), below) - the staff powers page asks both, and the
+# suites turn the switch.
 STAFF_LOGIN_CODES = os.environ.get("ELUSION_STAFF_LOGIN_CODES", "on").strip().lower() \
     not in ("off", "0", "false", "no")
 
 
-# TRUSTED DEVICES: THE CODE ONCE PER COMPUTER, NOT ONCE PER LOGIN.
-#
-# A code on every login was the owner's own complaint on the first day he had
-# it: every sign-in meant a trip to the inbox. What the code is FOR is a
-# password used from somewhere that is not the staff member's own computer, and
-# that question only needs asking once per computer. So a login that got in
-# with a code is answered with a `device_token`, the game keeps it, and a later
-# login from the same computer that sends it back needs no code.
-#
-# - Only the hash is stored, like a session token.
-# - TRUSTED_DEVICE_DAYS from the code, then a new code. Not sliding: a computer
-#   stays trusted for a month from when it proved itself, not for ever by use.
-# - At the rank it was trusted at. A promotion (or a demotion) is a new code,
-#   so somebody made a mod proves their computer as a mod. Compared against
-#   role_for(), which is also what set_role.py and ELUSION_OWNER feed, so no
-#   route that changes a rank has to remember to revoke anything.
-# - Gone on a password change, a recovery reset or "log out everywhere" - the
-#   three things somebody does when they think the account is not only theirs.
-# - The newest TRUSTED_DEVICES_KEPT per account.
-# - A device token is never enough on its own: it is checked only after the
-#   password and the ban check have passed.
-TRUSTED_DEVICE_DAYS = 30
-TRUSTED_DEVICES_KEPT = 5
-
-
-def _trusted_device(db, row, raw, now):
-    """True when `raw` is a device token this account proved, still in date,
-    at the rank the account holds now. Marks it used."""
-    raw = str(raw or "")
-    if raw == "" or len(raw) > 128:
-        return False
-    found = db.execute(
-        "SELECT role, expires_at FROM trusted_devices WHERE token_hash = ? AND user_id = ?",
-        (_token_hash(raw), row["id"]),
-    ).fetchone()
-    if found is None or _row_int(found, "expires_at") <= now or found["role"] != role_for(row):
-        return False
-    db.execute("UPDATE trusted_devices SET last_used_at = ? WHERE token_hash = ? AND user_id = ?",
-               (now, _token_hash(raw), row["id"]))
-    return True
-
-
-def _trust_device(db, row, now):
-    """A new device token for a login that just proved itself with a code.
-    Returns the token; only its hash is kept. Caller commits."""
-    raw = secrets.token_urlsafe(32)
-    db.execute(
-        "INSERT INTO trusted_devices (token_hash, user_id, role, created_at, last_used_at, expires_at)"
-        " VALUES (?, ?, ?, ?, ?, ?)",
-        (_token_hash(raw), row["id"], role_for(row), now, now,
-         now + TRUSTED_DEVICE_DAYS * 86400),
-    )
-    db.execute(
-        "DELETE FROM trusted_devices WHERE user_id = ? AND token_hash NOT IN ("
-        " SELECT token_hash FROM trusted_devices WHERE user_id = ?"
-        " ORDER BY created_at DESC, rowid DESC LIMIT ?)",
-        (row["id"], row["id"], TRUSTED_DEVICES_KEPT),
-    )
-    return raw
-
-
-def _forget_devices(db, user_id):
-    """Every computer this account proved has to prove itself again. Caller commits."""
-    db.execute("DELETE FROM trusted_devices WHERE user_id = ?", (user_id,))
+# TRUSTED DEVICES - the code once per computer, not once per login - are
+# auth/'s (services.py says how), and TRUSTED_DEVICE_DAYS and
+# TRUSTED_DEVICES_KEPT are named here again where the package registers.
 
 
 def staff_login_protected(row):
@@ -5827,709 +5541,6 @@ def staff_login_protected(row):
     address, on a server that has the step on and can send mail."""
     return (STAFF_LOGIN_CODES and role_at_least(row, "mod")
             and not needs_recovery_email(row) and mail_can_send())
-
-
-def _staff_login_step(db, row, data, ip, now):
-    """
-    None when this login may have its token now; otherwise the answer to send
-    instead. Called after the password and the ban check have both passed.
-    """
-    if not staff_login_protected(row):
-        return None
-    address = row["email"]
-    sent_to = _mask_email(address)
-    # Spaces are how people copy "183 774" out of a mail; anything longer than
-    # a code is refused before it reaches the hash.
-    code = re.sub(r"\s", "", str(data.get("code") or ""))[:16]
-
-    # A COMPUTER THAT HAS ALREADY PROVED ITSELF needs no code. See TRUSTED
-    # DEVICES. Only when no code was sent: a code is always checked as a code.
-    if not code and _trusted_device(db, row, data.get("device"), now):
-        db.commit()
-        return None
-
-    if code:
-        ok, _reason = _consume_code(db, row["id"], STAFF_LOGIN_CODE_PURPOSE, code, now)
-        if ok:
-            db.commit()
-            # The login answers with a device token, so this computer is not
-            # asked again. Only here: a code that was right, just now.
-            g.staff_code_proved = True
-            return None
-        _register_failed_login(db, row, now)
-        _record_login_attempt(db, row["username"], ip, False, "bad-code")
-        # 400, NOT 401. The game reads a 401 as "wrong name or password", and
-        # the password here was right.
-        return {
-            "error": "Bad Code",
-            "code_required": True,
-            "sent_to": sent_to,
-            "message": "That code is not right, or it has run out. Use the newest "
-                       "email, or clear the box and log in again for a new code.",
-        }, 400
-
-    pending = db.execute(
-        "SELECT created_at, expires_at FROM auth_codes WHERE user_id = ? AND purpose = ?",
-        (row["id"], STAFF_LOGIN_CODE_PURPOSE),
-    ).fetchone()
-    recent = (pending is not None and _row_int(pending, "expires_at") > now
-              and now - _row_int(pending, "created_at") < STAFF_LOGIN_CODE_RESEND_SECONDS)
-    if not recent:
-        new_code = _new_code()
-        _store_code(db, row["id"], STAFF_LOGIN_CODE_PURPOSE, new_code, address, now)
-        db.commit()
-        send_mail_async(
-            address, "Elusion RPG - your staff login code",
-            "Your staff login code is %s\n\n"
-            "It expires in %d minutes. Somebody - hopefully you - just typed the "
-            "correct password for %s. If that was not you, change your password "
-            "now: it is known, and this code is the only thing that stopped them."
-            % (new_code, RESET_CODE_TTL_SECONDS // 60, row["username"]))
-    _record_login_attempt(db, row["username"], ip, False, "code-sent")
-    return {
-        "code_required": True,
-        "sent_to": sent_to,
-        "expires_in": RESET_CODE_TTL_SECONDS,
-        "message": "Staff login: we emailed a code to %s." % sent_to,
-    }, 202
-
-
-@app.post("/api/auth/login")
-@no_write_lock
-def login():
-    """
-    Log in and receive a session token
-    ---
-    tags:
-      - Auth
-    consumes:
-      - application/json
-    parameters:
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          properties:
-            username:
-              type: string
-            password:
-              type: string
-            install:
-              type: string
-              description: "This copy of the game's install id (64 hex). Optional; see INSTALL IDS"
-    responses:
-      200:
-        description: Logged in
-        schema:
-          type: object
-          properties:
-            user_id:
-              type: integer
-            username:
-              type: string
-            role:
-              type: string
-            token:
-              type: string
-            expires_at:
-              type: integer
-      400:
-        description: Validation error
-      401:
-        description: Bad username or password
-        schema:
-          type: object
-          properties:
-            error:
-              type: string
-            message:
-              type: string
-    """
-    data = request.get_json(silent=True)
-
-    is_valid, errors = validate_credentials(data)
-    if not is_valid:
-        return {"error": "Bad Request", "message": errors}, 400
-
-    # THE DOOR. Before the throttle, before the user lookup, before any
-    # hashing: a closed server should cost one indexed read and say so. The
-    # owner is exempt, or the switch could lock its own operator out.
-    closed = maintenance_refusal(data["username"])
-    if closed is not None:
-        return closed
-
-    db = get_db()
-    ip = client_ip()
-    now = int(time.time())
-
-    # THE PER-IP GATE COMES FIRST - before the user lookup, before the account
-    # lockout, before any password hashing. A spray should cost the server one
-    # indexed COUNT and nothing else; running scrypt for an attacker is doing
-    # 32MB of work per guess ON THEIR BEHALF, which turns the good hash into a
-    # denial-of-service lever.
-    _prune_login_attempts(db, now)
-    # Expired sessions go here too. This is the one request every returning
-    # player makes, which makes it the natural place to tidy a table that only
-    # ever grows - and the delete is indexed on a column every row has.
-    _prune_sessions(db, now)
-    ip_state = _ip_throttle_state(db, ip, now)
-    if ip_state is not None:
-        reason, retry = ip_state
-        _record_login_attempt(db, (data or {}).get("username", ""), ip, False, reason)
-        return {
-            "error": "Too Many Requests",
-            "message": "Too many failed attempts from this address. Try again in %s." % _wait_words(retry),
-        }, 429
-
-    row = db.execute(
-        # SELECT * rather than a column list: ban_state() and role_for() both read
-        # from this row, and a list here is a list that gets forgotten the next
-        # time a column is added - which is exactly what happened when the ban
-        # columns arrived.
-        "SELECT * FROM users WHERE username = ?",
-        (data["username"],),
-    ).fetchone()
-
-    # LOCKOUT comes before the password check on purpose: while an account is
-    # frozen, no amount of guessing gets a verdict, correct or not. Only a real
-    # row can be frozen, so a locked username is knowable - the accepted cost of
-    # per-account lockout (see SECURITY_NOTES.md E-5).
-    if row is not None and _row_int(row, "lockout_until") > now:
-        retry = _row_int(row, "lockout_until") - now
-        _record_login_attempt(db, data["username"], ip, False, "account-locked")
-        return {
-            "error": "Too Many Requests",
-            "message": "Too many failed attempts. Try again in %s." % _wait_words(retry),
-        }, 429
-
-    # same response whether the user is missing or the password is wrong -
-    # otherwise this endpoint tells an attacker which usernames exist.
-    #
-    # NOT `row is None or not check_password_hash(...)`, which is what this was.
-    # `or` short-circuits, so a missing user skipped the hash entirely and came
-    # back in about a millisecond while a real user with a wrong password spent
-    # about a hundred in scrypt. The response was identical and the clock was
-    # not, which enumerates usernames just as well. See _TIMING_DUMMY_HASH.
-    #
-    # The verify now ALWAYS runs — against the real hash when there is a row,
-    # against the dummy when there is not — so both paths pay the same cost and
-    # there is no early return for a stopwatch to find.
-    stored_hash = row["password_hash"] if row is not None else _TIMING_DUMMY_HASH
-    password_ok = check_password_hash(stored_hash, data["password"])
-
-    if row is None or not password_ok:
-        locked = row is not None and _register_failed_login(db, row, now)
-        # The REASON is recorded even though the RESPONSE cannot distinguish
-        # them. The 401 has to stay identical or it enumerates usernames; the
-        # log is on our side of that line, and "no-such-user" against forty
-        # names is the signature of a spray.
-        _record_login_attempt(
-            db, data["username"], ip, False,
-            "no-such-user" if row is None else "bad-password",
-        )
-        # THE MISS THAT LOCKS IT SAYS SO. It used to answer the same 401 as the
-        # seven before it, so the player learned about the lock only by typing
-        # the RIGHT password next and being told to wait fifteen minutes. The
-        # next attempt would have said "locked" anyway - this is the same
-        # sentence one try sooner, not anything a stranger could not learn.
-        if locked:
-            return {
-                "error": "Too Many Requests",
-                "message": "Too many failed attempts. Try again in %s."
-                           % _wait_words(LOGIN_LOCKOUT_SECONDS),
-            }, 429
-        return {
-            "error": "Unauthorized",
-            "message": "Incorrect username or password.",
-        }, 401
-
-    # AFTER the password check, deliberately. Telling someone their account is
-    # banned before they have proved it is theirs would make this endpoint a
-    # way to find out who is banned.
-    #
-    # 403 rather than 401, and the reason IS included - unlike the routes that
-    # hide behind a 404, a banned player has every right to know they are
-    # banned and why. Silence there reads as the game being broken.
-    ban = ban_state(row)
-    install_hash = _install_hash(data.get("install"))
-    if ban is not None:
-        # THE COMPUTER IS RECORDED EVEN THOUGH THE LOGIN IS REFUSED. The
-        # password was right, so this is the account's holder at their own
-        # machine - and a player banned before install ids existed has no
-        # computer on file until they try once more, which they always do.
-        # The address is not recorded here; that rule is older and unchanged.
-        _record_account_install(db, row["id"], install_hash, now)
-        _record_login_attempt(db, row["username"], ip, False, "banned")
-        return {
-            "error": "Forbidden",
-            "message": "This account is banned." if ban["permanent"]
-                       else "This account is banned until further notice.",
-            "ban": ban,
-        }, 403
-
-    # STAFF: the password is right, and it is still not enough. See STAFF
-    # LOGIN CODES above.
-    step = _staff_login_step(db, row, data, ip, now)
-    if step is not None:
-        return step
-
-    # A login that gets its token clears the streak - the throttle is about
-    # CONSECUTIVE misses, so one success resets it. Only here, after the staff
-    # step: a correct password followed by a wrong code is still a miss. Skip
-    # the write when there is nothing to clear, which is the common case.
-    if _row_int(row, "failed_logins") or _row_int(row, "lockout_until"):
-        db.execute(
-            "UPDATE users SET failed_logins = 0, lockout_until = 0 WHERE id = ?",
-            (row["id"],),
-        )
-        db.commit()
-
-    hardened, bound_to = login_hardening()
-    token, expires_at = issue_token(row["id"], install_hash=bound_to, hardened=hardened,
-                                    staff=role_at_least(row, "mod"), confirmed=True)
-    # ONE LOGIN AT A TIME: only a login that got its token. A wrong password,
-    # a ban or a staff code still to come ends nothing.
-    _end_other_sessions(db, row["id"], token)
-    device_token = _trust_device(db, row, now) if g.get("staff_code_proved") else ""
-    db.commit()
-    _record_login_attempt(db, row["username"], ip, True, "")
-    # ON SUCCESS ONLY, and after the ban check above - a banned account never
-    # reaches here, so a ban cannot keep refreshing its own address history and
-    # extending the block on everyone who shares the connection.
-    _record_account_ip(db, row["id"], ip, now)
-    _record_account_install(db, row["id"], install_hash, now)
-
-    return {
-        "user_id": row["id"],
-        "username": row["username"],
-        # THE OWNER IS ALWAYS THE OWNER, whatever the column says. A stored
-        # rank is a row someone could revoke; the owner is configuration.
-        # Locking the owner out of their own server with an UPDATE should not
-        # be possible, so role_for() answers from ELUSION_OWNER first.
-        "role": role_for(row),
-        # The owner's powers: the owner, or a co-owner while the switch is on.
-        "is_owner": has_owner_powers(row["username"]),
-        # THE COLOUR COMES WITH THE LOGIN, so a second machine draws the name
-        # the player chose on the first one.
-        "name_hue": name_hue_of(row),
-        "token": token,
-        "expires_at": expires_at,
-        # THE PROMPT SWITCH. The client shows the "secure your account" step
-        # when this is true, which is how every existing account picks up a
-        # recovery address without anybody having to go and ask them.
-        "email_verified": not needs_recovery_email(row),
-        "needs_email": needs_recovery_email(row),
-        # A staff account that logged in on the password alone, because there
-        # was nowhere to send a code. The HUD says so. See STAFF LOGIN CODES.
-        "staff_unprotected": role_at_least(row, "mod") and not staff_login_protected(row),
-        # Only after a staff code: this computer's proof, for the next login.
-        # See TRUSTED DEVICES.
-        **({"device_token": device_token} if device_token else {}),
-    }, 200
-
-
-@app.get("/api/auth/session")
-@require_auth
-def session_info():
-    """
-    Validate a stored token
-    ---
-    tags:
-      - Auth
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-    responses:
-      200:
-        description: Token is valid
-        schema:
-          type: object
-          properties:
-            user_id:
-              type: integer
-            username:
-              type: string
-            role:
-              type: string
-            expires_at:
-              type: integer
-      401:
-        description: Missing, invalid or expired token
-    """
-    # THIS IS ALSO THE HEARTBEAT. The game calls it every HEARTBEAT seconds
-    # while a character is in the world, for two reasons:
-    #
-    #   a 401 here is how a kicked or banned player finds out. Both delete the
-    #   session; without a regular call the client never asks, and keeps
-    #   playing until it is restarted - which made a kick a suggestion.
-    #
-    #   the stamp below is how staff see who is actually playing. A session
-    #   lasts thirty days, so "holds a session" is not "online".
-    #
-    # ONE UPDATE BY PRIMARY KEY. The token's hash is the row, so this touches exactly
-    # the session asking and nothing else. expires_at is NOT extended: a
-    # heartbeat proves the client is running, not that the login is fresher.
-    db = get_db()
-    stamp_presence(db)
-    db.commit()
-
-    # THE CLOSING NOTICE RIDES THE HEARTBEAT. This is the only call every
-    # client in the world makes on a timer, which makes it the one place
-    # that can tell everyone at once that the server is closing - and it is
-    # how the client knows to flush its save while it still has a session.
-    # None while the server is open, so the client can just test for it.
-    return {
-        "user_id": g.user["id"],
-        "username": g.user["username"],
-        "role": role_for(g.user),
-        "is_owner": has_owner_powers(g.user["username"]),
-        "name_hue": name_hue_of(g.user),
-        "expires_at": g.user["expires_at"],
-        "maintenance": maintenance_public(),
-        "email_verified": not needs_recovery_email(g.user),
-        "needs_email": needs_recovery_email(g.user),
-    }, 200
-
-
-@app.post("/api/auth/resume")
-@require_auth
-def resume_session():
-    """
-    Carry a remembered login into this game, on a new token
-    ---
-    tags:
-      - Auth
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-    responses:
-      200:
-        description: What /api/auth/session answers, plus the token to use from now on
-      401:
-        description: Missing, invalid or expired token
-    """
-    # ONE LOGIN AT A TIME, for the game that never typed a password. A second
-    # copy of the game opened on the same computer finds the same remembered
-    # token, and GET /api/auth/session would let both run on one session - the
-    # two-writer bug with nothing to end. So opening the game swaps the token:
-    # this one gets a fresh session, and every other session on the account,
-    # the one it came in on included, ends as if it had been signed in over.
-    #
-    # THE NEW TOKEN ENDS WHEN THE OLD ONE WOULD HAVE. A fresh thirty days
-    # here would let a remembered login - or a stolen token - renew itself
-    # forever without anybody typing a password. It is the same login, moved.
-    db = get_db()
-    hardened, bound_to = login_hardening()
-    token, expires_at = issue_token(g.user["id"], int(g.user["expires_at"]), install_hash=bound_to,
-                                    hardened=hardened, staff=role_at_least(g.user, "mod"))
-    # THE TOKEN IT CAME IN ON IS "ROTATED" (TOKEN LIFECYCLE): back from another
-    # copy of the game, it is theft.
-    _end_other_sessions(db, g.user["id"], token, rotated_token=bearer_token())
-    db.commit()
-    # A REMEMBERED LOGIN IS STILL A LOGIN from this computer and this address.
-    # "Remember me" can carry a player for thirty days without a password, and
-    # recording only on /login left that whole month out of the link view.
-    now = int(time.time())
-    _record_account_ip(db, g.user["id"], client_ip(), now)
-    _record_account_install(db, g.user["id"],
-                            _install_hash((request.get_json(silent=True) or {}).get("install")),
-                            now)
-    return {
-        "user_id": g.user["id"],
-        "username": g.user["username"],
-        "role": role_for(g.user),
-        "is_owner": has_owner_powers(g.user["username"]),
-        "name_hue": name_hue_of(g.user),
-        "token": token,
-        "expires_at": expires_at,
-        "maintenance": maintenance_public(),
-        "email_verified": not needs_recovery_email(g.user),
-        "needs_email": needs_recovery_email(g.user),
-    }, 200
-
-
-@app.post("/api/auth/confirm")
-@require_auth
-def confirm_password():
-    """
-    Type the password again, for the routes that ask (STEP-UP)
-    ---
-    tags:
-      - Auth
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [password]
-          properties:
-            password: {type: string}
-    responses:
-      200:
-        description: Confirmed for STEP_UP_SECONDS on this session
-      400:
-        description: No password given
-      401:
-        description: Missing, invalid or expired token - or, after CONFIRM_MAX_MISSES wrong ones, every session ended
-      403:
-        description: The wrong password
-    """
-    # TOKEN LIFECYCLE, STEP-UP. A wrong one is 403, never 401: the game reads
-    # 401 as "signed out". CONFIRM_MAX_MISSES wrong ones on one session is
-    # somebody with the token guessing at the password, and is theft.
-    payload = request.get_json(silent=True) or {}
-    password = payload.get("password")
-    if not isinstance(password, str) or not password:
-        return bad_request("password is required")
-    db = get_db()
-    row = db.execute("SELECT password_hash FROM users WHERE id = ?", (int(g.user["id"]),)).fetchone()
-    token_hash = _token_hash(bearer_token())
-    if row is None or not check_password_hash(row["password_hash"], password):
-        db.execute("UPDATE sessions SET confirm_misses = confirm_misses + 1 WHERE token_hash = ?", (token_hash,))
-        db.commit()
-        misses = db.execute("SELECT confirm_misses FROM sessions WHERE token_hash = ?", (token_hash,)).fetchone()
-        if misses is not None and int(misses["confirm_misses"]) >= CONFIRM_MAX_MISSES:
-            _end_for_theft(db, int(g.user["id"]), "%d wrong passwords to confirm" % CONFIRM_MAX_MISSES)
-            return {"error": "Unauthorized", "message": TOKEN_STOLEN_MESSAGE, "token_stolen": True}, 401
-        return {"error": "Forbidden", "message": "That is not your password.", "confirm_password": True}, 403
-    now = int(time.time())
-    db.execute("UPDATE sessions SET confirmed_at = ?, confirm_misses = 0 WHERE token_hash = ?", (now, token_hash))
-    db.commit()
-    return {"confirmed": True, "until": now + STEP_UP_SECONDS}, 200
-
-
-@app.post("/api/auth/logout")
-@require_auth
-def logout():
-    """
-    Invalidate the current token
-    ---
-    tags:
-      - Auth
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-    responses:
-      204:
-        description: Token invalidated
-      401:
-        description: Missing, invalid or expired token
-    """
-    db = get_db()
-    db.execute("DELETE FROM sessions WHERE token_hash = ?", (_token_hash(bearer_token()),))
-    db.commit()
-    return "", 204
-
-
-@app.post("/api/auth/logout-all")
-@require_auth
-def logout_all():
-    """
-    Invalidate every session for the logged-in account
-    ---
-    tags:
-      - Auth
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-    responses:
-      200:
-        description: Sessions invalidated
-        schema:
-          type: object
-          properties:
-            revoked:
-              type: integer
-      401:
-        description: Missing, invalid or expired token
-    """
-    # WHY THIS EXISTS, given TOKEN_TTL is thirty days.
-    #
-    # A long token is the right call for a game - nobody wants to retype a
-    # password to play for twenty minutes - but it is only defensible if there
-    # is a way to END one early. Without this, a token that leaks stays valid
-    # for up to a month and nothing anyone can do shortens that: changing a
-    # password would not help, because /api/auth/logout only kills the token
-    # doing the asking, and the attacker is holding a different one.
-    #
-    # So the answer to "30 days is a long time" is not a smaller number that
-    # annoys every honest player. It is this: the window stays generous, and it
-    # can be slammed shut on demand.
-    #
-    # DELETES THE CALLER'S TOKEN TOO. "Log out everywhere" that leaves the
-    # device you typed it on still logged in is not what anyone means by it,
-    # and if the reason you pressed it is that you think you were compromised,
-    # the ambiguity is the last thing you need.
-    db = get_db()
-    cursor = db.execute("DELETE FROM sessions WHERE user_id = ?", (g.user["id"],))
-    # And every computer's trust: see TRUSTED DEVICES.
-    _forget_devices(db, g.user["id"])
-    db.commit()
-
-    app.logger.warning(
-        "all sessions revoked  user=%r  ip=%s  count=%d",
-        g.user["username"], client_ip() or "?", cursor.rowcount,
-    )
-
-    return {"revoked": cursor.rowcount}, 200
-
-
-@app.post("/api/auth/password")
-@no_write_lock
-@require_auth
-def change_password():
-    """
-    Change the logged-in account's password
-    ---
-    tags:
-      - Auth
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          properties:
-            current_password:
-              type: string
-            new_password:
-              type: string
-    responses:
-      200:
-        description: Password changed; every session was revoked and a new one issued
-        schema:
-          type: object
-          properties:
-            token:
-              type: string
-            expires_at:
-              type: integer
-            revoked:
-              type: integer
-      400:
-        description: Validation error
-      401:
-        description: Missing token, or the current password is wrong
-      429:
-        description: Too many failed attempts
-    """
-    # THE OTHER HALF OF E-6. logout-all lets you end sessions; without this
-    # there was no way to change the credential that leaked, so an attacker who
-    # had the password simply logged back in and got a fresh 30-day token.
-    # Revoking without rotating is a door you keep closing on someone holding
-    # the key.
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return bad_request("Payload must be a JSON object.")
-
-    current = data.get("current_password")
-    new = data.get("new_password")
-
-    if not isinstance(current, str) or not isinstance(new, str):
-        return bad_request("current_password and new_password are required strings.")
-    if len(new) < MIN_PASSWORD_LENGTH:
-        return bad_request(
-            "Field 'new_password' must be at least %d characters." % MIN_PASSWORD_LENGTH
-        )
-    if new == current:
-        return bad_request("The new password must be different from the current one.")
-
-    db = get_db()
-    ip = client_ip()
-    now = int(time.time())
-
-    row = db.execute("SELECT * FROM users WHERE id = ?", (g.user["id"],)).fetchone()
-    if row is None:
-        # The token resolved a moment ago, so this is a deleted account racing
-        # its own session rather than anything the caller did.
-        return {"error": "Unauthorized", "message": "No such account."}, 401
-
-    # THE CURRENT PASSWORD IS REQUIRED, and it is the whole point. A valid token
-    # is not proof of identity here - a stolen token is exactly the situation
-    # this endpoint exists for, and letting one set a new password would hand
-    # the account to the thief rather than take it back.
-    #
-    # THROTTLED LIKE LOGIN, for the same reason: this is a second place to guess
-    # a password, and one that answers from an authenticated session. Leaving it
-    # unthrottled would put the lock back on the front door and a window beside
-    # it. Both ceilings apply, and a miss counts against both.
-    ip_state = _ip_throttle_state(db, ip, now)
-    if ip_state is not None:
-        reason, retry = ip_state
-        _record_login_attempt(db, row["username"], ip, False, reason)
-        return {
-            "error": "Too Many Requests",
-            "message": "Too many failed attempts from this address. Try again in %s." % _wait_words(retry),
-        }, 429
-
-    if _row_int(row, "lockout_until") > now:
-        retry = _row_int(row, "lockout_until") - now
-        _record_login_attempt(db, row["username"], ip, False, "account-locked")
-        return {
-            "error": "Too Many Requests",
-            "message": "Too many failed attempts. Try again in %s." % _wait_words(retry),
-        }, 429
-
-    if not check_password_hash(row["password_hash"], current):
-        _register_failed_login(db, row, now)
-        _record_login_attempt(db, row["username"], ip, False, "bad-password-on-change")
-        return {
-            "error": "Unauthorized",
-            "message": "The current password is incorrect.",
-        }, 401
-
-    # ONE TRANSACTION: re-hash, revoke, re-issue. Splitting these leaves a window
-    # where the password is new and the attacker's session is still live, which
-    # is the exact state the endpoint exists to remove.
-    #
-    # EVERY session goes, including the caller's own, and then a fresh one is
-    # issued to the caller. That ordering matters: "change my password" must not
-    # be a way to log everyone out except whoever currently holds a stolen token.
-    new_hash = generate_password_hash(new)
-    db.execute(
-        "UPDATE users SET password_hash = ?, failed_logins = 0, lockout_until = 0 WHERE id = ?",
-        (new_hash, row["id"]),
-    )
-    cursor = db.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
-    _forget_devices(db, row["id"])
-    db.commit()
-
-    revoked = cursor.rowcount
-    hardened, bound_to = login_hardening()
-    token, expires_at = issue_token(row["id"], install_hash=bound_to, hardened=hardened,
-                                    staff=role_at_least(row, "mod"), confirmed=True)
-    _record_login_attempt(db, row["username"], ip, True, "password-changed")
-
-    app.logger.warning(
-        "password changed  user=%r  ip=%s  sessions_revoked=%d",
-        row["username"], ip or "?", revoked,
-    )
-
-    return {"token": token, "expires_at": expires_at, "revoked": revoked}, 200
 
 
 # =============================================================================
@@ -6583,8 +5594,6 @@ RESET_IP_WINDOW_SECONDS = 15 * 60
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 MAX_EMAIL_LENGTH = 254
 
-# The one answer /api/auth/recover ever gives. See the header: a different
-# reply for "no such address" turns this into an account enumerator.
 def needs_recovery_email(row):
     """
     True when this account has no CONFIRMED recovery address.
@@ -6617,6 +5626,8 @@ def needs_recovery_email(row):
         return True
 
 
+# The one answer /api/auth/recover ever gives. See the header: a different
+# reply for "no such address" turns this into an account enumerator.
 RECOVER_GENERIC_MESSAGE = (
     "If that address is on an account, a code is on its way. "
     "It expires in %d minutes." % (RESET_CODE_TTL_SECONDS // 60)
@@ -6834,353 +5845,92 @@ def _mask_email(address):
     return "%s%s%s@%s" % (name[0], "*" * (len(name) - 2), name[-1], domain)
 
 
-@app.get("/api/account/email")
-@require_auth
-def get_account_email():
-    """
-    The recovery address on this account, masked
-    ---
-    tags:
-      - Account
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-    responses:
-      200:
-        description: Masked address and whether it has been verified
-      401:
-        description: Missing, invalid or expired token
-    """
-    row = get_db().execute(
-        "SELECT email, email_verified FROM users WHERE id = ?", (g.user["id"],)
-    ).fetchone()
-    address = "" if row is None else str(row["email"] or "")
-    return {
-        "email": _mask_email(address),
-        "has_email": address != "",
-        "verified": bool(row is not None and _row_int(row, "email_verified")),
-    }, 200
+# THE RECOVERY ADDRESS'S THREE ROUTES - GET and POST /api/account/email and
+# POST /api/account/email/verify - are the accountsettings/ package's since 19
+# Oct, registered with the name colour at THE ACCOUNT'S SETTINGS, further down.
+# The codes and the address's cleaning and masking are not theirs alone - the
+# recovery routes and the staff login use them too - so they are handed in.
 
 
-@app.post("/api/account/email")
-@no_write_lock
-@require_auth
-def set_account_email():
-    """
-    Set or change the recovery address (needs the current password)
-    ---
-    tags:
-      - Account
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [email, password]
-          properties:
-            email:    {type: string}
-            password: {type: string, description: "the account's current password"}
-    responses:
-      200:
-        description: Saved, unverified, and a code is on its way to it
-      400:
-        description: Not an address
-      401:
-        description: Wrong password, or no token
-    """
-    payload = request.get_json(silent=True) or {}
-    address = _clean_email(payload.get("email"))
-    if address == "":
-        return bad_request("That does not look like an email address.")
+# =============================================================================
+# AUTH - THE ROUTES - the auth/ package (since 19 Oct)
+# =============================================================================
+# The ten /api/auth routes, as they were here: endpoint names, docstrings,
+# which take a token, which keep the write lock off, and every message
+# (routes.lock). auth/__init__.py tells what each is for. Registered here,
+# after the code helpers and the mail they are handed; what every request
+# passes through - see AUTH, above - is this file's, handed in by name.
+import auth as auth_package  # noqa: E402
 
-    password = payload.get("password")
-    if not isinstance(password, str) or password == "":
-        return bad_request("password is required to change the recovery address.")
+auth_package.register(
+    app,
+    require_auth=require_auth,
+    no_write_lock=no_write_lock,
+    get_db=get_db,
+    # Defined with the saves, just below.
+    bad_request=lambda message: bad_request(message),
+    client_ip=client_ip,
+    validate_credentials=validate_credentials,
+    hash_password=generate_password_hash,
+    check_password=check_password_hash,
+    dummy_hash=_TIMING_DUMMY_HASH,
+    min_password_length=MIN_PASSWORD_LENGTH,
+    maintenance_refusal=maintenance_refusal,
+    maintenance_public=maintenance_public,
+    prune_login_attempts=_prune_login_attempts,
+    prune_sessions=_prune_sessions,
+    ip_throttle_state=_ip_throttle_state,
+    register_throttle_state=_register_throttle_state,
+    record_login_attempt=_record_login_attempt,
+    register_failed_login=_register_failed_login,
+    wait_words=_wait_words,
+    # ASKED ON EVERY CALL: test_throttle.py turns the window down.
+    ip_window=lambda: IP_WINDOW_SECONDS,
+    lockout_seconds=lambda: LOGIN_LOCKOUT_SECONDS,
+    ban_state=ban_state,
+    ban_evasion_state=_ban_evasion_state,
+    install_evasion_state=_install_evasion_state,
+    hash_install=_install_hash,
+    record_account_ip=_record_account_ip,
+    record_account_install=_record_account_install,
+    issue_token=issue_token,
+    login_hardening=login_hardening,
+    end_other_sessions=_end_other_sessions,
+    end_for_theft=_end_for_theft,
+    hash_token=_token_hash,
+    bearer_token=bearer_token,
+    stamp_presence=stamp_presence,
+    step_up_seconds=STEP_UP_SECONDS,
+    confirm_max_misses=CONFIRM_MAX_MISSES,
+    token_stolen_message=TOKEN_STOLEN_MESSAGE,
+    role_for=role_for,
+    default_role=DEFAULT_ROLE,
+    has_owner_powers=has_owner_powers,
+    role_at_least=role_at_least,
+    name_hue_of=name_hue_of,
+    row_int=_row_int,
+    needs_recovery_email=needs_recovery_email,
+    staff_login_protected=staff_login_protected,
+    mask_email=_mask_email,
+    make_code=_new_code,
+    store_code=_store_code,
+    consume_code=_consume_code,
+    clean_email=_clean_email,
+    # ASKED ON EVERY CALL: the suites replace it to read the codes it sends.
+    send_mail_async=lambda to_address, subject, body: send_mail_async(to_address, subject, body),
+    reset_code_ttl=RESET_CODE_TTL_SECONDS,
+    recover_message=RECOVER_GENERIC_MESSAGE,
+    reset_cooldown=RESET_REQUEST_COOLDOWN_SECONDS,
+    reset_max_per_ip=RESET_MAX_REQUESTS_PER_IP,
+    reset_ip_window=RESET_IP_WINDOW_SECONDS,
+)
 
-    db = get_db()
-    now = int(time.time())
-    row = db.execute("SELECT * FROM users WHERE id = ?", (g.user["id"],)).fetchone()
-    if row is None:
-        return {"error": "Unauthorized", "message": "No such account."}, 401
-
-    # THE CURRENT PASSWORD IS THE WHOLE POINT, and this is the most important
-    # line in the recovery feature.
-    #
-    # The recovery address is a key to the account. If a stolen SESSION could
-    # change it, an attacker with a token would point recovery at their own
-    # inbox, reset the password, and lock the real owner out permanently -
-    # turning a temporary theft into a permanent one. Knowing the password is
-    # the one thing a session thief does not have, so it is what this asks for.
-    if not check_password_hash(row["password_hash"], password):
-        _record_login_attempt(db, row["username"], client_ip(), False, "bad-password-on-email")
-        db.commit()
-        return {"error": "Unauthorized", "message": "That password is not correct."}, 401
-
-    # SAID, NOT SWALLOWED. With no mail set up the code went nowhere and this
-    # answered 200 "Check that inbox" all the same - a player waited for an
-    # email that could never come. After every check a request can fail on its
-    # own, and before anything is stored.
-    if not mail_can_send():
-        return {"error": "Service Unavailable",
-                "message": "The server cannot send email right now, so an address "
-                           "cannot be confirmed yet. Please try again later."}, 503
-
-    # UNVERIFIED UNTIL A CODE COMES BACK FROM IT. Until then this address
-    # cannot receive a reset, so a typo here costs a re-entry, not an account.
-    db.execute("UPDATE users SET email = ?, email_verified = 0 WHERE id = ?",
-               (address, row["id"]))
-
-    code = _new_code()
-    _store_code(db, row["id"], "verify", code, address, now)
-    db.commit()
-
-    send_mail_async(address, "Elusion RPG - confirm your recovery address",
-              "Your confirmation code is %s\n\n"
-              "It expires in %d minutes. If you did not ask for this, you can "
-              "ignore it - nothing has changed on your account."
-              % (code, RESET_CODE_TTL_SECONDS // 60))
-
-    return {"email": _mask_email(address), "verified": False,
-            "message": "Check that inbox for a confirmation code."}, 200
-
-
-@app.post("/api/account/email/verify")
-@no_write_lock
-@require_auth
-def verify_account_email():
-    """
-    Confirm the recovery address with the emailed code
-    ---
-    tags:
-      - Account
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [code]
-          properties:
-            code: {type: string}
-    responses:
-      200:
-        description: Verified - this address can now recover the account
-      400:
-        description: Wrong or expired code
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-    code = str(payload.get("code", "")).strip()
-    if code == "":
-        return bad_request("code is required.")
-
-    db = get_db()
-    ok, _reason = _consume_code(db, g.user["id"], "verify", code, int(time.time()))
-    if not ok:
-        db.commit()
-        return bad_request("That code is wrong or has expired.")
-
-    db.execute("UPDATE users SET email_verified = 1 WHERE id = ?", (g.user["id"],))
-    db.commit()
-    return {"verified": True, "message": "Recovery address confirmed."}, 200
-
-
-@app.post("/api/auth/recover")
-@no_write_lock
-def request_recovery():
-    """
-    Ask for a reset code by email
-    ---
-    tags:
-      - Auth
-    parameters:
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [email]
-          properties:
-            email: {type: string}
-    responses:
-      200:
-        description: Always the same answer, whether or not that address exists
-      429:
-        description: Too many requests from this address
-    """
-    payload = request.get_json(silent=True) or {}
-    address = _clean_email(payload.get("email"))
-
-    db = get_db()
-    now = int(time.time())
-    ip = client_ip()
-
-    # A CEILING PER ADDRESS, so this cannot be pointed at a list of leaked
-    # emails, or used to bomb one inbox from one machine. Counted before
-    # anything else, because a throttled caller should cost one indexed read.
-    recent = int(db.execute(
-        "SELECT COUNT(*) AS n FROM login_attempts "
-        "WHERE ip = ? AND reason = 'recover-request' AND at > ?",
-        (ip, now - RESET_IP_WINDOW_SECONDS),
-    ).fetchone()["n"] or 0)
-    if recent >= RESET_MAX_REQUESTS_PER_IP:
-        return {
-            "error": "Too Many Requests",
-            "message": "Too many recovery requests from this address. Try again later.",
-        }, 429
-
-    _record_login_attempt(db, "", ip, True, "recover-request")
-
-    row = None
-    if address != "":
-        # VERIFIED ONLY. An address nobody has proved they own is not a way in.
-        row = db.execute(
-            "SELECT * FROM users WHERE email = ? AND email_verified = 1", (address,)
-        ).fetchone()
-
-    if row is None:
-        # SAME WORK, SAME ANSWER. Hashing a throwaway code here costs what the
-        # real path costs, so the reply cannot be timed to learn whether the
-        # address is on an account - the same trick _TIMING_DUMMY_HASH plays on
-        # /login, for the same reason.
-        generate_password_hash(_new_code())
-        db.commit()
-        return {"ok": True, "message": RECOVER_GENERIC_MESSAGE}, 200
-
-    # ONE CODE A MINUTE PER ACCOUNT. Silently, because saying "you already have
-    # one" would confirm the address exists.
-    existing = db.execute(
-        "SELECT created_at FROM auth_codes WHERE user_id = ? AND purpose = 'reset'",
-        (row["id"],),
-    ).fetchone()
-    if existing is not None and _row_int(existing, "created_at") > now - RESET_REQUEST_COOLDOWN_SECONDS:
-        db.commit()
-        return {"ok": True, "message": RECOVER_GENERIC_MESSAGE}, 200
-
-    code = _new_code()
-    _store_code(db, row["id"], "reset", code, address, now)
-    db.commit()
-
-    send_mail_async(address, "Elusion RPG - your password reset code",
-              "Someone asked to reset the password for %s.\n\n"
-              "Your code is %s\n\n"
-              "It expires in %d minutes and can be used once. If this was not "
-              "you, ignore this email - your password has not changed."
-              % (row["username"], code, RESET_CODE_TTL_SECONDS // 60))
-
-    return {"ok": True, "message": RECOVER_GENERIC_MESSAGE}, 200
-
-
-@app.post("/api/auth/reset")
-@no_write_lock
-def complete_recovery():
-    """
-    Set a new password using the emailed code
-    ---
-    tags:
-      - Auth
-    parameters:
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [email, code, new_password]
-          properties:
-            email:        {type: string}
-            code:         {type: string}
-            new_password: {type: string}
-    responses:
-      200:
-        description: Password replaced, every session on the account destroyed
-      400:
-        description: Wrong or expired code, or a password that fails the rules
-      429:
-        description: Too many attempts from this address
-    """
-    payload = request.get_json(silent=True) or {}
-    address = _clean_email(payload.get("email"))
-    code = str(payload.get("code", "")).strip()
-    new = payload.get("new_password")
-
-    if not isinstance(new, str) or len(new) < MIN_PASSWORD_LENGTH:
-        return bad_request(
-            "Field 'new_password' must be at least %d characters." % MIN_PASSWORD_LENGTH)
-
-    db = get_db()
-    now = int(time.time())
-    ip = client_ip()
-
-    # The login throttle covers this too: it is a place to guess a code, and an
-    # unthrottled one would be a million tries from a loop.
-    ip_state = _ip_throttle_state(db, ip, now)
-    if ip_state is not None:
-        reason, retry = ip_state
-        _record_login_attempt(db, "", ip, False, reason)
-        db.commit()
-        return {
-            "error": "Too Many Requests",
-            "message": "Too many failed attempts from this address. Try again in %s." % _wait_words(retry),
-        }, 429
-
-    row = None
-    if address != "" and code != "":
-        row = db.execute(
-            "SELECT * FROM users WHERE email = ? AND email_verified = 1", (address,)
-        ).fetchone()
-
-    if row is None:
-        check_password_hash(_TIMING_DUMMY_HASH, code)
-        _record_login_attempt(db, "", ip, False, "reset-bad-code")
-        db.commit()
-        return bad_request("That code is wrong or has expired.")
-
-    ok, _reason = _consume_code(db, row["id"], "reset", code, now)
-    if not ok:
-        _record_login_attempt(db, row["username"], ip, False, "reset-bad-code")
-        db.commit()
-        # ONE MESSAGE FOR EVERY FAILURE. Separating "wrong" from "expired" from
-        # "you have run out of tries" tells an attacker how close they are.
-        return bad_request("That code is wrong or has expired.")
-
-    # EVERY SESSION GOES. This is the half that makes recovery worth having:
-    # the player reaching for it usually believes somebody else is already in
-    # their account, and a new password that left the intruder's token alive
-    # would not have removed them.
-    db.execute(
-        "UPDATE users SET password_hash = ?, failed_logins = 0, lockout_until = 0 "
-        "WHERE id = ?",
-        (generate_password_hash(new), row["id"]),
-    )
-    cursor = db.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
-    _forget_devices(db, row["id"])
-    revoked = cursor.rowcount
-    _record_login_attempt(db, row["username"], ip, True, "password-reset")
-    db.commit()
-
-    app.logger.warning("password RESET by email  user=%r  ip=%s  sessions_revoked=%d",
-                       row["username"], ip or "?", revoked)
-
-    send_mail_async(address, "Elusion RPG - your password was changed",
-              "The password for %s was just reset using a code sent to this "
-              "address, and every device signed in to it has been signed out.\n\n"
-              "If that was not you, change your password again immediately."
-              % row["username"])
-
-    return {"ok": True, "revoked": revoked,
-            "message": "Password updated. You can sign in now."}, 200
+# Named here as well, for the staff powers page and the suites that read them
+# off this module; auth/services.py is where they are set.
+STAFF_LOGIN_CODE_PURPOSE = auth_package.STAFF_LOGIN_CODE_PURPOSE
+STAFF_LOGIN_CODE_RESEND_SECONDS = auth_package.STAFF_LOGIN_CODE_RESEND_SECONDS
+TRUSTED_DEVICE_DAYS = auth_package.TRUSTED_DEVICE_DAYS
+TRUSTED_DEVICES_KEPT = auth_package.TRUSTED_DEVICES_KEPT
 
 
 # =============================================================================
@@ -7909,54 +6659,39 @@ def _ensure_account(user_id):
     ).fetchone()
 
 
-@app.put("/api/account/name-colour")
-@require_auth
-def set_name_colour():
-    """
-    Choose the colour your name is drawn in, everywhere
-    ---
-    tags:
-      - Account
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [hue]
-          properties:
-            hue: {type: integer, description: "0-359, a position on the colour wheel"}
-    responses:
-      200:
-        description: The hue as stored
-      400:
-        description: Not a whole number 0-359
-      401:
-        description: Missing, invalid or expired token
-    """
-    # EVERYBODY, STAFF INCLUDED. The rule used to be that staff names were
-    # painted in their rank colour and the Options slider did nothing for them;
-    # rank is shown by a badge now (the owner's crown, MOD and DEV), which a
-    # player cannot choose, so the colour is free for everybody to choose.
-    #
-    # A HUE, NOT A COLOUR. The client fixes saturation and brightness so every
-    # choice reads against the world; accepting a whole colour would let a
-    # patched client store black-on-black.
-    payload = request.get_json(silent=True) or {}
-    hue = parse_stat(payload.get("hue"))
-    if hue is None or hue > NAME_HUE_MAX:
-        return bad_request("hue must be a whole number 0-%d" % NAME_HUE_MAX)
+# =============================================================================
+# THE ACCOUNT'S SETTINGS - the accountsettings/ package (since 19 Oct)
+# =============================================================================
+# The recovery address (GET and POST /api/account/email, POST .../verify) and
+# the name colour (PUT /api/account/name-colour), as they were here: endpoint
+# names, docstrings, the write-lock marks and every message (routes.lock).
+# accountsettings/__init__.py says why the address needs the password and a
+# code. Handed what other areas share - the mail, the codes, the address's
+# cleaning and masking, the login log - each asked for when a request lands:
+# test_accounts.py stands in for the mail on this module, and the codes and
+# the address helpers belong with the recovery routes and the staff login.
+import accountsettings as accountsettings_package  # noqa: E402
 
-    db = get_db()
-    db.execute("UPDATE users SET name_hue = ? WHERE id = ?", (hue, g.user["id"]))
-    db.commit()
-    return {"name_hue": hue}, 200
-
-
+accountsettings_package.register(
+    app,
+    require_auth=require_auth,
+    no_write_lock=no_write_lock,
+    get_db=get_db,
+    bad_request=bad_request,
+    parse_stat=parse_stat,
+    hue_max=NAME_HUE_MAX,
+    clean_email=lambda raw: _clean_email(raw),
+    mask_email=lambda address: _mask_email(address),
+    row_int=lambda row, key: _row_int(row, key),
+    record_login_attempt=lambda db, username, ip, ok, reason="": _record_login_attempt(db, username, ip, ok, reason),
+    client_ip=lambda: client_ip(),
+    mail_can_send=lambda: mail_can_send(),
+    send_mail_async=lambda to_address, subject, body: send_mail_async(to_address, subject, body),
+    new_code=lambda: _new_code(),
+    store_code=lambda db, user_id, purpose, code, target, now: _store_code(db, user_id, purpose, code, target, now),
+    consume_code=lambda db, user_id, purpose, code, now: _consume_code(db, user_id, purpose, code, now),
+    code_ttl=lambda: RESET_CODE_TTL_SECONDS,
+)
 
 
 # =============================================================================
@@ -8062,663 +6797,15 @@ MUTE_MAX_MINUTES = moderation_package.MUTE_MAX_MINUTES
 REPORT_KEEP_SECONDS = moderation_package.REPORT_KEEP_SECONDS
 
 
-# How much gold one debug grant may mint, and how much it may take away. A
-# ceiling rather than no limit: a typo in a box should cost a re-press, not
-# make the Kingdom Tax board meaningless forever.
-DEBUG_GOLD_MAX = 1000000
-
-
-@app.post("/api/staff/gold")
-@require_auth
-@require_owner
-@require_fresh_password
-def staff_gold():
-    """
-    Give yourself gold for testing (owner only)
-    ---
-    tags:
-      - Staff
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: grant
-        schema:
-          type: object
-          required: [slot, amount]
-          properties:
-            slot:   {type: integer, example: 0}
-            amount: {type: integer, example: 5000}
-            bank:   {type: boolean, description: "Put it in the bank instead"}
-    responses:
-      200:
-        description: The new balances
-      400:
-        description: Bad slot, bad amount, or it would take you below zero
-      401:
-        description: Missing, invalid or expired token
-      404:
-        description: Not the owner, or no character in that slot
-    """
-    # WHY THIS EXISTS AT ALL, stated plainly: a server nobody can put gold on
-    # is a server whose shops, trades, bank, revive cost and guild founding
-    # cannot be tested by the person who wrote them. The game's debug keys did
-    # this job, but they were gated on OS.is_debug_build() and so disappeared
-    # the moment the game was exported - which is exactly when it most needs
-    # exercising. (Since game 0.7.1 there are no keys at all; the GM panel does
-    # their work.)
-    #
-    # OWNER ONLY, NOT MOD. Granting an item is a test fixture; minting the
-    # currency is the economy itself, and the Kingdom Tax board is built on
-    # the assumption that gold is scarce. One person can be trusted with that
-    # because it is their server.
-    #
-    # THROUGH THE LEDGER, LIKE EVERYTHING ELSE. A bare UPDATE would mint gold
-    # the supply invariant cannot see, and /api/economy/supply would start
-    # reporting drift that is not drift. The row says 'staff_gold', so every
-    # coin conjured for a test is visible as exactly that forever.
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-    if not _slot_exists(user_id, slot):
-        return {"error": "Not Found",
-                "message": "No character in slot %d." % slot}, 404
-
-    raw = payload.get("amount", 0)
-    if isinstance(raw, bool):
-        return bad_request("amount must be a whole number")
-    try:
-        amount = int(raw)
-    except (TypeError, ValueError):
-        return bad_request("amount must be a whole number")
-    if amount == 0:
-        return bad_request("amount must not be zero")
-    if abs(amount) > DEBUG_GOLD_MAX:
-        return bad_request("one grant is at most %d gold" % DEBUG_GOLD_MAX)
-
-    db = get_db()
-    to_bank = bool(payload.get("bank", False))
-    detail = "owner debug grant"
-
-    # THE ACCOUNTS ROW HAS TO EXIST FIRST, and this line is here because the
-    # first version did not have it. accounts rows are created lazily, on the
-    # first time somebody banks anything - so an owner who has never used the
-    # bank has no row, bank_gold_delta's UPDATE matched nothing, and it
-    # returned None rather than raising. The grant reported success, wrote no
-    # ledger row, and moved no gold. Silent, and the supply invariant stayed
-    # balanced throughout because nothing had happened at all.
-    _ensure_account(user_id)
-
-    try:
-        if to_bank:
-            if bank_gold_delta(db, user_id, amount, "staff_gold", detail) is None:
-                db.rollback()
-                return bad_request("that bank grant did not go through")
-        else:
-            if gold_delta(db, user_id, slot, amount, "staff_gold", detail) is None:
-                return {"error": "Not Found",
-                        "message": "No character in slot %d." % slot}, 404
-    except InsufficientGold:
-        db.rollback()
-        return bad_request("that would take the balance below zero")
-
-    # THE GIFTS LEDGER: the owner's own gold is a gift too (one taken back is a
-    # negative one). Same transaction as the gold.
-    _record_gold_gift(db, g.user, user_id, g.user["username"], None if to_bank else slot, amount)
-    db.commit()
-
-    account = _ensure_account(user_id)
-    purse = db.execute("SELECT gold FROM saves WHERE user_id = ? AND slot = ?",
-                       (user_id, slot)).fetchone()
-    return {
-        "slot": slot,
-        "granted": amount,
-        "where": "bank" if to_bank else "carried",
-        "gold": int(purse["gold"] or 0) if purse is not None else 0,
-        "bank_gold": int(account["bank_gold"] or 0),
-    }, 200
-
-
-# The highest level the owner's level tool sets - the client's sanity clamp on a
-# loaded save (CharacterData.MAX_LEVEL). There is no level cap in the game; this
-# only stops a typo making a character the server's curve cannot describe.
-STAFF_LEVEL_MAX = 99
-
-
-@app.post("/api/staff/level")
-@require_auth
-@require_owner
-@require_fresh_password
-def staff_level():
-    """
-    Set a character's level - yours, or the one a player is playing (owner only)
-    ---
-    tags:
-      - Staff
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        schema:
-          type: object
-          required: [level]
-          properties:
-            slot:     {type: integer, example: 0, description: "Your own character (no username)"}
-            username: {type: string, description: "Somebody else: the character they are playing"}
-            level:    {type: integer, example: 22}
-    responses:
-      200:
-        description: The character's new level, XP and maxima
-      400:
-        description: Bad slot or level
-      401:
-        description: Missing, invalid or expired token
-      403:
-        description: A co-owner naming the owner
-      404:
-        description: Not the owner, no such account, or no character
-    """
-    # WHY THIS EXISTS. Day 2: tier 6 weapons that need level 22, and eight
-    # hours of play between a new character and level 22. The person who has
-    # to test them cannot, and the gold grant above is the precedent: the owner
-    # may set up his own server's test fixtures.
-    #
-    # OWNER ONLY. It was self only, like the gold grant, until 10 Oct (0.21.0):
-    # the owner, testing with first-time players who "want to try the new
-    # weapons", "i also need the ability to set a players level so they can try
-    # out the game". A `username` that is not your own is THE CHARACTER THEY ARE
-    # PLAYING, exactly as a give finds it (_playing_slot()), never a slot from
-    # the request; a snapshot first ("before-level"), so the save history can
-    # put it back; a "level" line about THEM; and their sessions ended, as a
-    # rollback ends them, because their game holds its own copy of the level
-    # and nothing short of a reload replaces it. A co-owner may name anyone but
-    # the owner (owner_may_touch()). Your own name, or none, is your own slot.
-    #
-    # A LEVEL SET IS A LEVEL-UP OR A LEVEL-DOWN, done the way the kill route
-    # does one: XP to zero and the curve's xp_to_next for the new level, the
-    # maxima derived from the level and what is worn, and the pools full. The
-    # refill is recorded as a level-up grant, so the healing check does not
-    # read the client's full bars as a cheat. Logged as "level", in the same
-    # transaction, like every staff action.
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-    db = get_db()
-
-    raw = payload.get("level")
-    if isinstance(raw, bool):
-        return bad_request("level must be a whole number")
-    try:
-        level = int(raw)
-    except (TypeError, ValueError):
-        return bad_request("level must be a whole number")
-    if level < 1 or level > STAFF_LEVEL_MAX:
-        return bad_request("level must be 1-%d" % STAFF_LEVEL_MAX)
-
-    target = None
-    wanted = str(payload.get("username", "") or "").strip()
-    if wanted and wanted.casefold() != str(g.user["username"]).casefold():
-        target = _user_by_name(wanted)
-        if target is None:
-            return {"error": "Not Found", "message": "No such account."}, 404
-        if not owner_may_touch(g.user, target):
-            return OWNER_UNTOUCHABLE
-        user_id = int(target["id"])
-        slot = _playing_slot(db, user_id)
-        if slot is None:
-            return {"error": "Not Found",
-                    "message": "%s has no character." % target["username"]}, 404
-    else:
-        slot = parse_slot(payload.get("slot"))
-        if slot is None:
-            return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-
-    row = db.execute("SELECT * FROM saves WHERE user_id = ? AND slot = ?",
-                     (user_id, slot)).fetchone()
-    if row is None:
-        return {"error": "Not Found",
-                "message": "No character in slot %d." % slot}, 404
-
-    if target is not None:
-        take_snapshot(db, user_id, slot, "before-level")
-    was = int(row["level"] or 1)
-    derived = _derived_stats(row, level=level)
-    if derived is None:
-        return bad_request("that character's class has no level curve")
-    xp_to_next = int(gamedata.xp_needed_for_level(level))
-
-    db.execute(
-        """
-        UPDATE saves
-           SET level = ?, xp = 0, xp_to_next = ?,
-               max_hp = ?, max_mana = ?, max_stamina = ?,
-               hp = ?, mana = ?, stamina = ?, updated_at = ?
-         WHERE user_id = ? AND slot = ?
-        """,
-        (level, xp_to_next,
-         derived["max_hp"], derived["max_mana"], derived["max_stamina"],
-         derived["max_hp"], derived["max_mana"], derived["max_stamina"],
-         int(time.time()), user_id, slot),
-    )
-    db.execute(
-        "INSERT INTO consume_grants (user_id, slot, item_id, target, amount, at) "
-        "VALUES (?, ?, ?, '', 0, ?)",
-        (user_id, slot, LEVELUP_GRANT_ID, int(time.time())),
-    )
-    if target is not None:
-        # THEIR GAME RELOADS, as after a rollback: counted first, like a kick.
-        now = int(time.time())
-        ended = int(db.execute(
-            "SELECT COUNT(*) AS n FROM sessions WHERE user_id = ? AND expires_at > ?",
-            (user_id, now)).fetchone()["n"] or 0)
-        db.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
-        name = row["name"] or row["class_id"]
-        # "player_level", not "level": done to a player, so it is on their
-        # record with the gives and rollbacks (STAFF_ACTION_GROUPS).
-        log_staff_action(
-            g.user, "player_level", target["username"], user_id,
-            "%s (slot %d): level %d -> %d; %d session(s) ended" % (name, slot, was, level, ended),
-        )
-        db.commit()
-        return {
-            "username": target["username"],
-            "character": name,
-            "slot": slot,
-            "level": level,
-            "was": was,
-            "xp_to_next": xp_to_next,
-            "max_hp": derived["max_hp"],
-            "sessions_ended": ended,
-        }, 200
-
-    log_staff_action(
-        g.user, "level", g.user["username"], g.user["id"],
-        "slot %d: level %d -> %d" % (slot, was, level),
-    )
-    db.commit()
-
-    return {
-        "slot": slot,
-        "level": level,
-        "was": was,
-        "xp": 0,
-        "xp_to_next": xp_to_next,
-        "max_hp": derived["max_hp"],
-        "max_mana": derived["max_mana"],
-        "max_stamina": derived["max_stamina"],
-        # What is stored now, so the client copies the server's pools rather
-        # than refilling its own.
-        "hp": derived["max_hp"],
-        "mana": derived["max_mana"],
-        "stamina": derived["max_stamina"],
-    }, 200
-
-
-# The skills the owner's skill tool sets, in the order the game lists them.
-# test_ownership.py holds it to VALID_SKILLS, so a seventh skill cannot be
-# added to the game and quietly left out of "all".
-STAFF_SKILL_ORDER = ("attack", "defense", "agility", "magic", "fishing", "cooking")
-
-
-@app.post("/api/staff/skill")
-@require_auth
-@require_owner
-@require_fresh_password
-def staff_skill():
-    """
-    Set your own character's skill levels, for testing (owner only)
-    ---
-    tags:
-      - Staff
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        schema:
-          type: object
-          required: [slot, skill, level]
-          properties:
-            slot:  {type: integer, example: 0}
-            skill: {type: string, example: "attack", description: 'One skill, or "all"'}
-            level: {type: integer, example: 50}
-    responses:
-      200:
-        description: Each skill set, with its new level, XP and next threshold
-      400:
-        description: Bad slot, skill or level
-      401:
-        description: Missing, invalid or expired token
-      404:
-        description: Not the owner, or no character in that slot
-    """
-    # WHY THIS EXISTS. The owner, 6 Oct: "i want full control of my stats in
-    # admin panel so i can do more testing". Skills train on hours of play -
-    # attack at the kill, the rest through /api/skill/train at a capped rate -
-    # so gear and recipes that need a skill level could not be tested without
-    # those hours. The level tool above is the precedent.
-    #
-    # OWNER ONLY, SELF ONLY, like the gold grant and the level tool: a slot, a
-    # skill and a level, applied to THE CALLER's character; a username in the
-    # payload is ignored.
-    #
-    # A SET, NOT A GRANT. The skill lands on the level asked for with no XP
-    # into it, up or down, the way the level tool sets a level. MAX_SKILL_LEVEL
-    # is the ceiling every server grant already observes. Logged as "skill", in
-    # the same transaction.
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-
-    slot = parse_slot(payload.get("slot"))
-    if slot is None:
-        return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-
-    skill = str(payload.get("skill", "")).strip().lower()
-    if skill == "all":
-        chosen = list(STAFF_SKILL_ORDER)
-    elif skill in VALID_SKILLS:
-        chosen = [skill]
-    else:
-        return bad_request("skill must be one of %s, or all"
-                           % ", ".join(STAFF_SKILL_ORDER))
-
-    raw = payload.get("level")
-    if isinstance(raw, bool):
-        return bad_request("level must be a whole number")
-    try:
-        level = int(raw)
-    except (TypeError, ValueError):
-        return bad_request("level must be a whole number")
-    if level < 1 or level > MAX_SKILL_LEVEL:
-        return bad_request("level must be 1-%d" % MAX_SKILL_LEVEL)
-
-    db = get_db()
-    if db.execute("SELECT 1 FROM saves WHERE user_id = ? AND slot = ?",
-                  (user_id, slot)).fetchone() is None:
-        return {"error": "Not Found",
-                "message": "No character in slot %d." % slot}, 404
-
-    before = {
-        row["skill_id"]: int(row["level"])
-        for row in db.execute("SELECT skill_id, level FROM skills"
-                              " WHERE user_id = ? AND slot = ?", (user_id, slot))
-    }
-    answer = {}
-    changes = []
-    for skill_id in chosen:
-        was = before.get(skill_id, 1)
-        db.execute(
-            """
-            INSERT INTO skills (user_id, slot, skill_id, level, xp)
-                 VALUES (?, ?, ?, ?, 0)
-            ON CONFLICT(user_id, slot, skill_id)
-              DO UPDATE SET level = excluded.level, xp = 0
-            """,
-            (user_id, slot, skill_id, level),
-        )
-        answer[skill_id] = {
-            "level": level,
-            "xp": 0,
-            "xp_next": int(gamedata.xp_needed_for_skill_level(skill_id, level)),
-            "was": was,
-        }
-        changes.append("%s %d -> %d" % (skill_id, was, level))
-
-    log_staff_action(
-        g.user, "skill", g.user["username"], g.user["id"],
-        "slot %d: %s" % (slot, ", ".join(changes)),
-    )
-    db.commit()
-
-    return {"slot": slot, "level": level, "skills": answer}, 200
-
-
-@app.post("/api/staff/grant")
-@require_auth
-@require_owner
-@require_fresh_password
-def staff_grant():
-    """
-    Give an item to yourself or to a player (owner only)
-    ---
-    tags:
-      - Staff
-    consumes:
-      - application/json
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [item_id]
-          properties:
-            slot: {type: integer, example: 0, description: "Your own character's slot. Needed unless username names somebody else."}
-            username: {type: string, example: someplayer, description: "Give it to this account instead, into the character it is playing. Your own name, or none, is yourself."}
-            item_id: {type: string, example: "petsniper"}
-            quantity: {type: integer, example: 1}
-            quality:
-              type: string
-              enum: [plain, roll, perfect]
-              description: "plain (the default) is the catalogue piece at 100%; roll rolls it like a drop or a purchase; perfect gives the Perfect roll. store is read as plain."
-    responses:
-      200:
-        description: "Your own: the backpack as stored, after the grant. Somebody else's: who, which character, what arrived and where."
-      400:
-        description: Bad slot, item id or quantity
-      404:
-        description: That slot is empty, no such account or it has no character, or you are not the owner
-      409:
-        description: The backpack it was going into is full
-      401:
-        description: Missing, invalid or expired token
-    """
-    # THE DEBUG KEYS, MOVED TO WHERE THEY CAN BE ENFORCED.
-    #
-    # F1-F7 and the P O I U Y T pet row used to add items to the client's own
-    # inventory, which then pushed the whole bag here on the next save. The rank
-    # check lived in the client - so a patched build that set Api.role to
-    # "owner" got the keys back, and could have skipped them entirely and just
-    # written the item into the array it was going to send anyway.
-    #
-    # Now the client asks and the SERVER decides. require_owner above is the real
-    # gate. Since game 0.7.1 the keys are gone altogether, and the GM panel's
-    # Give item and item catalogue are what call this.
-    #
-    # OWNER ONLY, NOT MOD AND UP (6 Oct 2026). It was require_role("mod"), and a
-    # mod could give themselves anything - a Perfect mythic, a stack of potions
-    # to sell - and trade it on. A rank is trust with PLAYERS; nothing about
-    # judging a chat report needs the power to create items, and "Item spawning
-    # is gated on the SERVER, not on a rank" in CLAUDE.md said where this was
-    # going. The two whole-write doors that leaned on this one being open (the
-    # bag in write_inventory() and the bank in write_bank()) closed with it, so
-    # the owner is now the only account that can make an item from nothing.
-    #
-    # TO SOMEBODY ELSE, SINCE 6 OCT 2026 (the owner: "give player item might be
-    # useful"). It said "SELF ONLY ... there should not be one until there is a
-    # reason": granting to someone else is a different action with different
-    # consequences. The reason came, and the consequences are what is below:
-    #
-    # - THE CHARACTER THEY ARE PLAYING (PLAYING_SLOT_SQL, the trade offer's
-    #   rule), never a slot the owner names - the panel knows a name, not
-    #   which of four characters is at the keyboard. Offline, their last save.
-    # - THEIR GAME IS TOLD. The bag is flagged (_mark_gift(), the trade flag's
-    #   column) and the broadcast poll hands the game the bag the server holds
-    #   and who gave what - the way a trade that finished without them watching
-    #   reaches them. Offline, they load the bag at login and read the line.
-    # - A SNAPSHOT FIRST ("before-give"), so the gift can be taken back with
-    #   the save history like any other change.
-    # - ITS OWN LINE IN THE LOG, "give", about THEM - on their record, where a
-    #   mod looking at them will see it, not filed under the owner's testing.
-    #
-    # Still owner only, and still no can_act_on(): the owner outranks everyone,
-    # and nobody else reaches this line.
-    payload = request.get_json(silent=True) or {}
-    user_id = g.user["id"]
-
-    target = None
-    wanted = str(payload.get("username", "") or "").strip()
-    if wanted and wanted.casefold() != str(g.user["username"]).casefold():
-        target = _user_by_name(wanted)
-        if target is None:
-            return {"error": "Not Found", "message": "No such account."}, 404
-        if not owner_may_touch(g.user, target):
-            return OWNER_UNTOUCHABLE
-        slot = _playing_slot(get_db(), int(target["id"]))
-        if slot is None:
-            return {"error": "Not Found",
-                    "message": "%s has no character to give it to." % target["username"]}, 404
-    else:
-        slot = parse_slot(payload.get("slot"))
-        if slot is None:
-            return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-        if not _slot_exists(user_id, slot):
-            return {"error": "Not Found", "message": "No character in slot %d." % slot}, 404
-
-    item_id = str(payload.get("item_id", "")).strip()
-    if not item_id or len(item_id) > 64:
-        return bad_request("item_id must be 1-64 characters")
-    # AN ID IS STILL NOT WHITELISTED, BUT A ROLL IS CHECKED. A grant of an
-    # unknown id stores it as typed (see "Item ids are not whitelisted" in
-    # CLAUDE.md); one that LOOKS like a roll and is not one - a stat the piece
-    # does not have, 300% - would be a piece every other route reads as nothing.
-    if gamedata.VARIANT_MARK in item_id and not gamedata.has_item(item_id):
-        return bad_request("'%s' is not a roll of any item" % item_id)
-
-    raw_quantity = payload.get("quantity", 1)
-    if isinstance(raw_quantity, bool):
-        return bad_request("quantity must be a positive integer")
-    try:
-        quantity = int(raw_quantity)
-    except (TypeError, ValueError):
-        return bad_request("quantity must be a positive integer")
-    if quantity <= 0:
-        return bad_request("quantity must be a positive integer")
-
-    # WHAT THE PIECE ROLLS. "plain" is the catalogue at 100%, the only way to
-    # have one now that the shop rolls what it sells; "roll" is what a kill or
-    # a purchase would hand over; "perfect" is the 1 in QUALITY_PERFECT_ODDS,
-    # so the owner can see one without granting a hundred - armour with its
-    # resistance at the top of its range, as a Perfect drop. "store" is read as
-    # "plain": it was the name for the 100% piece while the shop sold one, and
-    # the build-3 game that is out sends it. Only a plain id is rolled: an id
-    # that already names a roll is granted as named. Anything with no stats to
-    # roll is granted as it is.
-    quality = str(payload.get("quality", "plain") or "plain").strip().lower()
-    if quality == "store":
-        quality = "plain"
-    if quality not in ("plain", "roll", "perfect"):
-        return bad_request("quality must be plain, roll or perfect")
-    if quality != "plain" and gamedata.VARIANT_MARK not in item_id:
-        item_id = (gamedata.roll_quality(item_id) if quality == "roll"
-                   else gamedata.perfect_id(item_id, resist=True))
-
-    # The same ceiling an ordinary write gets. Staff is not a reason to be
-    # allowed to create a cell holding a billion potions - that is a corrupt
-    # row, not a privilege, and it would be this endpoint's fault.
-    limit = _stack_limit(item_id)
-    if quantity > limit:
-        return bad_request(
-            "quantity is %d, the most %s stacks to is %d" % (quantity, item_id, limit)
-        )
-
-    db = get_db()
-    if target is not None:
-        return _give_to_player(db, target, slot, item_id, quantity)
-
-    written = _add_to_backpack(user_id, slot, item_id, quantity)
-    if written is None:
-        return {
-            "error": "Conflict",
-            "message": "Your backpack is full (%d slots)." % INVENTORY_CAPACITY,
-        }, 409
-
-    # IN THE SAME TRANSACTION AS THE GRANT. An item that appears with no line in
-    # the log is exactly what this endpoint exists to prevent, and "log it
-    # afterwards" is how that happens the first time something raises in
-    # between.
-    log_staff_action(
-        g.user, "grant", g.user["username"], g.user["id"],
-        "%d x %s into slot %d" % (quantity, item_id, slot),
-    )
-    worth = _record_gift(db, g.user, user_id, g.user["username"], slot, item_id, quantity, "grant")
-    db.commit()
-
-    return {
-        "slot": slot,
-        "granted_item_id": item_id,
-        "granted_quantity": quantity,
-        "carry_positions": written,
-        "inventory": inventory_payload(user_id, slot),
-        # What it is worth (THE GIFTS LEDGER), so the panel can say it.
-        "worth": worth,
-    }, 200
-
-
-def _give_to_player(db, target, slot, item_id, quantity):
-    """
-    The half of POST /api/staff/grant that puts an item in somebody else's bag:
-    `target` is their users row, `slot` the character they are playing. A
-    snapshot first, then the item, the flag their game reads, and the log line,
-    in one transaction. See TO SOMEBODY ELSE in staff_grant().
-    """
-    receiver = int(target["id"])
-    take_snapshot(db, receiver, slot, "before-give")
-    written = _add_to_backpack(receiver, slot, item_id, quantity)
-    if written is None:
-        db.rollback()
-        return {
-            "error": "Conflict",
-            "message": "%s's backpack is full (%d slots)." % (target["username"], INVENTORY_CAPACITY),
-        }, 409
-
-    _mark_gift(db, receiver, slot, g.user["username"], item_id, quantity)
-    character = db.execute("SELECT name, class_id FROM saves WHERE user_id = ? AND slot = ?",
-                           (receiver, slot)).fetchone()
-    name = (character["name"] or character["class_id"]) if character is not None else "?"
-    log_staff_action(
-        g.user, "give", target["username"], receiver,
-        "%d x %s into %s (slot %d)" % (quantity, item_id, name, slot),
-    )
-    worth = _record_gift(db, g.user, receiver, target["username"], slot, item_id, quantity, "give")
-    db.commit()
-
-    now = int(time.time())
-    online = db.execute(
-        "SELECT 1 FROM sessions WHERE user_id = ? AND last_seen_at > ? AND expires_at > ? LIMIT 1",
-        (receiver, now - ONLINE_WINDOW_SECONDS, now),
-    ).fetchone() is not None
-    return {
-        "username": target["username"],
-        "slot": slot,
-        "character": name,
-        "granted_item_id": item_id,
-        "granted_quantity": quantity,
-        "carry_positions": written,
-        # So the panel can say WHEN they will see it: within a poll, or at
-        # their next login.
-        "online": online,
-        # And what it is worth (THE GIFTS LEDGER): 999 Piles of Gold is
-        # 24,975,000 gold, which nobody should find out from the ledger.
-        "worth": worth,
-    }, 200
+# =============================================================================
+# THE OWNER'S TOOLS - the ownertools/ package (since 19 Oct)
+# =============================================================================
+# Gold, a level, a skill and an item for testing or for a player, the gifts
+# report, the save history and the rollback, and moving players: nine routes,
+# registered further down (after the trade routes), once everything they are
+# handed exists. What the poll, the save route and the boot backfill share
+# with them stays here: the gift's flag, the gifts ledger's writers, taking a
+# snapshot, the teleport queue.
 
 
 # A GIFT RIDES THE TRADE FLAG. saves.resync_trade is "this character's game is
@@ -8774,12 +6861,13 @@ def _mark_gift(db, user_id, slot, by, item_id, quantity):
 # accounted for if i ever ask how much did i inflate my server".
 #
 # EVERY GIFT IS A ROW in owner_gifts, written in the same transaction as the
-# gift: a give to a player (_give_to_player), a grant to the owner himself
-# (staff_grant) and the owner's own gold (staff_gold, bank or purse; taking
-# some back is a negative row). Since 0.21.0 a co-owner's gifts too, with his
-# name as the giver (`actor_name`): "to yourself" is a giver to his own
-# account, and the report says who gave what (`by_giver`). What it was worth is worked out then
-# (gift_worth()) and kept, so a price changed later does not rewrite history:
+# gift: a give to a player, a grant to the owner himself (staff_grant) and the
+# owner's own gold (staff_gold, bank or purse; taking some back is a negative
+# row) - the routes are ownertools/'s, the writers below. Since 0.21.0 a
+# co-owner's gifts too, with his name as the giver (`actor_name`): "to
+# yourself" is a giver to his own account, and the report says who gave what
+# (`by_giver`). What it was worth is worked out then (gift_worth()) and kept,
+# so a price changed later does not rewrite history:
 #
 #     kind "gold"     coins and piles, at what using them pays (gold_item_value),
 #                     and gold given straight; "gold" is that amount
@@ -8799,8 +6887,8 @@ def _mark_gift(db, user_id, slot, by, item_id, quantity):
 # today would answer "how much have I given" with "nothing yet" (CLAUDE.md, "A
 # counter added by migration starts at zero").
 #
-# READ by GET /api/staff/gifts (gift_report(), owner only) and by giftwatch.py
-# on the server. test_gifts.py.
+# READ by GET /api/staff/gifts (ownertools/'s gift_report(), owner only) and by
+# giftwatch.py on the server. test_gifts.py.
 
 OWNER_GIFTS_SINCE_KEY = "owner_gifts_since"
 # Whose prices "sells_for" is: the one shop there is.
@@ -8862,122 +6950,6 @@ def _record_gold_gift(db, actor, receiver_id, receiver_name, slot, amount, sourc
     )
 
 
-def _gift_sums(db, where="", params=()):
-    row = db.execute(
-        "SELECT COUNT(*), COALESCE(SUM(gold), 0), COALESCE(SUM(lusions), 0),"
-        " COALESCE(SUM(value), 0), COALESCE(SUM(sells_for), 0), MIN(at), MAX(at)"
-        " FROM owner_gifts" + where, params).fetchone()
-    return {"gifts": int(row[0]), "gold": int(row[1]), "lusions": int(row[2]),
-            "item_value": int(row[3]), "item_sells_for": int(row[4]),
-            "first_at": int(row[5]) if row[5] is not None else None,
-            "last_at": int(row[6]) if row[6] is not None else None}
-
-
-def gift_report(db, user_id=None, recent=20):
-    """What the owner - and a co-owner - has given away and what it comes to,
-    for the route and the tests. `user_id` narrows it to one receiver."""
-    one = " WHERE user_id = ?" if user_id is not None else ""
-    params = (user_id,) if user_id is not None else ()
-    joiner = " AND " if one else " WHERE "
-    report = {
-        "totals": _gift_sums(db, one, params),
-        "to_players": _gift_sums(db, one + joiner + "(actor_id IS NULL OR user_id IS NOT actor_id)", params),
-        "to_yourself": _gift_sums(db, one + joiner + "user_id IS actor_id", params),
-    }
-    report["by_player"] = [
-        {"username": r[0], "gifts": int(r[1]), "gold": int(r[2]), "lusions": int(r[3]),
-         "item_value": int(r[4]), "item_sells_for": int(r[5]), "last_at": int(r[6])}
-        for r in db.execute(
-            "SELECT username, COUNT(*), SUM(gold), SUM(lusions), SUM(value), SUM(sells_for), MAX(at)"
-            " FROM owner_gifts" + one + " GROUP BY COALESCE(user_id, -1), username"
-            " ORDER BY SUM(gold) DESC, SUM(value) DESC, username LIMIT 50", params)
-    ]
-    # WHO GAVE IT (0.21.0): the owner, and a co-owner while the switch is on.
-    report["by_giver"] = [
-        {"username": r[0], "gifts": int(r[1]), "gold": int(r[2]), "lusions": int(r[3]),
-         "item_value": int(r[4]), "item_sells_for": int(r[5]), "last_at": int(r[6])}
-        for r in db.execute(
-            "SELECT actor_name, COUNT(*), SUM(gold), SUM(lusions), SUM(value), SUM(sells_for), MAX(at)"
-            " FROM owner_gifts" + one + " GROUP BY COALESCE(actor_id, -1), actor_name"
-            " ORDER BY SUM(gold) DESC, SUM(value) DESC, actor_name LIMIT 20", params)
-    ]
-    report["by_item"] = [
-        {"item_id": r[0], "kind": r[1], "quantity": int(r[2]), "gold": int(r[3]),
-         "lusions": int(r[4]), "item_value": int(r[5])}
-        for r in db.execute(
-            "SELECT item_id, kind, SUM(quantity), SUM(gold), SUM(lusions), SUM(value)"
-            " FROM owner_gifts" + one + " GROUP BY item_id, kind"
-            " ORDER BY SUM(gold) + SUM(value) + SUM(lusions) DESC LIMIT 15", params)
-    ]
-    report["recent"] = [
-        {"at": int(r[0]), "by": r[1], "username": r[2], "kind": r[3], "item_id": r[4],
-         "quantity": int(r[5]), "gold": int(r[6]), "lusions": int(r[7]), "item_value": int(r[8]),
-         "source": r[9]}
-        for r in db.execute(
-            "SELECT at, actor_name, username, kind, item_id, quantity, gold, lusions, value, source"
-            # BY WHEN, not by id: the gifts read back from the logs were written
-            # in one go at start-up, staff log first and gold ledger after.
-            " FROM owner_gifts" + one + " ORDER BY at DESC, id DESC LIMIT ?", params + (int(recent),))
-    ]
-    # THE ECONOMY NOW, to set it beside: every gold in a purse or a bank, and
-    # every gold the ledger says was ever made (gifts used, loot, sales).
-    purses = db.execute("SELECT COALESCE(SUM(gold), 0) FROM saves").fetchone()[0]
-    banks = db.execute("SELECT COALESCE(SUM(bank_gold), 0), COALESCE(SUM(lusions), 0) FROM accounts").fetchone()
-    made = db.execute("SELECT COALESCE(SUM(delta), 0) FROM gold_ledger WHERE delta > 0").fetchone()[0]
-    gold_now = int(purses) + int(banks[0])
-    report["economy"] = {"gold_now": gold_now, "lusions_now": int(banks[1]), "gold_ever_made": int(made)}
-    report["share_of_gold_now"] = (round(report["totals"]["gold"] / gold_now, 4) if gold_now > 0 else None)
-    since = db.execute("SELECT value FROM server_settings WHERE key = ?", (OWNER_GIFTS_SINCE_KEY,)).fetchone()
-    report["ledger_since"] = int(since[0]) if since is not None and str(since[0]).isdigit() else None
-    return report
-
-
-@app.get("/api/staff/gifts")
-@require_auth
-@require_owner
-def staff_gifts():
-    """
-    What the owner and the co-owners have given away, and what it comes to
-    ---
-    tags:
-      - Staff
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: query
-        name: username
-        type: string
-        description: Only what this account was given
-      - in: query
-        name: recent
-        type: integer
-        description: How many of the newest gifts to list (1-100, default 20)
-    responses:
-      200:
-        description: Totals, to players and to yourself, by player, by item, the newest, and the economy beside them
-      404:
-        description: Not the owner, or no such account
-    """
-    db = get_db()
-    user_id = None
-    wanted = str(request.args.get("username", "") or "").strip()
-    if wanted:
-        target = _user_by_name(wanted)
-        if target is None:
-            return {"error": "Not Found", "message": "No such account."}, 404
-        user_id = int(target["id"])
-    try:
-        recent = min(100, max(1, int(request.args.get("recent", 20))))
-    except (TypeError, ValueError):
-        recent = 20
-    report = gift_report(db, user_id, recent)
-    report["username"] = wanted or None
-    return report, 200
-
-
 # =============================================================================
 # SAVE SNAPSHOTS AND ROLLBACK
 # =============================================================================
@@ -8985,7 +6957,9 @@ def staff_gifts():
 # The owner, 6 Oct: "roll back ... might be useful" - a player who lost a
 # stack to a bug, a dupe to undo, a gift given to the wrong name. The server
 # keeps each character as it was, a few times over, and one owner-only route
-# puts one back.
+# puts one back. The two routes - the history and the rollback - are
+# ownertools/'s since 19 Oct; taking a snapshot, and what one holds, stay here,
+# because the save route takes them too.
 #
 # WHAT A SNAPSHOT HOLDS: everything about one character a mistake can change -
 # level, xp, the purse, what is worn, the pet that is out, every carried cell
@@ -9024,8 +6998,6 @@ def staff_gifts():
 # owner rolling back their own character is signed out the same way.
 SNAPSHOT_EVERY_SECONDS = 600
 SNAPSHOTS_KEPT = 20
-SNAPSHOT_REASONS = ("save", "before-give", "before-rollback", "before-level")
-ROLLBACK_REASON = "staff_rollback"
 
 
 def _character_state(db, user_id, slot):
@@ -9102,446 +7074,6 @@ def take_snapshot(db, user_id, slot, reason):
         (user_id, slot, user_id, slot, SNAPSHOTS_KEPT),
     )
     return int(cursor.lastrowid)
-
-
-def _snapshot_row(row):
-    """One snapshot as the save history lists it - never the JSON itself."""
-    return {
-        "id": int(row["id"]),
-        "taken_at": int(row["taken_at"]),
-        "reason": row["reason"],
-        "level": int(row["level"]),
-        "gold": int(row["gold"]),
-        "items": int(row["items"]),
-    }
-
-
-def _rollback_target(username):
-    """The account named, or (None, 404). The owner may name anyone, themselves
-    included; a co-owner anyone but the owner (owner_may_touch()); a name that
-    is not an account is the same 404 as any refusal."""
-    username = str(username or "").strip()
-    if not username:
-        return None, bad_request("username is required")
-    target = _user_by_name(username)
-    if target is None:
-        return None, ({"error": "Not Found", "message": "No such account."}, 404)
-    if not owner_may_touch(g.user, target):
-        return None, OWNER_UNTOUCHABLE
-    return target, None
-
-
-@app.get("/api/staff/snapshots")
-@require_auth
-@require_owner
-def staff_snapshots():
-    """
-    Read a player's save history (owner only)
-    ---
-    tags:
-      - Staff
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: query
-        name: username
-        type: string
-        required: true
-      - in: query
-        name: slot
-        type: integer
-        description: "Which character. Left out, the one they are playing."
-    responses:
-      200:
-        description: Their characters, the chosen one as it is now, and its snapshots newest first
-      400:
-        description: No username, or a bad slot
-      404:
-        description: No such account, no character there, or you are not the owner
-      401:
-        description: Missing, invalid or expired token
-    """
-    # A READ, SO NOT LOGGED. Looking is not an action on the player; the
-    # rollback it may lead to is, and that is logged with what it changed.
-    target, refusal = _rollback_target(request.args.get("username"))
-    if refusal is not None:
-        return refusal
-    db = get_db()
-    user_id = int(target["id"])
-
-    characters = [
-        {"slot": int(r["slot"]), "name": r["name"], "class_id": r["class_id"],
-         "level": int(r["level"] or 1)}
-        for r in db.execute("SELECT slot, name, class_id, level FROM saves"
-                            " WHERE user_id = ? ORDER BY slot", (user_id,))
-    ]
-    if not characters:
-        return {"error": "Not Found",
-                "message": "%s has no characters." % target["username"]}, 404
-
-    raw_slot = request.args.get("slot")
-    if raw_slot is None or str(raw_slot).strip() == "":
-        slot = _playing_slot(db, user_id)
-    else:
-        slot = parse_slot(raw_slot)
-        if slot is None:
-            return bad_request("slot must be an integer 0-%d" % MAX_SLOT)
-    now = _character_state(db, user_id, slot) if slot is not None else None
-    if now is None:
-        return {"error": "Not Found", "message": "No character in slot %s." % raw_slot}, 404
-
-    snapshots = [_snapshot_row(r) for r in db.execute(
-        "SELECT id, taken_at, reason, level, gold, items FROM save_snapshots"
-        " WHERE user_id = ? AND slot = ? ORDER BY taken_at DESC, id DESC",
-        (user_id, slot))]
-    return {
-        "username": target["username"],
-        "slot": slot,
-        "playing": _playing_slot(db, user_id),
-        "characters": characters,
-        "now": {"name": now["name"], "class_id": now["class_id"], "level": now["level"],
-                "gold": now["gold"], "items": len(now["carry"])},
-        "snapshots": snapshots,
-        "kept": SNAPSHOTS_KEPT,
-        "every_seconds": SNAPSHOT_EVERY_SECONDS,
-    }, 200
-
-
-@app.post("/api/staff/rollback")
-@require_auth
-@require_owner
-@require_fresh_password
-def staff_rollback():
-    """
-    Put a player's character back to a snapshot (owner only)
-    ---
-    tags:
-      - Staff
-    consumes:
-      - application/json
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-        description: "Bearer <token>"
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [username, snapshot_id]
-          properties:
-            username:    {type: string, example: someplayer}
-            snapshot_id: {type: integer, example: 42, description: "From GET /api/staff/snapshots"}
-    responses:
-      200:
-        description: "Restored: what it was and is now, the snapshot that undoes it, and how many sessions ended"
-      400:
-        description: No username, or a snapshot_id that is not a whole number
-      404:
-        description: No such account, no such snapshot of theirs, the character is gone, or you are not the owner
-      409:
-        description: The character is in an open trade, or its slot now holds another class
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-    target, refusal = _rollback_target(payload.get("username"))
-    if refusal is not None:
-        return refusal
-    raw_id = payload.get("snapshot_id")
-    if isinstance(raw_id, bool):
-        return bad_request("snapshot_id must be a whole number")
-    try:
-        snapshot_id = int(raw_id)
-    except (TypeError, ValueError):
-        return bad_request("snapshot_id must be a whole number")
-    if isinstance(raw_id, float) and raw_id != snapshot_id:
-        return bad_request("snapshot_id must be a whole number")
-
-    db = get_db()
-    user_id = int(target["id"])
-    # BY ID AND ACCOUNT TOGETHER: the name in the request and the snapshot have
-    # to agree, so a stale panel holding somebody else's id cannot roll the
-    # wrong player back.
-    snap = db.execute(
-        "SELECT * FROM save_snapshots WHERE id = ? AND user_id = ?",
-        (snapshot_id, user_id)).fetchone()
-    if snap is None:
-        return {"error": "Not Found", "message": "No such snapshot of %s." % target["username"]}, 404
-    slot = int(snap["slot"])
-    state = _stored_json(snap["snapshot"], {})
-    row = db.execute("SELECT * FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone()
-    if row is None:
-        return {"error": "Not Found", "message": "That character no longer exists."}, 404
-    # A SLOT IS A CLASS (one per class), so this only fails if the character
-    # was deleted and made again since - and the delete takes the snapshots
-    # with it. Checked anyway: a warrior's bag and skills on a mage is not a
-    # state anything in this file expects.
-    if state.get("class_id") != row["class_id"]:
-        return {"error": "Conflict",
-                "message": "That snapshot is of a %s; the slot holds a %s now." % (
-                    state.get("class_id", "?"), row["class_id"])}, 409
-    # NOT IN THE MIDDLE OF A TRADE - the delete route's rule, for its reason:
-    # an open trade names items in this bag, and a rollback changes the bag
-    # under it. It ends on its own at TRADE_EXPIRY_SECONDS.
-    trade = _trade_find_open(db, user_id)
-    if trade is not None and (
-            (trade["a_user"] == user_id and trade["a_slot"] == slot)
-            or (trade["b_user"] == user_id and trade["b_slot"] == slot)):
-        return {"error": "Conflict",
-                "message": "%s is in a trade. Try again when it has finished or timed out." % (
-                    target["username"])}, 409
-
-    # ---- everything above this line is validation; everything below commits --
-
-    was = _character_state(db, user_id, slot)
-    undo = take_snapshot(db, user_id, slot, "before-rollback")
-    now = int(time.time())
-
-    db.execute("DELETE FROM carry_items WHERE user_id = ? AND slot = ?", (user_id, slot))
-    carry = [(user_id, slot, int(c[0]), str(c[1]), int(c[2]))
-             for c in state.get("carry", [])
-             if isinstance(c, list) and len(c) == 3 and 0 <= int(c[0]) < CARRY_CAPACITY]
-    if carry:
-        db.executemany("INSERT INTO carry_items (user_id, slot, position, item_id, quantity)"
-                       " VALUES (?, ?, ?, ?, ?)", carry)
-    db.execute("DELETE FROM skills WHERE user_id = ? AND slot = ?", (user_id, slot))
-    skills = [(user_id, slot, str(s[0]), max(1, int(s[1])), max(0, int(s[2])))
-              for s in state.get("skills", []) if isinstance(s, list) and len(s) == 3]
-    if skills:
-        db.executemany("INSERT INTO skills (user_id, slot, skill_id, level, xp)"
-                       " VALUES (?, ?, ?, ?, ?)", skills)
-
-    # THE PURSE THROUGH THE LEDGER, by the difference, never written outright.
-    gold_now = int(row["gold"] or 0)
-    gold_then = max(0, int(state.get("gold", 0)))
-    if gold_then != gold_now:
-        gold_delta(db, user_id, slot, gold_then - gold_now, ROLLBACK_REASON,
-                   "rollback to snapshot #%d by %s" % (snapshot_id, g.user["username"]))
-
-    # THE PET ONLY IF IT IS STILL HELD - the save route's rule. It may have
-    # been in this bag then and in nobody's now.
-    pet = str(state.get("active_pet_id", "") or "")
-    if pet and not _owns_item(user_id, slot, pet):
-        pet = ""
-    equipment = state.get("equipment", {}) if isinstance(state.get("equipment"), dict) else {}
-    level = max(1, int(state.get("level", 1)))
-    db.execute(
-        "UPDATE saves SET level = ?, xp = ?, xp_to_next = ?, equipment = ?, active_pet_id = ?,"
-        " resync_trade = NULL, updated_at = ? WHERE user_id = ? AND slot = ?",
-        (level, max(0, int(state.get("xp", 0))),
-         int(gamedata.xp_needed_for_level(level)),
-         json.dumps(equipment), pet, now, user_id, slot),
-    )
-    # THE MAXIMA FOLLOW THE OLD LEVEL AND GEAR; THE POOLS ONLY COME DOWN.
-    stored = db.execute("SELECT class_id, level, equipment FROM saves WHERE user_id = ? AND slot = ?",
-                        (user_id, slot)).fetchone()
-    derived = _derived_stats(stored)
-    if derived is not None:
-        db.execute(
-            "UPDATE saves SET max_hp = ?, max_mana = ?, max_stamina = ?,"
-            " hp = MIN(hp, ?), mana = MIN(mana, ?), stamina = MIN(stamina, ?), pools_at = ?"
-            " WHERE user_id = ? AND slot = ?",
-            (derived["max_hp"], derived["max_mana"], derived["max_stamina"],
-             derived["max_hp"], derived["max_mana"], derived["max_stamina"], now,
-             user_id, slot),
-        )
-
-    # THEIR GAME RELOADS - see the section header. Counted first, like a kick,
-    # because "were they playing" is the useful number.
-    ended = int(db.execute(
-        "SELECT COUNT(*) AS n FROM sessions WHERE user_id = ? AND expires_at > ?",
-        (user_id, now)).fetchone()["n"] or 0)
-    db.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
-
-    after = _character_state(db, user_id, slot)
-    log_staff_action(
-        g.user, "rollback", target["username"], user_id,
-        "%s (slot %d) to snapshot #%d of %s UTC: level %d -> %d, gold %d -> %d, %d -> %d"
-        " carried; undo is #%s; %d session(s) ended" % (
-            row["name"], slot, snapshot_id,
-            time.strftime("%Y-%m-%d %H:%M", time.gmtime(int(snap["taken_at"]))),
-            was["level"], after["level"], was["gold"], after["gold"],
-            len(was["carry"]), len(after["carry"]),
-            undo if undo is not None else "-", ended),
-    )
-    db.commit()
-
-    return {
-        "username": target["username"],
-        "slot": slot,
-        "character": row["name"],
-        "restored": snapshot_id,
-        "taken_at": int(snap["taken_at"]),
-        "undo_snapshot": undo,
-        "was": {"level": was["level"], "gold": was["gold"], "items": len(was["carry"])},
-        "now": {"level": after["level"], "gold": after["gold"], "items": len(after["carry"])},
-        "pet_cleared": bool(state.get("active_pet_id")) and pet == "",
-        "sessions_ended": ended,
-    }, 200
-
-
-@app.post("/api/staff/teleport")
-@require_auth
-@require_role("dev")
-def staff_teleport():
-    """
-    Move a player, or everyone, to a place
-    ---
-    tags:
-      - Moderation
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          properties:
-            username: {type: string, description: "who to move; omit when everyone is true"}
-            everyone: {type: boolean, description: "move every account - owner only"}
-            area:     {type: string, description: "destination area; defaults to yours"}
-            x:        {type: number}
-            y:        {type: number}
-    responses:
-      200:
-        description: How many moves were queued, and where
-      400:
-        description: Neither a username nor everyone
-      403:
-        description: Only the owner may move everyone
-      404:
-        description: No such account, one you may not act on, or not staff
-      401:
-        description: Missing, invalid or expired token
-    """
-    payload = request.get_json(silent=True) or {}
-    everyone = bool(payload.get("everyone", False))
-
-    db = get_db()
-    now = int(time.time())
-
-    # WHERE. Defaults to the caller's own area, because "come here" is the
-    # thing a dev wants nine times out of ten and typing your own location is
-    # a step with nothing to gain.
-    #
-    # THE AREA OF THE CHARACTER BEING PLAYED. This read `LIMIT 1` with no
-    # ORDER BY, which is whichever save SQLite happened to return first - not
-    # even the latest - so "bring everyone to me" could send them to where an
-    # alt was parked.
-    area = str(payload.get("area", "") or _playing_area(db, g.user["id"]) or "elusion").strip()
-    if area == "":
-        area = "elusion"
-
-    try:
-        x = float(payload.get("x", 0) or 0)
-        y = float(payload.get("y", 0) or 0)
-    except (TypeError, ValueError):
-        return bad_request("x and y must be numbers")
-
-    # ---------------------------------------------------------------- everyone
-    if everyone:
-        # MOVING THE WHOLE SERVER IS AN OWNER'S ACT. A dev may reach for one
-        # player; emptying the world into one spot is the kind of thing that
-        # wants the narrowest rank in the game behind it.
-        if not has_owner_powers(g.user["username"]):
-            return {
-                "error": "Forbidden",
-                "message": "Only the owner or a co-owner may teleport everyone.",
-            }, 403
-
-        rows = db.execute("SELECT id, username FROM users ORDER BY id").fetchall()
-        total = len(rows)
-        for slot, row in enumerate(rows):
-            queue_teleport(db, row["id"], area, x, y, slot, total, g.user["username"], now)
-
-        log_staff_action(g.user, "teleport", "everyone", None,
-                         "%d players -> %s (%.0f, %.0f)" % (total, area, x, y))
-        post_broadcast("Everyone has been moved to %s." % area, "system", g.user["username"])
-        db.commit()
-
-        return {
-            "moved": total, "area": area, "x": x, "y": y,
-            "everyone": True, "spacing": TELEPORT_SPACING,
-        }, 200
-
-    # ------------------------------------------------------------ one player
-    username = str(payload.get("username", "")).strip()
-    if username == "":
-        return bad_request('send {"username": "..."} or {"everyone": true}')
-
-    # can_act_on via the same helper every sanction uses, so a mod cannot move
-    # somebody who outranks them and nobody can move the owner.
-    target, refusal = _moderation_target({"username": username})
-    if refusal is not None:
-        return refusal
-
-    queue_teleport(db, target["id"], area, x, y, 0, 1, g.user["username"], now)
-    log_staff_action(g.user, "teleport", target["username"], target["id"],
-                     "-> %s (%.0f, %.0f)" % (area, x, y))
-    db.commit()
-
-    return {
-        "moved": 1, "username": target["username"], "area": area,
-        "x": x, "y": y, "everyone": False,
-    }, 200
-
-
-@app.post("/api/teleport/ack")
-@require_auth
-def acknowledge_teleport():
-    """
-    Confirm a pending teleport was carried out
-    ---
-    tags:
-      - Status
-    parameters:
-      - in: header
-        name: Authorization
-        type: string
-        required: true
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required: [id]
-          properties:
-            id: {type: integer, description: "the id the poll handed you"}
-    responses:
-      200:
-        description: Cleared, or already gone
-      401:
-        description: Missing, invalid or expired token
-    """
-    # THE CLIENT CLEARS IT, NOT THE SERVER ON DELIVERY. A teleport removed the
-    # moment it was handed out is a teleport lost if the client never applied
-    # it - the window closed, the game crashed, the player alt-tabbed into a
-    # scene change. It stays queued until somebody says they actually moved.
-    #
-    # Matched on id so a stale ack cannot clear a NEWER teleport issued in the
-    # meantime, which would strand the player where they were sent from.
-    payload = request.get_json(silent=True) or {}
-    try:
-        teleport_id = int(payload.get("id", 0))
-    except (TypeError, ValueError):
-        return bad_request("id must be a whole number")
-
-    db = get_db()
-    cursor = db.execute(
-        "DELETE FROM pending_teleports WHERE user_id = ? AND id = ?",
-        (g.user["id"], teleport_id),
-    )
-    db.commit()
-    return {"cleared": cursor.rowcount > 0}, 200
 
 
 def _days_words(minutes):
@@ -10715,6 +8247,73 @@ trade_package.register(
     staff_page=(STAFF_PAGE_DEFAULT, STAFF_PAGE_MAX),
     catalogue=gamedata,
 )
+
+# =============================================================================
+# THE OWNER'S TOOLS, REGISTERED - the ownertools/ package (see above)
+# =============================================================================
+# Here rather than at their old place because of what they are handed: the
+# carry's grants, the skills, which character is played and the open trade
+# are all defined above this line and after that one.
+import ownertools as ownertools_package  # noqa: E402
+
+ownertools_package.register(
+    app,
+    require_auth=require_auth,
+    require_owner=require_owner,
+    require_role=require_role,
+    require_fresh_password=require_fresh_password,
+    get_db=get_db,
+    bad_request=bad_request,
+    parse_slot=parse_slot,
+    max_slot=MAX_SLOT,
+    slot_exists=_slot_exists,
+    catalogue=gamedata,
+    # A LOOKUP: test_concurrency.py holds this module's _ensure_account open.
+    ensure_account=lambda user_id: _ensure_account(user_id),
+    gold_delta=gold_delta,
+    bank_gold_delta=bank_gold_delta,
+    insufficient_gold=InsufficientGold,
+    record_gift=_record_gift,
+    record_gold_gift=_record_gold_gift,
+    find_user=_user_by_name,
+    owner_may_touch=owner_may_touch,
+    owner_untouchable=OWNER_UNTOUCHABLE,
+    playing_slot=_playing_slot,
+    playing_area=_playing_area,
+    take_snapshot=take_snapshot,
+    character_state=_character_state,
+    stored_json=_stored_json,
+    derived_stats=_derived_stats,
+    levelup_grant_id=LEVELUP_GRANT_ID,
+    log_staff_action=log_staff_action,
+    valid_skills=VALID_SKILLS,
+    max_skill_level=MAX_SKILL_LEVEL,
+    stack_limit=_stack_limit,
+    add_to_backpack=_add_to_backpack,
+    bag_cells=INVENTORY_CAPACITY,
+    inventory_of=inventory_payload,
+    mark_gift=_mark_gift,
+    online_window=ONLINE_WINDOW_SECONDS,
+    gifts_since_key=OWNER_GIFTS_SINCE_KEY,
+    snapshots_kept=SNAPSHOTS_KEPT,
+    snapshot_every=SNAPSHOT_EVERY_SECONDS,
+    find_open_trade=_trade_find_open,
+    carry_cells=CARRY_CAPACITY,
+    owns_item=_owns_item,
+    has_owner_powers=has_owner_powers,
+    queue_teleport=queue_teleport,
+    teleport_spacing=TELEPORT_SPACING,
+    post_broadcast=post_broadcast,
+    moderation_target=_moderation_target,
+)
+
+# Named here as well, for the suites that read them off this module;
+# ownertools/services.py is where they are set.
+DEBUG_GOLD_MAX = ownertools_package.DEBUG_GOLD_MAX
+STAFF_LEVEL_MAX = ownertools_package.STAFF_LEVEL_MAX
+STAFF_SKILL_ORDER = ownertools_package.STAFF_SKILL_ORDER
+ROLLBACK_REASON = ownertools_package.ROLLBACK_REASON
+
 
 # =============================================================================
 # WHO IS AROUND - the players/ package (since 18 Oct)

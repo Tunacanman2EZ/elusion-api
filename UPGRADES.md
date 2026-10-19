@@ -33,6 +33,30 @@ go at the end of **Open**.
   into its package (ARCHITECTURE.md step 11), where the order of creation is
   checked once.
 
+### 10. Four packages write a refill's note the same way
+
+- **Where:** consuming/data.py, death/data.py, kill/data.py and
+  ownertools/data.py each have their own `INSERT INTO consume_grants`: a
+  potion's grant, a revive's and a respawn's, a level-up's.
+- **Why it matters:** the healing check (status/) reads those rows to tell an
+  earned refill from a claimed one, so they must agree on the shape. Today
+  they do, and test_healing drives all of them; a column added to
+  consume_grants would have to be added in four places.
+- **Fix:** small - status/ hands back one `note_refill()` from register(), and
+  the four are handed it. Worth doing with the table batch (step 12), when
+  consume_grants' CREATE moves to its owner anyway.
+
+### 11. giftwatch.py keeps its own copy of the gifts report's SQL
+
+- **Where:** giftwatch.py, beside ownertools/data.py's `gift_report()`.
+- **What it is:** it was copied because importing it meant importing app.py,
+  whose start-up writes. It is a package's now, and importing that runs
+  nothing. test_gifts.py GL-8 holds the two copies to the same numbers.
+- **Fix:** small - giftwatch prints what `ownertools.data.gift_report()`
+  answers instead of summing it again itself (its own sums and the route's
+  report are shaped differently, so its printing changes too); GL-8 already
+  checks the numbers it prints, and would hold the change.
+
 ## Done
 
 ### 1. The API docs page was blank - fixed 18 Oct
@@ -149,3 +173,21 @@ and handed to kill/ through app.py, which keeps the old name. The bare-app
 run makes a kill's bag with it, and checks that nothing dropped makes no bag
 and a roll past nine cells is cut and committed; three sabotages in it each
 fail a check.
+
+### Found and fixed with the last three moves, 19 Oct
+
+- **`SNAPSHOT_REASONS`** in app.py was defined and read by nothing. Removed.
+- **The comment that explains the recovery answer** ("the one answer
+  /api/auth/recover ever gives") sat above `needs_recovery_email()`, a
+  different thing. It is above `RECOVER_GENERIC_MESSAGE` now.
+- **test_refusals' "the server still uses 403" read app.py alone**, and the
+  password confirm's 403 moved to auth/. It reads the packages too now, and
+  counts code rather than comments.
+- **Nothing proved the mail was handed in as a lookup.** The suites replace
+  send_mail and send_mail_async with the same recorder, so a route handed the
+  real send_mail_async once still landed in it - through the real one's own
+  lookup of send_mail. test_accounts A-6 replaces only send_mail_async now:
+  an address confirmed and a reset asked for must both reach it. Handing
+  either package the real one by value fails it.
+- **CLAUDE.md named `_give_to_player()`** in three places; it is ownertools/'s
+  `give_to_player()`, and `gift_report()` is ownertools/data.py's.

@@ -19,7 +19,7 @@ section below holds one of them:
        new player for a recovery address, answered "check that inbox", and sent
        nothing - and the login screen does not let anyone past that prompt.
 """
-import importlib.util, os, sqlite3, sys, time
+import importlib.util, os, re, sqlite3, sys, time
 import hashlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -304,6 +304,38 @@ check("reopening the game stores the new token as a hash too",
 client.post("/api/auth/logout", headers=bearer(resumed))
 check("and logging out removes the row it hashed to",
       raw("SELECT COUNT(*) FROM sessions WHERE user_id = ?", (uid("leakproof"),))[0][0] == 0)
+
+
+
+# =============================================================================
+section("A-6  the mail is asked for when it is sent")
+# =============================================================================
+# THE ROUTES ARE HANDED app.py's MAIL AS A LOOKUP (accountsettings/ and auth/,
+# 19 Oct), so a stand-in put on app.py is the one they reach. Above, the
+# stand-in is the same recorder as send_mail, so a route handed the real
+# send_mail_async once would still land in SENT - through the real one, which
+# looks send_mail up. Here only send_mail_async is replaced, by a recorder of
+# its own: an address confirmed and a reset asked for must both land in it, and
+# nothing in SENT.
+ASYNC = []
+app_module.send_mail_async = lambda to_address, subject, body: ASYNC.append((to_address, subject, body)) or True
+MAIL["on"] = True
+before = len(SENT)
+ip = fresh_ip()
+r = register("asyncmail", ip)
+token = r.get_json()["token"]
+r = client.post("/api/account/email", headers=bearer(token), json={"email": "asyncmail@example.com", "password": PW})
+code = re.search(r"\b(\d{6})\b", ASYNC[-1][2]).group(1) if ASYNC else ""
+check("the address's code goes through the send_mail_async on app.py, asked when it is sent",
+      r.status_code == 200 and [a[0] for a in ASYNC] == ["asyncmail@example.com"], (r.get_json(), ASYNC))
+r = client.post("/api/account/email/verify", headers=bearer(token), json={"code": code})
+check("  (and the code it carries confirms the address)", r.status_code == 200, r.get_json())
+r = client.post("/api/auth/recover", json={"email": "asyncmail@example.com"}, environ_base={"REMOTE_ADDR": fresh_ip()})
+check("and so does a reset's", r.status_code == 200 and len(ASYNC) == 2 and ASYNC[-1][0] == "asyncmail@example.com"
+      and "reset" in ASYNC[-1][1].lower(), ASYNC[-1:])
+check("  with nothing through the other one", len(SENT) == before, SENT[before:])
+app_module.send_mail_async = _record_mail
+MAIL["on"] = False
 
 
 print("\n%d passed, %d failed" % (passed, failed))

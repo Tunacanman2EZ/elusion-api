@@ -27,9 +27,10 @@ totals, to players and to the givers themselves apart, who gave it (the owner,
 and since 0.21.0 a co-owner), by player, the biggest gifts, the newest, and the
 gold in every purse and bank now beside it.
 
-The SQL is gift_report()'s, written out again here rather than imported:
-importing app.py runs its start-up, and its start-up writes. If one changes,
-change the other - test_gifts.py GL-8 holds them to the same numbers.
+The SQL is gift_report()'s (ownertools/data.py since 19 Oct), written out
+again here rather than imported: this predates the package, when importing it
+meant importing app.py, whose start-up writes. If one changes, change the
+other - test_gifts.py GL-8 holds them to the same numbers.
 
 READ ONLY, opened mode=ro so it cannot be anything else. It prints usernames,
 item names, amounts and dates - no passwords, tokens or email addresses - so

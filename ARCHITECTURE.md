@@ -8,7 +8,7 @@ it follows the same road.
 ## Where it stands
 
 `app.py` was about 20,000 lines when this was written (16 Oct), and is about
-11,400 with the carry, who-is-around, the switches and the kill out (18 Oct): the shared core (config, the database and
+9,000 with every area out but the core's own pages (19 Oct): the shared core (config, the database and
 its write lock, sessions and tokens, the auth decorators, rate limiting,
 request timing) and the areas not yet moved, one after another. It works, and every
 area is covered by its own suite, but one file that size has a cost that grows:
@@ -46,6 +46,9 @@ Beside it, **feature packages**: a folder per area, each in three layers.
 | `players/` | 18 Oct | **moved out** of app.py: who is online and nearby, the presence ticket |
 | `switches/` | 18 Oct | **moved out** of app.py: the server's switches, `/api/status`, the owner's announcement |
 | `kill/` | 18 Oct | **moved out** of app.py: a kill reported and paid for, and its two records |
+| `ownertools/` | 19 Oct | **moved out** of app.py: the owner's gold, level, skill, grants, gifts report, save history, rollback, teleport |
+| `accountsettings/` | 19 Oct | **moved out** of app.py: the recovery address and the name colour |
+| `auth/` | 19 Oct | **moved out** of app.py: register, login, the session and its renewal, the password asked again, logout, the password, recovery |
 
 ## Where it is going
 
@@ -300,9 +303,21 @@ areas that hold money and items:
       defined further down. test_killrecord's "no commit of its own" reads the
       packages now, and test_killwatch holds killwatch.py's copy of the
       window and the respawn floor to the gate's.
-    - the owner's tools: gold, level, skill, grant, the gifts ledger, the save
-      history and rollback, teleport and its acknowledgement (9)
-    - the account's settings: e-mail and its check, the name colour (4)
+    - ~~the owner's tools: gold, level, skill, grant, the gifts ledger, the save
+      history and rollback, teleport and its acknowledgement (9)~~ (19 Oct,
+      `ownertools/`), **registered after trade**, where everything it is
+      handed exists. Taking a snapshot (the save route takes them too), the
+      gift marker and its reading (the poll's resync), the gifts ledger's
+      writers (the boot backfill uses them) and the teleport queue (the
+      poll's) stay in app.py and are handed in.
+    - ~~the account's settings: e-mail and its check, the name colour (4)~~
+      (19 Oct, `accountsettings/`). Nothing it uses was its alone: the mail,
+      the codes, the address's cleaning and masking are shared with recovery
+      and the staff login, and are handed in as lookups - test_accounts
+      stands in for the mail, and its A-6 proves the stand-in is reached.
+    These three moves (and auth/, step 12) were made side by side, each in a
+    copy of the tree, and merged: every route's docstring, marks and the
+    whole /apispec_1.json came out identical to before.
     What stays in app.py on purpose: `/api/staff/powers` (it reads every route
     and quotes every area's limits - the composition root's own page), the
     broadcast poll `GET /api/server/broadcasts` (the heartbeat: it stamps
@@ -315,6 +330,17 @@ areas that hold money and items:
 12. then the core itself (sessions, tokens, auth - the other 10 routes) into a
     package of its own, and each table's `CREATE` into its area - and app.py
     is the composition root it was meant to be.
+    ~~The routes~~ (19 Oct, `auth/`): register, login, the session read and
+    its renewal, the password asked again, logout and logout-all, the
+    password change, and recovery's two. **What every request passes
+    through stays in app.py**: require_auth and the other decorators, the
+    session lookup and the token's hash, the token lifecycle (issuing,
+    hardening, ending others, theft), the throttles and the login log, bans
+    and their evasion checks, the install binding, the presence stamp, the
+    maintenance gate, the staff-code switch and the mail - each handed in,
+    the suites' stand-ins as lookups. Left: **each table's CREATE into its
+    package**, in one batch where the order of creation is checked once
+    (UPGRADES.md item 7 goes with it).
 
 Things noticed along the way that need upgrading, but are not part of a move,
 are kept in UPGRADES.md - checked before they are written there.

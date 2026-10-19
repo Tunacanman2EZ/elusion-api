@@ -3,7 +3,8 @@
 Every feature package (ARCHITECTURE.md) - playerstats/, events/, insights/,
 and killrecord/, friends/, gathering/, loot/, guilds/, parties/, chat/, trade/, kingdom/, world/, moderation/,
 staffdesk/, equipment/, consuming/, death/, bank/, carry/, skills/, saves/, status/, shop/, players/,
-switches/ and kill/, taken out of app.py - is built the
+switches/, kill/, ownertools/,
+accountsettings/ and auth/, taken out of app.py - is built the
 BE105 way: each has a
 register(app, ...) that is HANDED the app, its login checks and its database,
 and never imports app.py. The source of each is checked for that elsewhere
@@ -55,6 +56,10 @@ import loot  # noqa: E402
 import moderation  # noqa: E402
 import insights  # noqa: E402
 import kill as kill_package  # noqa: E402
+import ownertools as ownertools_package  # noqa: E402
+import accountsettings as accountsettings_package  # noqa: E402
+from werkzeug.security import generate_password_hash  # noqa: E402
+import auth as auth_package  # noqa: E402
 import killrecord  # noqa: E402
 import kingdom  # noqa: E402
 import playerstats  # noqa: E402
@@ -73,7 +78,8 @@ PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
 # The ones this file registers on its bare apps, below.
 RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds", "parties",
             "chat", "trade", "kingdom", "world", "moderation", "staffdesk", "equipment", "consuming",
-            "death", "bank", "carry", "skills", "saves", "status", "shop", "players", "switches", "kill")
+            "death", "bank", "carry", "skills", "saves", "status", "shop", "players", "switches", "kill",
+            "ownertools", "accountsettings", "auth")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -147,7 +153,8 @@ def bare_app(name):
         " chat_muted_until INTEGER NOT NULL DEFAULT 0, chat_mute_reason TEXT NOT NULL DEFAULT '',"
         " chat_muted_by TEXT NOT NULL DEFAULT '',"
         " chat_tokens REAL NOT NULL DEFAULT 8.0, last_chat_at INTEGER NOT NULL DEFAULT 0,"
-        " last_image_at INTEGER NOT NULL DEFAULT 0, last_world_image_at INTEGER NOT NULL DEFAULT 0);"
+        " last_image_at INTEGER NOT NULL DEFAULT 0, last_world_image_at INTEGER NOT NULL DEFAULT 0,"
+        " email TEXT NOT NULL DEFAULT '', email_verified INTEGER NOT NULL DEFAULT 0, password_hash TEXT NOT NULL DEFAULT '', failed_logins INTEGER NOT NULL DEFAULT 0, lockout_until INTEGER NOT NULL DEFAULT 0);"
         "CREATE TABLE chat_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, role TEXT,"
         " body TEXT, created_at INTEGER, channel TEXT, target_id INTEGER, image_id TEXT, guild TEXT, name_hue INTEGER);"
         "CREATE TABLE chat_deletions (message_id INTEGER PRIMARY KEY, channel TEXT, user_id INTEGER, target_id INTEGER,"
@@ -174,18 +181,20 @@ def bare_app(name):
         " explored TEXT NOT NULL DEFAULT '{}', xp INTEGER NOT NULL DEFAULT 0,"
         " xp_to_next INTEGER NOT NULL DEFAULT 100, bank_gold INTEGER NOT NULL DEFAULT 0,"
         " last_kill_at INTEGER NOT NULL DEFAULT 0, kill_tokens REAL NOT NULL DEFAULT 20.0,"
-        " PRIMARY KEY (user_id, slot));"
+        " resync_trade TEXT, PRIMARY KEY (user_id, slot));"
         "CREATE TABLE character_deletions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, slot INTEGER,"
         " class_id TEXT, name TEXT, level INTEGER, gold INTEGER NOT NULL DEFAULT 0, deleted_at INTEGER,"
         " snapshot TEXT);"
-        "CREATE TABLE save_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, slot INTEGER);"
+        "CREATE TABLE save_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, slot INTEGER,"
+        " taken_at INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '', level INTEGER NOT NULL DEFAULT 1, gold INTEGER NOT NULL DEFAULT 0, items INTEGER NOT NULL DEFAULT 0, fingerprint TEXT NOT NULL DEFAULT '', snapshot TEXT NOT NULL DEFAULT '{}');"
         "CREATE TABLE consume_grants (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, slot INTEGER, item_id TEXT,"
         " target TEXT NOT NULL DEFAULT '', amount INTEGER NOT NULL DEFAULT 0, at INTEGER);"
         "CREATE TABLE parties (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER);"
         "CREATE TABLE party_members (user_id INTEGER PRIMARY KEY, party_id INTEGER, is_leader INTEGER DEFAULT 0,"
         " joined_at INTEGER);"
         "CREATE TABLE party_invites (user_id INTEGER, from_id INTEGER, created_at INTEGER, PRIMARY KEY (user_id, from_id));"
-        "CREATE TABLE sessions (user_id INTEGER, last_seen_at INTEGER, expires_at INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE sessions (user_id INTEGER, last_seen_at INTEGER, expires_at INTEGER NOT NULL DEFAULT 0,"
+        " token_hash TEXT, confirmed_at INTEGER NOT NULL DEFAULT 0, confirm_misses INTEGER NOT NULL DEFAULT 0);"
         "CREATE TABLE guilds (id INTEGER PRIMARY KEY, name TEXT, folded TEXT UNIQUE, founded_by TEXT, created_at INTEGER);"
         "CREATE TABLE guild_members (user_id INTEGER PRIMARY KEY, guild_id INTEGER, rank TEXT, joined_at INTEGER);"
         "CREATE TABLE guild_invites (guild_id INTEGER, user_id INTEGER, invited_by TEXT, created_at INTEGER,"
@@ -229,7 +238,12 @@ def bare_app(name):
         "CREATE TABLE presence_tickets (token_hash TEXT PRIMARY KEY, session_hash TEXT NOT NULL, user_id INTEGER NOT NULL,"
         " slot INTEGER NOT NULL, identity TEXT NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);"
         "CREATE TABLE server_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_by TEXT NOT NULL DEFAULT '',"
-        " updated_at INTEGER NOT NULL DEFAULT 0);")
+        " updated_at INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE owner_gifts (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, actor_id INTEGER, actor_name TEXT NOT NULL, user_id INTEGER, username TEXT NOT NULL, slot INTEGER, kind TEXT NOT NULL, item_id TEXT NOT NULL DEFAULT '', quantity INTEGER NOT NULL, gold INTEGER NOT NULL DEFAULT 0, lusions INTEGER NOT NULL DEFAULT 0, value INTEGER NOT NULL DEFAULT 0, sells_for INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL);"
+        "CREATE TABLE pending_teleports (id INTEGER NOT NULL, user_id INTEGER PRIMARY KEY, area TEXT NOT NULL, x REAL NOT NULL DEFAULT 0, y REAL NOT NULL DEFAULT 0, slot_index INTEGER NOT NULL DEFAULT 0, group_size INTEGER NOT NULL DEFAULT 1, issued_by TEXT NOT NULL DEFAULT '', issued_at INTEGER NOT NULL);"
+        "CREATE TABLE auth_codes (user_id INTEGER, purpose TEXT, code_hash TEXT, target TEXT, expires_at INTEGER, attempts INTEGER NOT NULL DEFAULT 0, created_at INTEGER, PRIMARY KEY (user_id, purpose));"
+        "CREATE TABLE trusted_devices (token_hash TEXT PRIMARY KEY, user_id INTEGER, role TEXT, created_at INTEGER, last_used_at INTEGER, expires_at INTEGER);"
+        "CREATE UNIQUE INDEX bare_users_name ON users(username);")
     now = int(time.time())
     for user in USERS.values():
         conn.execute("INSERT INTO users (id, username, role, created_at) VALUES (?, ?, ?, ?)",
@@ -911,6 +925,250 @@ def bare_app(name):
         post_broadcast=lambda body, kind="system", by="": told.append((kind, body[:60], by)) or len(told),
         create_loot_bag=app.config["loot"].create_bag)
 
+    # ownertools/: the owner's gate lets in the carry's owners, so a check can
+    # make ann a co-owner; the password asked again is the switches' header;
+    # "dev" is the boss and bo, so bo can be a dev without the owner's powers.
+    # The money is the guilds' purse (which refuses below zero) and a bank
+    # beside it on accounts; a gift is a row in owner_gifts, as app.py's
+    # writers make one, worth ten gold an item; a snapshot is a row in
+    # save_snapshots holding the character as the stand-in reads it; the bag
+    # is the carry's own; a teleport is a row in pending_teleports; the log is
+    # the staff desk's staff_actions.
+    def owner_state(db, user_id, slot):
+        row = db.execute("SELECT class_id, name, level, xp, xp_to_next, gold, active_pet_id, equipment"
+                         " FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone()
+        if row is None:
+            return None
+        return {"class_id": row["class_id"], "name": row["name"], "level": int(row["level"] or 1),
+                "xp": int(row["xp"] or 0), "xp_to_next": int(row["xp_to_next"] or 0), "gold": int(row["gold"] or 0),
+                "active_pet_id": row["active_pet_id"] or "", "equipment": json.loads(row["equipment"] or "{}"),
+                "carry": [[int(r[0]), r[1], int(r[2])] for r in db.execute(
+                    "SELECT position, item_id, quantity FROM carry_items WHERE user_id = ? AND slot = ?"
+                    " ORDER BY position", (user_id, slot))],
+                "skills": [[r[0], int(r[1]), int(r[2])] for r in db.execute(
+                    "SELECT skill_id, level, xp FROM skills WHERE user_id = ? AND slot = ? ORDER BY skill_id",
+                    (user_id, slot))]}
+
+    def owner_snapshot(db, user_id, slot, reason):
+        state = owner_state(db, user_id, slot)
+        if state is None:
+            return None
+        return db.execute("INSERT INTO save_snapshots (user_id, slot, taken_at, reason, level, gold, items, snapshot)"
+                          " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                          (user_id, slot, int(time.time()), reason, state["level"], state["gold"],
+                           len(state["carry"]), json.dumps(state))).lastrowid
+
+    def owner_bank(db, user_id, delta, reason, detail=""):
+        have = db.execute("SELECT bank_gold FROM accounts WHERE user_id = ?", (user_id,)).fetchone()
+        if have is None:
+            return None
+        if have[0] + delta < 0:
+            raise Short()
+        db.execute("UPDATE accounts SET bank_gold = ? WHERE user_id = ?", (have[0] + delta, user_id))
+        return have[0] + delta
+
+    def owner_gift(db, actor, receiver_id, receiver_name, slot, item_id, quantity, source):
+        worth = {"kind": "item", "gold": 0, "lusions": 0, "value": 10 * int(quantity), "sells_for": 5 * int(quantity)}
+        db.execute("INSERT INTO owner_gifts (at, actor_id, actor_name, user_id, username, slot, kind, item_id, quantity,"
+                   " value, sells_for, source) VALUES (?, ?, ?, ?, ?, ?, 'item', ?, ?, ?, ?, ?)",
+                   (int(time.time()), actor["id"], actor["username"], receiver_id, receiver_name, slot, item_id,
+                    int(quantity), worth["value"], worth["sells_for"], source))
+        return worth
+
+    def owner_gold_gift(db, actor, receiver_id, receiver_name, slot, amount):
+        db.execute("INSERT INTO owner_gifts (at, actor_id, actor_name, user_id, username, slot, kind, quantity, gold,"
+                   " source) VALUES (?, ?, ?, ?, ?, ?, 'gold', ?, ?, 'staff_gold')",
+                   (int(time.time()), actor["id"], actor["username"], receiver_id, receiver_name, slot,
+                    int(amount), int(amount)))
+
+    def owner_teleport(db, user_id, area, x, y, index, total, by, now):
+        db.execute("INSERT OR REPLACE INTO pending_teleports (id, user_id, area, x, y, slot_index, group_size,"
+                   " issued_by, issued_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   (now * 100 + user_id, user_id, area, x, y, index, total, by, now))
+
+    def dev_and_up(_rank):
+        def decorator(view):
+            def wrapped(*args, **kwargs):
+                if g.user["username"] not in (OWNER, "bo"):
+                    return {"error": "Not Found", "message": "The requested URL was not found on the server."}, 404
+                return view(*args, **kwargs)
+            wrapped.__name__ = view.__name__
+            return wrapped
+        return decorator
+
+    app.config["gift_marks"] = []
+    ownertools_package.register(
+        app, require_auth=require_auth, require_owner=owner_or_co, require_role=dev_and_up,
+        require_fresh_password=asks_again, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+        parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None, max_slot=3,
+        slot_exists=lambda user_id, slot: get_db().execute(
+            "SELECT 1 FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone() is not None,
+        catalogue=OwnerCatalogue, ensure_account=ensure_account, gold_delta=purse_delta, bank_gold_delta=owner_bank,
+        insufficient_gold=Short, record_gift=owner_gift, record_gold_gift=owner_gold_gift, find_user=account,
+        owner_may_touch=lambda actor, target: actor["username"] == OWNER or target["username"] != OWNER,
+        owner_untouchable=({"error": "Forbidden", "message": "That is the owner's account."}, 403),
+        playing_slot=playing_slot, playing_area=area_played, take_snapshot=owner_snapshot,
+        character_state=owner_state, stored_json=lambda raw, fallback: json.loads(raw) if raw else fallback,
+        derived_stats=lambda row, level=None: {"max_hp": 100 + 10 * (level or row["level"]), "max_mana": 50,
+                                               "max_stamina": 30},
+        levelup_grant_id="__levelup__", log_staff_action=write_log,
+        valid_skills={"attack", "defense", "agility", "magic", "fishing", "cooking"}, max_skill_level=50,
+        stack_limit=carry.stack_limit, add_to_backpack=carry.add_to_backpack, bag_cells=GATHER_CELLS,
+        inventory_of=carry.inventory_of,
+        mark_gift=lambda _db, user_id, slot, by, item_id, quantity: app.config["gift_marks"].append(
+            (user_id, slot, by, item_id, quantity)),
+        online_window=45, gifts_since_key="owner_gifts_since", snapshots_kept=20, snapshot_every=600,
+        find_open_trade=trade.data.find_open, carry_cells=GATHER_CELLS + 2, owns_item=carry.owns_item,
+        has_owner_powers=lambda name: name in owners, queue_teleport=owner_teleport, teleport_spacing=48,
+        post_broadcast=lambda body, kind="system", by="": told.append((kind, body[:60], by)) or len(told),
+        moderation_target=within_reach)
+
+    # accountsettings/: the mail is app.config's - whether it can go out, and
+    # a list of what went - and a code is the same six digits every time, kept
+    # in a dict as app.py's table keeps them, one per account and purpose;
+    # masking an address marks it, so the answer shows the mask was handed in;
+    # the login log is the database's; the hue stops at 359.
+    app.config["mail_on"] = True
+    app.config["mailed"] = []
+    app.config["codes"] = {}
+
+    def code_kept(_db, user_id, purpose, code, target, _now):
+        app.config["codes"][(user_id, purpose)] = (code, target)
+
+    def code_spent(_db, user_id, purpose, code, _now):
+        kept = app.config["codes"].get((user_id, purpose))
+        if kept is None or kept[0] != code:
+            return False, "wrong"
+        del app.config["codes"][(user_id, purpose)]
+        return True, "ok"
+
+    accountsettings_package.register(
+        app, require_auth=require_auth, no_write_lock=no_write_lock, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400), parse_stat=parse_stat,
+        hue_max=359, clean_email=lambda raw: str(raw or "").strip().lower() if "@" in str(raw or "") else "",
+        mask_email=lambda address: "masked:" + address, row_int=lambda row, key: int(row[key] or 0),
+        record_login_attempt=lambda db, username, ip, ok, reason="": db.execute(
+            "INSERT INTO login_attempts VALUES (?, ?, ?, ?, ?)", (username, int(ok), reason, ip, int(time.time()))),
+        client_ip=lambda: "203.0.113.9", mail_can_send=lambda: app.config["mail_on"],
+        send_mail_async=lambda to_address, subject, body: app.config["mailed"].append((to_address, subject, body)),
+        new_code=lambda: "424242", store_code=code_kept, consume_code=code_spent, code_ttl=lambda: 900)
+
+    # auth/: an account's way in. A password's hash is "pw:" and the password,
+    # checked the same way, so the bare app needs no scrypt; a session is a
+    # sessions row that issue_token() writes under a numbered token, and what
+    # each was asked is kept on the app ("door"), with the mail sent, the
+    # computers and addresses recorded and the theft calls; the gates - a
+    # closed server, the two address throttles, the two evasion checks - are
+    # the door's, so a check can trip one; the login log is the database's
+    # login_attempts, written as app.py writes it, three misses lock an
+    # account; codes go in auth_codes, hashed as "c:" and the code, and the
+    # next one minted is the door's. The bearer token is the X-Test-Token
+    # header, the caller's address X-Test-IP.
+    auth_box = app.config.setdefault("door", {
+        "closed": False, "ip": None, "probe": None, "evader": None, "install_evader": None, "hardened": False,
+        "can_mail": True, "next_code": "123456", "mail": [], "issued": [], "others": [], "theft": [],
+        "pruned": [], "stamped": [], "ips": [], "installs": []})
+
+    def auth_ip():
+        return request.headers.get("X-Test-IP", "10.0.0.9")
+
+    def auth_credentials(payload):
+        if not isinstance(payload, dict) or not isinstance(payload.get("username"), str) \
+                or not isinstance(payload.get("password"), str):
+            return False, ["username and password are required"]
+        if len(payload["password"]) < 8:
+            return False, ["Field 'password' must be at least 8 characters."]
+        return True, []
+
+    def auth_log_attempt(db, username, ip, ok, reason=""):
+        db.execute("INSERT INTO login_attempts (username, ok, reason, ip, at) VALUES (?, ?, ?, ?, ?)",
+                   (username, 1 if ok else 0, reason, ip, int(time.time())))
+        db.commit()
+
+    def auth_failed_login(db, row, now):
+        misses = int(row["failed_logins"] or 0) + 1
+        locked = misses >= 3
+        db.execute("UPDATE users SET failed_logins = ?, lockout_until = ? WHERE id = ?",
+                   (misses, now + 900 if locked else 0, row["id"]))
+        db.commit()
+        return locked
+
+    def auth_mint(user_id, expires_at=None, install_hash="", hardened=False, staff=False, confirmed=False):
+        token = "tok%d" % (len(auth_box["issued"]) + 1)
+        expires_at = expires_at or int(time.time()) + 3600
+        auth_box["issued"].append({"user_id": user_id, "token": token, "expires_at": expires_at, "install": install_hash,
+                               "hardened": hardened, "staff": staff, "confirmed": confirmed})
+        get_db().execute("INSERT INTO sessions (user_id, last_seen_at, expires_at, token_hash) VALUES (?, ?, ?, ?)",
+                         (user_id, int(time.time()), expires_at, "h:" + token))
+        get_db().commit()
+        return token, expires_at
+
+    def auth_end_others(db, user_id, keep_token, rotated_token=None):
+        auth_box["others"].append((user_id, keep_token, rotated_token))
+        db.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?", (user_id, "h:" + keep_token))
+
+    def auth_theft(db, user_id, why):
+        auth_box["theft"].append((user_id, why))
+        db.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        db.commit()
+
+    def auth_rank(row):
+        return row["role"] or "player"
+
+    def auth_row_int(row, key):
+        return int(row[key] or 0) if key in row.keys() else 0
+
+    def auth_stash_code(db, user_id, purpose, code, target, now):
+        db.execute("INSERT OR REPLACE INTO auth_codes (user_id, purpose, code_hash, target, expires_at, attempts,"
+                   " created_at) VALUES (?, ?, ?, ?, ?, 0, ?)", (user_id, purpose, "c:" + code, target, now + 900, now))
+
+    def auth_spend_code(db, user_id, purpose, code, now):
+        row = db.execute("SELECT code_hash FROM auth_codes WHERE user_id = ? AND purpose = ?",
+                         (user_id, purpose)).fetchone()
+        if row is None or row["code_hash"] != "c:" + str(code):
+            return False, "wrong"
+        db.execute("DELETE FROM auth_codes WHERE user_id = ? AND purpose = ?", (user_id, purpose))
+        return True, "ok"
+
+    auth_package.register(
+        app, require_auth=require_auth, no_write_lock=no_write_lock, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400), client_ip=auth_ip,
+        validate_credentials=auth_credentials, hash_password=lambda raw: "pw:" + raw,
+        check_password=lambda stored, raw: stored == "pw:" + str(raw), dummy_hash="pw:\x00nobody",
+        min_password_length=8,
+        maintenance_refusal=lambda name: ({"error": "Service Unavailable", "message": "Closed for a bit.",
+                                           "maintenance": True}, 503) if auth_box["closed"] and name != OWNER else None,
+        maintenance_public=lambda: {"on": True} if auth_box["closed"] else None,
+        prune_login_attempts=lambda db, now: auth_box["pruned"].append("attempts"),
+        prune_sessions=lambda db, now: auth_box["pruned"].append("sessions"),
+        ip_throttle_state=lambda db, ip, now: auth_box["ip"], register_throttle_state=lambda db, ip, now: auth_box["probe"],
+        record_login_attempt=auth_log_attempt, register_failed_login=auth_failed_login,
+        wait_words=lambda seconds: "%d seconds" % seconds, ip_window=lambda: 600, lockout_seconds=lambda: 900,
+        ban_state=lambda row: {"permanent": True, "reason": row["ban_reason"]} if row["is_banned"] else None,
+        ban_evasion_state=lambda db, ip, now: auth_box["evader"],
+        install_evasion_state=lambda db, install_hash: auth_box["install_evader"],
+        hash_install=lambda raw: "i:" + raw if raw else "",
+        record_account_ip=lambda db, user_id, ip, now: auth_box["ips"].append((user_id, ip)),
+        record_account_install=lambda db, user_id, install_hash, now: auth_box["installs"].append((user_id, install_hash)),
+        issue_token=auth_mint, login_hardening=lambda: (auth_box["hardened"], "i:bound" if auth_box["hardened"] else ""),
+        end_other_sessions=auth_end_others, end_for_theft=auth_theft, hash_token=lambda raw: "h:" + str(raw),
+        bearer_token=lambda: request.headers.get("X-Test-Token", ""),
+        stamp_presence=lambda db, slot=None: auth_box["stamped"].append(g.user["id"]),
+        step_up_seconds=900, confirm_max_misses=3, token_stolen_message="Somebody else has this login.",
+        role_for=auth_rank, default_role="wanderer", has_owner_powers=lambda name: name == OWNER,
+        role_at_least=lambda row, rank: RANKS.index(auth_rank(row)) >= RANKS.index(rank),
+        name_hue_of=lambda row: row["name_hue"], row_int=auth_row_int,
+        needs_recovery_email=lambda row: auth_box["can_mail"] and (row is None or not auth_row_int(row, "email_verified")),
+        staff_login_protected=lambda row: auth_box["can_mail"] and RANKS.index(auth_rank(row)) >= RANKS.index("mod")
+        and auth_row_int(row, "email_verified") == 1,
+        mask_email=lambda address: address[:1] + "***" + address[address.index("@"):],
+        make_code=lambda: auth_box["next_code"], store_code=auth_stash_code, consume_code=auth_spend_code,
+        clean_email=lambda raw: str(raw or "").strip().lower() if "@" in str(raw or "") else "",
+        send_mail_async=lambda to_address, subject, body: auth_box["mail"].append((to_address, subject, body)) or True,
+        reset_code_ttl=900, recover_message="If that address is on an account, a code is on its way.",
+        reset_cooldown=60, reset_max_per_ip=3, reset_ip_window=900)
+
     # bank/: a four-cell bank, handed the grid steps the carry hands back -
     # as app.py hands them - and the bank's own catalogue.
     app.config["bank_api"] = bank_package.register(
@@ -985,6 +1243,33 @@ class ShopCatalogue:
     @staticmethod
     def roll_quality(item_id):
         return item_id + "~d104" if item_id == "ironsword" else item_id
+
+
+class OwnerCatalogue:
+    """What ownertools/ asks of gamedata: an XP curve of 100 x level and 50 a
+    skill level, what marks a roll ("~"), which rolled id is a real roll (an
+    iron sword's), and how a piece is rolled or perfected."""
+    VARIANT_MARK = "~"
+
+    @staticmethod
+    def xp_needed_for_level(level):
+        return 100 * level
+
+    @staticmethod
+    def xp_needed_for_skill_level(skill_id, level):
+        return 50 * level
+
+    @staticmethod
+    def has_item(item_id):
+        return item_id in ("ironsword~d104",)
+
+    @staticmethod
+    def roll_quality(item_id):
+        return item_id + "~d97"
+
+    @staticmethod
+    def perfect_id(item_id, resist=False):
+        return item_id + ("~p_r" if resist else "~p")
 
 
 class KillCatalogue:
@@ -1213,7 +1498,7 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/players/online", "/api/presence/ticket", "/api/players/nearby", "/api/status",
                        "/api/server/maintenance", "/api/server/minbuild", "/api/server/pvp", "/api/server/trade",
                        "/api/server/coowners", "/api/server/coowners", "/api/server/broadcast",
-                       "/api/combat/kill"]), rules)
+                       "/api/combat/kill", "/api/staff/gold", "/api/staff/level", "/api/staff/skill", "/api/staff/grant", "/api/staff/gifts", "/api/staff/snapshots", "/api/staff/rollback", "/api/staff/teleport", "/api/teleport/ack", "/api/account/email", "/api/account/email", "/api/account/email/verify", "/api/account/name-colour", "/api/auth/register", "/api/auth/login", "/api/auth/session", "/api/auth/resume", "/api/auth/confirm", "/api/auth/logout", "/api/auth/logout-all", "/api/auth/password", "/api/auth/recover", "/api/auth/reset"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -2927,6 +3212,524 @@ check("loot's own bag-maker, handed back: nothing dropped is no bag; a roll past
 check("  and any other monster with its article",
       kill_package.mythic_find_text(KillCatalogue([]), "ann", "meteorite", "icebat") == "ann found the Meteorite on an Ice Bat!"
       and kill_package.mythic_find_text(KillCatalogue([]), "ann", "rock", "bat") == "ann found the rock on a Bat!")
+def tool(path, body, as_who="boss", again=True):
+    return switch(path, body, as_who, again)
+
+
+def tool_read(path, as_who="boss"):
+    res = client_a.get(path, headers=who(as_who))
+    return res.status_code, res.get_json() or {}
+
+
+def logged_last(action):
+    rows = ann_says("SELECT actor_name, action, target_name, detail FROM staff_actions WHERE action = ?"
+                    " ORDER BY id DESC LIMIT 1", (action,))
+    return rows[0] if rows else None
+
+
+# The owner's tools, set up here: the boss's warrior in slot 0 at level 10 with
+# nothing in the purse, a bank of nothing; ann's slot 0 at level 5 with a
+# potion and a pebble, playing, signed in; every gift, snapshot and teleport
+# from before gone.
+now = int(time.time())
+around("DELETE FROM owner_gifts; DELETE FROM save_snapshots; DELETE FROM pending_teleports;"
+       " DELETE FROM accounts WHERE user_id IN (1, 2); DELETE FROM trades;"
+       " DELETE FROM carry_items WHERE user_id IN (1, 2); DELETE FROM skills WHERE user_id IN (1, 2);"
+       " DELETE FROM consume_grants WHERE user_id IN (1, 2); DELETE FROM saves WHERE user_id = 2 AND slot > 0;")
+around("INSERT OR REPLACE INTO saves (user_id, slot, class_id, level, area, updated_at, name, gold, xp, xp_to_next)"
+       " VALUES (?, ?, 'warrior', ?, ?, ?, ?, ?, 0, 100)",
+       [(1, 0, 10, "crypt", now, "Boss", 0), (2, 0, 5, "field", now, "Ann", 70)])
+around("INSERT INTO carry_items VALUES (2, 0, ?, ?, ?)", [(0, "smallhealthpotion", 2), (1, "pebble", 1)])
+around("INSERT INTO sessions (user_id, last_seen_at, expires_at) VALUES (2, ?, ?)", [(now, now + 3600)])
+app_a.config["owners"].discard("ann")
+
+check("owner's tools: a player is told they do not exist; one that changes a purse asks for the password",
+      tool("/api/staff/gold", {"slot": 0, "amount": 5}, "ann")[0] == 404
+      and tool("/api/staff/gold", {"slot": 0, "amount": 5}, again=False)[0] == 403
+      and tool_read("/api/staff/gifts", "ann")[0] == 404)
+code, body = tool("/api/staff/gold", {"slot": 0, "amount": 500})
+check("gold: into the owner's purse, through the ledger, and on the gifts ledger as his own",
+      (code, body) == (200, {"slot": 0, "granted": 500, "where": "carried", "gold": 500, "bank_gold": 0})
+      and ann_says("SELECT user_id, slot, kind, gold, source FROM owner_gifts") == [(1, 0, "gold", 500, "staff_gold")],
+      body)
+code, body = tool("/api/staff/gold", {"slot": 0, "amount": 200, "bank": True})
+check("  into the bank, the account made first; and the 400s it had",
+      (code, body.get("where"), body.get("bank_gold"), body.get("gold")) == (200, "bank", 200, 500)
+      and tool("/api/staff/gold", {"slot": 0, "amount": 0})[1].get("message") == "amount must not be zero"
+      and tool("/api/staff/gold", {"slot": 0, "amount": 1000001})[1].get("message")
+      == "one grant is at most 1000000 gold"
+      and tool("/api/staff/gold", {"slot": 0, "amount": True})[1].get("message") == "amount must be a whole number"
+      and tool("/api/staff/gold", {"slot": 0, "amount": -600})[1].get("message")
+      == "that would take the balance below zero" and ann_says("SELECT gold FROM saves WHERE user_id = 1")[0][0] == 500,
+      body)
+code, body = tool("/api/staff/level", {"slot": 0, "level": 12})
+check("a level: set like a level-up - no XP in, the next step, the maxima and the pools full, the refill noted",
+      code == 200 and (body.get("level"), body.get("was"), body.get("xp_to_next"), body.get("max_hp"), body.get("hp"))
+      == (12, 10, 1200, 220, 220)
+      and ann_says("SELECT item_id FROM consume_grants WHERE user_id = 1") == [("__levelup__",)]
+      and logged_last("level") == ("boss", "level", "boss", "slot 0: level 10 -> 12"), body)
+code, body = tool("/api/staff/level", {"username": "ann", "level": 7})
+check("  somebody else's: the one they play, a snapshot first, signed out, on THEIR record",
+      code == 200 and (body.get("username"), body.get("slot"), body.get("was"), body.get("level"),
+                       body.get("sessions_ended")) == ("ann", 0, 5, 7, 1)
+      and ann_says("SELECT reason, level FROM save_snapshots WHERE user_id = 2") == [("before-level", 5)]
+      and ann_says("SELECT COUNT(*) FROM sessions WHERE user_id = 2")[0][0] == 0
+      and logged_last("player_level")[2] == "ann", body)
+app_a.config["owners"].add("ann")
+check("  a co-owner may set a player's, never the owner's; and the 400 and 404 it had",
+      tool("/api/staff/level", {"username": "boss", "level": 3}, "ann")
+      == (403, {"error": "Forbidden", "message": "That is the owner's account."})
+      and tool("/api/staff/level", {"slot": 0, "level": 100})[1].get("message") == "level must be 1-99"
+      and tool("/api/staff/level", {"username": "nobody", "level": 3}) == (404, {"error": "Not Found",
+                                                                                 "message": "No such account."}))
+app_a.config["owners"].discard("ann")
+code, body = tool("/api/staff/skill", {"slot": 0, "skill": "all", "level": 30})
+check("skills: all six set to the level asked, no XP into them, each with its next step, logged",
+      code == 200 and sorted(body.get("skills", {})) == sorted(["attack", "defense", "agility", "magic", "fishing",
+                                                                "cooking"])
+      and body["skills"]["attack"] == {"level": 30, "xp": 0, "xp_next": 1500, "was": 1}
+      and ann_says("SELECT COUNT(*) FROM skills WHERE user_id = 1 AND slot = 0 AND level = 30 AND xp = 0")[0][0] == 6
+      and logged_last("skill")[3].startswith("slot 0: attack 1 -> 30"), body)
+around("UPDATE skills SET xp = 77 WHERE user_id = 1 AND slot = 0 AND skill_id = 'magic'")
+check("  one skill - set over XP already in it, which it clears - or the 400s it had",
+      tool("/api/staff/skill", {"slot": 0, "skill": "magic", "level": 31})[1]["skills"]["magic"]["was"] == 30
+      and ann_says("SELECT level, xp FROM skills WHERE user_id = 1 AND slot = 0 AND skill_id = 'magic'") == [(31, 0)]
+      and tool("/api/staff/skill", {"slot": 0, "skill": "dancing", "level": 3})[1].get("message")
+      == "skill must be one of attack, defense, agility, magic, fishing, cooking, or all"
+      and tool("/api/staff/skill", {"slot": 0, "skill": "all", "level": 51})[1].get("message") == "level must be 1-50")
+code, body = tool("/api/staff/grant", {"slot": 0, "item_id": "smallhealthpotion", "quantity": 2})
+check("an item for yourself: into the bag, logged, on the gifts ledger at its worth",
+      code == 200 and (body.get("granted_item_id"), body.get("granted_quantity"), body.get("worth", {}).get("value"))
+      == ("smallhealthpotion", 2, 20) and cells_of(body)[0] == ("smallhealthpotion", 2)
+      and logged_last("grant")[3] == "2 x smallhealthpotion into slot 0"
+      and ann_says("SELECT source, user_id FROM owner_gifts WHERE kind = 'item'") == [("grant", 1)], body)
+check("  rolled, or Perfect, as asked; a roll that is no roll, a bad count, a stack too big, refused",
+      tool("/api/staff/grant", {"slot": 0, "item_id": "ironsword", "quality": "roll"})[1].get("granted_item_id")
+      == "ironsword~d97"
+      and tool("/api/staff/grant", {"slot": 0, "item_id": "ironsword", "quality": "perfect"})[1].get("granted_item_id")
+      == "ironsword~p_r"
+      and tool("/api/staff/grant", {"slot": 0, "item_id": "ironsword~d104"})[0] == 200
+      and tool("/api/staff/grant", {"slot": 0, "item_id": "bogus~x"})[1].get("message")
+      == "'bogus~x' is not a roll of any item"
+      and tool("/api/staff/grant", {"slot": 0, "item_id": "pebble", "quantity": 0})[1].get("message")
+      == "quantity must be a positive integer"
+      and tool("/api/staff/grant", {"slot": 0, "item_id": "pebble", "quality": "shiny"})[1].get("message")
+      == "quality must be plain, roll or perfect"
+      and tool("/api/staff/grant", {"slot": 0, "item_id": "smallhealthpotion", "quantity": 6})[1].get("message")
+      == "quantity is 6, the most smallhealthpotion stacks to is 5")
+code, body = tool("/api/staff/grant", {"username": "ann", "item_id": "pebble"})
+check("a gift to a player: into the one they play, a snapshot first, their game told, on their record",
+      code == 200 and (body.get("username"), body.get("slot"), body.get("character"), body.get("online"))
+      == ("ann", 0, "Ann", False)
+      and ann_says("SELECT reason FROM save_snapshots WHERE user_id = 2 ORDER BY id") == [("before-level",),
+                                                                                       ("before-give",)]
+      and app_a.config["gift_marks"][-1] == (2, 0, "boss", "pebble", 1)
+      and logged_last("give")[2:] == ("ann", "1 x pebble into Ann (slot 0)")
+      and ann_says("SELECT user_id, source FROM owner_gifts WHERE source = 'give'") == [(2, "give")], body)
+around("INSERT INTO carry_items VALUES (2, 0, ?, 'pebble', 1)", [(3,)])
+check("  a full bag is the 409 it was, and nothing of the gift is kept - not even its snapshot",
+      tool("/api/staff/grant", {"username": "ann", "item_id": "pebble"})
+      == (409, {"error": "Conflict", "message": "ann's backpack is full (4 slots)."})
+      and len(ann_says("SELECT id FROM save_snapshots WHERE user_id = 2")) == 2)
+code, gifts = tool_read("/api/staff/gifts")
+check("the gifts report: every gift counted, to players and to yourself, by player and item, the newest first",
+      code == 200 and gifts["totals"]["gifts"] == 7 and gifts["to_players"]["gifts"] == 1
+      and gifts["to_yourself"]["gold"] == 700 and gifts["recent"][0]["source"] == "give"
+      and [p["username"] for p in gifts["by_player"]][:1] == ["boss"] and gifts["username"] is None, gifts)
+check("  narrowed to one player, or the 404 for nobody",
+      tool_read("/api/staff/gifts?username=ann")[1]["totals"]["gifts"] == 1
+      and tool_read("/api/staff/gifts?username=nobody")[0] == 404)
+code, hist = tool_read("/api/staff/snapshots?username=ann")
+check("a player's save history: their characters, the one played as it is now, its snapshots newest first",
+      code == 200 and hist.get("slot") == 0 and hist.get("playing") == 0
+      and [s["reason"] for s in hist.get("snapshots", [])] == ["before-give", "before-level"]
+      and hist["now"]["level"] == 7 and (hist.get("kept"), hist.get("every_seconds")) == (20, 600), hist)
+check("  and the 400s and the 404 it had",
+      tool_read("/api/staff/snapshots")[1].get("message") == "username is required"
+      and tool_read("/api/staff/snapshots?username=ann&slot=9")[1].get("message") == "slot must be an integer 0-3"
+      and tool_read("/api/staff/snapshots?username=ann&slot=2")[0] == 404)
+first = hist["snapshots"][-1]["id"]
+around("INSERT INTO sessions (user_id, last_seen_at, expires_at) VALUES (2, ?, ?)", [(now, now + 3600)])
+around("UPDATE saves SET gold = 120 WHERE user_id = 2 AND slot = 0")
+code, body = tool("/api/staff/rollback", {"username": "ann", "snapshot_id": first})
+check("a rollback: the level, the purse (through the ledger), the bag put back; undoable, signed out, logged",
+      code == 200 and (body.get("restored"), body.get("was", {}).get("level"), body.get("now", {}).get("level"),
+                       body.get("now", {}).get("items"), body.get("sessions_ended")) == (first, 7, 5, 2, 1)
+      and ann_says("SELECT item_id FROM carry_items WHERE user_id = 2 AND slot = 0 ORDER BY position")
+      == [("smallhealthpotion",), ("pebble",)] and body["now"]["gold"] == 70
+      and app_a.config["minted"]["gold"][-1] == (2, 0, -50, "staff_rollback")
+      and ann_says("SELECT reason FROM save_snapshots WHERE id = ?", (body.get("undo_snapshot"),))
+      == [("before-rollback",)]
+      and logged_last("rollback")[2] == "ann", body)
+around("INSERT INTO trades (trade_id, a_user, a_slot, b_user, b_slot, state, updated_at) VALUES"
+       " ('t-roll', 2, 0, 3, 0, 'open', ?)", [(now,)])
+check("  not in the middle of a trade; nor somebody else's snapshot; nor a number that is not one",
+      tool("/api/staff/rollback", {"username": "ann", "snapshot_id": first})[0] == 409
+      and tool("/api/staff/rollback", {"username": "bo", "snapshot_id": first})
+      == (404, {"error": "Not Found", "message": "No such snapshot of bo."})
+      and tool("/api/staff/rollback", {"username": "ann", "snapshot_id": 1.5})[1].get("message")
+      == "snapshot_id must be a whole number"
+      and tool("/api/staff/rollback", {"username": "ann", "snapshot_id": first}, again=False)[0] == 403)
+around("DELETE FROM trades WHERE trade_id = 't-roll'")
+code, body = tool("/api/staff/teleport", {"username": "ann", "area": "crypt", "x": 5, "y": 6}, again=False)
+moved = ann_says("SELECT id, area, x, y, issued_by FROM pending_teleports WHERE user_id = 2")
+check("a teleport: one player moved, queued for their poll, logged - and no password asked",
+      (code, body) == (200, {"moved": 1, "username": "ann", "area": "crypt", "x": 5.0, "y": 6.0, "everyone": False})
+      and [m[1:] for m in moved] == [("crypt", 5.0, 6.0, "boss")]
+      and logged_last("teleport")[2:] == ("ann", "-> crypt (5, 6)"), body)
+code, body = tool("/api/staff/teleport", {"everyone": True, "x": 1, "y": 2}, again=False)
+check("  everyone, by the owner: to his own area, said in the world; a dev may not",
+      code == 200 and body.get("moved") == len(ann_says("SELECT id FROM users")) and body.get("area") == "crypt"
+      and body.get("spacing") == 48 and told[-1][1] == "Everyone has been moved to crypt."
+      and tool("/api/staff/teleport", {"everyone": True}, "bo", again=False)
+      == (403, {"error": "Forbidden", "message": "Only the owner or a co-owner may teleport everyone."})
+      and tool("/api/staff/teleport", {"username": "ann"}, "ann", again=False)[0] == 404
+      and tool("/api/staff/teleport", {"username": "ann", "x": "far"}, again=False)[1].get("message")
+      == "x and y must be numbers"
+      and tool("/api/staff/teleport", {}, again=False)[1].get("message") == 'send {"username": "..."} or {"everyone": true}')
+mine = ann_says("SELECT id FROM pending_teleports WHERE user_id = 2")[0][0]
+check("the acknowledgement: only the game it was for clears it, by its id; a stale or a stranger's clears nothing",
+      tool("/api/teleport/ack", {"id": mine}, "bo", again=False) == (200, {"cleared": False})
+      and tool("/api/teleport/ack", {"id": mine + 1}, "ann", again=False) == (200, {"cleared": False})
+      and tool("/api/teleport/ack", {"id": mine}, "ann", again=False) == (200, {"cleared": True})
+      and not ann_says("SELECT id FROM pending_teleports WHERE user_id = 2")
+      and tool("/api/teleport/ack", {"id": "x"}, "ann", again=False)[1].get("message") == "id must be a whole number")
+check("  and the numbers app.py reads off the package are the ones it had",
+      (ownertools_package.DEBUG_GOLD_MAX, ownertools_package.STAFF_LEVEL_MAX, ownertools_package.ROLLBACK_REASON,
+       ownertools_package.STAFF_SKILL_ORDER) == (1000000, 99, "staff_rollback",
+                                                 ("attack", "defense", "agility", "magic", "fishing", "cooking")))
+def mine(method, path, body=None, as_who="ann"):
+    res = getattr(client_a, method)(path, headers=who(as_who), json=body)
+    return res.status_code, res.get_json() or {}
+
+
+kept_hue = ann_says("SELECT name_hue FROM users WHERE id = 2")[0][0]
+around("UPDATE users SET email = '', email_verified = 0, password_hash = ? WHERE id = 2",
+       [(generate_password_hash("hunter22"),)])
+app_a.config["codes"].clear()
+mailed = app_a.config["mailed"]
+check("accountsettings: no recovery address yet - the mask it was handed, nothing to confirm",
+      mine("get", "/api/account/email") == (200, {"email": "masked:", "has_email": False, "verified": False}))
+check("  the 400s it had: not an address, no password",
+      mine("post", "/api/account/email", {"email": "nope", "password": "hunter22"})[1].get("message")
+      == "That does not look like an email address."
+      and mine("post", "/api/account/email", {"email": "ann@example.com"})[1].get("message")
+      == "password is required to change the recovery address.")
+tried = len(ann_says("SELECT * FROM login_attempts WHERE reason = 'bad-password-on-email'"))
+check("  the wrong password is the 401 it was, written to the login log from the caller's address",
+      mine("post", "/api/account/email", {"email": "ann@example.com", "password": "guess"})
+      == (401, {"error": "Unauthorized", "message": "That password is not correct."})
+      and ann_says("SELECT username, ok, ip FROM login_attempts WHERE reason = 'bad-password-on-email'")[tried:]
+      == [("ann", 0, "203.0.113.9")])
+app_a.config["mail_on"] = False
+code, body = mine("post", "/api/account/email", {"email": "ann@example.com", "password": "hunter22"})
+check("  with no mail to send it, refused (503) and nothing stored - not a code mailed nowhere",
+      code == 503 and body.get("error") == "Service Unavailable"
+      and ann_says("SELECT email FROM users WHERE id = 2") == [("",)] and not app_a.config["codes"], body)
+app_a.config["mail_on"] = True
+code, body = mine("post", "/api/account/email", {"email": " Ann@Example.com ", "password": "hunter22"})
+check("an address set: cleaned, stored unconfirmed, a code kept for it and mailed to it",
+      (code, body) == (200, {"email": "masked:ann@example.com", "verified": False,
+                             "message": "Check that inbox for a confirmation code."})
+      and ann_says("SELECT email, email_verified FROM users WHERE id = 2") == [("ann@example.com", 0)]
+      and app_a.config["codes"] == {(2, "verify"): ("424242", "ann@example.com")}
+      and mailed[-1][:2] == ("ann@example.com", "Elusion RPG - confirm your recovery address")
+      and "424242" in mailed[-1][2] and "15 minutes" in mailed[-1][2], (body, mailed[-1:]))
+check("  and read back masked, there, not yet confirmed",
+      mine("get", "/api/account/email") == (200, {"email": "masked:ann@example.com", "has_email": True,
+                                                  "verified": False}))
+check("confirming: no code, or the wrong one, is the 400 it was - and still unconfirmed",
+      mine("post", "/api/account/email/verify", {})[1].get("message") == "code is required."
+      and mine("post", "/api/account/email/verify", {"code": "111111"})
+      == (400, {"error": "Bad Request", "message": "That code is wrong or has expired."})
+      and ann_says("SELECT email_verified FROM users WHERE id = 2") == [(0,)])
+check("  the right one confirms it, and the code is spent",
+      mine("post", "/api/account/email/verify", {"code": " 424242 "})
+      == (200, {"verified": True, "message": "Recovery address confirmed."})
+      and ann_says("SELECT email_verified FROM users WHERE id = 2") == [(1,)] and not app_a.config["codes"]
+      and mine("get", "/api/account/email")[1].get("verified") is True)
+check("  and the two that hash are kept out of the write lock, as they were; the reads and the hue are not",
+      [getattr(app_a.view_functions[e], "_elusion_no_write_lock", False)
+       for e in ("get_account_email", "set_account_email", "verify_account_email", "set_name_colour")]
+      == [False, True, True, False])
+check("the name colour: a hue on the wheel is stored and answered; past it, or not a number, the 400 it was",
+      mine("put", "/api/account/name-colour", {"hue": 123}) == (200, {"name_hue": 123})
+      and ann_says("SELECT name_hue FROM users WHERE id = 2") == [(123,)]
+      and mine("put", "/api/account/name-colour", {"hue": 360})[1].get("message") == "hue must be a whole number 0-359"
+      and mine("put", "/api/account/name-colour", {"hue": "red"})[0] == 400
+      and ann_says("SELECT name_hue FROM users WHERE id = 2") == [(123,)])
+around("UPDATE users SET email = '', email_verified = 0, password_hash = '', name_hue = ? WHERE id = 2", [(kept_hue,)])
+def auth_door(**more):
+    app_a.config["door"].update(more)
+    return app_a.config["door"]
+
+
+def knock(path, body=None, as_who=None, token=None, ip=None, method="post"):
+    headers = dict(who(as_who) if as_who else {}, **({"X-Test-Token": token} if token else {}),
+                   **({"X-Test-IP": ip} if ip else {}))
+    res = getattr(client_a, method)(path, headers=headers, json=body)
+    return res.status_code, res.get_json() if res.data else None
+
+
+def logins_logged(**where):
+    clause = " AND ".join("%s = ?" % k for k in where) or "1"
+    return ann_says("SELECT username, ok, reason, ip FROM login_attempts WHERE " + clause + " ORDER BY rowid",
+                    tuple(where.values()))
+
+
+def newest_login():
+    """The last login_attempts row, or a row of Nones when there is none."""
+    return (logins_logged() or [(None, None, None, None)])[-1]
+
+
+the_door = auth_door()
+now = int(time.time())
+around("DELETE FROM login_attempts; DELETE FROM auth_codes; DELETE FROM trusted_devices;")
+around("INSERT INTO login_attempts (username, ok, reason, ip, at) VALUES (?, 0, ?, ?, ?)",
+       [("Kit", "no-such-user", "10.0.0.9", now - 60), ("kit", "no-such-user", "10.0.0.9", now - 700),
+        ("kit", "no-such-user", "10.9.9.9", now - 60), ("kit", "bad-password", "10.0.0.9", now - 60)])
+check("auth: register refuses what it always refused, the gates first and each written to the login log",
+      knock("/api/auth/register", {"username": "kit"})[0] == 400
+      and (auth_door(closed=True) and knock("/api/auth/register", {"username": "kit", "password": "kitpassword"})[0] == 503)
+      and (auth_door(closed=False, ip=("ip-spray", 30))
+           and knock("/api/auth/register", {"username": "kit", "password": "kitpassword"})
+           == (429, {"error": "Too Many Requests",
+                     "message": "Too many failed attempts from this address. Try again in 30 seconds."}))
+      and (auth_door(ip=None, probe=("register-probe", 40))
+           and knock("/api/auth/register", {"username": "kit", "password": "kitpassword"})[1]["message"]
+           == "Too many registration attempts from this address. Try again in 40 seconds.")
+      and (auth_door(probe=None, evader={"username": "banned"})
+           and knock("/api/auth/register", {"username": "kit", "password": "kitpassword"})
+           == (403, {"error": "Forbidden", "message": "New accounts cannot be created from this connection."}))
+      and (auth_door(evader=None, install_evader={"username": "banned"})
+           and knock("/api/auth/register", {"username": "kit", "password": "kitpassword", "install": "pc1"})[1]["message"]
+           == "New accounts cannot be created from this computer.")
+      and [r[2] for r in logins_logged(ok=0)][-4:] == ["ip-spray", "register-probe", "register-ban-evasion",
+                                                  "register-ban-evasion-install"]
+      and ann_says("SELECT COUNT(*) FROM users WHERE username = 'kit'")[0][0] == 0)
+auth_door(install_evader=None, hardened=True)
+code, body = knock("/api/auth/register", {"username": "kit", "password": "kitpassword", "install": "pc1"})
+kit_id = body.get("user_id") if body else None
+check("  a new account: its hash stored, its first session issued bound and confirmed, its computer and address computers",
+      code == 201 and {k: body.get(k) for k in ("username", "role", "is_owner", "name_hue", "email_verified",
+                                                 "needs_email")}
+      == {"username": "kit", "role": "wanderer", "is_owner": False, "name_hue": None, "email_verified": False,
+          "needs_email": True}
+      and the_door["issued"] and body.get("token") == the_door["issued"][-1]["token"]
+      and {k: the_door["issued"][-1][k] for k in ("user_id", "install", "hardened", "confirmed")}
+      == {"user_id": kit_id, "install": "i:bound", "hardened": True, "confirmed": True}
+      and ann_says("SELECT password_hash FROM users WHERE id = ?", (kit_id,)) == [("pw:kitpassword",)]
+      and the_door["ips"][-1:] == [(kit_id, "10.0.0.9")] and the_door["installs"][-1:] == [(kit_id, "i:pc1")], (body, the_door["issued"][-1:]))
+check("  and its own first-login misses, from this address inside the window, stop counting as a spray - only those",
+      [r[2] for r in ann_says("SELECT username, ok, reason, ip FROM login_attempts WHERE lower(username) = 'kit'"
+                              " AND reason IN ('no-such-user', 'signup-first-login', 'bad-password') ORDER BY rowid")]
+      == ["signup-first-login", "no-such-user", "no-such-user", "bad-password"])
+auth_door(hardened=False)
+check("  the same name again, any case, is the 409 it was, and written down",
+      knock("/api/auth/register", {"username": "KIT", "password": "kitpassword"})
+      == (409, {"error": "Conflict", "message": "That username is already taken."})
+      and newest_login()[2] == "register-conflict")
+
+del the_door["pruned"][:]
+check("login: a closed server and the address throttle come first; a missing name and a wrong password are one 401",
+      (auth_door(closed=True) and knock("/api/auth/login", {"username": "kit", "password": "kitpassword"})[0] == 503)
+      and (auth_door(closed=False, ip=("ip-spray", 30))
+           and knock("/api/auth/login", {"username": "kit", "password": "kitpassword"})[0] == 429)
+      and (auth_door(ip=None) and knock("/api/auth/login", {"username": "nobody", "password": "whatever1"})
+           == knock("/api/auth/login", {"username": "kit", "password": "wrongpass1"})
+           == (401, {"error": "Unauthorized", "message": "Incorrect username or password."}))
+      and [r[2] for r in logins_logged(ok=0)][-3:] == ["ip-spray", "no-such-user", "bad-password"]
+      and the_door["pruned"][:2] == ["attempts", "sessions"], the_door["pruned"])
+check("  the miss that locks it says so, and while it is locked even the right password waits",
+      knock("/api/auth/login", {"username": "kit", "password": "wrongpass2"})[0] == 401
+      and knock("/api/auth/login", {"username": "kit", "password": "wrongpass3"})[1]
+      == {"error": "Too Many Requests", "message": "Too many failed attempts. Try again in 900 seconds."}
+      and knock("/api/auth/login", {"username": "kit", "password": "kitpassword"})[0] == 429
+      and newest_login()[2] == "account-locked")
+around("UPDATE users SET lockout_until = 0, failed_logins = 0, is_banned = 1, ban_reason = 'griefing' WHERE id = ?",
+       [(kit_id,)])
+check("  a ban is told after the password, never before, with the computer still recorded",
+      knock("/api/auth/login", {"username": "kit", "password": "kitpassword", "install": "pc2"})
+      == (403, {"error": "Forbidden", "message": "This account is banned.",
+                "ban": {"permanent": True, "reason": "griefing"}})
+      and the_door["installs"][-1:] == [(kit_id, "i:pc2")]
+      and knock("/api/auth/login", {"username": "kit", "password": "wrongpass4"})[0] == 401)
+around("UPDATE users SET is_banned = 0, failed_logins = 2 WHERE id = ?", [(kit_id,)])
+ended_before = len(the_door["others"])
+code, body = knock("/api/auth/login", {"username": "kit", "password": "kitpassword", "install": "pc1"})
+check("  the right password: a session, the streak cleared, every other session on it ended, the login logged",
+      code == 200 and the_door["issued"] and body.get("token") == the_door["issued"][-1]["token"] and body.get("role") == "player"
+      and body.get("staff_unprotected") is False and "device_token" not in body
+      and ann_says("SELECT failed_logins, lockout_until FROM users WHERE id = ?", (kit_id,)) == [(0, 0)]
+      and the_door["others"][ended_before:] == [(kit_id, body["token"], None)] and newest_login()[1:3] == (1, "")
+      and the_door["installs"][-1:] == [(kit_id, "i:pc1")], body)
+
+around("UPDATE users SET role = 'mod', email = 'kit@example.com', email_verified = 1 WHERE id = ?", [(kit_id,)])
+mailed = len(the_door["mail"])
+code, body = knock("/api/auth/login", {"username": "kit", "password": "kitpassword"})
+check("a staff login: the right password is not enough - a code is mailed, once a minute, its purpose its own",
+      (code, body) == (202, {"code_required": True, "sent_to": "k***@example.com", "expires_in": 900,
+                             "message": "Staff login: we emailed a code to k***@example.com."})
+      and len(the_door["mail"]) == mailed + 1 and "123456" in the_door["mail"][-1][2]
+      and ann_says("SELECT purpose FROM auth_codes WHERE user_id = ?", (kit_id,)) == [("staff-login",)]
+      and knock("/api/auth/login", {"username": "kit", "password": "kitpassword"})[0] == 202
+      and len(the_door["mail"]) == mailed + 1 and newest_login()[2] == "code-sent", body)
+code, body = knock("/api/auth/login", {"username": "kit", "password": "kitpassword", "code": "654321"})
+check("  a wrong code is a 400 - the password was right - and a miss on the streak",
+      code == 400 and body.get("error") == "Bad Code" and body.get("code_required") is True
+      and ann_says("SELECT failed_logins FROM users WHERE id = ?", (kit_id,)) == [(1,)]
+      and newest_login()[2] == "bad-code", body)
+code, body = knock("/api/auth/login", {"username": "kit", "password": "kitpassword", "code": "123 456"})
+device_token = (body or {}).get("device_token", "")
+computers = ann_says("SELECT user_id, role, expires_at - created_at FROM trusted_devices")
+check("  the right code, typed with its space: the session, and this computer trusted, at its rank, for thirty days",
+      code == 200 and len(device_token) == 43 and computers == [(kit_id, "mod", 30 * 86400)]
+      and ann_says("SELECT token_hash FROM trusted_devices") == [("h:" + device_token,)], (body, computers))
+mailed = len(the_door["mail"])
+code, body = knock("/api/auth/login", {"username": "kit", "password": "kitpassword", "device": device_token})
+check("  that computer is not asked again; promoted, it is",
+      code == 200 and len(the_door["mail"]) == mailed and "device_token" not in body
+      and (around("UPDATE users SET role = 'dev' WHERE id = ?", [(kit_id,)]) is None)
+      and knock("/api/auth/login", {"username": "kit", "password": "kitpassword", "device": device_token})[0] == 202)
+around("DELETE FROM auth_codes")
+around("INSERT INTO trusted_devices (token_hash, user_id, role, created_at, last_used_at, expires_at)"
+       " VALUES (?, ?, 'dev', ?, ?, ?)", [("h:old%d" % i, kit_id, now - 100 + i, now, now + 86400) for i in range(6)])
+knock("/api/auth/login", {"username": "kit", "password": "kitpassword"})
+knock("/api/auth/login", {"username": "kit", "password": "kitpassword", "code": "123456"})
+check("  and an account keeps only its newest five computers",
+      ann_says("SELECT COUNT(*) FROM trusted_devices WHERE user_id = ?", (kit_id,)) == [(5,)]
+      and ann_says("SELECT COUNT(*) FROM trusted_devices WHERE token_hash IN ('h:old0', 'h:old1')") == [(0,)])
+
+USERS["bo"].update(expires_at=now + 7200, name_hue=40, email_verified=1)
+around("UPDATE users SET password_hash = 'pw:bo-password', email = 'bo@example.com', email_verified = 1,"
+       " failed_logins = 0, lockout_until = 0 WHERE id = 3; DELETE FROM sessions WHERE user_id = 3;")
+around("INSERT INTO sessions (user_id, last_seen_at, expires_at, token_hash) VALUES (3, ?, ?, ?)",
+       [(now, now + 7200, "h:bo-a"), (now, now + 7200, "h:bo-b")])
+code, body = knock("/api/auth/session", as_who="bo", method="get")
+check("the heartbeat: stamped, and the same shape as a login, the closing notice on it",
+      (code, body) == (200, {"user_id": 3, "username": "bo", "role": "player", "is_owner": False, "name_hue": 40,
+                             "expires_at": now + 7200, "maintenance": None, "email_verified": True,
+                             "needs_email": False}) and the_door["stamped"][-1:] == [3], body)
+code, body = knock("/api/auth/resume", {"install": "pc3"}, as_who="bo", token="bo-a")
+check("resume: a new token that ends when the old one would have, the old one ended as rotated",
+      code == 200 and the_door["issued"] and body.get("token") == the_door["issued"][-1]["token"] and body.get("expires_at") == now + 7200
+      and the_door["issued"][-1]["expires_at"] == now + 7200 and the_door["others"][-1:] == [(3, body["token"], "bo-a")]
+      and the_door["installs"][-1:] == [(3, "i:pc3")] and the_door["ips"][-1:] == [(3, "10.0.0.9")], body)
+around("DELETE FROM sessions WHERE user_id = 3")
+around("INSERT INTO sessions (user_id, last_seen_at, expires_at, token_hash) VALUES (3, ?, ?, ?)",
+       [(now, now + 7200, "h:bo-a"), (now, now + 7200, "h:bo-b")])
+check("confirm: no password is the 400, a wrong one the 403 - never a 401 - and counted on the session",
+      knock("/api/auth/confirm", {}, as_who="bo", token="bo-a")
+      == (400, {"error": "Bad Request", "message": "password is required"})
+      and knock("/api/auth/confirm", {"password": "nope"}, as_who="bo", token="bo-a")
+      == (403, {"error": "Forbidden", "message": "That is not your password.", "confirm_password": True})
+      and ann_says("SELECT confirm_misses FROM sessions WHERE token_hash = 'h:bo-a'") == [(1,)])
+code, body = knock("/api/auth/confirm", {"password": "bo-password"}, as_who="bo", token="bo-a")
+check("  the right one opens the step-up for its window and clears the misses",
+      code == 200 and body.get("confirmed") is True and body.get("until", 0) - int(time.time()) in (899, 900)
+      and ann_says("SELECT confirm_misses, confirmed_at > 0 FROM sessions WHERE token_hash = 'h:bo-a'") == [(0, 1)])
+knock("/api/auth/confirm", {"password": "nope"}, as_who="bo", token="bo-b")
+knock("/api/auth/confirm", {"password": "nope"}, as_who="bo", token="bo-b")
+check("  and the third wrong one on a session is theft: every session ends, and the game is told",
+      knock("/api/auth/confirm", {"password": "nope"}, as_who="bo", token="bo-b")
+      == (401, {"error": "Unauthorized", "message": "Somebody else has this login.", "token_stolen": True})
+      and the_door["theft"][-1:] == [(3, "3 wrong passwords to confirm")]
+      and ann_says("SELECT COUNT(*) FROM sessions WHERE user_id = 3") == [(0,)])
+around("DELETE FROM sessions WHERE user_id = 3")
+around("INSERT INTO sessions (user_id, last_seen_at, expires_at, token_hash) VALUES (3, ?, ?, ?)",
+       [(now, now + 7200, "h:bo-a"), (now, now + 7200, "h:bo-b"), (now, now + 7200, "h:bo-c")])
+around("INSERT OR REPLACE INTO trusted_devices (token_hash, user_id, role, created_at, last_used_at, expires_at)"
+       " VALUES ('h:bo-pc', 3, 'player', ?, ?, ?)", [(now, now, now + 86400)])
+check("logout ends the one session the token is; logout-all every one, and every trusted computer",
+      knock("/api/auth/logout", as_who="bo", token="bo-a") == (204, None)
+      and [r[0] for r in ann_says("SELECT token_hash FROM sessions WHERE user_id = 3 ORDER BY token_hash")]
+      == ["h:bo-b", "h:bo-c"]
+      and knock("/api/auth/logout-all", as_who="bo", token="bo-b") == (200, {"revoked": 2})
+      and ann_says("SELECT COUNT(*) FROM sessions WHERE user_id = 3") == [(0,)]
+      and ann_says("SELECT COUNT(*) FROM trusted_devices WHERE user_id = 3") == [(0,)])
+
+check("the password change refuses what it always did: a body, both strings, the length, the same one again",
+      knock("/api/auth/password", ["x"], as_who="bo")[1]["message"] == "Payload must be a JSON object."
+      and knock("/api/auth/password", {"current_password": "bo-password"}, as_who="bo")[1]["message"]
+      == "current_password and new_password are required strings."
+      and knock("/api/auth/password", {"current_password": "bo-password", "new_password": "short"},
+                as_who="bo")[1]["message"] == "Field 'new_password' must be at least 8 characters."
+      and knock("/api/auth/password", {"current_password": "bo-password", "new_password": "bo-password"},
+                as_who="bo")[1]["message"] == "The new password must be different from the current one.")
+check("  throttled like a login, and a wrong current password is a 401 and a miss on the streak",
+      (auth_door(ip=("ip-spray", 30)) and knock("/api/auth/password", {"current_password": "bo-password",
+                                                                  "new_password": "bo-new-password"},
+                                           as_who="bo")[0] == 429)
+      and (auth_door(ip=None) and knock("/api/auth/password", {"current_password": "guess-one",
+                                                          "new_password": "bo-new-password"}, as_who="bo")
+           == (401, {"error": "Unauthorized", "message": "The current password is incorrect."}))
+      and ann_says("SELECT failed_logins FROM users WHERE id = 3") == [(1,)]
+      and newest_login()[2] == "bad-password-on-change")
+around("INSERT INTO sessions (user_id, last_seen_at, expires_at, token_hash) VALUES (3, ?, ?, ?)",
+       [(now, now + 7200, "h:bo-x"), (now, now + 7200, "h:bo-y")])
+around("INSERT OR REPLACE INTO trusted_devices (token_hash, user_id, role, created_at, last_used_at, expires_at)"
+       " VALUES ('h:bo-pc', 3, 'player', ?, ?, ?)", [(now, now, now + 86400)])
+code, body = knock("/api/auth/password", {"current_password": "bo-password", "new_password": "bo-new-password"},
+                   as_who="bo")
+check("  changed: the new hash, the streak cleared, every session ended and one issued, the computers forgotten",
+      code == 200 and body.get("revoked") == 2 and the_door["issued"] and body.get("token") == the_door["issued"][-1]["token"]
+      and the_door["issued"][-1]["confirmed"] is True
+      and ann_says("SELECT password_hash, failed_logins FROM users WHERE id = 3") == [("pw:bo-new-password", 0)]
+      and [r[0] for r in ann_says("SELECT token_hash FROM sessions WHERE user_id = 3")] == ["h:" + body["token"]]
+      and ann_says("SELECT COUNT(*) FROM trusted_devices WHERE user_id = 3") == [(0,)]
+      and newest_login()[1:3] == (1, "password-changed"), body)
+
+RECOVER_SAID = {"ok": True, "message": "If that address is on an account, a code is on its way."}
+mailed = len(the_door["mail"])
+check("recovery: an address on no account, or on one not confirmed, is the same answer and no mail",
+      knock("/api/auth/recover", {"email": "nobody@example.com"}) == (200, RECOVER_SAID)
+      and (around("UPDATE users SET email_verified = 0 WHERE id = 3") is None)
+      and knock("/api/auth/recover", {"email": "BO@example.com"}) == (200, RECOVER_SAID)
+      and len(the_door["mail"]) == mailed and newest_login()[2] == "recover-request")
+around("UPDATE users SET email_verified = 1 WHERE id = 3")
+around("DELETE FROM login_attempts WHERE reason = 'recover-request'")
+check("  a confirmed one: the same answer, a reset code stored and mailed - once a minute",
+      knock("/api/auth/recover", {"email": "bo@example.com"}) == (200, RECOVER_SAID)
+      and len(the_door["mail"]) == mailed + 1 and the_door["mail"][-1][0] == "bo@example.com" and "123456" in the_door["mail"][-1][2]
+      and ann_says("SELECT purpose FROM auth_codes WHERE user_id = 3") == [("reset",)]
+      and knock("/api/auth/recover", {"email": "bo@example.com"}) == (200, RECOVER_SAID) and len(the_door["mail"]) == mailed + 1)
+check("  and the address's ceiling: three requests, then the 429",
+      knock("/api/auth/recover", {"email": "x@example.com"}) == (200, RECOVER_SAID)
+      and knock("/api/auth/recover", {"email": "x@example.com"})
+      == (429, {"error": "Too Many Requests",
+                "message": "Too many recovery requests from this address. Try again later."})
+      and knock("/api/auth/recover", {"email": "x@example.com"}, ip="10.0.0.10") == (200, RECOVER_SAID))
+around("INSERT INTO sessions (user_id, last_seen_at, expires_at, token_hash) VALUES (3, ?, ?, ?)",
+       [(now, now + 7200, "h:bo-z")])
+around("INSERT OR REPLACE INTO trusted_devices (token_hash, user_id, role, created_at, last_used_at, expires_at)"
+       " VALUES ('h:bo-pc', 3, 'player', ?, ?, ?)", [(now, now, now + 86400)])
+mailed = len(the_door["mail"])
+check("reset: the length first, then the throttle; no account and a wrong code are one 400, both written down",
+      knock("/api/auth/reset", {"email": "bo@example.com", "code": "123456", "new_password": "short"})[1]["message"]
+      == "Field 'new_password' must be at least 8 characters."
+      and (auth_door(ip=("ip-spray", 30)) and knock("/api/auth/reset", {"email": "bo@example.com", "code": "123456",
+                                                                   "new_password": "bo-third-password"})[0] == 429)
+      and (auth_door(ip=None) and knock("/api/auth/reset", {"email": "nobody@example.com", "code": "123456",
+                                                       "new_password": "bo-third-password"})
+           == knock("/api/auth/reset", {"email": "bo@example.com", "code": "999999",
+                                        "new_password": "bo-third-password"})
+           == (400, {"error": "Bad Request", "message": "That code is wrong or has expired."}))
+      and [r[2] for r in logins_logged()][-2:] == ["reset-bad-code", "reset-bad-code"]
+      and ann_says("SELECT password_hash FROM users WHERE id = 3") == [("pw:bo-new-password",)])
+around("UPDATE auth_codes SET code_hash = 'c:123456' WHERE user_id = 3")
+signed_in = ann_says("SELECT COUNT(*) FROM sessions WHERE user_id = 3")[0][0]
+code, body = knock("/api/auth/reset", {"email": "bo@example.com", "code": "123456",
+                                       "new_password": "bo-third-password"})
+check("  the right code: the new password, every session and trusted computer gone, and a mail to say so",
+      signed_in == 2
+      and (code, body) == (200, {"ok": True, "revoked": 2, "message": "Password updated. You can sign in now."})
+      and ann_says("SELECT password_hash FROM users WHERE id = 3") == [("pw:bo-third-password",)]
+      and ann_says("SELECT COUNT(*) FROM sessions WHERE user_id = 3") == [(0,)]
+      and ann_says("SELECT COUNT(*) FROM trusted_devices WHERE user_id = 3") == [(0,)]
+      and len(the_door["mail"]) == mailed + 1 and "your password was changed" in the_door["mail"][-1][1]
+      and newest_login()[1:3] == (1, "password-reset"), body)
+for _key in ("expires_at", "name_hue", "email_verified"):
+    USERS["bo"].pop(_key)
 code, body = switch("/api/server/broadcast", {"body": "  Mind the slimes  ", "kind": "Shout"}, again=False)
 check("the owner's voice: said in the world as sent, trimmed, its kind in lower case, its id handed back",
       (code, body) == (200, {"id": len(told), "kind": "shout", "body": "Mind the slimes", "by": "boss"})
@@ -2948,7 +3751,7 @@ check("and nobody without a login gets in anywhere",
                                                   "/api/account", "/api/save", "/api/character?slot=0",
                                                   "/api/player/status?slot=0", "/api/shop/stall",
                                                   "/api/players/online", "/api/players/nearby?slot=0",
-                                                  "/api/server/coowners")]
+                                                  "/api/server/coowners", "/api/staff/gifts", "/api/staff/snapshots?username=ann", "/api/account/email", "/api/auth/session")]
       + [client_a.post(path, json={"slot": 0}).status_code for path in ("/api/fishing/catch", "/api/cooking/cook",
                                                                          "/api/loot/take", "/api/guild/create",
                                                                          "/api/staff/guild", "/api/party/invite",
@@ -2979,12 +3782,12 @@ check("and nobody without a login gets in anywhere",
                                                                          "/api/server/minbuild", "/api/server/pvp",
                                                                          "/api/server/trade", "/api/server/coowners",
                                                                          "/api/server/broadcast",
-                                                                         "/api/combat/kill")]
+                                                                         "/api/combat/kill", "/api/staff/gold", "/api/staff/level", "/api/staff/skill", "/api/staff/grant", "/api/staff/rollback", "/api/staff/teleport", "/api/teleport/ack", "/api/account/email", "/api/account/email/verify", "/api/auth/resume", "/api/auth/confirm", "/api/auth/logout", "/api/auth/logout-all", "/api/auth/password")]
       + [client_a.put(path, json={}).status_code for path in ("/api/staff/role", "/api/account/bank",
                                                               "/api/account/lusions", "/api/character/inventory",
                                                               "/api/character/skills", "/api/save",
-                                                              "/api/player/status")]
-      == [401] * 84)
+                                                              "/api/player/status", "/api/account/name-colour")]
+      == [401] * 103)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")
@@ -3018,7 +3821,8 @@ check("the code map finds the packages app.py imports: %s" % ", ".join(PACKAGES)
       set(PACKAGES) >= {"playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds",
                         "parties", "chat", "trade", "kingdom", "world", "moderation", "staffdesk",
                         "equipment", "consuming", "death", "bank", "carry", "skills", "saves", "status",
-                        "shop", "players", "switches", "kill"},
+                        "shop", "players", "switches", "kill", "ownertools",
+                        "accountsettings", "auth"},
       PACKAGES)
 check("  and every one of them runs on a bare app in this file", set(PACKAGES) == set(RUN_HERE),
       sorted(set(PACKAGES) ^ set(RUN_HERE)))

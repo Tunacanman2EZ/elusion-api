@@ -374,11 +374,19 @@ for name in ("require_role", "require_owner"):
           "the next reader will reach for the textbook answer unless it is here")
 
 # And the reverse, so the rule is enforced in both directions: every 403 in the
-# file sits in a route, never in a decorator that admits one.
-with open(os.path.join(HERE, "app.py"), "r", encoding="utf-8") as fh:
-    source_lines = fh.readlines()
-forbidden_lines = [i + 1 for i, line in enumerate(source_lines) if re.search(r"\b403\b", line)]
-check("app.py still uses 403 somewhere", len(forbidden_lines) > 0, len(forbidden_lines))
+# server sits in a route, never in a decorator that admits one. THE ROUTES ARE
+# IN THE PACKAGES too since 16 Oct - the password confirm's 403 is auth/'s - so
+# they are read as well, found the code map's way.
+import codemap  # noqa: E402
+
+source_lines = open(os.path.join(HERE, "app.py"), "r", encoding="utf-8").readlines()
+for _package, _rows, _layers in codemap.feature_packages():
+    for _name in sorted(os.listdir(os.path.join(HERE, _package))):
+        if _name.endswith(".py"):
+            source_lines += open(os.path.join(HERE, _package, _name), "r", encoding="utf-8").readlines()
+forbidden_lines = [i + 1 for i, line in enumerate(source_lines) if re.search(r"\b403\b", line.split("#", 1)[0])]
+check("the server still uses 403 somewhere, in code (app.py or a package)", len(forbidden_lines) > 0,
+      len(forbidden_lines))
 
 
 print("\n" + "=" * 70)
