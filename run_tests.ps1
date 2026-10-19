@@ -62,6 +62,9 @@
 # weight. test_deploy.py checks a real variable beats the file. elusion.db is
 # never opened by a test. That is worth knowing rather than trusting, because
 # the one time it is wrong it is wrong about real accounts and password hashes.
+# So it is a test as well as a sentence: test_isolation.py reads every suite
+# and fails one that loads app.py before setting ELUSION_DB, or sets it to
+# anything but testdir.PATH or the temp folder.
 #
 #
 # SIDE BY SIDE, BECAUSE NOTHING IS SHARED ANY MORE

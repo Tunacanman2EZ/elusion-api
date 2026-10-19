@@ -247,3 +247,14 @@ it uses the package's function and that its numbers are the route's.
 - **test_ownership's per-user table list read app.py only**, so fifteen moved
   tables would have dropped out of its write scan. It reads the packages'
   schema.py too, and finds the same 33 tables it did.
+
+### 13. Nothing held the suites to their throwaway database - fixed 19 Oct
+
+Found from the owner's lesson on test configuration ("rules live as tests").
+run_tests.ps1 explained why no suite opens `elusion.db`: each one sets
+`ELUSION_DB` to a temp file before it loads app.py. All 55 that load it did,
+but a new one that forgot would have opened the owner's real accounts and
+said nothing. `test_isolation.py` now reads every suite's source and fails one
+that loads app.py first, sets nothing, or points anywhere but testdir.PATH or
+the temp folder; it checks its own checker on made-up suites too. (Not
+test_quality.py - that one is gear quality rolls.)

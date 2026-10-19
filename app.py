@@ -1242,12 +1242,14 @@ def init_db():
         -- THE BOOKS ON EVERY MONSTER (0.10.0; E3_SCOPE.md option C, step 1).
         -- presence.py keeps its own count of every monster's health from what
         -- the area's leader says and every hit any game sends (combatbook.py),
-        -- and writes down what it saw here - and into nothing else: these two
-        -- tables are the only ones that process writes. NOTHING READS THEM TO
-        -- DECIDE ANYTHING YET: a kill is paid as it always was. killwatch.py
-        -- matches kill_reports against combat_kills ("THE BOOKS"), and step 2
-        -- makes a kill need an agreed row. Kept two weeks, like kill_reports;
-        -- presence.py prunes them.
+        -- and writes down what it saw here. Those two tables, the aura's heal
+        -- grants (consume_grants) and where everyone stands (position_samples,
+        -- below) are all that process writes. killwatch.py matches
+        -- kill_reports against combat_kills ("THE BOOKS"), and since 0.57.0
+        -- (step 2) the owner's receipts switch makes a kill need an agreed
+        -- row (kill/, "Kill receipts" in CLAUDE.md); off, a kill is paid as it
+        -- always was. Kept two weeks, like kill_reports; presence.py prunes
+        -- them.
         --
         -- One row per player who hit a monster that died: AGREED (the books'
         -- count reached zero too), SHORT (the leader said it died with health
@@ -1285,6 +1287,24 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_combat_flags_user ON combat_flags(user_id, last_at);
         CREATE INDEX IF NOT EXISTS idx_combat_flags_at ON combat_flags(last_at);
+
+        -- WHERE EVERYONE STANDS (19 Oct; LAUNCH_ONE_WAY_DOORS.md, D3). saves
+        -- holds no position, and a position nobody wrote down cannot be had
+        -- back when the world boss or server-run monsters need to know how
+        -- people move. presence.py writes one row per character every 15
+        -- seconds it moved or changed area (POSITION_SAMPLE_SECONDS) and
+        -- prunes them after two weeks. NOTHING READS THEM YET.
+        CREATE TABLE IF NOT EXISTS position_samples (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            at       INTEGER NOT NULL,
+            user_id  INTEGER NOT NULL,
+            slot     INTEGER NOT NULL DEFAULT -1,
+            area     TEXT    NOT NULL,
+            x        REAL    NOT NULL,
+            y        REAL    NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_position_samples_at ON position_samples(at);
+        CREATE INDEX IF NOT EXISTS idx_position_samples_user ON position_samples(user_id, slot, at);
 
         -- EVERY CONSUMABLE THE SERVER AUTHORISED, one row each.
         --

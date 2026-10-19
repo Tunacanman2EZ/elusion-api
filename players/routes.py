@@ -240,14 +240,16 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, ca
         """
         # AREA, NOT DISTANCE, AND THE NAME OF THIS ROUTE OVERSTATES IT.
         #
-        # The server stores which AREA a character is in (saves.area, written by
-        # PUT /api/save) and nothing finer. There is no position on the server and
-        # no heartbeat carrying one, so "nearby" here means "in the same area and
-        # online" - which is the honest maximum today and is genuinely what a trade
-        # panel needs, because you cannot see another player at all yet.
+        # The API stores which AREA a character is in (saves.area, written by
+        # PUT /api/save). Where one stands is presence.py's: it draws everyone in
+        # an area to each other (0.7.0), and since 19 Oct writes a sample every
+        # 15 seconds to position_samples, which nothing here reads yet. So
+        # "nearby" means "in the same area and online" - what a trade panel
+        # needs.
         #
-        # WHEN PRESENCE ARRIVES, this is the seam: the query gains a distance test
-        # and the response gains a position, and the client does not change shape.
+        # THE SEAM, if distance is ever wanted: the query gains a distance test
+        # against the newest sample and the response gains a position, and the
+        # client does not change shape.
         user_id = g.user["id"]
 
         slot = parse_slot(request.args.get("slot"))

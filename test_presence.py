@@ -256,6 +256,11 @@ async def run(port, server):
     check("walking to another area leaves the old one", left(got_b) == [uid("presa")], got_b)
     check("  and joins the new", uid("presa") in joined(got_c), got_c)
     check("  where you are told who is there", uid("presc") in joined(got_a), got_a)
+    await asyncio.sleep(0.5)
+    stood = [tuple(r) for r in sql("SELECT slot, area, x, y FROM position_samples WHERE user_id = ?",
+                                   (uid("presa"),))]
+    check("  and where a game stands reaches position_samples off the wire (P-12)",
+          (0, "elusion", 12.0, 12.0) in stood and any(r[1] == "field" for r in stood), stood)
     await a.send(state("field", x=100.0, y=200.0))
     await collect(a), await collect(b), await collect(c)
 
@@ -1087,14 +1092,89 @@ async def kills_written_soon():
           calls == [(1, 0, None)] and flags_left == 1 and presence.KILLS_FLUSH_SECONDS <= 0.25, (calls, flags_left))
 
 
+async def positions_written():
+    """WHERE EVERYONE STANDS (19 Oct; LAUNCH_ONE_WAY_DOORS.md, D3): a sample of
+    each character that moved, beside the books and never in their write."""
+    section("P-12 WHERE EVERYONE STANDS: A SAMPLE OF EACH CHARACTER THAT MOVED, WRITTEN BESIDE THE BOOKS")
+    def samples():
+        return [tuple(r) for r in sql("SELECT user_id, slot, area, x, y FROM position_samples"
+                                      " WHERE user_id IN (9001, 9002, 9003) ORDER BY id")]
+    hub = presence.PresenceServer(sweep_seconds=5, tick_seconds=5)
+    hub.position_sample_seconds = 0.0
+    walker = presence.Player(None, 9001, "hash-1", {}, time.time() + 60, slot=1)
+    walker.area, walker.x, walker.y = "field", 120.5, 340.0
+    nowhere = presence.Player(None, 9002, "hash-2", {}, time.time() + 60, slot=0)
+    hub.players = {9001: walker, 9002: nowhere}
+    await hub.flush_books()
+    check("a character in an area is written down: who, which character, the area and where",
+          samples() == [(9001, 1, "field", 120.5, 340.0)], samples())
+    check("  and one in no area yet is not", all(r[0] != 9002 for r in samples()), samples())
+    await hub.flush_books()
+    check("standing still writes nothing more", len(samples()) == 1, samples())
+    walker.x = 180.0
+    await hub.flush_books()
+    walker.area = "town"
+    await hub.flush_books()
+    check("a step writes a sample, and so does another area where it stood",
+          samples()[1:] == [(9001, 1, "field", 180.0, 340.0), (9001, 1, "town", 180.0, 340.0)], samples())
+    hub.position_sample_seconds = 3600.0
+    walker.x = 999.0
+    await hub.flush_books()
+    check("  but only one a sample's length (POSITION_SAMPLE_SECONDS, %g s)" % presence.POSITION_SAMPLE_SECONDS,
+          len(samples()) == 3 and 5.0 <= presence.POSITION_SAMPLE_SECONDS <= 60.0, samples())
+    old = int(time.time()) - presence.POSITIONS_KEPT_SECONDS - 60
+    con = sqlite3.connect(DB_PATH)
+    con.execute("INSERT INTO position_samples (at, user_id, slot, area, x, y) VALUES (?, 9003, 0, 'field', 1, 1)",
+                (old,))
+    con.commit()
+    con.close()
+    hub._positions_pruned_at = 0.0
+    await hub.flush_books()
+    check("a sample older than POSITIONS_KEPT_SECONDS (two weeks) is pruned, the rest kept",
+          all(r[0] != 9003 for r in samples()) and len(samples()) == 3
+          and presence.POSITIONS_KEPT_SECONDS == 14 * 86400, samples())
+
+    # A DATABASE FROM BEFORE THE TABLE: the books are written all the same.
+    before = os.path.join(testdir.PATH, "before_positions.db")
+    con = sqlite3.connect(before)
+    con.execute("CREATE TABLE combat_kills (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, area TEXT,"
+                " enemy_id TEXT, origin TEXT, leader_id INTEGER, user_id INTEGER, slot INTEGER, verdict TEXT,"
+                " damage INTEGER, refused INTEGER, hp_left INTEGER, max_hp INTEGER, seconds REAL)")
+    con.execute("CREATE TABLE combat_flags (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, area TEXT,"
+                " kind TEXT, count INTEGER, detail TEXT, first_at INTEGER, last_at INTEGER)")
+    con.commit()
+    con.close()
+    real_path = presence.DB_PATH
+    presence.DB_PATH = before
+    try:
+        old_db = presence.PresenceServer(sweep_seconds=5, tick_seconds=5)
+        old_db.position_sample_seconds = 0.0
+        mover = presence.Player(None, 9001, "hash-1", {}, time.time() + 60, slot=1)
+        mover.area, mover.x, mover.y = "field", 10.0, 10.0
+        old_db.players = {9001: mover}
+        old_db._kills = [{"at": int(time.time()), "area": "field", "enemy_id": "slime", "origin": "",
+                          "leader_id": 0, "user_id": 9001, "slot": 1, "verdict": "agreed", "damage": 5,
+                          "refused": 0, "hp_left": 0, "max_hp": 5, "seconds": 1.0}]
+        await old_db.flush_books()
+    finally:
+        presence.DB_PATH = real_path
+    con = sqlite3.connect(before)
+    kills_there = con.execute("SELECT COUNT(*) FROM combat_kills").fetchone()[0]
+    con.close()
+    check("a database from before the table still gets the death the books judged, and says why it has no positions",
+          kills_there == 1 and bool(presence._POSITIONS_TABLE_MISSING), (kills_there, presence._POSITIONS_TABLE_MISSING))
+
+
 async def main():
     await kills_written_soon()
+    await positions_written()
     presence.HELLO_SECONDS = 0.5
     combatbook.HOLD_SECONDS = 0.2
     combatbook.PENDING_SECONDS = 0.3
     combatbook.EMPTY_KEEP = 0.5
     server = presence.PresenceServer(sweep_seconds=0.3, tick_seconds=0.05)
     server.flush_seconds = 0.2
+    server.position_sample_seconds = 0.1
     server.start_clocks()
     async with serve(server.handler, "127.0.0.1", 0, max_size=presence.MAX_SOCKET_BYTES) as ws_server:
         port = list(ws_server.sockets)[0].getsockname()[1]

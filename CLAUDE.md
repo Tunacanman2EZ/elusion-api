@@ -50,6 +50,11 @@ ever touches `elusion.db` - and in a folder of its own for each run
 the same time. **A new suite puts its databases under `testdir.PATH`**, never
 at a fixed name in `tempfile.gettempdir()`: that is the shared folder, and two
 runs at once wrote over each other's data (UPGRADES.md, item 2).
+**And that is checked, not trusted** (19 Oct): `test_isolation.py` reads
+every suite's source and fails one that loads app.py before it sets
+`ELUSION_DB`, sets nothing, or points it anywhere but testdir.PATH or the temp
+folder. A new suite that forgets is a red run, not a quiet write to the
+owner's real accounts.
 
 **THERE IS NO CHECK COUNT WRITTEN DOWN HERE, AND THAT IS DELIBERATE.** This
 line used to say "262 checks" and the Layout below used to give a figure for
@@ -1411,8 +1416,8 @@ every rule.
 - **Why not a route.** gunicorn runs two workers that share no memory and
   eight threads between them; a socket held open for a session would hold a
   thread. One asyncio process keeps every connection in one place, in memory.
-  A position is worth something for a tenth of a second, so none of it is
-  written to the database.
+  A position is worth something for a tenth of a second, so the relay writes
+  none of it to the database - only the sample below.
 - **It never sees a login.** `POST /api/presence/ticket` (behind
   `require_auth`, `{"slot"}`) writes a ticket to `presence_tickets` - stored
   hashed, tied to the session that asked, two minutes long - and answers
@@ -1470,6 +1475,18 @@ every rule.
   the first seven as ever - and in the join entry. Nothing else reads them;
   the books do not. test_presence.py: carried, refused out of range, told in
   a join.
+- **WHERE EVERYONE STANDS, WRITTEN DOWN (19 Oct; LAUNCH_ONE_WAY_DOORS.md,
+  D3).** `saves` holds no position, and one nobody wrote down cannot be had
+  back. Every `POSITION_SAMPLE_SECONDS` (15) presence.py writes a row to
+  `position_samples` (`at, user_id, slot, area, x, y`) for each character in
+  an area that moved or changed area since its last one, and prunes rows past
+  `POSITIONS_KEPT_SECONDS` (two weeks) hourly. It is its own write after the
+  books' (`flush_positions()`, `write_positions()`), so a database from
+  before the table loses nothing the books judged; it says so once in the
+  log. **Nothing reads it yet**: it is the history the world boss, server-run
+  monsters and E-3's last step will choose their numbers from. About four
+  million rows over two weeks at 50 players moving all day. test_presence.py
+  P-12.
 
 ## Shared monsters: one game runs them, presence.py passes the notes
 
@@ -2438,6 +2455,10 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
   maintenance   the kill switch and its countdown
   security_doc  the docs against the code: SECURITY.md's claims, and that
                 DEPLOY.md names the runner rather than a list of suites
+  isolation     every suite on a throwaway database: read from the suites'
+                own source, so a new one that forgets ELUSION_DB fails
+  receipts      kill receipts: a kill is paid only against the books' agreed
+                death, used once, and the switch that turns it on
   deploy        what the first live deploy found: the .env read first, and
                 backups that are one file each
   guilds / friends / mail / map / teleport / recovery / settings /
@@ -2527,8 +2548,12 @@ TIME). The ledger functions went with it.
   existence. It is now at least RECORDED - `kill_reports` logs every claim the
   server paid out, in the same transaction, and refused kills leave no row -
   and since 0.10.0 WATCHED: the books judge every death and killwatch.py
-  matches every paid kill to them. Still paid on the game's word until step 2.
-  The deepest open finding; see SECURITY_NOTES.md (E-3).
+  matches every paid kill to them. Since 0.57.0 (step 2) the owner's receipts
+  switch pays a kill only against the books' agreed death ("Kill receipts");
+  with it off, a kill is paid on the game's word as before. What is left is
+  the books' own source: they count from what the area's leader game says
+  its monsters do. Step 3 (server-run monsters) closes that. The deepest open
+  finding; see SECURITY_NOTES.md (E-3).
 - `app.run()` is Flask's development server even with debug off. Right for local
   play, wrong for anything public; a real deployment needs a WSGI server, TLS,
   and `ELUSION_TRUSTED_PROXIES` set to match - see `client_ip()`.

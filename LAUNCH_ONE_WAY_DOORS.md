@@ -88,7 +88,12 @@ launcher, a storefront that patches (itch.io's app does), or a hard rule that
 the wire never breaks — any of those is fine. Not having picked one is what
 costs.
 
-### D3 — Data you are not recording · **partly open, and the cheap half is cheap**
+### D3 — Data you are not recording · **closed: positions recorded (19 Oct)**
+
+*Built 19 October 2026:* presence.py writes a sample of where each character
+stands every 15 seconds it moved, into `position_samples`, kept two weeks;
+nothing reads it yet. No new requests: presence already knew, so the heartbeat
+did not need to carry anything (api/CLAUDE.md, "WHERE EVERYONE STANDS").
 
 Adding a column later is easy. Reconstructing what it would have held is
 impossible.
@@ -161,7 +166,8 @@ In order, and short on purpose:
 1. ~~**The version handshake (D1).**~~ Done — `X-Elusion-Build`, the 426
    refusal and `/api/server/minbuild` are built and ship disarmed at 0.
 2. **Decide the update path (D2).** No code. Decide it before the build.
-3. **Record positions (D3).** Column and heartbeat only, nothing reading them.
+3. ~~**Record positions (D3).**~~ Done 19 Oct - `position_samples`,
+   written by presence.py, nothing reading them.
 4. **Say the economy may be reset (D4).** One sentence, to the first cohort,
    before they earn anything.
 5. **The trade switch,** from `E3_SCOPE.md` — not a door, but it is the thing

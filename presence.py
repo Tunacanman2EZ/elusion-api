@@ -11,7 +11,9 @@ that: gunicorn runs two workers that share no memory, each request borrows one
 of eight threads, and a socket held open for a whole session would hold a
 thread with it. This is one small asyncio process that keeps every connection
 in one place, and in memory: a position is worth something for a tenth of a
-second, so none of it touches the database.
+second, so none of it touches the database. (Since 19 Oct one sample of where
+each character stands is written every 15 seconds, for what comes later -
+position_samples, POSITION_SAMPLE_SECONDS. The relay never waits on it.)
 
 IT NEVER SEES A LOGIN. The game asks the API for a ticket (POST
 /api/presence/ticket, behind require_auth), and hands the ticket to this socket.
@@ -271,6 +273,18 @@ KILLS_FLUSH_SECONDS = 0.25
 # counts - a monster born in its last minute lives on after it.
 STIR_READ_SECONDS = 30.0
 STIR_GRACE_SECONDS = 3600
+# WHERE EVERYONE STANDS, WRITTEN DOWN (19 Oct; LAUNCH_ONE_WAY_DOORS.md, D3).
+# The saves hold no position at all, and a position nobody wrote down cannot be
+# had back later: the world boss, server-run monsters and E-3's last step will
+# want to know how people really move, not a guess at it. This process already
+# knows where every character stands, so every POSITION_SAMPLE_SECONDS it
+# writes one row for each that moved or changed area (position_samples), in a
+# write of its own - a database from before the table must never cost a death
+# the books judged. NOTHING READS THEM YET. Kept POSITIONS_KEPT_SECONDS: at 50
+# players moving all day that is about four million rows over the two weeks; at
+# one tester, a few thousand a day.
+POSITION_SAMPLE_SECONDS = 15.0
+POSITIONS_KEPT_SECONDS = 14 * 86400
 
 # What a body may claim to be doing: the player scenes' own animation names.
 ANIM_PATTERN = re.compile(r"^(idle|walk|attack|death|hitflash)(up|down|left|right)$")
@@ -437,6 +451,34 @@ def write_books(kills, flags, prune_before=None):
         conn.close()
 
 
+_POSITIONS_TABLE_MISSING = []
+
+
+def write_positions(rows, prune_before=None):
+    """Write position samples, (at, user_id, slot, area, x, y) each, and drop
+    those older than prune_before - in a transaction of its own (see
+    POSITION_SAMPLE_SECONDS). Runs in a thread."""
+    if not rows and prune_before is None:
+        return
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    try:
+        if rows:
+            conn.executemany("INSERT INTO position_samples (at, user_id, slot, area, x, y)"
+                             " VALUES (?, ?, ?, ?, ?, ?)", rows)
+        if prune_before is not None:
+            conn.execute("DELETE FROM position_samples WHERE at < ?", (int(prune_before),))
+        conn.commit()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
+        if not _POSITIONS_TABLE_MISSING:
+            _POSITIONS_TABLE_MISSING.append(str(exc))
+            print("[PRESENCE] positions cannot be written (%s): this database is from "
+                  "before them - start app.py once to add the table" % exc, flush=True)
+    finally:
+        conn.close()
+
+
 def aura_numbers():
     """(share, reach, cooldown) of the healer's aura, from the catalogue -
     a share of 0 when it has none."""
@@ -557,6 +599,9 @@ class Player:
         self.area = ""
         self.x = 0.0
         self.y = 0.0
+        # Where its last position sample put it, (area, x, y) rounded; None
+        # before the first (POSITION_SAMPLE_SECONDS).
+        self.sampled = None
         self.anim = "idledown"
         self.fx = []
         self.pet = ""
@@ -790,6 +835,9 @@ class PresenceServer:
         self.tick_seconds = TICK_SECONDS if tick_seconds is None else tick_seconds
         self.flush_seconds = FLUSH_SECONDS
         self.kills_flush_seconds = KILLS_FLUSH_SECONDS
+        self.position_sample_seconds = POSITION_SAMPLE_SECONDS
+        self._positions_at = 0.0
+        self._positions_pruned_at = 0.0
         self._tasks = []
         self._closing = set()
         # THE BOOKS: one per area that has a map, kept while the process runs.
@@ -1369,6 +1417,38 @@ class PresenceServer:
         except Exception as exc:  # noqa: BLE001
             print("[PRESENCE] could not write the books: %r" % exc, flush=True)
 
+    def take_positions(self, now):
+        """(at, user_id, slot, area, x, y) for every character in an area that
+        moved or changed area since its last sample, for write_positions()."""
+        rows = []
+        for p in list(self.players.values()):
+            if not p.area:
+                continue
+            here = (p.area, round(p.x), round(p.y))
+            if here == p.sampled:
+                continue
+            p.sampled = here
+            rows.append((int(now), int(p.user_id), int(p.slot), p.area, round(p.x, 1), round(p.y, 1)))
+        return rows
+
+    async def flush_positions(self, now):
+        """WHERE EVERYONE STANDS: a sample every position_sample_seconds, and
+        the old ones pruned hourly. Never in the books' write (write_positions)."""
+        rows = []
+        if now - self._positions_at >= self.position_sample_seconds:
+            self._positions_at = now
+            rows = self.take_positions(now)
+        prune = None
+        if now - self._positions_pruned_at >= 3600.0:
+            self._positions_pruned_at = now
+            prune = now - POSITIONS_KEPT_SECONDS
+        if not rows and prune is None:
+            return
+        try:
+            await asyncio.to_thread(write_positions, rows, prune)
+        except Exception as exc:  # noqa: BLE001
+            print("[PRESENCE] could not write the positions: %r" % exc, flush=True)
+
     async def flush_books(self):
         kills, flags = self.take_books()
         now = time.time()
@@ -1382,12 +1462,13 @@ class PresenceServer:
         if now - self._pruned_at >= 3600.0:
             self._pruned_at = now
             prune = now - BOOKS_KEPT_SECONDS
-        if not kills and not flags and prune is None:
-            return
-        try:
-            await asyncio.to_thread(write_books, kills, flags, prune)
-        except Exception as exc:  # noqa: BLE001
-            print("[PRESENCE] could not write the books: %r" % exc, flush=True)
+        if kills or flags or prune is not None:
+            try:
+                await asyncio.to_thread(write_books, kills, flags, prune)
+            except Exception as exc:  # noqa: BLE001
+                print("[PRESENCE] could not write the books: %r" % exc, flush=True)
+        # After the books, never before them: a game may be waiting on a death.
+        await self.flush_positions(now)
 
     async def sweep_loop(self):
         while True:
