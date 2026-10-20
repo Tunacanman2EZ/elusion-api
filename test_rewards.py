@@ -102,29 +102,22 @@ ember = sum(gear_tiers(eid, KILLS).get(5, 0) for eid in DARK) / (KILLS * len(DAR
 per_hour = ember * 300
 check("a dark-band player finds about one legendary an hour (5 kills a minute)",
       0.5 <= per_hour <= 1.5, round(per_hour, 2))
-# THE DARK BAND: its monsters, and since game 0.60.0 the Skeleton Lord in its
-# alcove. Each band's alcove skeleton rolls its tier as its band does.
-DARK_BAND_ELITES = {"skeletonlord"}
 check("no normal enemy outside the dark band can drop legendary",
       all(int(E[e]["max_loot_tier"]) < 5 for e in E
-          if E[e].get("grants_rewards", True) and not E[e].get("slots_are_gear")
-          and not e.startswith("dark") and e not in DARK_BAND_ELITES))
+          if E[e].get("grants_rewards", True) and not E[e].get("slots_are_gear") and not e.startswith("dark")))
 
-# THE ALCOVE SKELETONS (game 0.60.0): a bag every kill, its slot rolling the
-# band's own tier odds, never a tier up, back after three minutes. Camped
-# for an hour, the Lord adds about half a legendary to the dark band's one.
-SKELETONS = {"skeletonguard": "lightsprite", "skeletonwarden": "watersprite",
-             "skeletonknight": "earthsprite", "skeletonchampion": "firesprite",
-             "skeletonlord": "darksprite"}
-check("each alcove skeleton rolls its band's tier, as its band's monsters do, never a tier up",
-      all(E[s]["max_loot_tier"] == E[k]["max_loot_tier"] and E[s]["tier_odds"] == E[k]["tier_odds"]
-          and not E[s].get("tier_up_chance") and not E[s].get("slots_are_gear")
-          for s, k in SKELETONS.items()),
-      {s: (E[s]["max_loot_tier"], E[s]["tier_odds"], E[s].get("tier_up_chance")) for s in SKELETONS})
-LORD_KILLS = 20000
-lord = gear_tiers("skeletonlord", LORD_KILLS).get(5, 0) / LORD_KILLS
-check("the Skeleton Lord: a legendary about one kill in 40 - half one an hour, camped",
-      0.015 <= lord <= 0.035 and lord * 20 <= 0.7, round(lord, 4))
+# THE CRYPT'S SKELETONS (game 0.63.0): one solid tier each. A Soldier rolls
+# its bag as any tier-3 monster does; an Elite always drops one, rolled as
+# tier 4's, never a tier up - and neither is a boss to the books.
+check("a Skeleton Soldier rolls as a tier-3 monster, a Skeleton Elite as tier 4's, neither a boss",
+      E["skeletonsoldier"]["max_loot_tier"] == 3 and E["skeletonsoldier"]["tier_odds"] == E["earthsprite"]["tier_odds"]
+      and E["skeletonelite"]["max_loot_tier"] == 4 and E["skeletonelite"]["tier_odds"] == E["firesprite"]["tier_odds"]
+      and not E["skeletonelite"].get("tier_up_chance") and float(E["skeletonelite"]["bag_drop_chance"]) == 1.0
+      and not E["skeletonsoldier"].get("slots_are_gear") and not E["skeletonelite"].get("slots_are_gear"),
+      {k: (E[k]["max_loot_tier"], E[k]["tier_odds"]) for k in ("skeletonsoldier", "skeletonelite")})
+ELITE_KILLS = 20000
+elite = gear_tiers("skeletonelite", ELITE_KILLS)
+check("a Skeleton Elite never drops a legendary", 5 not in elite, elite)
 for boss in ("fireboss", "boss"):
     t = gear_tiers(boss, 8000); n = sum(t.values())
     check("%s: legendary about 1 in 4, amethyst otherwise" % boss,

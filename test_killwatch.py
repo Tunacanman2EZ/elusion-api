@@ -40,7 +40,10 @@ BURST_CEILING = killwatch._ceiling_for(
     int(gamedata.ENEMIES[BURST_ENEMY]["placed_count"]),
     killwatch.KILL_WINDOW_SECONDS, killwatch.KILL_RESPAWN_FLOOR_SECONDS)
 BURST = BURST_CEILING + 4
-BURST_GAP = 4      # seconds apart, so the whole burst sits inside one window
+# THE GAP IS WORKED OUT TOO, so the whole burst sits inside one window. It was
+# 4 s, and 0.63.0 doubling the Big Field's fields made the burst 103 kills -
+# 412 s, longer than the 300 s window.
+BURST_GAP = max(1, (killwatch.KILL_WINDOW_SECONDS - 1) // BURST)
 assert BURST * BURST_GAP < killwatch.KILL_WINDOW_SECONDS, (BURST, BURST_GAP)
 # PLACED AND PAYING. A large slime is placed and grants nothing - it bursts
 # into smalls - so a kill claim for one is the reward-less IMPOSSIBLE below, not
