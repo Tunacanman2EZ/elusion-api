@@ -347,8 +347,9 @@ print("\nvendor purchases burn gold")
 body = status("read the catalogue", client.get(
     "/api/shop/generalstore", headers=H), 200)
 check("the catalogue has stock", body and len(body.get("stock", [])) > 0, body)
-check("every row carries a server price",
-      body and all(isinstance(r.get("price"), int) and r["price"] > 0
+check("every row carries a server price - above zero, unless the row says it is free",
+      body and all(isinstance(r.get("price"), int)
+                   and (r["price"] == 0 if r.get("free") else r["price"] > 0)
                    for r in body["stock"]),
       body.get("stock", [])[:3] if body else None)
 
@@ -1871,8 +1872,10 @@ check("  for gear, potions, food, fish and the fishing kit",
       all(i in offers for i in ("doubleaxe", "greaterhealthpotion", "cookedreefclown", "rawmudfish", "ironfishingrod")))
 check("  and not for money, pets or lusions",
       not any(gd.ITEMS[i]["type_name"] in ("CURRENCY", "PET") for i in offers), sorted(offers)[:5])
-check("nothing sells for what the shop charges for it",
-      all(offers[i] < gd.shop_price("generalstore", i) for i in offers
+# WHAT THE SHOP GIVES AWAY is priced 0 at the till (below), so it is held to
+# what it WOULD cost in gold: a dropped one sells for less than that too.
+check("nothing sells for what the shop charges for it, or would charge in gold for a free one",
+      all(offers[i] < (gd.shop_price("generalstore", i) or gd._gold_price(store, gd.ITEMS[i])) for i in offers
           if gd.shop_price("generalstore", i) is not None))
 
 give("sellsam", "jadesword", 1)
@@ -1923,11 +1926,158 @@ status("and selling one straight back",
 check("  costs gold: buying to sell is never a profit", purse("sellsam") < gold_before,
       purse("sellsam") - gold_before)
 
-give("sellsam", "doubleaxe", 1)
-body = status("a mythic sells too", sell(SELLER, cell_of("sellsam", "doubleaxe"), "doubleaxe"), 200)
+# A DROPPED MYTHIC, which is always rolled: the plain piece is the shop's free
+# one since game 0.69.0 and is kept, not sold (below).
+_dropped_axe = gd.roll_quality("doubleaxe")
+give("sellsam", _dropped_axe, 1)
+body = status("a mythic sells too", sell(SELLER, cell_of("sellsam", _dropped_axe), _dropped_axe), 200)
 check("  for the same share of its value", body and body.get("total_received")
       == _math.floor(int(gd.ITEMS["doubleaxe"]["value"]) * rate))
 balanced("every sale")
+
+
+# =============================================================================
+# THE SHOP GIVES THE MYTHICS AWAY (game 0.69.0)
+# =============================================================================
+# The owner: "add mythic weapons to the shop marked as free so new players can
+# use free"; asked how, "Real ones, free, any level". The general store's
+# "free" list is handed over at no cost, one each per character (its bag, what
+# it wears and its account's bank), as the PLAIN catalogue piece. A drop always
+# rolls, so the plain id is the free one - gamedata.is_free() - and no vendor
+# buys it and no trade takes it. That is what stops "free" being a faucet.
+
+print("\nthe free mythics: one each, the plain piece, never sold or traded")
+
+
+def holds_of(username):
+    conn = db_conn()
+    n = conn.execute("SELECT COUNT(*) FROM trade_holds JOIN users ON users.id = trade_holds.user_id"
+                     " WHERE users.username = ?", (username,)).fetchone()[0]
+    conn.close()
+    return int(n)
+
+
+def take(headers, item_id, quantity=1):
+    return client.post("/api/shop/buy", headers=headers, json={
+        "slot": 0, "shop_id": "generalstore", "item_id": item_id, "quantity": quantity})
+
+
+FREE = list(store.get("free", []))
+check("the general store gives away the three mythic weapons",
+      sorted(FREE) == ["doubleaxe", "dynamite", "meteorite"], FREE)
+check("  and sells none of them for gold", not [i for i in FREE if i in store.get("stock", [])])
+check("  priced 0 at the till", all(gd.shop_price("generalstore", i) == 0 for i in FREE),
+      [gd.shop_price("generalstore", i) for i in FREE])
+check("  each worn from level 1", all(gd.ITEMS[i]["required_level"] == 1 for i in FREE))
+check("is_free: the plain piece is, a roll of it is not, and nor is anything for sale",
+      gd.is_free("meteorite") and not gd.is_free(gd.roll_quality("meteorite"))
+      and not gd.is_free("ironsword") and not gd.is_free("nosuchthing"))
+_rolled_meteorite = gd.roll_quality("meteorite")
+check("the till pays nothing for the plain one and the usual share for a roll of it",
+      gd.shop_sell_price("generalstore", "meteorite") is None
+      and gd.shop_sell_price("generalstore", _rolled_meteorite)
+      == min(_math.floor(int(gd.ITEMS["meteorite"]["value"]) * rate),
+             gd._gold_price(store, gd.ITEMS["meteorite"]) - 1),
+      [gd.shop_sell_price("generalstore", "meteorite"), gd.shop_sell_price("generalstore", _rolled_meteorite)])
+
+FAY = account("freefay")
+status("fay makes a mage", client.put(
+    "/api/save", headers=FAY, json={"slot": 0, "class_id": "mage", "name": "Fay"}), 200)
+shelf = status("the shelf", client.get("/api/shop/generalstore", headers=FAY), 200) or {}
+rows = shelf.get("stock", [])
+check("the shelf starts with them, flagged free, at no price",
+      [r.get("item_id") for r in rows[:len(FREE)]] == FREE
+      and all(r.get("free") is True and r.get("price") == 0 for r in rows[:len(FREE)])
+      and not any(r.get("free") for r in rows[len(FREE):]), rows[:4])
+check("  and names them in free_ids, so the Sell list can leave them out",
+      sorted(shelf.get("free_ids", [])) == sorted(FREE), shelf.get("free_ids"))
+check("  while what a dropped one fetches is still listed",
+      shelf.get("sell_prices", {}).get("meteorite")
+      == _math.floor(int(gd.ITEMS["meteorite"]["value"]) * rate), shelf.get("sell_prices", {}).get("meteorite"))
+
+seed_gold("freefay", 100)
+before, gold_before, buy_rows = supply(), purse("freefay"), ledger_rows("shop_buy")
+body = status("fay takes a Meteorite", take(FAY, "meteorite"), 200) or {}
+check("  the plain piece, unrolled, for nothing",
+      body.get("item_id") == "meteorite" and body.get("free") is True and body.get("total_paid") == 0
+      and body.get("gold") == gold_before, body)
+check("  in her bag, her purse as it was", holding("freefay", "meteorite") == 1 and purse("freefay") == gold_before)
+check("  no gold ledger row and no trade hold", ledger_rows("shop_buy") == buy_rows and holds_of("freefay") == 0,
+      (ledger_rows("shop_buy") - buy_rows, holds_of("freefay")))
+check("  and no gold was made or burned", supply()["held"] == before["held"])
+balanced("a free piece")
+
+res = take(FAY, "meteorite")
+check("a second one is refused: one each", res.status_code == 400
+      and "already have a free Meteorite" in (res.get_json() or {}).get("message", ""), res.get_json())
+check("  and she still has the one", holding("freefay", "meteorite") == 1)
+res = take(FAY, "dynamite", 2)
+check("two at once is refused", res.status_code == 400 and holding("freefay", "dynamite") == 0, res.get_json())
+
+status("she wears it at level 1", client.post(
+    "/api/character/equip", headers=FAY, json={"slot": 0, "item_id": "meteorite"}), 200)
+res = take(FAY, "meteorite")
+check("  and wearing it counts: still one each", res.status_code == 400
+      and "already wearing" in (res.get_json() or {}).get("message", "")
+      and holding("freefay", "meteorite") == 0, res.get_json())
+
+GUS = account("freegus")
+status("gus makes a warrior", client.put(
+    "/api/save", headers=GUS, json={"slot": 0, "class_id": "warrior", "name": "Gus"}), 200)
+status("gus takes a Double Axe", take(GUS, "doubleaxe"), 200)
+gold_before = purse("freegus")
+res = sell(GUS, cell_of("freegus", "doubleaxe"), "doubleaxe")
+check("the shop will not buy the free one back, and says why", res.status_code == 400
+      and "came free from the shop" in (res.get_json() or {}).get("message", ""), res.get_json())
+check("  nothing paid, nothing taken", purse("freegus") == gold_before and holding("freegus", "doubleaxe") == 1)
+status("he banks it", client.post("/api/bank/items", headers=GUS, json={
+    "slot": 0, "op": "deposit", "item_id": "doubleaxe", "quantity": 1}), 200)
+res = take(GUS, "doubleaxe")
+check("  and the bank counts: one each, take that one out instead", res.status_code == 400
+      and "bank already holds" in (res.get_json() or {}).get("message", "")
+      and holding("freegus", "doubleaxe") == 0, res.get_json())
+_gus_drop = gd.roll_quality("doubleaxe")
+give("freegus", _gus_drop, 1)
+body = status("a dropped Double Axe still sells", sell(GUS, cell_of("freegus", _gus_drop), _gus_drop), 200)
+check("  at its share of its value", body and body.get("total_received")
+      == _math.floor(int(gd.ITEMS["doubleaxe"]["value"]) * rate), body)
+
+TESS = account("freetess")
+status("tess makes a tank", client.put(
+    "/api/save", headers=TESS, json={"slot": 0, "class_id": "tank", "name": "Tess"}), 200)
+_tess_drop = gd.roll_quality("dynamite")
+give("freetess", _tess_drop, 1)
+status("a dropped Dynamite does not stop her taking the free one", take(TESS, "dynamite"), 200)
+check("  she holds both", holding("freetess", "dynamite") == 1 and holding("freetess", _tess_drop) == 1)
+
+# Gus can cover the kingdom's cut, so what refuses the crossing below is the
+# free piece and nothing else.
+seed_gold("freegus", 10000)
+present(TESS, GUS)
+status("tess opens a trade with gus", client.post(
+    "/api/trade/offer", headers=TESS, json={"slot": 0, "username": "freegus"}), 200)
+res = client.post("/api/trade/update", headers=TESS, json={"items": [{"item_id": "dynamite", "quantity": 1}]})
+check("the free one cannot go up in a trade, and the window is told why", res.status_code == 400
+      and "cannot be traded" in (res.get_json() or {}).get("message", ""), res.get_json())
+status("the dropped one can", client.post("/api/trade/update", headers=TESS, json={
+    "items": [{"item_id": _tess_drop, "quantity": 1}]}), 200)
+
+# AND AT THE CROSSING, where every check is made again: a free piece written
+# into the offer behind the update's back is still refused, and nothing moves.
+conn = db_conn()
+_open = conn.execute("SELECT trade_id FROM trades WHERE state = 'open' AND a_user ="
+                     " (SELECT id FROM users WHERE username = 'freetess')").fetchone()["trade_id"]
+conn.execute("INSERT INTO trade_items (trade_id, side, item_id, quantity) VALUES (?, 'a', 'dynamite', 1)", (_open,))
+conn.commit()
+conn.close()
+status("tess accepts", confirm(TESS), 200)
+res = confirm(GUS)
+check("  and gus's accept is refused for the free one", res.status_code == 400
+      and "cannot be traded" in (res.get_json() or {}).get("message", ""), res.get_json())
+check("  nothing crossed", holding("freetess", "dynamite") == 1 and holding("freetess", _tess_drop) == 1
+      and holding("freegus", "dynamite") == 0 and holding("freegus", _tess_drop) == 0)
+client.post("/api/trade/cancel", headers=TESS, json={})
+balanced("the free pieces")
 
 
 print("\n%d passed, %d failed" % (passed, failed))

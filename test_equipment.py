@@ -937,14 +937,17 @@ import gamedata as _gd  # noqa: E402
 MYTHIC = {"meteorite": "mage", "doubleaxe": "warrior", "dynamite": "tank"}
 for _item, _cls in MYTHIC.items():
     _row = C.ITEMS.get(_item, {})
-    check("%s is a tier 6 %s weapon at level 22 in the server's catalogue" % (_item, _cls),
-          _row.get("tier") == 6 and _row.get("required_level") == 22
+    # WORN FROM LEVEL 1 since game 0.69.0 (it was 22): the general store gives
+    # each class its own (test_economy.py, "free").
+    check("%s is a tier 6 %s weapon from level 1 in the server's catalogue" % (_item, _cls),
+          _row.get("tier") == 6 and _row.get("required_level") == 1
           and _row.get("required_classes") == [_cls]
           and _row.get("equip_slot_name") == "WEAPON", _row)
 
 _sold = [(_shop, _item) for _shop, _def in _gd.SHOPS.items()
          for _item in MYTHIC if _item in _def.get("stock", [])]
-check("no shop sells them", not _sold, _sold)
+check("no shop sells them for gold - the general store gives them away", not _sold
+      and all(_item in _gd.SHOPS["generalstore"].get("free", []) for _item in MYTHIC), _sold)
 
 # NO TIER LADDER REACHES TIER 6. Rolled, not reasoned about: every enemy, many
 # times, through the same roll_loot_tier() a kill uses. A mythic comes only
@@ -963,19 +966,18 @@ _myth_uid = _eq.execute("SELECT id FROM users WHERE username = 'mythcheck'").fet
 for _pos, _item in enumerate(["meteorite", "doubleaxe"]):
     _eq.execute("INSERT OR REPLACE INTO carry_items (user_id, slot, position,"
                 " item_id, quantity) VALUES (?, 0, ?, ?, 1)", (_myth_uid, _pos, _item))
-_eq.execute("UPDATE saves SET level = 21 WHERE user_id = ? AND slot = 0", (_myth_uid,))
 _eq.commit()
 
-res = client.post("/api/character/equip", headers=MH, json={"slot": 0, "item_id": "meteorite"})
-check("a level 21 mage is refused the Meteorite", res.status_code in (400, 403), res.status_code)
-_eq.execute("UPDATE saves SET level = 22 WHERE user_id = ? AND slot = 0", (_myth_uid,))
-_eq.commit()
 res = client.post("/api/character/equip", headers=MH, json={"slot": 0, "item_id": "doubleaxe"})
-check("a level 22 mage is refused the warrior's Double Axe", res.status_code in (400, 403), res.status_code)
+check("a mage is refused the warrior's Double Axe", res.status_code in (400, 403), res.status_code)
 res = client.post("/api/character/equip", headers=MH, json={"slot": 0, "item_id": "meteorite"})
 _worn = client.get("/api/character?slot=0", headers=MH).get_json().get("equipment", {})
-check("and wears the Meteorite at 22", res.status_code == 200 and _worn.get("weapon") == "meteorite",
+check("and wears the Meteorite at level 1", res.status_code == 200 and _worn.get("weapon") == "meteorite",
       [res.status_code, _worn])
+# The kills below were written for a level 22 mage, as this one was before the
+# level came off; they stay at 22.
+_eq.execute("UPDATE saves SET level = 22 WHERE user_id = ? AND slot = 0", (_myth_uid,))
+_eq.commit()
 
 # A MYTHIC FROM A KILL, end to end: the roll, the bag, the take and the notice
 # everyone online is sent. The odds are set to 1 on one enemy for these kills,

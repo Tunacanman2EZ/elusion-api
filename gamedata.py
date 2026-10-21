@@ -421,21 +421,55 @@ def shop_price(shop_id, item_id):
     exactly one.
 
     ROUNDED UP, AND FLOORED AT 1. Rounding down would let a markup below 1.0
-    price a cheap item at zero, and a vendor handing out free stock is a faucet
-    wearing a sink's clothes. Up also keeps the arithmetic on the house's side,
-    which is the correct direction for something whose job is to destroy gold.
+    price a cheap item at zero, and a vendor handing out free stock by accident
+    is a faucet wearing a sink's clothes. Up also keeps the arithmetic on the
+    house's side, which is the correct direction for something whose job is to
+    destroy gold.
+
+    0 FOR WHAT THE SHOP GIVES AWAY ON PURPOSE (its "free" list, 0.69.0). That
+    is not the faucet above, because a free piece can never become gold: see
+    is_free(), which shop_sell_price() and every trade check ask.
     """
     shop = SHOPS.get(shop_id)
     if shop is None:
         return None
+    if item_id in (shop.get("free") or []):
+        return 0 if item_row(item_id) is not None else None
     if item_id not in shop.get("stock", []):
         return None
     definition = item_row(item_id)
     if definition is None:
         return None
+    return _gold_price(shop, definition)
 
+
+def _gold_price(shop, definition):
+    """What this shop charges in gold for one of these: value times its
+    markup, rounded up, at least 1. shop_price() for the stock; the sell cap
+    asks it of a free piece too, which has a worth even when it is given."""
     multiplier = float(shop.get("price_multiplier", 1.0))
     return max(1, int(math.ceil(int(definition.get("value", 0)) * multiplier)))
+
+
+def is_free(item_id):
+    """
+    True for the PLAIN catalogue piece of something a shop gives away (its
+    "free" list, 0.69.0: the owner, "add mythic weapons to the shop marked as
+    free so new players can use free", and asked how, "Real ones, free, any
+    level").
+
+    THE PLAIN ID IS THE FREE ONE. shop_buy hands a free item over unrolled,
+    and a drop of the same item always rolls ("meteorite~d104p96") - so the id
+    alone says which is which, with no new mark on any cell, bag or trade row.
+    A free piece is never bought back (shop_sell_price()) and never traded
+    (trade/data.py hold_refusal()), which is what stops "free" being a faucet;
+    a rolled one sells and trades as it always did. An owner grant of the
+    plain id is the free piece too.
+
+    Asked of SHOPS when called, so a suite's patched shop is heard.
+    """
+    item_id = str(item_id)
+    return any(item_id in (shop.get("free") or []) for shop in SHOPS.values())
 
 
 # WHAT A VENDOR WILL BUY. Gear, potions and food, fish and the fishing kit:
@@ -458,6 +492,22 @@ def shop_sell_price(shop_id, item_id):
     asks is a loop: buy, sell, repeat, and the gold comes from nowhere. The
     multiplier the game exports is far below the markup today (0.05 against
     1.0), so this cap only ever bites on a mistake - which is when it matters.
+
+    NOTHING FOR A FREE PIECE (is_free(), 0.69.0). A vendor that gives
+    something away and buys it back is a printing press with one extra step;
+    the rolled drop of the same item still sells (vendor_pays()).
+    """
+    if is_free(item_id):
+        return None
+    return vendor_pays(shop_id, item_id)
+
+
+def vendor_pays(shop_id, item_id):
+    """
+    shop_sell_price() without the free rule: what this vendor pays for any
+    piece of this catalogue item. The catalogue answer lists it for every
+    item, so the panel can price a rolled drop of something the shop also
+    gives away, and leaves the plain free piece out by its own list.
     """
     shop = SHOPS.get(shop_id)
     if shop is None:
@@ -472,10 +522,14 @@ def shop_sell_price(shop_id, item_id):
     price = int(math.floor(int(definition.get("value", 0)) * multiplier))
     # A ROLLED PIECE IS PRICED AS ITS BASE, and capped by what the shop
     # charges for the base: the shelf never holds a roll, so asking about
-    # "ironsword~d107" there would find nothing and skip the cap.
-    charged = shop_price(shop_id, base_id(item_id))
-    if charged is not None:
-        price = min(price, charged - 1)
+    # "ironsword~d107" there would find nothing and skip the cap. A base the
+    # shop gives away is capped by what it would charge in gold: 0 would
+    # refuse every drop of it.
+    base = base_id(item_id)
+    if base in shop.get("stock", []) or base in (shop.get("free") or []):
+        base_row = item_row(base)
+        if base_row is not None:
+            price = min(price, _gold_price(shop, base_row) - 1)
     return price if price > 0 else None
 
 

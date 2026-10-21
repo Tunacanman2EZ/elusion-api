@@ -37,8 +37,16 @@ def hold_refusal(db, catalogue, user_id, items, now=None):
     bag and the bank, because a held piece can be carried to another character
     through the bank and must not get out by the side door. Two pieces with the
     same id are the same piece, so it does not matter which of them is the new
-    one - only how many are."""
+    one - only how many are.
+
+    AND A FREE PIECE NEVER (gamedata.is_free(), 0.69.0): what the shop gives
+    away is the plain catalogue piece, kept by whoever took it. Asked here
+    because this is the one check both the offer and the execution make."""
     now = int(time.time()) if now is None else int(now)
+    for item_id in items:
+        if catalogue.is_free(item_id):
+            row = catalogue.item_row(item_id) or {}
+            return services.free_words(row.get("display_name", item_id))
     for item_id, quantity in items.items():
         if not services.held_kind(catalogue, item_id):
             continue

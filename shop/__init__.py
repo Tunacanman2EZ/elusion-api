@@ -21,6 +21,13 @@ catalogue piece and its price, and what is handed over is rolled on the spot
 (85-115% a stat, now and then a Perfect), at the same price whatever it rolls.
 A Perfect bought is held from trade like one found.
 
+SOME OF IT IS FREE (0.69.0). A shop's "free" list - the general store's is
+the three mythic weapons - is handed over at no cost, one each per character
+(counting its bag, what it wears and its account's bank), as the PLAIN
+catalogue piece, never rolled. A drop always rolls, so the plain id is the
+free one: gamedata.is_free() says so, and the sell route and every trade check
+refuse it. That is why "free" is not a faucet.
+
 SELLING IS A SMALL FAUCET, on purpose. The gold is minted, reason shop_sell, at
 the vendor's sell_multiplier of an item's value, so an hour's junk is worth
 less than the hour's coin (test_pacing.py measures it). A sale names one cell

@@ -5317,7 +5317,7 @@
 			"xp_reward": 84
 		}
 	],
-	"generated_at": 1792536321,
+	"generated_at": 1792610220,
 	"items": [
 		{
 			"armor_value": 6,
@@ -6944,7 +6944,7 @@
 			"required_classes": [
 				"warrior"
 			],
-			"required_level": 22,
+			"required_level": 1,
 			"required_skill": "",
 			"required_skill_level": 1,
 			"restore_amount": 0,
@@ -6977,7 +6977,7 @@
 			"required_classes": [
 				"tank"
 			],
-			"required_level": 22,
+			"required_level": 1,
 			"required_skill": "",
 			"required_skill_level": 1,
 			"restore_amount": 0,
@@ -9644,7 +9644,7 @@
 			"required_classes": [
 				"mage"
 			],
-			"required_level": 22,
+			"required_level": 1,
 			"required_skill": "",
 			"required_skill_level": 1,
 			"restore_amount": 0,
@@ -10566,6 +10566,11 @@
 	"shops": [
 		{
 			"display_name": "Kingdom Supplies",
+			"free": [
+				"meteorite",
+				"doubleaxe",
+				"dynamite"
+			],
 			"price_multiplier": 1.0,
 			"restock_seconds": 0.0,
 			"sell_multiplier": 0.05,

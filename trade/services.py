@@ -2,7 +2,7 @@
 lives, how long a fresh find waits, what one side is worth, and whose side is
 whose. Pure: no database, no request. `catalogue` is gamedata, handed in by
 app.py and asked on every call (item_row, mythic_tier, stack_value,
-trade_tax, has_item)."""
+trade_tax, has_item, is_free)."""
 
 # How many distinct item types one side may put up. The backpack is
 # INVENTORY_CAPACITY cells and both sides need room to RECEIVE, so this is
@@ -55,6 +55,12 @@ def hold_words(display_name, first_free_at, now):
             % (display_name, TRADE_HOLD_SECONDS // 3600,
                ("%d hour%s" % (hours, "" if hours == 1 else "s")) if hours > 0 else "a moment",
                TRADE_HOLD_SECONDS // 3600))
+
+
+def free_words(display_name):
+    """The sentence for a piece the shop gave away (gamedata.is_free())."""
+    return ("%s came free from the shop, so it is yours to keep: it cannot be traded. "
+            "One that dropped can be." % display_name)
 
 
 def expired(trade, now):

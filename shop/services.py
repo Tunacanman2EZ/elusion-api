@@ -4,9 +4,10 @@ catalogue's - gamedata.shop_price() and shop_sell_price() - so a panel and the
 till can never disagree about a price.)"""
 
 
-def stock_row(item_id, definition, price):
+def stock_row(item_id, definition, price, free=False):
     """One item on the shelf: what it is, what it needs, and what the till
-    charges for it - all from the server's own ItemData copy."""
+    charges for it - all from the server's own ItemData copy. free marks what
+    the shop gives away (0.69.0): price 0, one each, kept rather than sold."""
     return {
         "item_id": item_id,
         "display_name": definition.get("display_name", item_id),
@@ -46,4 +47,22 @@ def stock_row(item_id, definition, price):
 
         "max_stack": definition.get("max_stack", 1),
         "price": price,
+        "free": bool(free),
     }
+
+
+def already_words(display_name, where):
+    """The refusal for a second free piece: what, where the first one is, and
+    the rule (shop_buy, 0.69.0)."""
+    if where == "worn":
+        return "You are already wearing your free %s. The shop gives one to each character." % display_name
+    if where == "banked":
+        return ("Your bank already holds a free %s. Take that one out instead - "
+                "the shop gives one to each character." % display_name)
+    return "You already have a free %s. The shop gives one to each character." % display_name
+
+
+def free_words(display_name):
+    """Why a free piece will not sell or trade (0.69.0)."""
+    return ("%s came free from the shop, so it is yours to keep: "
+            "it cannot be sold or traded." % display_name)

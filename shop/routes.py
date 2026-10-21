@@ -71,9 +71,12 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, sl
               description: >
                 Bought. Returns the new gold balance and backpack. item_id is the
                 piece that arrived - for gear, rolled on the spot ("jadesword~d104p96");
-                stock_id is the shelf's id it was bought as.
+                stock_id is the shelf's id it was bought as. free is true for what
+                the shop gives away: the plain piece, at no cost, one each.
             400:
-              description: Bad slot, unknown shop, item not stocked, or not enough gold
+              description: >
+                Bad slot, unknown shop, item not stocked, not enough gold, or a
+                free piece this character already has (carried, worn or banked)
             404:
               description: That slot is empty
             409:
@@ -140,7 +143,22 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, sl
 
         total = unit_price * quantity
 
+        # WHAT THE SHOP GIVES AWAY (its "free" list, 0.69.0): price 0, one each,
+        # the plain piece. See gamedata.is_free() for why that is not a faucet.
+        free = item_id in (catalogue.SHOPS[shop_id].get("free") or [])
+
         db = get_db()
+        if free:
+            name = (catalogue.item_row(item_id) or {}).get("display_name", item_id)
+            if quantity != 1:
+                return bad_request("The shop gives one %s to each character, not %d." % (name, quantity))
+            # ONE EACH, counting the bag, what is worn and the account's bank.
+            # Under the write lock every write route takes (app.py, THE WRITE
+            # LOCK), so two claims at once cannot both read "none".
+            where = data.where_held(db, user_id, slot, item_id)
+            if where is not None:
+                return bad_request(services.already_words(name, where))
+
         carried = data.purse(db, user_id, slot)
         if carried < total:
             return bad_request(
@@ -159,7 +177,11 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, sl
         # Perfect). Same price whatever it rolls, so an average purchase is the
         # catalogue piece, as it was. A potion, a worm or a rod has nothing to roll
         # and comes as it is. Gear stacks to one, so quantity is 1 here.
-        bought = catalogue.roll_quality(item_id)
+        #
+        # A FREE PIECE IS NOT ROLLED. The plain id is what marks it as the free
+        # one (gamedata.is_free()), and a roll would make it a drop that sells;
+        # it also means throwing it away and taking another re-rolls nothing.
+        bought = item_id if free else catalogue.roll_quality(item_id)
 
         written = add_to_backpack(user_id, slot, bought, quantity)
         if written is None:
@@ -169,18 +191,25 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, sl
                 "message": "Your backpack is full (%d slots)." % bag_cells,
             }, 409
 
-        # A PERFECT FROM THE SHOP IS HELD FROM TRADE like one from a bag: gold
-        # from cheated kills buys it as well as anything.
-        place_trade_hold(db, user_id, bought, quantity)
+        if free:
+            # NOTHING TO BURN AND NOTHING TO HOLD. gold_delta() writes no zero
+            # (it answers None for one), and a free piece never trades, so a
+            # trade hold on it would only be a row to prune.
+            remaining = data.purse(db, user_id, slot)
+        else:
+            # A PERFECT FROM THE SHOP IS HELD FROM TRADE like one from a bag:
+            # gold from cheated kills buys it as well as anything.
+            place_trade_hold(db, user_id, bought, quantity)
 
-        # THE BURN. Negative delta, through gold_delta() so it lands in the ledger
-        # in the same transaction as the balance - see gold_ledger in init_db().
-        # This is gold leaving the world, not moving to a vendor's pocket: nothing
-        # holds it afterwards, which is what makes it a sink.
-        remaining = gold_delta(
-            db, user_id, slot, -total, "shop_buy",
-            "%s x%d @%d from %s" % (bought, quantity, unit_price, shop_id),
-        )
+            # THE BURN. Negative delta, through gold_delta() so it lands in the
+            # ledger in the same transaction as the balance - see gold_ledger in
+            # init_db(). This is gold leaving the world, not moving to a
+            # vendor's pocket: nothing holds it afterwards, which is what makes
+            # it a sink.
+            remaining = gold_delta(
+                db, user_id, slot, -total, "shop_buy",
+                "%s x%d @%d from %s" % (bought, quantity, unit_price, shop_id),
+            )
 
         db.commit()
 
@@ -192,6 +221,7 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, sl
             "quantity": quantity,
             "unit_price": unit_price,
             "total_paid": total,
+            "free": free,
             "gold": remaining,
             "inventory": inventory_of(user_id, slot),
         }, 200
@@ -262,6 +292,12 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, sl
         if shop_id not in catalogue.SHOPS:
             return bad_request("Unknown shop '%s'. Is gamedata.json current?" % shop_id)
 
+        # A FREE PIECE IS KEPT (gamedata.is_free(), 0.69.0), and said so: "the
+        # shop does not buy that" about a Meteorite it buys when it dropped
+        # would read as a bug.
+        if catalogue.is_free(item_id):
+            return bad_request(services.free_words(
+                (catalogue.item_row(item_id) or {}).get("display_name", item_id)))
         unit_price = catalogue.shop_sell_price(shop_id, item_id)
         if unit_price is None:
             return bad_request("The shop does not buy that.")
@@ -335,7 +371,15 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, sl
         # ItemData.value by the shop's multiplier itself and usually get the same
         # answer - and the day the rounding rule changes, it would quietly get a
         # different one and show a price the server refuses. One source.
+        #
+        # WHAT IT GIVES AWAY FIRST (0.69.0), flagged free at price 0, so the
+        # panel heads them on their own shelf above everything for gold.
         stock = []
+        for item_id in shop.get("free") or []:
+            definition = catalogue.item_row(item_id)
+            if definition is None:
+                continue
+            stock.append(services.stock_row(item_id, definition, 0, free=True))
         for item_id in shop.get("stock", []):
             definition = catalogue.item_row(item_id)
             if definition is None:
@@ -346,11 +390,18 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, sl
         # WHAT THE SHOP PAYS, for every item it would buy, from the same function
         # /api/shop/sell prices with - so the Sell list shows the number the till
         # pays, not one the panel worked out.
+        #
+        # BY CATALOGUE ID, so a price here is what ANY piece of it fetches -
+        # vendor_pays(), not shop_sell_price(), because a rolled drop of
+        # something the shop gives away still sells. The plain free pieces are
+        # named in free_ids, and the panel leaves those out.
         sell_prices = {}
         for item_id in catalogue.ITEMS:
-            price = catalogue.shop_sell_price(shop["shop_id"], item_id)
+            price = catalogue.vendor_pays(shop["shop_id"], item_id)
             if price is not None:
                 sell_prices[item_id] = price
+        free_ids = sorted({item_id for any_shop in catalogue.SHOPS.values()
+                           for item_id in (any_shop.get("free") or [])})
 
         return {
             "shop_id": shop["shop_id"],
@@ -358,6 +409,7 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, sl
             "stock": stock,
             "sell_multiplier": float(shop.get("sell_multiplier", 0.0) or 0.0),
             "sell_prices": sell_prices,
+            "free_ids": free_ids,
         }, 200
 
     app.add_url_rule("/api/shop/buy", endpoint="shop_buy",

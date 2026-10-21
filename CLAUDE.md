@@ -1310,6 +1310,33 @@ so a stock change is a re-export, a copy and a restart, with no code change.
 - **Tests read prices from the catalogue.** `test_economy.py` and
   `test_equipment.py` had a potion's 50 typed in, and the price pass turned
   seven checks red that were about the ledger and the tooltip, not the price.
+- **The mythic weapons are free (game 0.69.0).** The owner: "add mythic
+  weapons to the shop marked as free so new players can use free"; asked how,
+  "Real ones, free, any level". The shop's `free` list (the game's
+  `ShopData.free`, exported) is the Meteorite, the Double Axe and Dynamite, and
+  all three are worn from level 1 now (`required_level` was 22).
+  - `shop_price()` is 0 for them; everything else keeps its floor of 1.
+  - `/api/shop/buy` hands one over with no gold moved, no ledger row (a zero
+    is not a ledger event) and no trade hold, ONE EACH per character:
+    `shop/data.py where_held()` counts its bag, what it wears and its
+    account's bank, and the refusal says where the first one is. Quantity 1
+    only. The write lock every write route takes keeps two claims at once
+    from both reading "none".
+  - **The plain piece, never rolled.** A drop always rolls
+    (`meteorite~d104p96`), so the plain id is the free one:
+    `gamedata.is_free()`. `shop_sell_price()` refuses it and `shop_sell` says
+    why; `trade/data.py hold_refusal()` refuses it at the offer and again at
+    the crossing. A rolled drop sells and trades as it always did, and is
+    capped by what the shop would charge in gold for the base
+    (`vendor_pays()`, which the catalogue answer's `sell_prices` uses).
+    Throwing the free one away and taking another re-rolls nothing. An owner
+    grant of the plain id ("plain") is the free piece too.
+  - `GET /api/shop/<id>` lists the free rows first, `"free": true` at price 0,
+    and names the plain free ids in `free_ids`, which the game's Sell list
+    leaves out.
+  - Lost on a full death like any worn gear; the shop gives another. The
+    healer has no mythic yet, so there is none for it.
+  - `test_economy.py`, "the free mythics".
 
 ## Quality rolls: the roll is in the id
 

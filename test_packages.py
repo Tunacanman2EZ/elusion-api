@@ -1260,6 +1260,15 @@ class ShopCatalogue:
     def shop_sell_price(shop_id, item_id):
         return {"ironsword": 50, "pebble": 1}.get(item_id) if shop_id == "stall" else None
 
+    # The stall gives nothing away (gamedata.is_free(), 0.69.0), so what any
+    # piece fetches is what the till pays. test_economy.py holds the free rules
+    # on the real catalogue.
+    vendor_pays = shop_sell_price
+
+    @staticmethod
+    def is_free(item_id):
+        return False
+
     @staticmethod
     def roll_quality(item_id):
         return item_id + "~d104" if item_id == "ironsword" else item_id
@@ -1462,6 +1471,11 @@ class TradeCatalogue:
     @staticmethod
     def trade_tax(value):
         return int(value) // 10
+
+    @staticmethod
+    def is_free(item_id):
+        """Nothing here came free from a shop (gamedata.is_free(), 0.69.0)."""
+        return False
 
 
 def snapshots_of(app):
