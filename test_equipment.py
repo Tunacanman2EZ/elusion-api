@@ -350,9 +350,16 @@ def dps(class_id, tier):
 # 25, healer 3 and tank 9 through the entire retune that replaced them.
 check("the warrior's unarmed dps is the reference, at 24/s",
       abs(base_dps("warrior") - 24.0) < 0.001, base_dps("warrior"))
-check("the mage sits below it, not above - 0.85x was the target",
-      abs(base_dps("mage") / base_dps("warrior") - 0.8333) < 0.01,
+# THE HEAVY SPIKE (game 0.71.0), the owner: "mage needs to be strong enough to
+# kill enemies at level 1". 30 once a second, a quarter above the swing alone -
+# and under the swing and its wave, which is the warrior's real number (below).
+check("the mage sits a quarter above the swing alone - 1.25x since game 0.71.0",
+      abs(base_dps("mage") / base_dps("warrior") - 1.25) < 0.01,
       base_dps("mage") / base_dps("warrior"))
+_mage_row = (C._GD.get("combat", {}).get("classes", {}) or {}).get("mage", {})
+check("  and the sim's mage is the game's, as exported",
+      _mage_row.get("base") == BASE["mage"] and abs(float(_mage_row.get("cooldown", 0)) - PERIOD["mage"]) < 1e-9,
+      [_mage_row.get("base"), _mage_row.get("cooldown"), BASE["mage"], PERIOD["mage"]])
 check("so does the healer, at ten shots a second",
       abs(base_dps("healer") / base_dps("warrior") - 0.8333) < 0.01,
       base_dps("healer") / base_dps("warrior"))
@@ -416,18 +423,31 @@ check("and the healer is the one whose ladder rounds coarsest",
 # THE GAP THAT USED TO BE RECORDED HERE IS CLOSED. This line said the mage did
 # roughly 2.3x the warrior and always had. It does not any more - mage.gd's
 # damage_per_magic went 25 -> 9, healer.gd's 3 -> 2, tank.gd's aura 9 -> 4 -
-# and the figure is still printed rather than only asserted, because a number
+# (and the mage's 9 over 0.45s became 30 over 1.0s in game 0.71.0, a quarter
+# above the swing, still under the swing and its wave) - and the figure is still printed rather than only asserted, because a number
 # someone reads every run is how the next drift gets noticed early.
 print("      (class dps in ember, relative to the warrior: %s)" % ", ".join(
     "%s %.2fx" % (c, dps(c, "ember") / dps("warrior", "ember")) for c in BASE))
 
 # AND IT STAYS CLOSED. The print above is a courtesy; this is the guard. No
 # class may out-damage the warrior on a single target at any tier, and none may
-# fall below two thirds of it.
+# fall below two thirds of its swing.
+#
+# THE WARRIOR IS ITS SWING AND ITS WAVE (game 0.38.0): every swing's wave hits
+# wave_ratio of it again, so that is what a class is measured against - the
+# mage's heavy spike (game 0.71.0) is a quarter above the swing alone. And the
+# mage counts its critical spike, crit_chance of its casts crit_mult as hard.
+_classes = C._GD.get("combat", {}).get("classes", {}) or {}
+WAVE = float(_classes.get("warrior", {}).get("wave_ratio", 0.0))
+MAGE_CRIT = 1.0 + float(_mage_row.get("crit_chance", 0.0)) * (float(_mage_row.get("crit_mult", 1.0)) - 1.0)
+check("the warrior's wave and the mage's crit are exported, for the guard below",
+      WAVE > 0 and MAGE_CRIT > 1.0, [WAVE, MAGE_CRIT])
 for tier in TIERS:
     spread = {c: dps(c, tier) / dps("warrior", tier) for c in BASE}
-    check("no class out-damages the warrior single-target in %s" % tier,
-          max(spread.values()) <= 1.0 + 1e-9, spread)
+    whole = {c: dps(c, tier) * (MAGE_CRIT if c == "mage" else 1.0) / (dps("warrior", tier) * (1.0 + WAVE))
+             for c in BASE if c != "warrior"}
+    check("no class out-damages the warrior's swing and wave single-target in %s" % tier,
+          max(whole.values()) <= 1.0 + 1e-9, whole)
     check("and none is left behind in %s" % tier,
           min(spread.values()) >= 0.63, spread)
 

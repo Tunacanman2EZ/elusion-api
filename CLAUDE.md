@@ -1676,7 +1676,17 @@ finds. `test_combatbook.py` holds the books, `test_presence.py` P-8 the wiring.
   `aura_heal_share`, `aura_radius`, `aura_range`, `aura_reach`): its rate adds
   the burn, `unit * aura_ticks * aura_damage_share / aura_cooldown` (one orb a
   second, not hastened), and its biggest hit is the bigger of a doubled orb
-  and a tick; presence.py reads the heal numbers (THE AURA'S HEALS). Each class's formula is written out above the code;
+  and a tick; presence.py reads the heal numbers (THE AURA'S HEALS). Since
+  game 0.71.0 the mage's row carries `crit_chance` / `crit_mult` (THE
+  CRITICAL SPIKE: one cast in five hits twice as hard), and the bound takes
+  every cast critical: the biggest hit `unit * crit_mult` and the rate
+  `unit * haste * max(casts, crit_mult) / cooldown`. The same release made the
+  spike 30 once a second (it was 9 every 0.45 s) and scaled every staff and
+  the Meteorite up to match, so a critical spike is far past the old bound:
+  deploy this WITH the 0.71.0 game, never after. Its third cast's three
+  spikes and the ice shards round each (frostring.gd) share what the cast has
+  hit, so one monster still takes one hit a cast and need nothing more; a
+  catalogue without the crit crits nothing. Each class's formula is written out above the code;
   the game's suite (`_test_combat_bounds_match_the_game`) holds the exported
   numbers to the game's own. Every bound gets `SLACK` (1.5) while watching.
 - **Hits**: one over the biggest is booked at the cap and waits

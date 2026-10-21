@@ -304,7 +304,7 @@ MAX_STEPS_PER_TICK = 4
 #   slash   a warrior's slash wave: from where it starts, toward (tx, ty)
 #   axe     the Double Axe thrown at (tx, ty); flags 2 wide, 4 bloody
 #   recall  the Double Axe called back
-#   stalag  a mage's stalagmite at (tx, ty)
+#   stalag  a mage's stalagmite at (tx, ty); flag 128 critical (game 0.71.0)
 #   meteor  a Meteorite meteor at (tx, ty), `delay` ms after the cast; flag 1 pulls
 #   dyn     a stick of Dynamite from (ox, oy) to (tx, ty), `delay` ms after the throw
 #   orb     a healer's orb from (ox, oy) toward (tx, ty)

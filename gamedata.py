@@ -1286,8 +1286,16 @@ def combat_bounds(identity):
             dps = max(dps, unit * haste * (1.0 / cooldown + (1.0 + spin) / swing) + bleed)
     elif cls == "mage":
         casts = 2.0 if "METEOR" in specials else 1.0
-        max_hit = unit
-        dps = unit * haste * casts / cooldown
+        # Since game 0.71.0 THE CRITICAL SPIKE (mage.gd): one cast in
+        # crit_chance hits crit_mult times as hard, and the bound takes the
+        # worst, every cast one, as the healer's takes every orb doubled. Its
+        # three spikes and the ice shards round each (frostring.gd) share what
+        # the cast has hit, so one monster still takes one hit a cast. A
+        # catalogue from before says nothing and crits nothing.
+        crit = max(float(row.get("crit_mult", 1.0) or 1.0), 1.0) \
+            if float(row.get("crit_chance", 0.0) or 0.0) > 0.0 else 1.0
+        max_hit = unit * crit
+        dps = unit * haste * max(casts, crit) / cooldown
         if "METEOR" in specials:
             # The crater burns meteor_burn_share of a hit every
             # meteor_burn_every seconds, one fire per monster at a time

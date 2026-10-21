@@ -226,7 +226,8 @@ low = gamedata.combat_bounds({"cls": "warrior", "lvl": 1, "gear": ["ironsword", 
 check("  but not one the character may not wear yet (its level)",
       low["max_hit"] == math.ceil((w["base"] + top("ironsword")) * big), low)
 other = gamedata.combat_bounds({"cls": "mage", "lvl": 30, "gear": ["embersword"], "skills": {}, "pets": []})
-check("  nor another class's", other["max_hit"] == cls_rows["mage"]["base"], other)
+check("  nor another class's - a mage's own base, as critical as its casts may be",
+      other["max_hit"] == math.ceil(cls_rows["mage"]["base"] * cls_rows["mage"].get("crit_mult", 1.0)), other)
 
 # THE DOUBLE AXE LEFT SPINNING (0.11.9): it climbs to axe_spin_max_rate swings
 # a second, and a pass out or back is a swing - the bound holds the top rate,
@@ -260,12 +261,26 @@ check("  a catalogue from before says nothing, and spins at 1x and bleeds nothin
 m = cls_rows["mage"]
 b1 = gamedata.combat_bounds({"cls": "mage", "lvl": 30, "gear": ["emberstaff"], "skills": {}, "pets": []})
 b2 = gamedata.combat_bounds({"cls": "mage", "lvl": 30, "gear": ["meteorite"], "skills": {}, "pets": []})
-check("a mage casts once a cooldown",
-      abs(b1["dps"] - hit_of(m["base"], "emberstaff") / m["cooldown"]) < 0.05, b1)
+crit = m.get("crit_mult", 1.0) if m.get("crit_chance", 0) > 0 else 1.0
+check("a mage casts once a cooldown, and every cast may be critical (game 0.71.0)",
+      m.get("crit_chance", 0) > 0 and crit == 2.0
+      and b1["max_hit"] == math.ceil(hit_of(m["base"], "emberstaff") * crit)
+      and abs(b1["dps"] - hit_of(m["base"], "emberstaff") * crit / m["cooldown"]) < 0.05, [b1, m])
 check("  the Meteorite twice, and its crater's burn on top (0.12.0)",
       m.get("meteor_burn_share", 0) > 0
-      and abs(b2["dps"] - hit_of(m["base"], "meteorite") * (2 / m["cooldown"] + m["meteor_burn_share"] / m["meteor_burn_every"])) < 0.05,
+      and abs(b2["dps"] - hit_of(m["base"], "meteorite") * (max(2, crit) / m["cooldown"] + m["meteor_burn_share"] / m["meteor_burn_every"])) < 0.05,
       [b2, m])
+_no_crit = dict(m)
+for key in ("crit_chance", "crit_mult"):
+    _no_crit.pop(key, None)
+cls_rows["mage"] = _no_crit
+try:
+    bo = gamedata.combat_bounds({"cls": "mage", "lvl": 30, "gear": ["emberstaff"], "skills": {}, "pets": []})
+finally:
+    cls_rows["mage"] = m
+check("  a catalogue from before says nothing, and crits nothing - the old bound",
+      bo["max_hit"] == math.ceil(hit_of(m["base"], "emberstaff"))
+      and abs(bo["dps"] - hit_of(m["base"], "emberstaff") / m["cooldown"]) < 0.05, bo)
 t = cls_rows["tank"]
 b1 = gamedata.combat_bounds({"cls": "tank", "lvl": 30, "gear": ["embermaul"], "skills": {}, "pets": []})
 b2 = gamedata.combat_bounds({"cls": "tank", "lvl": 30, "gear": ["dynamite"], "skills": {}, "pets": []})

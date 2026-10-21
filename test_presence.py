@@ -600,8 +600,10 @@ async def run(port, server):
     await collect(i)
     ivy_bounds = server.players[uid("presi")].fighter.bounds
     hal_bounds = server.players[uid("presh")].fighter.bounds
+    # By the rate: since game 0.71.0 a bare mage's critical spike is as big a
+    # single hit as Hal's kitted swing and wave.
     check("  each player's bounds come from their own ticket",
-          hal_bounds["max_hit"] > ivy_bounds["max_hit"] > 0, (hal_bounds, ivy_bounds))
+          hal_bounds["dps"] > ivy_bounds["dps"] > 0 and ivy_bounds["max_hit"] > 0, (hal_bounds, ivy_bounds))
     half = fire["max_hp"] // 2
     left_hp = fire["max_hp"] - half
     sent = 0

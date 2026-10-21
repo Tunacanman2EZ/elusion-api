@@ -163,11 +163,15 @@ def bag(*item_ids):
 # module produced was wrong, and test_equipment.py's ladder section failed 31
 # checks against a game that was correctly balanced.
 #
-# The figures that matter are damage / period, which is why 9 over 0.45s and 2
-# over 0.10s are not the typos they look like:
+# The figures that matter are damage / period, which is why 2 over 0.10s is
+# not the typo it looks like:
 #
-#     warrior  24 / 1.00 = 24.0/s     the reference
-#     mage      9 / 0.45 = 20.0/s     0.85x - ranged, and the cast explodes
+#     warrior  24 / 1.00 = 24.0/s     the reference: the swing alone, before
+#                                     its wave (three quarters of a swing more)
+#     mage     30 / 1.00 = 30.0/s     1.25x the swing, under the swing and its
+#                                     wave - THE HEAVY SPIKE (game 0.71.0); it
+#                                     was 9 over 0.45s, and a level 1 mage's
+#                                     whole bar could not finish one sprite
 #     healer    2 / 0.10 = 20.0/s     0.80x - ranged, ten shots a second
 #     tank      4 / 0.25 = 16.0/s     lower on purpose: it hits EVERYTHING in
 #                                     range, so one target is its worst case
@@ -176,8 +180,8 @@ def bag(*item_ids):
 # the literals. Until then, test_equipment.py asserts the dps they produce
 # against the ratios the class scripts state, so a drift this size fails loudly
 # instead of quietly rewriting every number downstream.
-BASE_DAMAGE = {"warrior": 24, "mage": 9, "healer": 2, "tank": 4}
-ATTACK_PERIOD = {"warrior": 1.00, "mage": 0.45, "healer": 0.10, "tank": 0.25}
+BASE_DAMAGE = {"warrior": 24, "mage": 30, "healer": 2, "tank": 4}
+ATTACK_PERIOD = {"warrior": 1.00, "mage": 1.00, "healer": 0.10, "tank": 0.25}
 ARMOUR_HALF_POINT = 200.0
 
 
