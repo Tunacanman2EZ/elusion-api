@@ -496,11 +496,24 @@ def aura_numbers():
     return max(share, 0.0), max(reach, 0.0), max(cooldown, 0.0)
 
 
+def _vigour_of(conn, user_id, slot, at):
+    """The max health a VIGOUR meal in force at `at` adds to this character
+    (consuming/'s food_buffs, 0.74.0), or 0 - also when the table is not there
+    yet, which is a server from before meals and changes nothing."""
+    try:
+        row = conn.execute("SELECT amount FROM food_buffs WHERE user_id = ? AND slot = ?"
+                           " AND kind = 'VIGOUR' AND ends_at > ?", (user_id, slot, at)).fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    return max(0, int(row["amount"] or 0)) if row is not None else 0
+
+
 def write_heal_grants(rows, at):
     """THE AURA'S HEALS: for each (user_id, slot, share), a consume_grants row
     of that share of the character's own maximum hp, as app.py derives it -
-    gamedata.max_stats_for() with what it is wearing. Runs in a thread.
-    Returns the rows written."""
+    gamedata.max_stats_for() with what it is wearing - and a VIGOUR meal's
+    health on top while it lasts (0.74.0). Runs in a thread. Returns the rows
+    written."""
     if not rows or gamedata is None:
         return []
     conn = sqlite3.connect(DB_PATH, timeout=5)
@@ -520,7 +533,11 @@ def write_heal_grants(rows, at):
                                            worn if isinstance(worn, dict) else {})
             if not stats:
                 continue
-            amount = int(math.ceil(float(stats["max_hp"]) * float(share))) + HEAL_ROUNDING
+            # A VIGOUR MEAL RAISES THE MAXIMUM the share is of (0.74.0): the
+            # healed player's game heals that share of its buffed health, and
+            # a grant sized on the bare one would leave the rest unexplained.
+            top = int(stats["max_hp"]) + _vigour_of(conn, int(user_id), int(slot), int(at))
+            amount = int(math.ceil(float(top) * float(share))) + HEAL_ROUNDING
             out.append((int(user_id), int(slot), HEAL_GRANT_ID, "HP", amount, int(at)))
         if out:
             conn.executemany("INSERT INTO consume_grants (user_id, slot, item_id, target, amount, at)"

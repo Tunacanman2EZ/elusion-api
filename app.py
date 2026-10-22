@@ -27,13 +27,13 @@ import threading
 import unicodedata
 import math
 import smtplib
+import mailer
 import hashlib
 import ipaddress
 import socket
 import urllib.error
 import urllib.parse
 import urllib.request
-from email.message import EmailMessage
 from functools import wraps
 
 app = Flask(__name__)
@@ -1036,6 +1036,11 @@ import moderation.schema as moderation_schema  # noqa: E402
 import friends.schema as friends_schema  # noqa: E402
 import guilds.schema as guilds_schema  # noqa: E402
 import parties.schema as parties_schema  # noqa: E402
+# 0.74.0 larder and smith: the meal in force (consuming/) and the smith's
+# certifications (smith/), created with the rest below.
+import consuming.schema as consuming_schema  # noqa: E402
+import smith.schema as smith_schema  # noqa: E402
+import economyrules.schema as economyrules_schema  # noqa: E402
 
 
 def init_db():
@@ -1358,6 +1363,10 @@ def init_db():
             ON lusion_ledger(user_id, at);
         CREATE INDEX IF NOT EXISTS idx_lusion_ledger_reason
             ON lusion_ledger(reason, at);
+        -- BY WHEN, for the owner's flow report (0.74.0) - its twin on
+        -- gold_ledger says why.
+        CREATE INDEX IF NOT EXISTS idx_lusion_ledger_at
+            ON lusion_ledger(at);
 
         CREATE TABLE IF NOT EXISTS consume_grants (
             id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1632,6 +1641,23 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_gold_ledger_spent_reason
             ON gold_ledger(reason, delta) WHERE delta < 0;
 
+        -- BY WHEN, for the owner's flow report (0.74.0, economywatch/): the
+        -- owner's "a daily report of where gold comes from and where it goes,
+        -- by source" is every row of a window of whole UTC days, grouped by
+        -- day and reason. None of the four above is ordered by `at` alone, so
+        -- without this one the report read the whole ledger whatever window
+        -- it asked for.
+        --
+        -- MEASURED, NOT ASSUMED, the way the board's were: on two million
+        -- rows over a year, today's rows came back in 87ms without it and
+        -- 1.7ms with it, a week in 103ms and 36ms. A covering (at, reason,
+        -- delta) was tried too - 0.9ms and 19ms - and cost twice the disk,
+        -- 50 MB to this one's 26; with the report keeping every settled day
+        -- once it has read it, today's rows are the only ones read twice, so
+        -- the smaller index is the one that pays. About a second to build.
+        CREATE INDEX IF NOT EXISTS idx_gold_ledger_at
+            ON gold_ledger(at);
+
         -- SERVER-WIDE SETTINGS THAT OUTLIVE A RESTART.
         --
         -- WHY A TABLE AND NOT A CONSTANT: the maintenance switch is thrown
@@ -1777,6 +1803,9 @@ def init_db():
     friends_schema.create(db)
     guilds_schema.create(db)
     parties_schema.create(db)
+    consuming_schema.create(db)
+    smith_schema.create(db)
+    economyrules_schema.create(db)
 
     _migrate_bank_to_account(db)
 
@@ -5172,28 +5201,17 @@ def send_mail(to_address, subject, body):
             "Set them, or ELUSION_MAIL_CONSOLE=1 for local testing.", to_address)
         return False
 
-    message = EmailMessage()
-    message["From"] = MAIL_FROM
-    message["To"] = to_address
-    message["Subject"] = subject
-    message.set_content(body)
-
-    try:
-        if SMTP_PORT == 465:
-            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15)
-        else:
-            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15)
-            server.starttls()
-        with server:
-            if SMTP_USER:
-                server.login(SMTP_USER, SMTP_PASSWORD)
-            server.send_message(message)
-        return True
-    except Exception as error:
-        # Deliberately broad: smtplib raises a dozen different things and every
-        # one of them means the same thing here.
+    # THE CONVERSATION ITSELF IS mailer.py's (0.74.0), so the canary - which
+    # must never import this file - mails the owner the same way this does.
+    # The settings are still this module's, read at call time as they always
+    # were, so a suite that sets SMTP_HOST here is still heard.
+    sent, error = mailer.deliver(
+        {"host": SMTP_HOST, "port": SMTP_PORT, "user": SMTP_USER, "password": SMTP_PASSWORD,
+         "sender": MAIL_FROM},
+        to_address, subject, body, smtp=smtplib)
+    if not sent:
         app.logger.error("mail to %s failed: %s", to_address, error)
-        return False
+    return sent
 
 
 def send_mail_async(to_address, subject, body):
@@ -5521,12 +5539,51 @@ def _derived_stats(row, class_id=None, level=None):
     raises IndexError here and fails loudly in the tests, rather than quietly
     deriving a bare maximum. class_id and level override the row's own when the
     caller knows better (the save route's class, the kill route's new level).
+
+    AND A MEAL'S BUFF WHILE IT LASTS (0.74.0, found at the merge). A Vigour
+    meal raises the game's max health and a Wisdom meal its max mana; the
+    status route clamps to this, so leaving them out cut a fed character back
+    to the bare ceiling on every save - the heal of the meal itself included.
+    Only a row that says whose it is (user_id and slot - the saves rows the
+    routes read) can have a meal; anything else is derived as before.
     """
-    return gamedata.max_stats_for(
+    stats = gamedata.max_stats_for(
         row["class_id"] if class_id is None else class_id,
         int(row["level"] if level is None else level),
         _stored_json(row["equipment"], {}),
     )
+    if stats is None:
+        return None
+    extra_hp, extra_mana = _food_buff_maxima(row)
+    if extra_hp or extra_mana:
+        stats = dict(stats)
+        stats["max_hp"] = int(stats["max_hp"]) + extra_hp
+        stats["max_mana"] = int(stats["max_mana"]) + extra_mana
+    return stats
+
+
+def _food_buff_maxima(row):
+    """(max health, max mana) the meal in force adds to this row's character -
+    (0, 0) for no meal, a row that does not say whose it is, no request to
+    read the database in, or a database from before meals. consuming/'s
+    food_buffs is the one place the meal is written down."""
+    try:
+        keys = row.keys()
+    except AttributeError:
+        return 0, 0
+    if "user_id" not in keys or "slot" not in keys or not has_request_context():
+        return 0, 0
+    try:
+        found = get_db().execute(
+            "SELECT kind, amount FROM food_buffs WHERE user_id = ? AND slot = ? AND ends_at > ?",
+            (int(row["user_id"]), int(row["slot"]), int(time.time()))).fetchone()
+    except sqlite3.OperationalError:
+        return 0, 0
+    if found is None:
+        return 0, 0
+    amount = max(0, int(found["amount"] or 0))
+    kind = str(found["kind"])
+    return (amount if kind == "VIGOUR" else 0), (amount if kind == "WISDOM" else 0)
 
 
 # GET AND PUT /api/save ARE saves/'s since 18 Oct, with GET /api/character and
@@ -6200,6 +6257,10 @@ kill_package.register(
     note_refill=_note_refill,
     receipts_on=kill_receipts_on,
     client_build=client_build,
+    # THE MATERIALS' SCALE (0.74.0): the owner's material_drop_scale, asked of
+    # economyrules/ on every kill - imported at THE LARDER AND THE SMITH,
+    # further down, so asked for when a kill lands.
+    material_scale=lambda db: economyrules.value(db, "material_drop_scale"),
 )
 
 # Named here as well, for the suites and the notes that read them off this
@@ -7516,6 +7577,10 @@ shop_package.register(
     grid_cells=_grid_cells,
     grid_rewrite=_grid_rewrite,
     resync=_carry_resync,
+    # THE OWNER'S PRICES (0.74.0, economyrules/, registered with the owner's
+    # tools below): LOOKED UP ON EACH CALL, since the package is set up further
+    # down this file than the shop.
+    terms=lambda db, shop_id: _economy_shop_terms(db, shop_id),
 )
 
 
@@ -7727,6 +7792,9 @@ trade_package.register(
     query_int=_query_int,
     staff_page=(STAFF_PAGE_DEFAULT, STAFF_PAGE_MAX),
     catalogue=gamedata,
+    # THE OWNER'S TAX (0.74.0, economyrules/), looked up on each call as the
+    # shop's prices are.
+    tax_terms=lambda db: _economy_tax_terms(db),
 )
 
 # =============================================================================
@@ -7795,6 +7863,66 @@ DEBUG_GOLD_MAX = ownertools_package.DEBUG_GOLD_MAX
 STAFF_LEVEL_MAX = ownertools_package.STAFF_LEVEL_MAX
 STAFF_SKILL_ORDER = ownertools_package.STAFF_SKILL_ORDER
 ROLLBACK_REASON = ownertools_package.ROLLBACK_REASON
+
+
+# --- 0.74.0 economy rules ---
+# THE ECONOMY'S NUMBERS, AND THE OWNER'S WATCH OVER THEM (0.74.0). Three of the
+# owner's five economy ideas, "we need to do these tasks also max power":
+#
+#   economyrules/   "economy numbers you can change without shipping" - the
+#                   trade tax, the general store's prices and the scales the
+#                   larder and the smith read, in a table the owner sets from
+#                   the GM panel. The shop and the trade routes above are
+#                   handed _economy_shop_terms() and _economy_tax_terms(),
+#                   which answer only what the owner set, so an empty table is
+#                   the game exactly as it was. Its tables are created by
+#                   init_db() with the other packages'.
+#   economywatch/   "a daily report of where gold comes from and where it
+#                   goes, by source" (GET /api/owner/economy/flow), and the
+#                   canary's last word and a check on demand
+#                   (/api/owner/economy/canary).
+#
+# THE CANARY ITSELF RUNS FROM CRON, not from here: canary.py, hourly, as the
+# service's user (deploy/update_server.sh installs the line). This file only
+# reads what it last wrote and runs the same checks when the owner asks -
+# canary.py's own functions, so there is one set of checks.
+import canary  # noqa: E402
+import economyrules as economyrules_package  # noqa: E402
+import economywatch as economywatch_package  # noqa: E402
+
+economyrules_package.register(
+    app,
+    require_auth=require_auth,
+    require_owner=require_owner,
+    require_the_owner=require_the_owner,
+    require_fresh_password=require_fresh_password,
+    get_db=get_db,
+    bad_request=bad_request,
+    log_staff_action=log_staff_action,
+    is_the_owner=lambda user: is_owner(user["username"]),
+)
+_economy_shop_terms = economyrules_package.shop_terms
+_economy_tax_terms = economyrules_package.tax_terms
+# For the suites, which write the owner's table by hand.
+_economy_rules_cache_clear = economyrules_package.clear_cache
+
+_ECONOMY_WATCH = economywatch_package.register(
+    app,
+    require_auth=require_auth,
+    require_owner=require_owner,
+    no_write_lock=no_write_lock,
+    get_db=get_db,
+    bad_request=bad_request,
+    query_int=_query_int,
+    # LOOKED UP ON EACH CALL: the suites point DB_PATH at their own database.
+    # The status file is beside the database - /var/lib/elusion on the server,
+    # where the cron line writes it.
+    read_canary=lambda: canary.read_status(canary.default_status_path(DB_PATH)),
+    run_canary=lambda: canary.run_checks(DB_PATH),
+)
+# For the suites, which date ledger rows in the past and then read the flow.
+_economy_flow_cache_clear = _ECONOMY_WATCH.cache_clear
+# --- end 0.74.0 economy rules ---
 
 
 # =============================================================================
@@ -8010,7 +8138,9 @@ parties.register(
 # THE KINGDOM TAX BOARD IS kingdom/ (18 Oct): GET /api/economy/kingdom, the
 # board's cache and every read it makes of the two ledgers. register() hands
 # back cache_clear(), which the suites call between moving gold and reading the
-# board; the size of the board is still asked here by its old name.
+# board; the size of the board is still asked here by its old name. Since
+# 0.74.0 it takes gifts to the crown too (POST /api/kingdom/donate), so it is
+# handed the gold ledger and the catalogue's patron titles.
 import kingdom as kingdom_package  # noqa: E402
 
 _KINGDOM = kingdom_package.register(
@@ -8018,10 +8148,93 @@ _KINGDOM = kingdom_package.register(
     require_auth=require_auth,
     get_db=get_db,
     guild_tag=guild_tag,
+    bad_request=bad_request,
+    parse_slot=parse_slot,
+    max_slot=MAX_SLOT,
+    catalogue=gamedata,
+    gold_delta=gold_delta,
 )
 _kingdom_cache_clear = _KINGDOM.cache_clear
 KINGDOM_BOARD_SIZE = kingdom_package.KINGDOM_BOARD_SIZE
 KINGDOM_BOARD_CACHE_SECONDS = kingdom_package.KINGDOM_BOARD_CACHE_SECONDS
+
+
+# --- 0.74.0 larder and smith ---
+# =============================================================================
+# THE LARDER AND THE SMITH (0.74.0) - the larder/ and smith/ packages
+# =============================================================================
+# The owner, 22 Oct: "Cooking + a smith" - monsters drop materials that fit
+# them and food; cooking grows past fish into meals of two or more
+# ingredients that heal more and give a short buff; a new smith spends
+# materials plus gold to upgrade gear, with a "Royal Certification" step to
+# reach the higher tiers. What lives where:
+#
+#   larder/    POST /api/cooking/recipe and GET /api/cooking/recipes - a meal
+#              cooked, and the recipe book
+#   smith/     GET /api/smith/status, POST /api/smith/quote, /temper and
+#              /certify, and its table, smith_ranks (smith/schema.py, made by
+#              init_db() with the meal's food_buffs, consuming/schema.py)
+#   elsewhere  the materials a kill drops (gamedata.roll_kill_rewards(), the
+#              kill's material_scale above), the bait a cast takes
+#              (gathering/), a meal's buff when it is eaten (consuming/ and
+#              its food_buffs), the buff on the character's load (saves/) and
+#              on the presence ticket the books bound a fighter by (players/,
+#              gamedata.might_percent()), and the gift to the crown (kingdom/,
+#              above)
+#
+# ECONOMY NUMBERS THE OWNER CAN CHANGE ARE economyrules/'s (Agent 5's
+# package): material_drop_scale, temper_gold_scale and
+# certification_gold_scale, asked through economyrules.value() at the moment
+# they are needed - a lookup, so a number changed is the next request's.
+# Every coin moves through gold_delta() (smith_temper, royal_certification,
+# donation) and every item through the carry's grants.
+import economyrules  # noqa: E402
+import larder  # noqa: E402
+import smith as smith_package  # noqa: E402
+
+larder.register(
+    app,
+    require_auth=require_auth,
+    get_db=get_db,
+    bad_request=bad_request,
+    parse_slot=parse_slot,
+    max_slot=MAX_SLOT,
+    slot_exists=_slot_exists,
+    catalogue=gamedata,
+    skills_of=skills_payload,
+    # Looked up on each meal, as the fire's are, so a suite's stand-in is heard.
+    take_from_backpack=lambda user_id, slot, item_id, quantity, keys_last=False:
+        _take_from_backpack(user_id, slot, item_id, quantity, keys_last=keys_last),
+    add_to_backpack=lambda user_id, slot, item_id, quantity: _add_to_backpack(user_id, slot, item_id, quantity),
+    grant_skill_xp=lambda user_id, slot, skill_id, gained: _grant_skill_xp(user_id, slot, skill_id, gained),
+    status_of=status_payload,
+    inventory_of=inventory_payload,
+    bag_cells=INVENTORY_CAPACITY,
+)
+
+smith_package.register(
+    app,
+    require_auth=require_auth,
+    get_db=get_db,
+    bad_request=bad_request,
+    parse_slot=parse_slot,
+    max_slot=MAX_SLOT,
+    catalogue=gamedata,
+    rule=lambda db, key: economyrules.value(db, key),
+    gold_delta=gold_delta,
+    take_from_backpack=lambda user_id, slot, item_id, quantity, keys_last=False:
+        _take_from_backpack(user_id, slot, item_id, quantity, keys_last=keys_last),
+    inventory_of=inventory_payload,
+    carry_request=_carry_request,
+    parse_grid_cell=parse_grid_cell,
+    carry_cells=CARRY_CAPACITY,
+    grid_cells=_grid_cells,
+    grid_rewrite=_grid_rewrite,
+    resync=_carry_resync,
+    # A held find keeps its hold under the id tempering gives it (trade/'s).
+    move_trade_hold=lambda db, user_id, old_id, new_id: trade_package.data.move_hold(db, user_id, old_id, new_id),
+)
+# --- end 0.74.0 larder and smith ---
 
 
 @app.get("/api/economy/supply")

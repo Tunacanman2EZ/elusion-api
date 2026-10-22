@@ -31,6 +31,8 @@ STAFF_ACTION_KINDS = (
     "event",
     # 0.57.0: the kill receipts' switch (switches/).
     "receipts",
+    # 0.74.0: an economy rule set or put back to the game's own (economyrules/).
+    "economy_rule",
 )
 
 # NAMED SETS OF KINDS the log can be asked for by one name (?action=moderation).

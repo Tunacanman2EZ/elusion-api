@@ -308,9 +308,11 @@ captured = []
 real_roll = gamedata.roll_kill_rewards
 
 
-def spy(enemy_id, class_id="", bag_scale=1.0, xp_scale=1.0):
+def spy(enemy_id, class_id="", bag_scale=1.0, xp_scale=1.0, material_drop_scale=1.0):
+    # material_drop_scale (0.74.0) is the owner's economy number, not the
+    # stirring lands': passed through as the kill route sent it.
     captured.append((enemy_id, bag_scale, xp_scale))
-    return real_roll(enemy_id, class_id, bag_scale, xp_scale)
+    return real_roll(enemy_id, class_id, bag_scale, xp_scale, material_drop_scale=material_drop_scale)
 
 
 def kill(enemy_id):
@@ -347,9 +349,14 @@ check("the XP paid is the server's, with the stir in it",
 
 kept_rng = gamedata._rng
 try:
+    # THE BAG ROLL ALONE: since 0.74.0 a monster's materials make a bag of
+    # their own (gamedata.roll_material_drops()), on their own odds that no
+    # stir touches, so they are switched off here to measure what a stir
+    # scales - the bag roll - and nothing else.
     def bag_rate(scale, enemy_id, n=4000):
         gamedata._rng = random.Random(12345)
-        return sum(1 for _ in range(n) if gamedata.roll_kill_rewards(enemy_id, "", scale)["contents"]) / n
+        return sum(1 for _ in range(n)
+                   if gamedata.roll_kill_rewards(enemy_id, "", scale, material_drop_scale=0.0)["contents"]) / n
     plain, stirred = bag_rate(1.0, "darkslime"), bag_rate(1.5, "darkslime")
     check("the roll: a 30%% monster drops near 45%% at 1.5x (%.2f, %.2f)" % (plain, stirred),
           0.26 < plain < 0.34 and 0.41 < stirred < 0.49, (plain, stirred))

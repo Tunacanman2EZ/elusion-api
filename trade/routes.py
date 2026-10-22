@@ -28,6 +28,10 @@ register() is handed app.py's own pieces - it never imports app.py:
     query_int           (name, default, low, high) -> the query's int, or None
     staff_page          (default, most) a staff page holds
     catalogue           gamedata: what an item is and is worth, and the tax
+    tax_terms           (db) -> the owner's trade tax, as keyword arguments for
+                        catalogue.trade_tax() - {} when the owner has set none
+                        (economyrules/, 0.74.0). Left out, the tax is the
+                        catalogue's own, as it was before the owner could set it.
 
 THE ENDPOINT NAMES ARE app.py's - trade_offer, trade_current, trade_update,
 trade_confirm, trade_cancel, staff_trades, trade_history - and routes.lock
@@ -49,7 +53,14 @@ from .services import (STAFF_TRADE_STATES, TRADE_HISTORY_SHOWN, TRADE_MAX_ITEM_T
 def register(app, *, require_auth, require_role, get_db, bad_request, parse_slot, max_slot, slot_exists,
              ignores, presence_for, online_window, playing_slot, trades_enabled, take_from_backpack,
              add_to_backpack, gold_delta, inventory_of, mark_resync, take_resync, name_hue_of,
-             moderation_target, query_int, staff_page, catalogue):
+             moderation_target, query_int, staff_page, catalogue, tax_terms=None):
+
+    # THE OWNER'S TAX (0.74.0): the rate and the floor the owner set on the
+    # server (economyrules/), asked by the quote and by the charge alike - so
+    # the number on the confirm button is the number taken. Nothing set,
+    # nothing passed: the game's own 5% and 1.
+    def tax(db, value):
+        return catalogue.trade_tax(value, **(dict(tax_terms(db) or {}) if tax_terms is not None else {}))
 
     def trade_payload(db, trade):
         """
@@ -102,7 +113,7 @@ def register(app, *, require_auth, require_role, get_db, bad_request, parse_slot
                 "offering_value": offered,
                 # What this side will pay: tax on what it RECEIVES, which is the
                 # other side's offer.
-                "tax": catalogue.trade_tax(receives_value) if receives_value is not None else None,
+                "tax": tax(db, receives_value) if receives_value is not None else None,
                 # STILL THERE? A trade with somebody who has closed the game can
                 # only ever be cancelled, and the window should say so rather
                 # than leave you waiting for an accept that is not coming.
@@ -195,8 +206,8 @@ def register(app, *, require_auth, require_role, get_db, bad_request, parse_slot
             return refuse(db, trade_id,
                           *bad_request("This trade contains an item the server does not know."))
 
-        a_tax = catalogue.trade_tax(b_value)   # A pays on what A receives
-        b_tax = catalogue.trade_tax(a_value)
+        a_tax = tax(db, b_value)   # A pays on what A receives
+        b_tax = tax(db, a_value)
 
         # 3. PURSES. Read inside the transaction, never from the trade row: the
         # offer records what was PROMISED, and what is HELD is a different fact

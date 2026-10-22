@@ -2,8 +2,10 @@
 that was worth (a package since 18 Oct; the route is as it was in app.py).
 
     POST /api/combat/kill   report a kill and receive its rewards: the XP and
-                            any level it brings, the attack XP, the loot bag,
-                            and the kill's record - in one transaction
+                            any level it brings, the attack XP, the loot bag
+                            (with the monster's materials in it since 0.74.0,
+                            or holding only them), and the kill's record - in
+                            one transaction
 
 THE CLIENT REPORTS WHICH ENEMY DIED, AND NOTHING ELSE. Before this route, the
 game's BaseEnemy._die() granted the XP, rolled the loot and spawned the bag on

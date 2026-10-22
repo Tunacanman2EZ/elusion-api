@@ -2432,6 +2432,80 @@ Danger a player walked INTO can take and give normally. Consent is the whole
 difference, which makes an announced portal the right mechanic rather than a
 summon - stepping through is the consent, and it sorts the audience for free.
 
+## The larder, the smith and the crown's ledger (game 0.74.0)
+
+The owner, 22 Oct: materials and cooking from the Clockwork pack, "Cooking + a
+smith", "recipes people can make with the food", and all five economy ideas,
+"max power". Built by five agents against one written contract and merged.
+Four new packages and changes to five old ones:
+
+| package | routes | table(s) | ledger reason |
+|---|---|---|---|
+| `larder/` | `POST /api/cooking/recipe`, `GET /api/cooking/recipes` | - | - |
+| `consuming/` (meals) | the existing consume route answers `food_buff` | `food_buffs` (one per character) | - |
+| `smith/` | `GET /api/smith/status`, `POST /api/smith/quote`, `/temper`, `/certify` | `smith_ranks` | `smith_temper`, `royal_certification` |
+| `kingdom/` (patronage) | `POST /api/kingdom/donate`; titles on the board | - (the ledger) | `donation` |
+| `economyrules/` | `GET /api/economy/rules`, `GET`/`PUT /api/owner/economy/rules` | `economy_rules`, `economy_rule_changes` | - |
+| `economywatch/` | `GET /api/owner/economy/flow`, `GET`/`POST /api/owner/economy/canary` | - (reads the ledgers) | - |
+
+- **Material drops** are `gamedata.roll_kill_rewards()`'s: each enemy's
+  `material_drops` rolled independently at `chance * material_drop_scale`. A
+  kill whose bag roll said no makes a bag of materials ALONE - no gold, ever
+  (a material must never be a reason for more gold). Boss bags with materials
+  could push coins past the nine cells, so `fold_coins()` merges the two
+  smallest coin stacks into one of the same value - only when a bag has
+  materials, so every other bag is byte-for-byte as before.
+- **Recipes** take every ingredient from the whole carry (bag cells first, then
+  the hotbar keys - never the bank), roll the fish's burn on the recipe's level
+  and mastery, and pay `recipe.xp` cooking XP. A burnt meal takes the
+  ingredients anyway.
+- **Meals** record the buff in `food_buffs` the moment the server takes the
+  meal; one at a time, a potion leaves it running. The presence ticket carries
+  it (players/), so the books bound a Might fighter by the higher hit; the
+  aura's heal grant is sized on Vigour health (presence.py `_vigour_of()`); and
+  `_derived_stats()` adds Vigour and Wisdom to the maxima while the meal lasts
+  - without that, found at the merge, the status route cut a fed character back
+  to the bare ceiling on every save. Only a row that says whose it is (user_id,
+  slot) can carry a meal; anything else derives as before.
+- **Bait**: the catch uses the best bait carried (most `bait_rolls`, ties to the
+  first id), rolls the catch that many times and keeps the highest tier.
+- **Tempering** rewrites the quality letters in the item id
+  (`jadechest~a104h96r605` -> `~a107h99r605`): every rolled stat +temper_step
+  to temper_cap, the resistance untouched, Perfect and fully tempered refused.
+  The piece keeps its trade hold under the new id (`trade/data.py
+  move_hold()`), so a fresh mythic cannot escape its 48-hour hold through the
+  anvil. Gold = value x temper_gold_rate x temper_gold_scale, at least one coin.
+- **Certification** is the next rank only, per character; a deleted character
+  takes its ranks and its meal with it (`saves/data.py drop()`).
+- **Patronage** counts an ACCOUNT's lifetime `donation` rows for the title.
+- **Economy rules**: `economyrules.value(db, key)` is the one reader - the
+  owner's row or the default, cached per database for a few seconds and cleared
+  on a change. With no rows every number is exactly what it was. The shop's
+  buy and sell prices and the trade tax read it; the larder and the smith read
+  `material_drop_scale`, `temper_gold_scale`, `certification_gold_scale`. A
+  change asks for the password again (owner only), is bounded, and is logged in
+  `economy_rule_changes` and the staff log. The trade tax floor cannot go below
+  1: at 0 small trades go untaxed, which the exporter already refuses.
+- **The gold flow** groups gold_ledger (and lusion_ledger) per UTC day and
+  reason; `idx_gold_ledger_at` and `idx_lusion_ledger_at` keep it bounded.
+- **The canary runs hourly on the server.** `update_server.sh` installs
+  `/etc/cron.d/elusion-canary` (idempotent; also `--install-canary-cron` on its
+  own). Root only opens the root-only settings file and hands it over on
+  standard input; `runuser` drops to the service user before Python starts, so
+  no setting is ever on a command line. `canary.py --status-file` writes the
+  result atomically and the database stays read-only. On a failure it mails the
+  owner's confirmed recovery address (co-owners while their switch is on) via
+  `mailer.py` - `send_mail()` moved there so the canary can mail without
+  importing app.py, which writes the database on import - when the books first
+  break, when what is broken changes, and once a day while they stay broken.
+  The first server update that brings this runs the OLD update script, so the
+  cron arrives on the update after, or at once with `--install-canary-cron`.
+
+Tests: `test_larder.py`, `test_smith.py`, `test_patronage.py`,
+`test_economyrules.py`, `test_goldflow.py`, `test_canary.py`, and the bare-app
+runs of the new packages in `test_packages.py`. Every new check was watched
+failing with its fault put back.
+
 ## Layout
 
 ```

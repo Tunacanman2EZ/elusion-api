@@ -2,12 +2,19 @@
 package since 18 Oct; the route is as it was in app.py).
 
     GET /api/economy/kingdom   the totals, the breakdown by reason, the top
-                               players and guilds, and the caller's own line
+                               players and guilds - each with its patron's
+                               title (0.74.0) - and the caller's own line,
+                               with what it has given the crown and the title
+                               it is climbing to
+    POST /api/kingdom/donate   a gift of gold to the crown (0.74.0): burned,
+                               reason donation, for a title on the board
 
 EVERY COIN DESTROYED IS A CONTRIBUTION - the trade tax (trade/), the shop, a
-revive, what the dead leave behind - and lusions are a second column, never
-added to the gold. DERIVED, NEVER COUNTED: the board is a read of the two
-ledgers, and there is no running total anywhere to disagree with them.
+revive, what the dead leave behind, and a gift to the crown - and lusions are
+a second column, never added to the gold. DERIVED, NEVER COUNTED: the board is
+a read of the two ledgers, and there is no running total anywhere to disagree
+with them. A patron's title is derived the same way, from the account's
+donation rows (services.title_for()).
 
 THE SHARED HALF IS CACHED for KINGDOM_BOARD_CACHE_SECONDS, because it is the
 same for everybody and costs a pass over the ledger; the caller's own line and

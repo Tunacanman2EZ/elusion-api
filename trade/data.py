@@ -29,6 +29,30 @@ def place_hold(db, catalogue, user_id, item_id, quantity=1, now=None):
         )
 
 
+def move_hold(db, user_id, old_id, new_id, now=None):
+    """
+    A piece the smith tempered (0.74.0) keeps its hold under its new id: the
+    hold with the most time left on `old_id`, if this account has one in
+    force, is moved to `new_id` with its clock as it was. Returns whether one
+    moved.
+
+    BECAUSE THE HOLD IS ON THE ID. A tempered mythic is a new id, and without
+    this the 48 hours a fresh find waits would end the moment it went on the
+    anvil - a cheated kill laundered through the smith. Moving it, rather than
+    holding the new id afresh, means an honest find tempered a day after it
+    dropped waits one more day, not two. The latest hold moves, so a second
+    piece of the same id found earlier is not held any longer than it was.
+    """
+    now = int(time.time()) if now is None else int(now)
+    cur = db.execute(
+        "UPDATE trade_holds SET item_id = ? WHERE id = ("
+        " SELECT id FROM trade_holds WHERE user_id = ? AND item_id = ? AND held_until > ?"
+        " ORDER BY held_until DESC, id DESC LIMIT 1) AND user_id = ?",
+        (new_id, user_id, old_id, now, user_id),
+    )
+    return cur.rowcount > 0
+
+
 def hold_refusal(db, catalogue, user_id, items, now=None):
     """None when every piece in `items` ({item_id: quantity}) may be traded by
     this account, else the sentence that says which may not and when it may.

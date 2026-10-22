@@ -47,9 +47,11 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, cl
              derived_stats, catalogue, take_snapshot, status_of, inventory_of, skills_of, find_open_trade,
              gold_delta, deletions_kept, delete_reason):
 
-    def slot_view(row):
-        """One slot as the game lists it - see services.slot_view()."""
-        return services.slot_view(row, stored_json(row["equipment"], {}), stored_json(row["explored"], {}))
+    def slot_view(row, buffs=None):
+        """One slot as the game lists it - see services.slot_view(). `buffs` is
+        data.food_buffs() for the account, {slot: row}."""
+        return services.slot_view(row, stored_json(row["equipment"], {}), stored_json(row["explored"], {}),
+                                  services.food_buff_view((buffs or {}).get(int(row["slot"]))))
 
     def list_saves():
         """
@@ -70,10 +72,13 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, cl
             description: Missing, invalid or expired token
         """
         rows = data.all_of(get_db(), g.user["id"])
+        # EACH CHARACTER'S MEAL IN FORCE (0.74.0), or null: one read for all of
+        # them, beside the rows.
+        buffs = data.food_buffs(get_db(), g.user["id"], int(time.time()))
 
         return {
             "username": g.user["username"],
-            "slots": [slot_view(r) for r in rows],
+            "slots": [slot_view(r, buffs) for r in rows],
         }, 200
 
     def write_save():
@@ -331,7 +336,7 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, cl
             required: true
         responses:
           200:
-            description: Identity, vitals, backpack and skills together
+            description: Identity, vitals, backpack, skills and the meal in force (food_buff, or null) together
           400:
             description: Bad slot
           404:
@@ -385,6 +390,11 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, cl
             # should not have to know to ask somewhere else.
             "equipment": stored_json(row["equipment"], {}),
             "skills": skills_of(user_id, slot),
+            # THE MEAL IN FORCE, or null (0.74.0) - what serverstorage.gd reads
+            # at login, so a pie eaten before a relog is still on the HUD after
+            # it, with the time the server gave it rather than a fresh clock.
+            "food_buff": services.food_buff_view(
+                data.food_buffs(get_db(), user_id, int(time.time())).get(slot)),
         }, 200
 
     def character_delete():

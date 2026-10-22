@@ -2,7 +2,10 @@
 route is as it was in app.py).
 
     POST /api/character/consume   the server takes the item and says what it
-                                  restores; the game applies it
+                                  restores; the game applies it. A meal with
+                                  a buff (0.74.0) starts the character's food
+                                  buff here, in food_buffs (schema.py), one at a
+                                  time, and the answer carries it
 
 WHY THIS ENDPOINT EXISTS AT ALL, when the client could simply drop the item
 from its next inventory sync and be done with it.

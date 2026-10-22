@@ -11,8 +11,9 @@ register() is handed app.py's own pieces - it never imports app.py:
                         refusal or None)
     carry_capacity      how many cells the carry has, hotbar included
     catalogue           gamedata: whether this character may use the item,
-                        and what it restores - asked on every call, so a
-                        suite's stand-in for consume_check() is heard
+                        what it restores and the buff a meal gives (buff_of(),
+                        0.74.0) - asked on every call, so a suite's stand-in
+                        for consume_check() is heard
     skills_of           (user_id, slot) -> {skill: {"level", "xp"}}
     valid_skills        every skill the game has
     take_from_backpack  (user_id, slot, item_id, quantity, prefer=) -> True,
@@ -58,7 +59,7 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, pa
                 position: {type: integer, example: 21, description: "The carried cell used (0-19 bag, 20-29 hotbar). Spent first when it holds the item."}
         responses:
           200:
-            description: The item was destroyed; apply its effect
+            description: "The item was destroyed; apply its effect. food_buff is the meal in force afterwards (a meal with a buff starts its own, replacing any other), or null"
           400:
             description: Bad slot or item_id
           403:
@@ -138,7 +139,19 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, pa
         target, amount = catalogue.restore_for(item_id)
         # WHAT THIS AUTHORISED, not merely that it happened: the pool and how
         # much, read by the healing check (status/'s note_refill()).
-        note_refill(db, user_id, slot, item_id, int(time.time()), target=target, amount=amount)
+        now = int(time.time())
+        note_refill(db, user_id, slot, item_id, now, target=target, amount=amount)
+
+        # A MEAL'S BUFF (0.74.0) - the owner: meals that "heal more and give a
+        # short buff". Recorded HERE, the moment the server took the meal,
+        # because the server bounds a buffed fighter by it (the presence
+        # ticket, gamedata.combat_bounds()) and a buff the client merely
+        # announced would be one anybody could announce. One at a time: a new
+        # meal replaces the last, whatever either was.
+        buff = catalogue.buff_of(item_id)
+        if buff is not None:
+            kind, buff_amount, seconds = buff
+            data.set_buff(db, user_id, slot, item_id, kind, buff_amount, now + seconds)
         db.commit()
 
         return {
@@ -155,6 +168,11 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, pa
             # game used to take one off its own copy and save the whole bag;
             # the bag is the server's now, so it adopts this instead.
             "inventory": inventory_of(user_id, slot),
+            # THE MEAL IN FORCE AFTERWARDS, or null (0.74.0): the one this
+            # meal started, or - for a potion - the one still running, so a
+            # game that sets FoodBuff from every answer never loses a meal to
+            # a drink.
+            "food_buff": services.food_buff_view(data.buff_of(db, user_id, slot, now)),
         }, 200
 
     app.add_url_rule("/api/character/consume", endpoint="character_consume",

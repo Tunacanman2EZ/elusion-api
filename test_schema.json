@@ -223,6 +223,12 @@
    "CREATE INDEX idx_lusion_ledger_reason\n            ON lusion_ledger(reason, at)"
   ],
   [
+   "index",
+   "idx_lusion_ledger_at",
+   "lusion_ledger",
+   "CREATE INDEX idx_lusion_ledger_at\n            ON lusion_ledger(at)"
+  ],
+  [
    "table",
    "consume_grants",
    "consume_grants",
@@ -353,6 +359,12 @@
    "idx_gold_ledger_spent_reason",
    "gold_ledger",
    "CREATE INDEX idx_gold_ledger_spent_reason\n            ON gold_ledger(reason, delta) WHERE delta < 0"
+  ],
+  [
+   "index",
+   "idx_gold_ledger_at",
+   "gold_ledger",
+   "CREATE INDEX idx_gold_ledger_at\n            ON gold_ledger(at)"
   ],
   [
    "table",
@@ -803,6 +815,54 @@
    "idx_party_invites_from",
    "party_invites",
    "CREATE INDEX idx_party_invites_from\n            ON party_invites(from_id)"
+  ],
+  [
+   "table",
+   "food_buffs",
+   "food_buffs",
+   "CREATE TABLE food_buffs (\n            user_id INTEGER NOT NULL,\n            slot    INTEGER NOT NULL,\n            item_id TEXT    NOT NULL,\n            kind    TEXT    NOT NULL,\n            amount  INTEGER NOT NULL,\n            ends_at INTEGER NOT NULL,\n            PRIMARY KEY (user_id, slot),\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
+  ],
+  [
+   "index",
+   "sqlite_autoindex_food_buffs_1",
+   "food_buffs",
+   null
+  ],
+  [
+   "table",
+   "smith_ranks",
+   "smith_ranks",
+   "CREATE TABLE smith_ranks (\n            user_id   INTEGER NOT NULL,\n            slot      INTEGER NOT NULL,\n            rank      INTEGER NOT NULL,\n            earned_at INTEGER NOT NULL,\n            PRIMARY KEY (user_id, slot, rank),\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
+  ],
+  [
+   "index",
+   "sqlite_autoindex_smith_ranks_1",
+   "smith_ranks",
+   null
+  ],
+  [
+   "table",
+   "economy_rules",
+   "economy_rules",
+   "CREATE TABLE economy_rules (\n            key         TEXT    PRIMARY KEY,\n            value       REAL    NOT NULL,\n            updated_at  INTEGER NOT NULL,\n            updated_by  TEXT    NOT NULL DEFAULT ''\n        )"
+  ],
+  [
+   "index",
+   "sqlite_autoindex_economy_rules_1",
+   "economy_rules",
+   null
+  ],
+  [
+   "table",
+   "economy_rule_changes",
+   "economy_rule_changes",
+   "CREATE TABLE economy_rule_changes (\n            id          INTEGER PRIMARY KEY AUTOINCREMENT,\n            at          INTEGER NOT NULL,\n            key         TEXT    NOT NULL,\n            old_value   REAL,\n            new_value   REAL,\n            by_id       INTEGER,\n            by_name     TEXT    NOT NULL DEFAULT '',\n            FOREIGN KEY (by_id) REFERENCES users(id) ON DELETE SET NULL\n        )"
+  ],
+  [
+   "index",
+   "idx_economy_rule_changes_at",
+   "economy_rule_changes",
+   "CREATE INDEX idx_economy_rule_changes_at\n            ON economy_rule_changes(at)"
   ],
   [
    "index",
@@ -2465,6 +2525,149 @@
     ]
    ]
   },
+  "economy_rule_changes": {
+   "columns": [
+    [
+     0,
+     "id",
+     "INTEGER",
+     0,
+     null,
+     1
+    ],
+    [
+     1,
+     "at",
+     "INTEGER",
+     1,
+     null,
+     0
+    ],
+    [
+     2,
+     "key",
+     "TEXT",
+     1,
+     null,
+     0
+    ],
+    [
+     3,
+     "old_value",
+     "REAL",
+     0,
+     null,
+     0
+    ],
+    [
+     4,
+     "new_value",
+     "REAL",
+     0,
+     null,
+     0
+    ],
+    [
+     5,
+     "by_id",
+     "INTEGER",
+     0,
+     null,
+     0
+    ],
+    [
+     6,
+     "by_name",
+     "TEXT",
+     1,
+     "''",
+     0
+    ]
+   ],
+   "foreign_keys": [
+    [
+     0,
+     0,
+     "users",
+     "by_id",
+     "id",
+     "NO ACTION",
+     "SET NULL",
+     "NONE"
+    ]
+   ],
+   "index_info": {
+    "idx_economy_rule_changes_at": [
+     [
+      0,
+      1,
+      "at"
+     ]
+    ]
+   },
+   "indexes": [
+    [
+     "idx_economy_rule_changes_at",
+     0,
+     "c",
+     0
+    ]
+   ]
+  },
+  "economy_rules": {
+   "columns": [
+    [
+     0,
+     "key",
+     "TEXT",
+     0,
+     null,
+     1
+    ],
+    [
+     1,
+     "value",
+     "REAL",
+     1,
+     null,
+     0
+    ],
+    [
+     2,
+     "updated_at",
+     "INTEGER",
+     1,
+     null,
+     0
+    ],
+    [
+     3,
+     "updated_by",
+     "TEXT",
+     1,
+     "''",
+     0
+    ]
+   ],
+   "foreign_keys": [],
+   "index_info": {
+    "sqlite_autoindex_economy_rules_1": [
+     [
+      0,
+      0,
+      "key"
+     ]
+    ]
+   },
+   "indexes": [
+    [
+     "sqlite_autoindex_economy_rules_1",
+     1,
+     "pk",
+     0
+    ]
+   ]
+  },
   "ended_sessions": {
    "columns": [
     [
@@ -2521,6 +2724,92 @@
    "indexes": [
     [
      "sqlite_autoindex_ended_sessions_1",
+     1,
+     "pk",
+     0
+    ]
+   ]
+  },
+  "food_buffs": {
+   "columns": [
+    [
+     0,
+     "user_id",
+     "INTEGER",
+     1,
+     null,
+     1
+    ],
+    [
+     1,
+     "slot",
+     "INTEGER",
+     1,
+     null,
+     2
+    ],
+    [
+     2,
+     "item_id",
+     "TEXT",
+     1,
+     null,
+     0
+    ],
+    [
+     3,
+     "kind",
+     "TEXT",
+     1,
+     null,
+     0
+    ],
+    [
+     4,
+     "amount",
+     "INTEGER",
+     1,
+     null,
+     0
+    ],
+    [
+     5,
+     "ends_at",
+     "INTEGER",
+     1,
+     null,
+     0
+    ]
+   ],
+   "foreign_keys": [
+    [
+     0,
+     0,
+     "users",
+     "user_id",
+     "id",
+     "NO ACTION",
+     "CASCADE",
+     "NONE"
+    ]
+   ],
+   "index_info": {
+    "sqlite_autoindex_food_buffs_1": [
+     [
+      0,
+      0,
+      "user_id"
+     ],
+     [
+      1,
+      1,
+      "slot"
+     ]
+    ]
+   },
+   "indexes": [
+    [
+     "sqlite_autoindex_food_buffs_1",
      1,
      "pk",
      0
@@ -2723,6 +3012,13 @@
     ]
    ],
    "index_info": {
+    "idx_gold_ledger_at": [
+     [
+      0,
+      1,
+      "at"
+     ]
+    ],
     "idx_gold_ledger_reason": [
      [
       0,
@@ -2773,6 +3069,12 @@
     ]
    },
    "indexes": [
+    [
+     "idx_gold_ledger_at",
+     0,
+     "c",
+     0
+    ],
     [
      "idx_gold_ledger_reason",
      0,
@@ -3796,6 +4098,13 @@
     ]
    ],
    "index_info": {
+    "idx_lusion_ledger_at": [
+     [
+      0,
+      1,
+      "at"
+     ]
+    ],
     "idx_lusion_ledger_reason": [
      [
       0,
@@ -3822,6 +4131,12 @@
     ]
    },
    "indexes": [
+    [
+     "idx_lusion_ledger_at",
+     0,
+     "c",
+     0
+    ],
     [
      "idx_lusion_ledger_reason",
      0,
@@ -5166,6 +5481,81 @@
    "indexes": [
     [
      "sqlite_autoindex_skills_1",
+     1,
+     "pk",
+     0
+    ]
+   ]
+  },
+  "smith_ranks": {
+   "columns": [
+    [
+     0,
+     "user_id",
+     "INTEGER",
+     1,
+     null,
+     1
+    ],
+    [
+     1,
+     "slot",
+     "INTEGER",
+     1,
+     null,
+     2
+    ],
+    [
+     2,
+     "rank",
+     "INTEGER",
+     1,
+     null,
+     3
+    ],
+    [
+     3,
+     "earned_at",
+     "INTEGER",
+     1,
+     null,
+     0
+    ]
+   ],
+   "foreign_keys": [
+    [
+     0,
+     0,
+     "users",
+     "user_id",
+     "id",
+     "NO ACTION",
+     "CASCADE",
+     "NONE"
+    ]
+   ],
+   "index_info": {
+    "sqlite_autoindex_smith_ranks_1": [
+     [
+      0,
+      0,
+      "user_id"
+     ],
+     [
+      1,
+      1,
+      "slot"
+     ],
+     [
+      2,
+      2,
+      "rank"
+     ]
+    ]
+   },
+   "indexes": [
+    [
+     "sqlite_autoindex_smith_ranks_1",
      1,
      "pk",
      0

@@ -1,10 +1,15 @@
 """gathering - fishing and cooking: what a rod lands, and what a fire makes
 of it (a package since 18 Oct; the routes are as they were in app.py).
 
-    POST /api/fishing/catch   land a fish: one worm spent, the catch rolled,
-                              fishing XP paid
+    POST /api/fishing/catch   land a fish: one bait spent - the best carried,
+                              since 0.74.0 - the catch rolled once a roll the
+                              bait gives and the best fish kept, fishing XP
+                              paid
     POST /api/cooking/cook    cook one raw fish: the burn rolled, cooking XP
                               paid
+
+A MEAL OF SEVERAL INGREDIENTS is larder/'s (0.74.0), POST /api/cooking/recipe,
+which answers in the shape services.cooked() gives a fish.
 
 BOTH BUILT TO THE RULE IN docs/inventoryauthority.md, which named them before
 either existed: "Anything that creates, destroys or moves an item is a server

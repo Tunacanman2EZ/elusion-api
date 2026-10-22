@@ -1,9 +1,14 @@
 """saves/data.py - the SQL. saves is the table a character is (app.py's
 init_db()); character_deletions (schema.py) keeps what a deletion took.
 Deleting a character also clears its rows in the tables other areas own - its
-carry, skills, heal grants, save history, kill record and loot bags - because
-none of them means anything without the character. No commits: the routes
-make them."""
+carry, skills, heal grants, save history, kill record and loot bags, and since
+0.74.0 its meal in force (consuming/'s food_buffs) and its smith's
+certifications (smith/'s smith_ranks) - because none of them means anything
+without the character. No commits: the routes make them.
+
+THE MEAL IN FORCE IS READ HERE TOO (0.74.0): the character's load carries it,
+so the game's FoodBuff starts from the server's word at login rather than from
+nothing. consuming/ writes the row; this only reads it."""
 
 
 def all_of(db, user_id):
@@ -12,6 +17,14 @@ def all_of(db, user_id):
         "SELECT * FROM saves WHERE user_id = ? ORDER BY slot",
         (user_id,),
     ).fetchall()
+
+
+def food_buffs(db, user_id, now):
+    """{slot: food_buffs row} for every character of this account with a meal
+    in force at `now` - one read for the whole listing."""
+    return {int(row["slot"]): row for row in db.execute(
+        "SELECT slot, item_id, kind, amount, ends_at FROM food_buffs"
+        " WHERE user_id = ? AND ends_at > ?", (user_id, int(now))).fetchall()}
 
 
 def row_of(db, user_id, slot):
@@ -165,8 +178,14 @@ def drop(db, user_id, slot):
     next character made in this slot is somebody else. The copy keep_copy()
     wrote is what is kept of this one. And its kill record: the next character
     in this slot starts its own.
+
+    AND ITS MEAL AND ITS SMITH'S RANK (0.74.0), for the same reason: a Royal
+    Smith's certification was earned by that character, with that character's
+    gold, and a fresh level 1 in the same slot inherits neither it nor the
+    tail end of a pie.
     """
-    for table in ("carry_items", "skills", "consume_grants", "save_snapshots", "kill_tally"):
+    for table in ("carry_items", "skills", "consume_grants", "save_snapshots", "kill_tally",
+                  "food_buffs", "smith_ranks"):
         db.execute("DELETE FROM %s WHERE user_id = ? AND slot = ?" % table, (user_id, slot))
     db.execute("DELETE FROM loot_bags WHERE user_id = ? AND slot = ?", (user_id, slot))
     db.execute("DELETE FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot))

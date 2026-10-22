@@ -1,7 +1,8 @@
 """players/data.py - the SQL: who is online, who shares an area, what a
 character holds for its ticket, and the ticket. The tables are app.py's
 (init_db()) but the one written here: presence_tickets, this package's
-(schema.py), which presence.py reads.
+(schema.py), which presence.py reads - and food_buffs, consuming/'s (0.74.0),
+read for the meal a ticket carries.
 
 `playing_slot_sql` is app.py's PLAYING_SLOT_SQL, handed in: which character an
 account is playing, as one SQL expression that takes two parameters in order,
@@ -137,6 +138,14 @@ def fighting_skills(db, user_id, slot):
     return {r["skill_id"]: int(r["level"]) for r in db.execute(
         "SELECT skill_id, level FROM skills WHERE user_id = ? AND slot = ?"
         " AND skill_id IN ('attack', 'magic', 'agility')", (user_id, slot))}
+
+
+def food_buff(db, user_id, slot, now):
+    """The meal in force for this character at `now` (consuming/'s food_buffs,
+    0.74.0), or None. Read for the ticket; consuming/ writes it."""
+    return db.execute(
+        "SELECT item_id, kind, amount, ends_at FROM food_buffs"
+        " WHERE user_id = ? AND slot = ? AND ends_at > ?", (user_id, slot, int(now))).fetchone()
 
 
 def issue_ticket(db, token_hash, session_hash, user_id, slot, identity, now, expires_at):

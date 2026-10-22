@@ -745,23 +745,81 @@ sudo -u elusion /opt/elusion/venv/bin/python /opt/elusion/api/restore_drill.py -
 
 `canary.py` reads the live database — read-only, so it can never be what broke a
 number — and checks the invariants the ledger exists to hold: gold and lusions
-conserved, no negative balances, no skill past the cap. Run it on a schedule; it
-**exits non-zero** the moment one drifts, which is a bug or a tamper and either
-way something to see the same day.
+conserved, no negative balances, no skill past the cap. It **exits non-zero**
+the moment one drifts, which is a bug or a tamper and either way something to
+see the same day.
+
+**On the live server it runs by itself, hourly (0.74.0).** `deploy/update_server.sh`
+writes `/etc/cron.d/elusion-canary` on every run — rewritten only when it
+differs, and put back if it was deleted or edited — so nothing here is typed by
+hand. The line, as the script writes it (`update_server.sh --canary-cron`
+prints it without changing anything):
+
+```
+41 * * * * root cd /opt/elusion/api && /usr/sbin/runuser -u elusion -- /opt/elusion/venv/bin/python /opt/elusion/api/canary.py --db /var/lib/elusion/elusion.db --status-file /var/lib/elusion/canary_status.json --mail --env-stdin --quiet < /etc/elusion/elusion.env >> /var/log/elusion-canary.log 2>&1
+```
+
+- **As `elusion`, read-only.** The line is root's only so that root can open
+  the settings file — root's alone, `chmod 600` — and hand it over on standard
+  input (`--env-stdin`); `runuser` drops to `elusion` before Python starts. No
+  setting is ever on a command line, where `ps` would show it.
+- **What it found goes to `/var/lib/elusion/canary_status.json`**, written
+  atomically (a temporary file, then a rename): when it checked, whether every
+  number held, what broke, and what the mail did. The GM panel's **Economy**
+  tab shows it (`GET /api/owner/economy/canary`) and says so when the last
+  check is more than two hours old — the sign the timer has stopped.
+  **Check now** on the same tab runs the same checks on a read-only connection
+  and shows them; it leaves the status file to the timer.
+- **On a failure it mails the owner** — every owner account's *confirmed*
+  recovery address: the owner's, and a co-owner's while the co-owner switch is
+  on — through the server's own mail settings and SMTP code (`mailer.py`, which
+  the API's `send_mail()` uses too). It mails when the books first break, when
+  what is broken changes, and once a day while it stays broken, not every hour.
+  The status file and the log say how many addresses were mailed, never which.
+- **No mail set up** (no `ELUSION_SMTP_HOST` / `ELUSION_MAIL_FROM`): the status
+  file is still written, the panel still shows it, and the run exits non-zero
+  without saying more.
+- **`/var/log/elusion-canary.log`** only grows when something broke (`--quiet`).
+- **The first update that brings this** runs the script as it was before the
+  pull (bash had already read it), so the line goes in on the *next* run. Run
+  it once by hand instead:
+  `sudo bash /opt/elusion/api/deploy/update_server.sh --install-canary-cron`
+  — it writes only that file, says whether it changed, and stops.
+
+By hand, any time, against any copy:
 
 ```
 python3 canary.py --db /path/to/elusion.db --quiet
 ```
 
-`--quiet` prints nothing while all is well, so a cron line only speaks up when it
-should. Turn the non-zero exit into however you already get paged — mail, a
-channel webhook, whatever:
+`--quiet` prints nothing while all is well. On another box, the same line as
+above with its paths, or turn the non-zero exit into however you already get
+paged:
 
 ```
 15 * * * * cd /srv/elusion && python3 canary.py --db elusion.db --quiet || mail -s "ELUSION CANARY FAILED" you@example.com < /dev/null
 ```
 
-(Hourly above; the check is cheap. Point it at the same database the server writes.)
+### Where the gold goes
+
+The same tab's **gold flow** (`GET /api/owner/economy/flow?days=7`, 1-90 days)
+is a read of the two ledgers: gold minted and burned per UTC day and per
+reason, the net per day, the totals per reason for the window, and the gold
+in the world now (purses and banks); lusions the same. A past day is read once
+and kept (ten minutes after midnight UTC it can no longer change), so a report
+costs today's rows, on the `idx_gold_ledger_at` index.
+
+### The economy's numbers
+
+The trade tax (rate and floor), the general store's buy and sell
+multipliers, and the scales the material drops, the smith's tempering and
+the Royal Certification read live in the `economy_rules` table, set from the
+Economy tab by the owner alone (a co-owner reads them) and checked against
+each rule's bounds. Every change is in `economy_rule_changes` and the staff
+log, with who and when. Each API worker reads the table at most every 15
+seconds, so a change is in force everywhere within that. A rule nobody set is
+the game's own number, exactly; putting one back to its default deletes the
+row.
 
 ---
 

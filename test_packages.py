@@ -4,8 +4,8 @@ Every feature package (ARCHITECTURE.md) - playerstats/, events/, insights/,
 and killrecord/, friends/, gathering/, loot/, guilds/, parties/, chat/, trade/, kingdom/, world/, moderation/,
 staffdesk/, equipment/, consuming/, death/, bank/, carry/, skills/, saves/, status/, shop/, players/,
 switches/, kill/, ownertools/,
-accountsettings/ and auth/, taken out of app.py - is built the
-BE105 way: each has a
+accountsettings/ and auth/, taken out of app.py - and larder/ and smith/, built
+outside it (0.74.0) - is built the BE105 way: each has a
 register(app, ...) that is HANDED the app, its login checks and its database,
 and never imports app.py. The source of each is checked for that elsewhere
 (test_stats.py); this RUNS them without it - the "application factory"
@@ -72,6 +72,11 @@ import status as status_package  # noqa: E402
 import switches as switches_package  # noqa: E402
 import trade  # noqa: E402
 import world  # noqa: E402
+import larder  # noqa: E402
+import smith as smith_package  # noqa: E402
+import economyrules  # noqa: E402
+import economyrules.schema as economyrules_schema  # noqa: E402
+import economywatch  # noqa: E402
 
 # Found, not listed: what app.py imports that has a routes.py (codemap.py).
 PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
@@ -79,7 +84,7 @@ PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
 RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds", "parties",
             "chat", "trade", "kingdom", "world", "moderation", "staffdesk", "equipment", "consuming",
             "death", "bank", "carry", "skills", "saves", "status", "shop", "players", "switches", "kill",
-            "ownertools", "accountsettings", "auth")
+            "ownertools", "accountsettings", "auth", "larder", "smith", "economyrules", "economywatch")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -246,6 +251,10 @@ def bare_app(name):
         "CREATE TABLE pending_teleports (id INTEGER NOT NULL, user_id INTEGER PRIMARY KEY, area TEXT NOT NULL, x REAL NOT NULL DEFAULT 0, y REAL NOT NULL DEFAULT 0, slot_index INTEGER NOT NULL DEFAULT 0, group_size INTEGER NOT NULL DEFAULT 1, issued_by TEXT NOT NULL DEFAULT '', issued_at INTEGER NOT NULL);"
         "CREATE TABLE auth_codes (user_id INTEGER, purpose TEXT, code_hash TEXT, target TEXT, expires_at INTEGER, attempts INTEGER NOT NULL DEFAULT 0, created_at INTEGER, PRIMARY KEY (user_id, purpose));"
         "CREATE TABLE trusted_devices (token_hash TEXT PRIMARY KEY, user_id INTEGER, role TEXT, created_at INTEGER, last_used_at INTEGER, expires_at INTEGER);"
+        "CREATE TABLE food_buffs (user_id INTEGER, slot INTEGER, item_id TEXT, kind TEXT, amount INTEGER,"
+        " ends_at INTEGER, PRIMARY KEY (user_id, slot));"
+        "CREATE TABLE smith_ranks (user_id INTEGER, slot INTEGER, rank INTEGER, earned_at INTEGER,"
+        " PRIMARY KEY (user_id, slot, rank));"
         "CREATE UNIQUE INDEX bare_users_name ON users(username);")
     now = int(time.time())
     for user in USERS.values():
@@ -356,7 +365,8 @@ def bare_app(name):
                        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
                        slot_exists=lambda user_id, slot: get_db().execute(
                            "SELECT 1 FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone() is not None,
-                       item_row={"bronzefishingrod": {"tier": 2}}.get, roll_catch=roll_catch, roll_cook=roll_cook,
+                       item_row={"bronzefishingrod": {"tier": 2}, "lugworm": {"tier": 1, "bait_rolls": 2}}.get,
+                       roll_catch=roll_catch, roll_cook=roll_cook,
                        skills_of=skills_of, take_from_backpack=take, add_to_backpack=add, grant_skill_xp=grant,
                        status_of=lambda user_id, slot: {"slot": slot},
                        inventory_of=lambda user_id, slot: [{"position": p, "item_id": i, "quantity": q}
@@ -556,9 +566,22 @@ def bare_app(name):
                    query_int=query_int, staff_page=(50, 200), catalogue=TradeCatalogue)
 
     # kingdom/: the board, over the same ledgers; register() hands back the
-    # snapshot's cache_clear().
+    # snapshot's cache_clear(). A gift to the crown (0.74.0) goes through a
+    # ledger that writes the purse and gold_ledger, refuses to go below zero
+    # and answers with the balance, as app.py's gold_delta() does; the titles
+    # and the smallest gift are the KingdomCatalogue's.
+    def crown_delta(db, user_id, slot, delta, reason, detail=""):
+        have = db.execute("SELECT gold FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone()[0]
+        if have + delta < 0:
+            raise ValueError("below zero")
+        ledger_delta(db, user_id, slot, delta, reason, detail)
+        return have + delta
+
     app.config["kingdom"] = kingdom.register(app, require_auth=require_auth, get_db=get_db,
-                                             guild_tag=lambda name: name.upper())
+                                             guild_tag=lambda name: name.upper(),
+                                             bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+                                             parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None,
+                                             max_slot=3, catalogue=KingdomCatalogue, gold_delta=crown_delta)
 
     # world/: the settings row is a dict on the app, the world's voice a list
     # of its own (the events' announcer is P-3's), the moderation log the one
@@ -823,6 +846,36 @@ def bare_app(name):
         parse_grid_cell=grid_cell, carry_cells=GATHER_CELLS + 2, grid_cells=carry.grid_cells,
         grid_rewrite=carry.grid_rewrite, resync=carry.resync)
 
+    # larder/ (0.74.0): one recipe, a pie of two eggs and a flour at cooking
+    # level 3, that burns when app.config says so; the bag is the carry's
+    # own, the skill the skills' real grant, the vitals a stand-in.
+    larder.register(
+        app, require_auth=require_auth, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+        parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None, max_slot=3,
+        slot_exists=lambda user_id, slot: get_db().execute(
+            "SELECT 1 FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone() is not None,
+        catalogue=LarderCatalogue(app.config), skills_of=app.config["skills_api"].skills_of,
+        take_from_backpack=carry.take_from_backpack, add_to_backpack=carry.add_to_backpack,
+        grant_skill_xp=app.config["skills_api"].grant_xp, status_of=lambda user_id, slot: {"slot": slot},
+        inventory_of=carry.inventory_of, bag_cells=GATHER_CELLS)
+
+    # smith/ (0.74.0): a tier 2 sword the smith tempers for two ores and a
+    # tenth of its worth, and one rank, the Journeyman, at level 3 for an ore
+    # and 100 gold - both times the owner's numbers in app.config["rules"].
+    # The gold goes through the kingdom's crown_delta(), the bag is the
+    # carry's own, and a moved trade hold is written down in minted["holds"].
+    app.config["rules"] = {}
+    smith_package.register(
+        app, require_auth=require_auth, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+        parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None, max_slot=3,
+        catalogue=SmithCatalogue, rule=lambda _db, key: app.config["rules"].get(key, 1.0),
+        gold_delta=crown_delta, take_from_backpack=carry.take_from_backpack, inventory_of=carry.inventory_of,
+        carry_request=carry.carry_request, parse_grid_cell=grid_cell, carry_cells=GATHER_CELLS + 2,
+        grid_cells=carry.grid_cells, grid_rewrite=carry.grid_rewrite, resync=carry.resync,
+        move_trade_hold=lambda _db, user_id, old_id, new_id: minted["holds"].append(("moved", user_id, old_id, new_id)))
+
     # players/: who is around. The character an account plays is its lowest
     # slot, as for trade and the staff desk, and its area that save's; a rank
     # is the column, and an account with none is a "wanderer", so the default
@@ -927,14 +980,18 @@ def bare_app(name):
     # world (once), so its ceiling is reached in eleven kills; it is the land
     # stirring, so its bag and XP are scaled. The attack XP goes through the
     # skills' real grant, the notice through the switches' list, and the bag
-    # is made by what loot/ hands back, into this database.
+    # is made by what loot/ hands back, into this database. The materials'
+    # scale (0.74.0) is app.config's, asked on every kill, and the catalogue
+    # writes down the one it was rolled with.
     app.config["kill_rolls"] = []
+    app.config["kill_catalogue"] = KillCatalogue(app.config["kill_rolls"])
 
     kill_package.register(
         app, require_auth=require_auth, get_db=get_db,
         bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
         parse_slot=lambda raw: int(raw) if str(raw) in ("0", "1", "2", "3") else None, max_slot=3,
-        catalogue=KillCatalogue(app.config["kill_rolls"]),
+        material_scale=lambda _db: app.config.get("material_scale", 1.0),
+        catalogue=app.config["kill_catalogue"],
         stir_for=lambda db, enemy_id: (2.0, 1.5) if enemy_id == "bat" else (1.0, 1.0),
         derived_stats=lambda row, level=None: {"max_hp": 100 + 10 * level, "max_mana": 50, "max_stamina": 30},
         levelup_grant_id="__levelup__",
@@ -1206,6 +1263,32 @@ def bare_app(name):
         grid_move=carry.grid_move, grid_discard=carry.grid_discard, add_to_backpack=add,
         inventory_of=lambda user_id, slot: [{"position": p, "item_id": i, "quantity": q}
                                             for p, (i, q) in sorted(carried(user_id, slot).items())])
+
+    # economyrules/ (0.74.0): the owner's economy numbers, in the two tables
+    # its own schema.py makes - on this app's database, so the second app has
+    # none of the first's. The owner and a co-owner read them; the owner alone
+    # changes them, asked again; each change has a line in the staff log.
+    rules_db = sqlite3.connect(path)
+    economyrules_schema.create(rules_db)
+    rules_db.close()
+    economyrules.register(
+        app, require_auth=require_auth, require_owner=owner_or_co, require_the_owner=require_owner,
+        require_fresh_password=asks_again, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+        log_staff_action=lambda user, action, target, target_id=None, detail="": staff_log.append(
+            "%s %s %s: %s" % (user["username"], action, target, detail)),
+        is_the_owner=lambda user: user["username"] == OWNER)
+
+    # economywatch/ (0.74.0): the flow, over this database's two ledgers; the
+    # canary's status file is whatever app.config holds, and a check now is a
+    # stand-in that writes down it was asked.
+    app.config["canary_asked"] = []
+    app.config["economy_watch"] = economywatch.register(
+        app, require_auth=require_auth, require_owner=owner_or_co, no_write_lock=no_write_lock, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400), query_int=query_int,
+        read_canary=lambda: app.config.get("canary_status"),
+        run_canary=lambda: app.config["canary_asked"].append(name) or {
+            "checked_at": 1234, "ok": True, "failures": [], "checks": [{"name": "stand-in", "ok": True, "detail": ""}]})
     return app, said, logged, path
 
 
@@ -1306,7 +1389,8 @@ class KillCatalogue:
     pay, a bat, an ice bat, a boss), how many of each are placed (the bat,
     once), a roll that pays the same every time and is written down, an XP
     curve of 100 x level, the attack curve at 50 a level, and one item's
-    name for a mythic's notice."""
+    name for a mythic's notice. The materials' scale a roll was asked with
+    (0.74.0) is written down beside it, in material_scales."""
     ENEMIES = {"slime": {"display_name": "Slime"}, "bigslime": {"grants_rewards": False},
                "bat": {"display_name": "Bat"}, "icebat": {"display_name": "Ice Bat"},
                "boss": {"display_name": "The Crowned Beholder", "slots_are_gear": True}}
@@ -1314,13 +1398,15 @@ class KillCatalogue:
 
     def __init__(self, rolls):
         self.rolls = rolls
+        self.material_scales = []
 
     @staticmethod
     def spawn_count_for(enemy_id):
         return {"bat": 1}.get(enemy_id, 0)
 
-    def roll_kill_rewards(self, enemy_id, class_id, bag_scale, xp_scale):
+    def roll_kill_rewards(self, enemy_id, class_id, bag_scale, xp_scale, material_drop_scale=1.0):
         self.rolls.append((enemy_id, class_id, bag_scale, xp_scale))
+        self.material_scales.append(material_drop_scale)
         mythic = "meteorite" if enemy_id == "boss" else ""
         return {"xp": int(40 * xp_scale), "attack_xp": 10, "pet_won": False, "mythic": mythic,
                 "contents": [{"item_id": mythic or "pebble", "quantity": 1}]}
@@ -1412,10 +1498,15 @@ class DeathCatalogue:
 class GearCatalogue:
     """What equipment/ and consuming/ ask of gamedata: where a piece goes,
     whether this character may wear it, whether they may use a consumable,
-    and what it restores."""
+    what it restores, and the buff a meal gives (0.74.0): a herb pie is
+    eaten like a potion and makes her mighty, 5% for ten minutes."""
     SLOTS = {"cobaltrobe": "chest", "ironsword": "weapon", "crownhelm": "head"}
     NEEDS = {"crownhelm": 9}
-    KNOWN = set(SLOTS) | {"pebble", "smallhealthpotion", "elixir", "chefsoup"}
+    KNOWN = set(SLOTS) | {"pebble", "smallhealthpotion", "elixir", "chefsoup", "herbpie"}
+
+    @staticmethod
+    def buff_of(item_id):
+        return {"herbpie": ("MIGHT", 5, 600)}.get(item_id)
 
     @staticmethod
     def equip_slot_for(item_id):
@@ -1437,7 +1528,7 @@ class GearCatalogue:
             return {"ok": False, "reason": "level", "needs": 30}
         if item_id == "chefsoup":
             return {"ok": levels.get("cooking", 1) >= 5, "reason": "skill", "skill": "cooking", "needs": 5}
-        return {"ok": item_id == "smallhealthpotion", "reason": "nottype"}
+        return {"ok": item_id in ("smallhealthpotion", "herbpie"), "reason": "nottype"}
 
     @staticmethod
     def restore_for(item_id):
@@ -1476,6 +1567,86 @@ class TradeCatalogue:
     def is_free(item_id):
         """Nothing here came free from a shop (gamedata.is_free(), 0.69.0)."""
         return False
+
+
+class KingdomCatalogue:
+    """What kingdom/ asks of gamedata since 0.74.0: two patron titles, at 50
+    and 500 gold given, and a smallest gift of 10."""
+    CONSTANTS = {"patron_titles": [{"title": "Patron", "at": 50}, {"title": "Benefactor", "at": 500}],
+                 "donation_minimum": 10}
+
+
+class LarderCatalogue:
+    """What larder/ asks of gamedata (0.74.0): one recipe, a pie of two eggs
+    and a flour at cooking level 3 paying 25 XP, which heals 40 and makes the
+    eater mighty; it burns while app.config["burn"] is set, and every roll is
+    written down in app.config["recipe_rolls"]."""
+    RECIPES = {"pie": {"ingredients": [("egg", 2), ("flour", 1)], "level": 3, "xp": 25, "mastery_level": 9}}
+    NAMES = {"egg": "Egg", "flour": "Flour", "pie": "Pie"}
+
+    def __init__(self, config):
+        self.config = config
+
+    def recipe_ids(self):
+        return sorted(self.RECIPES)
+
+    def recipe_of(self, item_id):
+        return self.RECIPES.get(item_id)
+
+    def roll_recipe(self, item_id, level):
+        self.config.setdefault("recipe_rolls", []).append((item_id, level))
+        if self.config.get("burn"):
+            return {"ok": True, "burnt": True, "output": "", "xp": 0}
+        return {"ok": True, "burnt": False, "output": item_id, "xp": self.RECIPES[item_id]["xp"]}
+
+    def item_row(self, item_id):
+        name = self.NAMES.get(item_id)
+        return None if name is None else {"display_name": name, "required_level": 2}
+
+    @staticmethod
+    def buff_of(item_id):
+        return ("MIGHT", 5, 600) if item_id == "pie" else None
+
+    @staticmethod
+    def restore_for(item_id):
+        return ("HP", 40) if item_id == "pie" else ("", 0)
+
+
+class SmithCatalogue:
+    """What smith/ asks of gamedata (0.74.0): a tier 2 sword, rolled by its
+    damage alone ("sword~d100"), worth 500, that the smith tempers for two
+    ores and a tenth of its worth; a tier 3 one that needs the Journeyman; and
+    that rank, at level 3, for an ore and 100 gold. A temper adds the step to
+    the roll, never past the cap; "sword~d120" is a Perfect."""
+    QUALITY_HIGH = 115
+    CONSTANTS = {"temper_step": 3, "temper_cap": 115, "temper_gold_rate": 0.1,
+                 "temper_costs": [{"tier": 2, "materials": [{"item_id": "ore", "quantity": 2}], "certification": 0},
+                                  {"tier": 3, "materials": [{"item_id": "ore", "quantity": 1}], "certification": 1}],
+                 "certifications": [{"rank": 1, "name": "Journeyman", "max_tier": 3, "level": 3, "gold": 100,
+                                     "materials": [{"item_id": "ore", "quantity": 1}]}]}
+
+    @staticmethod
+    def item_row(item_id):
+        base, _, roll = str(item_id).partition("~")
+        if base == "ore":
+            return {"display_name": "Ore", "type_name": "MATERIAL", "tier": 1, "value": 5}
+        if base in ("sword", "bigsword") and (not roll or re.fullmatch(r"d1[0-2][0-9]|d[89][0-9]", roll)):
+            return {"display_name": "Sword", "type_name": "WEAPON", "tier": 2 if base == "sword" else 3,
+                    "value": 500}
+        return None
+
+    @staticmethod
+    def temper_roll(item_id, step, cap):
+        base, _, roll = str(item_id).partition("~")
+        if not roll:
+            return item_id, {}, {}, "norolls"
+        now = int(roll[1:])
+        if now == 120:
+            return item_id, {"damage": now}, {"damage": now}, "perfect"
+        if now >= cap:
+            return item_id, {"damage": now}, {"damage": now}, "tempered"
+        after = min(cap, now + step)
+        return "%s~d%d" % (base, after), {"damage": now}, {"damage": after}, ""
 
 
 def snapshots_of(app):
@@ -1532,7 +1703,12 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/players/online", "/api/presence/ticket", "/api/players/nearby", "/api/status",
                        "/api/server/maintenance", "/api/server/minbuild", "/api/server/pvp", "/api/server/trade",
                        "/api/server/receipts", "/api/server/coowners", "/api/server/coowners", "/api/server/broadcast",
-                       "/api/combat/kill", "/api/staff/gold", "/api/staff/level", "/api/staff/skill", "/api/staff/grant", "/api/staff/gifts", "/api/staff/snapshots", "/api/staff/rollback", "/api/staff/teleport", "/api/teleport/ack", "/api/account/email", "/api/account/email", "/api/account/email/verify", "/api/account/name-colour", "/api/auth/register", "/api/auth/login", "/api/auth/session", "/api/auth/resume", "/api/auth/confirm", "/api/auth/logout", "/api/auth/logout-all", "/api/auth/password", "/api/auth/recover", "/api/auth/reset"]), rules)
+                       "/api/combat/kill", "/api/staff/gold", "/api/staff/level", "/api/staff/skill", "/api/staff/grant", "/api/staff/gifts", "/api/staff/snapshots", "/api/staff/rollback", "/api/staff/teleport", "/api/teleport/ack", "/api/account/email", "/api/account/email", "/api/account/email/verify", "/api/account/name-colour", "/api/auth/register", "/api/auth/login", "/api/auth/session", "/api/auth/resume", "/api/auth/confirm", "/api/auth/logout", "/api/auth/logout-all", "/api/auth/password", "/api/auth/recover", "/api/auth/reset",
+                       "/api/kingdom/donate", "/api/cooking/recipe", "/api/cooking/recipes", "/api/smith/status",
+                       "/api/smith/quote", "/api/smith/temper", "/api/smith/certify",
+                       # economyrules/ and economywatch/ (0.74.0)
+                       "/api/economy/rules", "/api/owner/economy/rules", "/api/owner/economy/rules",
+                       "/api/owner/economy/flow", "/api/owner/economy/canary", "/api/owner/economy/canary"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -1656,6 +1832,29 @@ check("  a level too low, the 403 it was, and the fish kept",
 check("  what is not carried, the 404; what has no recipe, the 409",
       cook("rawtuna").get_json() == {"error": "Not Found", "message": "You are not carrying that."}
       and cook("bronzefishingrod").get_json() == {"error": "Conflict", "message": "That cannot be cooked."})
+# BAIT (0.74.0): the best bait carried by the catalogue handed in - a lugworm
+# rolls twice - and one of it spent; the worms are kept for later.
+conn = sqlite3.connect(path_a)
+conn.execute("DELETE FROM carry_items WHERE user_id = 2 AND slot = 0 AND position IN (2, 3)")
+conn.execute("INSERT INTO carry_items VALUES (2, 0, 2, 'lugworm', 1)")
+conn.commit()
+conn.close()
+casts = len(app_a.config["rolled"])
+res = fish()
+body = res.get_json() or {}
+check("  a lugworm beside the worms: it is the bait, rolled twice, one spent, the worms kept",
+      res.status_code == 200 and body.get("bait") == "lugworm" and len(app_a.config["rolled"]) - casts == 2
+      and ann_holds("lugworm") == 0 and ann_holds("fishingworm") == 2 and body.get("item_id") == "rawmudfish", body)
+check("  and with the lugworm gone, the worm again, once",
+      (fish().get_json() or {}).get("bait") == "fishingworm" and len(app_a.config["rolled"]) - casts == 3
+      and ann_holds("fishingworm") == 1)
+# Her bag put back as the cooking left it, for the checks below.
+conn = sqlite3.connect(path_a)
+conn.execute("DELETE FROM carry_items WHERE user_id = 2 AND slot = 0 AND position IN (1, 2, 3)")
+conn.executemany("INSERT INTO carry_items VALUES (2, 0, ?, ?, ?)",
+                 [(1, "fishingworm", 2), (2, "cookedmudfish", 1), (3, "rawshark", 1)])
+conn.commit()
+conn.close()
 
 
 BAGS_MADE = []
@@ -2099,6 +2298,58 @@ check("  the shared half is kept for %ds; the cache_clear() handed back drops it
       % kingdom.KINGDOM_BOARD_CACHE_SECONDS,
       again.get("total") == 23 and fresh.get("total") == 123
       and fresh.get("by_reason") == {"shop": 100, "kingdom_tax": 23}, (again.get("total"), fresh.get("total")))
+
+
+# PATRONAGE (0.74.0): a gift to the crown, through the ledger handed in, for
+# a title from the catalogue handed in.
+def give(body, as_who="ann"):
+    res = client_a.post("/api/kingdom/donate", headers=who(as_who), json=body)
+    return res.status_code, res.get_json() or {}
+
+
+def gifts_rows():
+    conn = sqlite3.connect(path_a)
+    rows = conn.execute("SELECT delta, reason FROM gold_ledger WHERE reason = 'donation' ORDER BY id").fetchall()
+    conn.close()
+    return rows
+
+
+def ann_gold():
+    conn = sqlite3.connect(path_a)
+    gold = conn.execute("SELECT gold FROM saves WHERE user_id = 2 AND slot = 0").fetchone()[0]
+    conn.close()
+    return gold
+
+
+conn = sqlite3.connect(path_a)
+conn.execute("UPDATE saves SET gold = 200 WHERE user_id = 2 AND slot = 0")
+conn.commit()
+conn.close()
+gifts = len(gifts_rows())
+check("patronage: the 400s and the 404 - under the smallest gift, past the purse, not a whole number, no character",
+      give({"slot": 0, "amount": 5}) == (400, {"error": "Bad Request",
+                                               "message": "The smallest gift the crown takes is 10 gold."})
+      and give({"slot": 0, "amount": 1000}) == (400, {"error": "Bad Request",
+                                                      "message": "That is 1000 gold and you have 200."})
+      and give({"slot": 0, "amount": 10.5})[0] == 400 and give({"slot": 0, "amount": True})[0] == 400
+      and give({"slot": 0})[0] == 400 and give({"slot": 9, "amount": 50})[0] == 400
+      and give({"slot": 2, "amount": 50}) == (404, {"error": "Not Found", "message": "No character in slot 2."})
+      and len(gifts_rows()) == gifts and ann_gold() == 200)
+code, body = give({"slot": 0, "amount": 60.0})
+check("  sixty given: burned through the ledger handed in, a Patron at fifty, the Benefactor next at five hundred",
+      (code, body) == (200, {"donated": 60, "title": "Patron", "next_title": "Benefactor", "next_at": 500, "gold": 140})
+      and gifts_rows()[gifts:] == [(-60, "donation")],
+      body)
+board = client_a.get("/api/economy/kingdom", headers=who("ann")).get_json() or {}
+check("  and on the board at once, the snapshot dropped: ann's row titled, bo's and boss's not, her own line too",
+      [(e["username"], e["title"]) for e in board.get("top", [])] == [("ann", "Patron"), ("bo", ""), ("boss", "")]
+      and board["top"][0]["contributed"] == 180
+      and {k: board.get("you", {}).get(k) for k in ("donated", "title", "next_title", "next_at")}
+      == {"donated": 60, "title": "Patron", "next_title": "Benefactor", "next_at": 500}, board.get("top"))
+check("  and somebody who never gave has no title, and the first one to reach for",
+      {k: (client_a.get("/api/economy/kingdom", headers=who("bo")).get_json() or {}).get("you", {}).get(k)
+       for k in ("donated", "title", "next_title", "next_at")}
+      == {"donated": 0, "title": "", "next_title": "Patron", "next_at": 50})
 def world_view():
     res = client_a.get("/api/server/world", headers=who("boss"))
     return res.status_code, res.get_json() or {}
@@ -2439,6 +2690,25 @@ check("  and what she does not carry is the 404 before anything else, what is no
       gear("/api/character/consume", {"item_id": "smallmanapotion"})[0] == 404
       and gear("/api/character/consume", {"item_id": "cobaltrobe"})
       == (409, {"error": "Conflict", "message": "That cannot be used."}))
+# A MEAL'S BUFF (0.74.0), from the catalogue handed in: written to the
+# package's own food_buffs, and carried on every consume answer after it.
+check("  no meal yet: the answer's food_buff is null", body.get("food_buff", "missing") is None, body)
+conn = sqlite3.connect(path_a)
+conn.executemany("INSERT INTO carry_items VALUES (2, 0, ?, ?, ?)", [(6, "herbpie", 1), (7, "smallhealthpotion", 1)])
+conn.commit()
+conn.close()
+code, body = gear("/api/character/consume", {"item_id": "herbpie"})
+pie = body.get("food_buff") or {}
+conn = sqlite3.connect(path_a)
+kept = conn.execute("SELECT item_id, kind, amount, ends_at FROM food_buffs WHERE user_id = 2 AND slot = 0").fetchall()
+conn.close()
+check("  a herb pie eaten: mighty, five percent, ten minutes from now - and the row the package keeps",
+      code == 200 and (pie.get("item_id"), pie.get("kind"), pie.get("amount")) == ("herbpie", "MIGHT", 5)
+      and abs(pie.get("ends_at", 0) - (int(time.time()) + 600)) <= 5
+      and kept == [("herbpie", "MIGHT", 5, pie.get("ends_at"))], (body, kept))
+code, body = gear("/api/character/consume", {"item_id": "smallhealthpotion", "position": 7})
+check("  and a potion after it changes nothing about the meal: the answer still carries it",
+      code == 200 and body.get("food_buff") == pie, body)
 def died(gold=None, bank=None, lusions=None):
     conn = sqlite3.connect(path_a)
     conn.execute("UPDATE saves SET hp = 0 WHERE user_id = 2 AND slot = 0")
@@ -3258,6 +3528,13 @@ check("one bat in the world: eleven paid in five minutes is the ceiling, and the
       slay("bat") == (429, {"error": "Too Many Requests", "message": "Only 1 'bat' exist in the world - that is"
                             " more kills than could have respawned in the last 5 minutes."}))
 around("UPDATE kill_reports SET at = ? WHERE user_id = 2 AND enemy_id = 'bat'", [(now - 400,)])
+app_a.config["material_scale"] = 2.5
+code, body = slay("bat")
+check("  the materials' scale is the one handed in, asked on the kill (0.74.0)",
+      code == 200 and app_a.config["kill_catalogue"].material_scales[-1] == 2.5, app_a.config["kill_catalogue"].material_scales)
+app_a.config["material_scale"] = 1.0
+around("UPDATE saves SET kill_tokens = 50, last_kill_at = 0 WHERE user_id = 2 AND slot = 0")
+around("DELETE FROM kill_reports WHERE user_id = 2 AND enemy_id = 'bat' AND at > ?", [(now - 200,)])
 code, body = slay("bat")
 check("  older than the window they do not count; and the stirring land's bat is rolled scaled",
       code == 200 and app_a.config["kill_rolls"][-1] == ("bat", "warrior", 2.0, 1.5) and body.get("xp_gained") == 60,
@@ -3895,6 +4172,260 @@ check("and nobody without a login gets in anywhere",
                                                               "/api/character/skills", "/api/save",
                                                               "/api/player/status", "/api/account/name-colour")]
       == [401] * 104)
+
+
+# THE LARDER AND THE SMITH (0.74.0), on the bare app: the catalogue, the
+# grants, the ledger and the economy's numbers all handed in.
+def ann_bag(cells, gold=None, level=None, cooking=None):
+    conn = sqlite3.connect(path_a)
+    conn.execute("DELETE FROM carry_items WHERE user_id = 2 AND slot = 0")
+    conn.executemany("INSERT INTO carry_items VALUES (2, 0, ?, ?, ?)", cells)
+    if gold is not None:
+        conn.execute("UPDATE saves SET gold = ? WHERE user_id = 2 AND slot = 0", (gold,))
+    if level is not None:
+        conn.execute("UPDATE saves SET level = ? WHERE user_id = 2 AND slot = 0", (level,))
+    if cooking is not None:
+        conn.execute("INSERT OR REPLACE INTO skills VALUES (2, 0, 'cooking', ?, ?)", (cooking, cooking * 10 - 10))
+    conn.commit()
+    conn.close()
+
+
+def ann_cells():
+    conn = sqlite3.connect(path_a)
+    found = {p: (i, q) for p, i, q in conn.execute(
+        "SELECT position, item_id, quantity FROM carry_items WHERE user_id = 2 AND slot = 0")}
+    conn.close()
+    return found
+
+
+def kitchen(path, body, as_who="ann"):
+    res = client_a.post(path, headers=who(as_who), json=dict({"slot": 0}, **body))
+    return res.status_code, res.get_json() or {}
+
+
+ann_bag([(0, "egg", 3), (1, "flour", 1), (2, "pebble", 1)], cooking=3)
+app_a.config["burn"] = False
+code, body = kitchen("/api/cooking/recipe", {"recipe_id": "pie"})
+check("larder: a pie - two eggs and the flour taken through the grant handed in, the pie into the freed cell, XP paid",
+      code == 200 and body.get("item_id") == "pie" and body.get("burnt") is False and body.get("output") == "pie"
+      and body.get("xp") == 25 and body.get("carry_positions") == [1]
+      and body.get("consumed") == [{"item_id": "egg", "quantity": 2}, {"item_id": "flour", "quantity": 1}]
+      and ann_cells() == {0: ("egg", 1), 1: ("pie", 1), 2: ("pebble", 1)}
+      and body.get("levelled_up") is True and body.get("cooking_level") == body["skills"]["cooking"]["level"] == 5
+      and app_a.config["recipe_rolls"][-1] == ("pie", 3), body)
+check("  the 404s, 403, 409 and 400s it gives: an egg short, too low a level, no such recipe, nothing named, no character",
+      kitchen("/api/cooking/recipe", {"recipe_id": "pie"}) == (404, {"error": "Not Found",
+                                                                    "message": "You are missing Egg."})
+      and kitchen("/api/cooking/recipe", {"recipe_id": "stew"}) == (409, {"error": "Conflict",
+                                                                         "message": "There is no recipe for that."})
+      and kitchen("/api/cooking/recipe", {"recipe_id": " "})[0] == 400
+      and kitchen("/api/cooking/recipe", {"slot": 3, "recipe_id": "pie"})[0] == 404
+      and kitchen("/api/cooking/recipe", {"slot": 9, "recipe_id": "pie"})[0] == 400
+      and ann_cells() == {0: ("egg", 1), 1: ("pie", 1), 2: ("pebble", 1)})
+ann_bag([(0, "egg", 2), (1, "flour", 1)], cooking=2)
+check("  and a cook below the recipe's level is refused before anything is taken",
+      kitchen("/api/cooking/recipe", {"recipe_id": "pie"}) == (403, {"error": "Forbidden",
+                                                                    "message": "You need cooking level 3."})
+      and ann_cells() == {0: ("egg", 2), 1: ("flour", 1)})
+ann_bag([(0, "egg", 2), (1, "flour", 1)], cooking=3)
+app_a.config["burn"] = True
+code, body = kitchen("/api/cooking/recipe", {"recipe_id": "pie"})
+check("  burnt: the ingredients are gone all the same, no pie, no XP",
+      code == 200 and body.get("burnt") is True and body.get("output") == "" and body.get("xp") == 0
+      and ann_cells() == {} and len(body.get("consumed", [])) == 2, body)
+app_a.config["burn"] = False
+ann_bag([(0, "egg", 3), (1, "flour", 2), (2, "pebble", 1), (3, "pebble", 1)], cooking=3)
+check("  a full bag: the 409, and not an egg taken",
+      kitchen("/api/cooking/recipe", {"recipe_id": "pie"}) == (409, {"error": "Conflict",
+                                                                    "message": "Your backpack is full (4 slots)."})
+      and ann_cells() == {0: ("egg", 3), 1: ("flour", 2), 2: ("pebble", 1), 3: ("pebble", 1)})
+book = client_a.get("/api/cooking/recipes", headers=who("ann")).get_json() or {}
+check("  the recipe book: the catalogue's one recipe, what it needs and pays, what it heals and its buff",
+      book == {"recipes": [{"id": "pie", "name": "Pie", "level": 3, "xp": 25, "mastery_level": 9, "required_level": 2,
+                            "ingredients": [{"item_id": "egg", "quantity": 2}, {"item_id": "flour", "quantity": 1}],
+                            "restores": {"target": "HP", "amount": 40},
+                            "buff": {"kind": "MIGHT", "amount": 5, "seconds": 600}}]}, book)
+
+ann_bag([(0, "sword~d100", 1), (1, "ore", 3), (2, "bigsword~d100", 1)], gold=1000, level=2)
+holds = len(app_a.config["minted"]["holds"])
+smithy = client_a.get("/api/smith/status?slot=0", headers=who("ann")).get_json() or {}
+check("smith: the status - no rank yet, the one rank and its cost beside what she carries, each tier's temper",
+      smithy == {"rank": 0, "rank_name": "", "temper_step": 3, "temper_cap": 115, "gold": 1000,
+                 "ranks": [{"rank": 1, "name": "Journeyman", "max_tier": 3, "level": 3, "gold": 100,
+                            "materials": [{"item_id": "ore", "quantity": 1, "have": 3}], "earned": False,
+                            "earned_at": 0}],
+                 "temper_costs": [{"tier": 2, "gold_rate": 0.1, "materials": [{"item_id": "ore", "quantity": 2,
+                                                                                "have": 3}],
+                                   "certification": 0, "certification_name": ""},
+                                  {"tier": 3, "gold_rate": 0.1, "materials": [{"item_id": "ore", "quantity": 1,
+                                                                                "have": 3}],
+                                   "certification": 1, "certification_name": "Journeyman"}]}, smithy)
+app_a.config["rules"] = {"certification_gold_scale": 2.0, "temper_gold_scale": 3.0}
+smithy = client_a.get("/api/smith/status?slot=0", headers=who("ann")).get_json() or {}
+check("  the owner's numbers handed in scale the gold: a rank at twice, a temper at three times",
+      smithy["ranks"][0]["gold"] == 200 and smithy["temper_costs"][0]["gold_rate"] == 0.3, smithy)
+app_a.config["rules"] = {}
+code, body = kitchen("/api/smith/quote", {"position": 0, "item_id": "sword~d100"})
+check("  a quote: what the roll becomes and what it costs, nothing done",
+      (code, body) == (200, {"item_id": "sword~d100", "new_item_id": "sword~d103", "before": {"damage": 100},
+                             "after": {"damage": 103}, "gold": 50, "certification": 0, "can": True, "reason": "",
+                             "materials": [{"item_id": "ore", "quantity": 2, "have": 3}]})
+      and ann_cells()[1] == ("ore", 3) and ann_row("gold") == 1000, body)
+check("  and the tier three sword's says the rank it needs",
+      kitchen("/api/smith/quote", {"position": 2, "item_id": "bigsword~d100"})[1].get("reason")
+      == "You need to be a Journeyman to temper tier 3 gear.")
+code, body = kitchen("/api/smith/temper", {"position": 0, "item_id": "sword~d100"})
+check("  tempered: the new roll in the same cell, two ores taken, the gold burned through the ledger, the hold moved",
+      code == 200 and body.get("item_id") == "sword~d103" and body.get("position") == 0 and body.get("gold") == 950
+      and body.get("consumed") == [{"item_id": "ore", "quantity": 2}]
+      and ann_cells() == {0: ("sword~d103", 1), 1: ("ore", 1), 2: ("bigsword~d100", 1)} and ann_row("gold") == 950
+      and ann_says("SELECT delta, reason FROM gold_ledger WHERE user_id = 2 AND reason = 'smith_temper'") == [
+          (-50, "smith_temper")]
+      and app_a.config["minted"]["holds"][holds:] == [("moved", 2, "sword~d100", "sword~d103")]
+      and body.get("status", {}).get("gold") == 950, body)
+check("  the refusals: a stale cell the carry's 409, an ore short, a rank not earned - nothing taken",
+      kitchen("/api/smith/temper", {"position": 0, "item_id": "sword~d100"})[1].get("resync", {}).get("reason")
+      == "stale_save"
+      and kitchen("/api/smith/temper", {"position": 0, "item_id": "sword~d103"})
+      == (404, {"error": "Not Found", "message": "You are missing Ore."})
+      and kitchen("/api/smith/temper", {"position": 2, "item_id": "bigsword~d100"})
+      == (403, {"error": "Forbidden", "message": "You need to be a Journeyman to temper tier 3 gear."})
+      and ann_cells() == {0: ("sword~d103", 1), 1: ("ore", 1), 2: ("bigsword~d100", 1)} and ann_row("gold") == 950)
+ann_bag([(0, "sword", 1), (1, "sword~d120", 1), (2, "sword~d115", 1), (3, "ore", 9)], gold=10)
+check("  a plain piece, a Perfect, one at the cap, a lump of ore, a light purse - each its own words",
+      [kitchen("/api/smith/temper", {"position": p, "item_id": i})[1].get("message")
+       for p, i in ((0, "sword"), (1, "sword~d120"), (2, "sword~d115"), (3, "ore"))]
+      == ["That piece has no rolls to temper.", "That piece is already perfect.", "That piece is fully tempered.",
+          "The smith tempers weapons and armour."]
+      and kitchen("/api/smith/temper", {"position": 9, "item_id": "x"})[0] == 400
+      and ann_cells()[3] == ("ore", 9), [kitchen("/api/smith/temper", {"position": 0, "item_id": "sword"})])
+ann_bag([(0, "sword~d100", 1), (3, "ore", 9)], gold=10)
+check("  and a purse short of the gold is the 400 the shop gives",
+      kitchen("/api/smith/temper", {"position": 0, "item_id": "sword~d100"})
+      == (400, {"error": "Bad Request", "message": "That costs 50 gold and you have 10."}))
+app_a.config["rules"] = {"temper_gold_scale": 0.0}
+check("  the owner's scale at nothing still charges one coin: a temper is never free",
+      kitchen("/api/smith/quote", {"position": 0, "item_id": "sword~d100"})[1].get("gold") == 1)
+app_a.config["rules"] = {}
+ann_bag([(1, "ore", 1)], gold=50, level=2)
+check("certify: not a rank, too low a level, then a purse short - the 400, 403 and 400, nothing taken",
+      kitchen("/api/smith/certify", {"rank": 2}) == (400, {"error": "Bad Request", "message": "rank must be one of 1"})
+      and kitchen("/api/smith/certify", {"rank": 1}) == (403, {"error": "Forbidden", "message": "You need level 3."})
+      and ann_bag([(1, "ore", 1)], gold=50, level=3) is None
+      and kitchen("/api/smith/certify", {"rank": 1}) == (400, {"error": "Bad Request",
+                                                              "message": "That costs 100 gold and you have 50."})
+      and ann_cells() == {1: ("ore", 1)})
+ann_bag([], gold=500, level=3)
+check("  and an ore short, the 404", kitchen("/api/smith/certify", {"rank": 1.0})
+      == (404, {"error": "Not Found", "message": "You are missing Ore."}))
+ann_bag([(1, "ore", 1), (2, "bigsword~d100", 1)], gold=500, level=3)
+code, body = kitchen("/api/smith/certify", {"rank": 1})
+check("  earned: the ore taken, the gold burned through the ledger, the rank in the package's table, the new status",
+      code == 200 and body.get("rank") == 1 and body.get("rank_name") == "Journeyman" and body.get("gold") == 400
+      and body["ranks"][0]["earned"] is True and body.get("consumed") == [{"item_id": "ore", "quantity": 1}]
+      and ann_cells() == {2: ("bigsword~d100", 1)} and ann_row("gold") == 400
+      and ann_says("SELECT delta, reason FROM gold_ledger WHERE user_id = 2 AND reason = 'royal_certification'")
+      == [(-100, "royal_certification")]
+      and [r[0] for r in ann_says("SELECT rank FROM smith_ranks WHERE user_id = 2 AND slot = 0")] == [1], body)
+check("  twice is the 409, and the tier three sword is the smith's to temper now",
+      kitchen("/api/smith/certify", {"rank": 1}) == (409, {"error": "Conflict", "message": "You are already a Journeyman."})
+      and kitchen("/api/smith/quote", {"position": 2, "item_id": "bigsword~d100"})[1].get("reason")
+      == "You are missing Ore.")
+check("  and every route of both packages is 401 with no login",
+      [client_a.post(path, json={}).status_code for path in ("/api/cooking/recipe", "/api/smith/quote",
+                                                              "/api/smith/temper", "/api/smith/certify",
+                                                              "/api/kingdom/donate")]
+      + [client_a.get(path).status_code for path in ("/api/cooking/recipes", "/api/smith/status?slot=0")]
+      == [401] * 7)
+# ECONOMY RULES AND THE OWNER'S WATCH (0.74.0): economyrules/ and
+# economywatch/, on the bare app as on the real server.
+economyrules.clear_cache()
+code, body = (lambda r: (r.status_code, r.get_json() or {}))(client_a.get("/api/economy/rules", headers=who("ann")))
+check("economy rules: any player reads the four the game draws, each its default on a table nobody has set",
+      code == 200 and body.get("rules") == {key: economyrules.default(key) for key in economyrules.PUBLIC}, body)
+check("  the owner's table is the owner's (and a co-owner's): a player gets the bare 404, and so does a change",
+      client_a.get("/api/owner/economy/rules", headers=who("ann")).status_code == 404
+      and client_a.put("/api/owner/economy/rules", headers=dict(who("ann"), **{"X-Test-Again": "yes"}),
+                       json={"key": "trade_tax_rate", "value": 0.1}).status_code == 404)
+owner_rules = client_a.get("/api/owner/economy/rules", headers=who("boss")).get_json() or {}
+check("  the owner reads every rule with its bounds, and may change them",
+      [row["key"] for row in owner_rules.get("rules", [])] == list(economyrules.RULES)
+      and owner_rules.get("can_change") is True and owner_rules.get("changes") == [], owner_rules)
+code = client_a.put("/api/owner/economy/rules", headers=who("boss"),
+                    json={"key": "trade_tax_rate", "value": 0.1}).status_code
+check("  a change asks for the password again", code == 403, code)
+res = client_a.put("/api/owner/economy/rules", headers=dict(who("boss"), **{"X-Test-Again": "yes"}),
+                   json={"key": "trade_tax_rate", "value": 0.1})
+changed = res.get_json() or {}
+check("  asked again: set, logged in the economy's log and the staff log, and every game told at once",
+      res.status_code == 200 and changed.get("changed") is True
+      and [r["value"] for r in changed.get("rules", []) if r["key"] == "trade_tax_rate"] == [0.1]
+      and changed.get("changes", [{}])[0].get("by") == "boss"
+      and staff_log[-1] == "boss economy_rule trade_tax_rate: trade_tax_rate: default (0.05) -> 0.1"
+      and client_a.get("/api/economy/rules", headers=who("ann")).get_json()["rules"]["trade_tax_rate"] == 0.1,
+      [changed.get("changes"), staff_log[-1:]])
+check("  and the second app, on its own database, still has the game's own - the cache is per database",
+      app_b.test_client().get("/api/economy/rules", headers=who("ann")).get_json()["rules"]["trade_tax_rate"]
+      == economyrules.default("trade_tax_rate"))
+res = client_a.put("/api/owner/economy/rules", headers=dict(who("boss"), **{"X-Test-Again": "yes"}),
+                   json={"key": "trade_tax_rate", "value": 0.9})
+check("  out of bounds is the 400, saying them", res.status_code == 400
+      and res.get_json()["message"] == "trade_tax_rate must be from 0 to 0.5 (you sent 0.9).", res.get_json())
+app_a.config["owners"].add("ann")
+co_read = client_a.get("/api/owner/economy/rules", headers=who("ann"))
+co_put = client_a.put("/api/owner/economy/rules", headers=dict(who("ann"), **{"X-Test-Again": "yes"}),
+                      json={"key": "trade_tax_rate", "value": None})
+app_a.config["owners"].discard("ann")
+check("  a co-owner reads them, told she may not change them, and a change is the 404",
+      co_read.status_code == 200 and (co_read.get_json() or {}).get("can_change") is False
+      and co_put.status_code == 404, [co_read.status_code, co_put.status_code])
+res = client_a.put("/api/owner/economy/rules", headers=dict(who("boss"), **{"X-Test-Again": "yes"}),
+                   json={"key": "trade_tax_rate", "value": None})
+check("  null puts the game's own number back, logged as the default",
+      res.status_code == 200 and client_a.get("/api/economy/rules", headers=who("ann")).get_json()["rules"]
+      ["trade_tax_rate"] == economyrules.default("trade_tax_rate")
+      and staff_log[-1] == "boss economy_rule trade_tax_rate: trade_tax_rate: 0.1 -> default (0.05)", staff_log[-1:])
+
+_flow_now = int(time.time())
+_flow_conn = sqlite3.connect(path_a)
+for _at, _delta, _reason in ((_flow_now - 86400, 40, "loot"), (_flow_now - 86400, -15, "shop_buy"),
+                             (_flow_now, 7, "loot"), (_flow_now, -3, "kingdom_tax"), (_flow_now - 9 * 86400, 999, "loot")):
+    _flow_conn.execute("INSERT INTO gold_ledger (at, user_id, slot, delta, reason) VALUES (?, 2, 0, ?, ?)",
+                       (_at, _delta, _reason))
+_flow_conn.commit()
+_since = (_flow_now // 86400 - 2) * 86400
+_want = _flow_conn.execute("SELECT COALESCE(SUM(CASE WHEN delta > 0 THEN delta END), 0),"
+                           " COALESCE(-SUM(CASE WHEN delta < 0 THEN delta END), 0) FROM gold_ledger WHERE at >= ?",
+                           (_since,)).fetchone()
+_flow_conn.close()
+app_a.config["economy_watch"].cache_clear()
+flow = client_a.get("/api/owner/economy/flow?days=3", headers=who("boss")).get_json() or {}
+check("the gold flow: three UTC days, oldest first, the window's minted and burned the ledger's own sums",
+      flow.get("days") == 3 and len(flow["gold"]["days"]) == 3 and flow["gold"]["days"][-1]["start"] == _flow_now // 86400 * 86400
+      and (flow["gold"]["minted"], flow["gold"]["burned"]) == tuple(_want)
+      and flow["gold"]["net"] == _want[0] - _want[1], [flow.get("gold", {}).get("minted"), _want])
+check("  a player gets the bare 404; days 0 or 91 is the 400",
+      client_a.get("/api/owner/economy/flow", headers=who("ann")).status_code == 404
+      and client_a.get("/api/owner/economy/flow?days=0", headers=who("boss")).status_code == 400
+      and client_a.get("/api/owner/economy/flow?days=91", headers=who("boss")).status_code == 400)
+app_a.config.pop("canary_status", None)
+never = client_a.get("/api/owner/economy/canary", headers=who("boss")).get_json() or {}
+app_a.config["canary_status"] = {"checked_at": int(time.time()) - 60, "ok": False,
+                                 "failures": [{"name": "gold conservation (ledger == held)", "detail": "drift 5"}],
+                                 "checks": []}
+last = client_a.get("/api/owner/economy/canary", headers=who("boss")).get_json() or {}
+now_check = client_a.post("/api/owner/economy/canary", headers=who("boss"))
+check("the canary: never run says checked_at null; the last report with its age; Check now runs the checks",
+      never.get("checked_at", "missing") is None and last.get("ok") is False and 60 <= last.get("age_seconds", 0) < 90
+      and last.get("stale") is False and now_check.status_code == 200 and app_a.config["canary_asked"] == ["a"]
+      and app_b.config["canary_asked"] == [], [never, last, app_a.config["canary_asked"]])
+check("  a player gets the bare 404 from both, and nobody without a login gets in anywhere new",
+      client_a.get("/api/owner/economy/canary", headers=who("ann")).status_code == 404
+      and client_a.post("/api/owner/economy/canary", headers=who("ann")).status_code == 404
+      and [client_a.get(path).status_code for path in ("/api/economy/rules", "/api/owner/economy/rules",
+                                                      "/api/owner/economy/flow", "/api/owner/economy/canary")]
+      + [client_a.post("/api/owner/economy/canary").status_code,
+         client_a.put("/api/owner/economy/rules", json={}).status_code] == [401] * 6)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")

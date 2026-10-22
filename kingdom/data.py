@@ -1,7 +1,10 @@
 """kingdom/data.py - the SQL. Reads only: gold_ledger, lusion_ledger and users
 are app.py's (init_db()), the guild tables guilds/'s (guilds/schema.py), and
 the board writes nothing - it is
-DERIVED, NEVER COUNTED (see routes.economy_kingdom)."""
+DERIVED, NEVER COUNTED (see routes.economy_kingdom). A gift to the crown
+(0.74.0) moves gold, and gold moves through app.py's gold_delta(), handed in -
+so this file still writes nothing; the purse is read here, as the shop reads
+it, to say "you have N"."""
 
 
 def gold_givers(db):
@@ -42,7 +45,12 @@ def gold_givers(db):
                guilds.name    AS guild,
                -SUM(gold_ledger.delta) AS given,
                -SUM(CASE WHEN gold_ledger.reason = 'death'
-                         THEN gold_ledger.delta ELSE 0 END) AS lost
+                         THEN gold_ledger.delta ELSE 0 END) AS lost,
+               -- WHAT THE ACCOUNT HAS GIVEN THE CROWN (0.74.0), for its
+               -- patron's title: one more CASE in the same aggregate, for the
+               -- reason `lost` gives - not a second pass over the ledger.
+               -SUM(CASE WHEN gold_ledger.reason = 'donation'
+                         THEN gold_ledger.delta ELSE 0 END) AS donated
           FROM gold_ledger
           JOIN users ON users.id = gold_ledger.user_id
           -- THE GUILD COMES ALONG FOR NOTHING, exactly as users.deaths does.
@@ -119,3 +127,18 @@ def guild_of(db, user_id):
         "SELECT gl.name FROM guild_members m JOIN guilds gl ON gl.id = m.guild_id"
         " WHERE m.user_id = ?", (user_id,)).fetchone()
     return row["name"] if row else ""
+
+
+def donated_by(db, user_id):
+    """What this ACCOUNT has given the crown in all (0.74.0): every donation
+    row, any character's. Read fresh for the caller's own line, never from
+    the board's snapshot - idx_gold_ledger_spent_user covers it."""
+    return int(db.execute(
+        "SELECT COALESCE(-SUM(delta), 0) FROM gold_ledger"
+        " WHERE user_id = ? AND delta < 0 AND reason = 'donation'", (user_id,)).fetchone()[0] or 0)
+
+
+def purse(db, user_id, slot):
+    """The character's carried gold, or None for no such character."""
+    row = db.execute("SELECT gold FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone()
+    return None if row is None else int(row["gold"] or 0)

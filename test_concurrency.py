@@ -280,6 +280,9 @@ SLOW_ROUTES = {
     "verify_account_email": "scrypt on the code",
     "chat_relay_image":     "fetches a picture from another server",
     "chat_upload_image":    "decodes and re-encodes a picture",
+    # 0.74.0: the GM panel's Check now - writes nothing, and sums the whole
+    # ledger on a read-only connection of its own first (economywatch/).
+    "owner_canary_check":   "sums the whole ledger, read-only, and writes nothing",
 }
 left_out = set()
 locked = 0

@@ -409,10 +409,17 @@ def roll_quality(item_id):
 
 
 
-def shop_price(shop_id, item_id):
+def shop_price(shop_id, item_id, price_multiplier=None, sell_multiplier=None):
     """
     What this vendor charges for one of these, or None when it does not stock
     it or the item does not exist.
+
+    THE OWNER'S NUMBER, WHEN THERE IS ONE (0.74.0). price_multiplier is the
+    markup the owner set on the server (economyrules/, "shop_price_multiplier"),
+    handed in by the till and the shelf; None - nobody set one, and every
+    caller from before - is the shop's own, exactly as it always was.
+    sell_multiplier is taken and not used, so one set of the owner's terms can
+    be handed to all three of these the same way.
 
     THE PRICE IS NOT STORED IN THE SHOP. It is ItemData.value times the shop's
     multiplier, computed here from the server's own catalogue. A shop that
@@ -440,15 +447,31 @@ def shop_price(shop_id, item_id):
     definition = item_row(item_id)
     if definition is None:
         return None
-    return _gold_price(shop, definition)
+    return _gold_price(shop, definition, price_multiplier)
 
 
-def _gold_price(shop, definition):
+def _gold_price(shop, definition, multiplier=None):
     """What this shop charges in gold for one of these: value times its
     markup, rounded up, at least 1. shop_price() for the stock; the sell cap
-    asks it of a free piece too, which has a worth even when it is given."""
-    multiplier = float(shop.get("price_multiplier", 1.0))
-    return max(1, int(math.ceil(int(definition.get("value", 0)) * multiplier)))
+    asks it of a free piece too, which has a worth even when it is given.
+    `multiplier` is the owner's markup (0.74.0); None is the shop's own."""
+    if multiplier is None:
+        multiplier = float(shop.get("price_multiplier", 1.0))
+    return max(1, int(math.ceil(_settled(int(definition.get("value", 0)) * float(multiplier)))))
+
+
+def _settled(product):
+    """A price or a tax before it is rounded, with the float's dust taken off
+    (0.74.0).
+
+    THE NUMBERS THE GAME SHIPPED WITH NEVER NEEDED IT: a markup of 1.0 is
+    exact, and every value times 0.05 rounds to the nearest double on the right
+    side of the whole number (test_economyrules.py checks every catalogue
+    value and every tax up to ten million). The numbers an owner types do: 100
+    times 1.1 is 110.00000000000001 in a double, and rounding that UP charged
+    111 for a sword the owner had priced at 110. Nine places is far finer than
+    a coin and far coarser than the dust."""
+    return round(float(product), 9)
 
 
 def is_free(item_id):
@@ -479,7 +502,7 @@ def is_free(item_id):
 SELLABLE_TYPES = ("WEAPON", "ARMOR", "CONSUMABLE", "FISH", "MATERIAL")
 
 
-def shop_sell_price(shop_id, item_id):
+def shop_sell_price(shop_id, item_id, price_multiplier=None, sell_multiplier=None):
     """
     What this vendor pays for one of these, or None when it will not buy it.
 
@@ -496,18 +519,23 @@ def shop_sell_price(shop_id, item_id):
     NOTHING FOR A FREE PIECE (is_free(), 0.69.0). A vendor that gives
     something away and buys it back is a printing press with one extra step;
     the rolled drop of the same item still sells (vendor_pays()).
+
+    THE OWNER'S TWO NUMBERS (0.74.0): sell_multiplier for what it pays, and
+    price_multiplier for the cap, which must be the markup the till is really
+    charging. None for either is the shop's own.
     """
     if is_free(item_id):
         return None
-    return vendor_pays(shop_id, item_id)
+    return vendor_pays(shop_id, item_id, price_multiplier, sell_multiplier)
 
 
-def vendor_pays(shop_id, item_id):
+def vendor_pays(shop_id, item_id, price_multiplier=None, sell_multiplier=None):
     """
     shop_sell_price() without the free rule: what this vendor pays for any
     piece of this catalogue item. The catalogue answer lists it for every
     item, so the panel can price a rolled drop of something the shop also
-    gives away, and leaves the plain free piece out by its own list.
+    gives away, and leaves the plain free piece out by its own list. The two
+    multipliers are the owner's, as shop_sell_price() takes them.
     """
     shop = SHOPS.get(shop_id)
     if shop is None:
@@ -518,8 +546,8 @@ def vendor_pays(shop_id, item_id):
     if str(definition.get("type_name", "")) not in SELLABLE_TYPES:
         return None
 
-    multiplier = float(shop.get("sell_multiplier", 0.0) or 0.0)
-    price = int(math.floor(int(definition.get("value", 0)) * multiplier))
+    multiplier = float(shop.get("sell_multiplier", 0.0) or 0.0) if sell_multiplier is None else float(sell_multiplier)
+    price = int(math.floor(_settled(int(definition.get("value", 0)) * multiplier)))
     # A ROLLED PIECE IS PRICED AS ITS BASE, and capped by what the shop
     # charges for the base: the shelf never holds a roll, so asking about
     # "ironsword~d107" there would find nothing and skip the cap. A base the
@@ -529,7 +557,7 @@ def vendor_pays(shop_id, item_id):
     if base in shop.get("stock", []) or base in (shop.get("free") or []):
         base_row = item_row(base)
         if base_row is not None:
-            price = min(price, _gold_price(shop, base_row) - 1)
+            price = min(price, _gold_price(shop, base_row, price_multiplier) - 1)
     return price if price > 0 else None
 
 
@@ -548,7 +576,7 @@ def stack_value(item_id, quantity):
     return int(definition.get("value", 0)) * int(quantity)
 
 
-def trade_tax(taxable_value):
+def trade_tax(taxable_value, rate=None, minimum=None):
     """
     The tax on receiving `taxable_value` worth of goods and gold.
 
@@ -566,14 +594,18 @@ def trade_tax(taxable_value):
     THE RATE COMES FROM THE GAME, NOT FROM HERE. GameConstants.KINGDOM_TAX_RATE
     is a balance decision and lives with the other balance decisions; this
     module restates no number that lives in the game.
+
+    UNLESS THE OWNER HAS SET ONE ON THE SERVER (0.74.0, economyrules/): `rate`
+    and `minimum` are those, handed in by the trade routes - the quote and the
+    charge alike, so they cannot disagree. None for either is the game's own.
     """
     taxable_value = int(taxable_value)
     if taxable_value <= 0:
         return 0
 
-    rate = float(CONSTANTS.get("kingdom_tax_rate", 0.05))
-    minimum = int(CONSTANTS.get("kingdom_tax_minimum", 1))
-    return max(minimum, int(math.ceil(taxable_value * rate)))
+    rate = float(CONSTANTS.get("kingdom_tax_rate", 0.05)) if rate is None else float(rate)
+    minimum = int(CONSTANTS.get("kingdom_tax_minimum", 1)) if minimum is None else int(minimum)
+    return max(minimum, int(math.ceil(_settled(taxable_value * rate))))
 
 
 def revive_gold_cost(total_gold):
@@ -1202,6 +1234,32 @@ def best_loadout(gear, class_id, level):
     return top, sum(by_slot.values()), specials
 
 
+def might_percent(identity):
+    """
+    The damage a MIGHT meal adds, in percent, for the character a presence
+    ticket describes - 0 when it has none (0.74.0).
+
+    THE TICKET CARRIES THE BUFF (players/routes.py, "buff"), written by the API
+    from food_buffs only while it is in force, so this is pure: no clock. A
+    ticket lives two minutes, so a bound can stay this much looser for at most
+    that long after the meal wears off, and never tighter than the meal.
+
+    MULTIPLIED ONTO THE WHOLE BOUND, which is the most it could be: the game
+    may add it to the gear's damage percent instead, and (1 + a)(1 + b) is at
+    least 1 + a + b; and it covers what does not scale with the character's
+    multiplier - a pet's puddles - in case the game's meal does. A real buffed
+    hit must never look too big, and a kill the books refuse is a kill the
+    receipts do not pay.
+    """
+    buff = identity.get("buff") if isinstance(identity, dict) else None
+    if not isinstance(buff, dict) or buff.get("kind") != "MIGHT":
+        return 0
+    try:
+        return max(0, int(buff.get("amount", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def combat_bounds(identity):
     """
     {"max_hit", "dps", "speed"} for the character a presence ticket describes:
@@ -1210,9 +1268,11 @@ def combat_bounds(identity):
     walk. None when this catalogue has no combat block.
 
     identity is the ticket's: "cls", "gear" (worn and carried equipment ids),
-    "skills" ({attack, magic, agility}) and "pets" (the pets it may have out).
-    A missing "gear" reads as the whole catalogue and missing "skills" as the
-    highest level - an older API's ticket can only make the bounds looser.
+    "skills" ({attack, magic, agility}), "pets" (the pets it may have out) and,
+    since 0.74.0, "buff" (the meal in force - might_percent()). A missing
+    "gear" reads as the whole catalogue and missing "skills" as the highest
+    level - an older API's ticket can only make the bounds looser. A missing
+    "buff" is no meal: the bounds are exactly what they were before meals.
     """
     if not COMBAT_EXPORTED or not isinstance(identity, dict):
         return None
@@ -1380,6 +1440,14 @@ def combat_bounds(identity):
                       / max(float(pets[p].get("cooldown", 2.0) or 2.0), 0.01) for p in held)
         max_hit = max(max_hit, pet_hit)
         dps += pet_dps + float(COMBAT.get("puddle_damage", 0)) * PUDDLE_TICKS_PER_SECOND
+
+    # A MIGHT MEAL (0.74.0), on the whole of it - every swing, orb, stick,
+    # puddle and pet bite - so the bound is the unbuffed one times the meal,
+    # never a hair under it. A fighter who has eaten nothing is multiplied by
+    # exactly 1.0, which changes no bound at all.
+    might = 1.0 + might_percent(identity) / 100.0
+    max_hit *= might
+    dps *= might
 
     walk = (int(row.get("speed", 0) or 0) + (agility - 1) * int(COMBAT.get("agility_speed", 10))) \
         * float(COMBAT.get("sprint", 2.0) or 2.0)
@@ -1946,6 +2014,183 @@ def roll_cook(item_id, cooking_level):
     }
 
 
+# =============================================================================
+# THE LARDER (0.74.0): bait, recipes and the food buffs
+# =============================================================================
+# The owner, 22 Oct: "we have a whole lot of materials and ways to expand
+# cooking in clockwork lets get those done", and "i want to make recipes people
+# can make with the food also". Cooking grows past one fish on the fire into
+# meals of two, three or more ingredients that heal more and give a short buff;
+# a better bait rolls the catch more than once. Every number is the game's
+# (ItemData's new exports, through gamedata.json); a catalogue from before them
+# has no bait but the worm, no recipes and no buffs, and every function below
+# then answers "none".
+
+def bait_rolls(item_id):
+    """How many times a cast with this bait rolls the catch (ItemData.bait_rolls),
+    0 for anything that is not bait. The worm is 1 in the game; a catalogue from
+    before the field says nothing, and the fishing route reads its worm as 1 on
+    its own (gathering/services.py)."""
+    row = item_row(item_id) or {}
+    try:
+        return max(0, int(row.get("bait_rolls", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def recipe_of(item_id):
+    """
+    A meal's recipe, or None for anything that is not one:
+
+        {"ingredients": [(item_id, quantity), ...], "level", "xp", "mastery_level"}
+
+    ingredients in the catalogue's order (by item_id), each a real item with a
+    count of at least one. A recipe naming an item this catalogue does not have
+    is not a recipe at all - the exporter refuses one, and taking a player's
+    other ingredients for a dish that cannot exist would be the worst way to
+    find out.
+    """
+    row = item_row(item_id)
+    if row is None or VARIANT_MARK in str(item_id):
+        return None
+    recipe = row.get("recipe")
+    if not isinstance(recipe, dict) or not recipe.get("ingredients"):
+        return None
+    ingredients = []
+    for entry in recipe.get("ingredients") or []:
+        try:
+            ingredient, quantity = str(entry["item_id"]), int(entry["quantity"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if quantity < 1 or not has_item(ingredient) or ingredient == item_id:
+            return None
+        ingredients.append((ingredient, quantity))
+    try:
+        level = max(1, int(recipe.get("level", 1) or 1))
+        mastery = max(1, int(recipe.get("mastery_level", 1) or 1))
+        xp = max(0, int(recipe.get("xp", 0) or 0))
+    except (TypeError, ValueError):
+        return None
+    return {"ingredients": ingredients, "level": level, "xp": xp, "mastery_level": mastery}
+
+
+def recipe_ids():
+    """Every meal in the catalogue, lowest cooking level first, then by id - the
+    order the Recipes view lists them in."""
+    meals = [(recipe_of(meal_id), meal_id) for meal_id in ITEMS]
+    meals = [(recipe["level"], meal_id) for recipe, meal_id in meals if recipe is not None]
+    return [meal_id for _level, meal_id in sorted(meals)]
+
+
+def roll_recipe(recipe_id, cooking_level):
+    """
+    Cook one meal. The same answers as roll_cook(), so the two routes and the
+    two panels read one shape:
+
+        {"ok": False, "reason": "unknown"}     no such meal
+        {"ok": False, "reason": "level", "needs": N}
+        {"ok": True, "burnt": True,  "output": "", "xp": 0}
+        {"ok": True, "burnt": False, "output": recipe_id, "xp": N}
+
+    THE BURN IS THE FISH'S, EXACTLY: burn_chance() with the recipe's level as
+    the floor and its mastery_level as the point it stops - so the curve the
+    cooking window draws for a fish is the curve it draws for a pie, off the
+    same constant. Burnt grants nothing, as a burnt fish does.
+    """
+    recipe = recipe_of(recipe_id)
+    if recipe is None:
+        return {"ok": False, "reason": "unknown"}
+    if int(cooking_level) < recipe["level"]:
+        return {"ok": False, "reason": "level", "needs": recipe["level"]}
+    curve = {"cook_level": recipe["level"], "cook_mastery_level": recipe["mastery_level"]}
+    if _rng.random() < burn_chance(curve, cooking_level):
+        return {"ok": True, "burnt": True, "output": "", "xp": 0}
+    return {"ok": True, "burnt": False, "output": recipe_id, "xp": recipe["xp"]}
+
+
+BUFF_KINDS = tuple(str(k) for k in (CONSTANTS.get("buff_kinds") or ("NONE", "MIGHT", "GUARD", "VIGOUR", "WISDOM")))
+
+
+def buff_of(item_id):
+    """
+    What eating one of these does for a while: (kind name, amount, seconds), or
+    None for anything that gives no buff.
+
+    BY NAME, NEVER BY THE ENUM'S INTEGER - restore_for()'s rule, for its
+    reason: ItemData.BuffKind is ordered, and a kind inserted above another
+    would turn every MIGHT into something else while a server comparing `== 1`
+    carried on. exportgamedata.gd writes buff_kind_name beside the integer.
+
+    MIGHT is +amount% damage, GUARD +amount armour, VIGOUR +amount max health
+    and WISDOM +amount max mana, for `seconds` (ItemData.buff_text()).
+    """
+    row = item_row(item_id)
+    if row is None:
+        return None
+    kind = str(row.get("buff_kind_name", "NONE") or "NONE")
+    try:
+        amount = int(row.get("buff_amount", 0) or 0)
+        seconds = int(row.get("buff_seconds", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if kind not in BUFF_KINDS or kind == "NONE" or amount <= 0 or seconds <= 0:
+        return None
+    return kind, amount, seconds
+
+
+def temper_roll(item_id, step, cap):
+    """
+    What the smith's temper makes of one piece (0.74.0): (new_id, before,
+    after, reason), before and after being {field: percent}. reason is "" when
+    the piece can be tempered, else:
+
+        "unknown"   not an item, or a roll that does not parse
+        "norolls"   nothing rolled: a plain catalogue piece, a potion, a stone
+        "perfect"   a Perfect piece - every stat at QUALITY_PERFECT already
+        "tempered"  every stat at the cap or above it: nothing left to raise
+
+    EVERY ROLLED STAT GOES UP `step` POINTS, never past `cap`, and one already
+    at or above the cap is left where it is. The id is rebuilt the one way
+    _parse_variant() reads it - every stat once, in QUALITY_FIELDS order, then
+    the resistance exactly as it was - so a tempered piece moves, wears, sells
+    and trades by every path a rolled piece already does.
+
+    THE CAP NEVER PASSES QUALITY_HIGH, whatever the catalogue says. A stat above
+    the top of the ordinary range is a roll neither parser accepts unless every
+    stat is QUALITY_PERFECT, so a cap of 118 would turn a sword into an id the
+    server reads as nothing. Tempering raises a roll; it does not make a
+    Perfect, which stays the one-in-a-hundred find.
+
+    A PLAIN PIECE HAS NOTHING TO TEMPER, on purpose: the plain id is what marks
+    a shop's free piece (is_free()), and tempering one into a rolled id would
+    turn something that may never be sold or traded into something that may.
+    """
+    item_id = str(item_id)
+    base, rolls, resist = _parse_variant(item_id)
+    if base is None or item_row(item_id) is None:
+        return item_id, {}, {}, "unknown"
+    if not rolls:
+        return item_id, {}, {}, "norolls"
+    before = dict(rolls)
+    if set(rolls.values()) == {QUALITY_PERFECT}:
+        return item_id, before, dict(before), "perfect"
+    top = min(int(cap), QUALITY_HIGH)
+    step = max(0, int(step))
+    after = {field: (percent if percent >= top else min(top, percent + step))
+             for field, percent in rolls.items()}
+    if after == before:
+        return item_id, before, after, "tempered"
+    new_id = base + VARIANT_MARK + "".join(
+        "%s%d" % (letter, after[field]) for letter, field in rolled_fields(item_row(base)) if field in after)
+    if resist is not None:
+        new_id += "%s%d%02d" % (RESIST_LETTER, resist[0], resist[1])
+    if _parse_variant(new_id) != (base, after, resist):
+        # Cannot happen while the cap is held under QUALITY_HIGH; if it ever
+        # does, the piece is refused rather than rewritten into nothing.
+        return item_id, before, dict(before), "unknown"
+    return new_id, before, after, ""
+
+
 def rarest_first(contents):
     """
     The bag's entries with the pet first, then the other items, then the coins.
@@ -1970,7 +2215,100 @@ def rarest_first(contents):
     return sorted(contents, key=rank)
 
 
-def roll_kill_rewards(enemy_id, class_id="", bag_scale=1.0, xp_scale=1.0):
+def roll_material_drops(enemy, scale=1.0):
+    """
+    What this monster drops BESIDE its bag (0.74.0): [{"item_id", "quantity"}],
+    each of its material_drops rolled on its own - chance times `scale`, never
+    past certain, and a quantity evenly from min to max. One entry an item, in
+    the catalogue's order.
+
+    The owner, 22 Oct: "monsters drop materials that fit them and food" - ore
+    from the slimes, an essence from each land's sprites, produce from the
+    bush mages, bone and skulls from the crypt. EnemyData.material_drops in the
+    game, through gamedata.json; the exporter has already refused a drop that
+    names no item, a chance outside (0, 1] or a min above its max, and an entry
+    that slipped past it anyway is skipped here rather than paid. A catalogue
+    from before the field says nothing, and nothing drops.
+
+    THE ROLLS COME AFTER EVERY OTHER ROLL A KILL MAKES (roll_kill_rewards()),
+    so a monster with no materials draws exactly the dice it drew before this
+    existed, and a seeded suite's bags are the bags they were.
+
+    `scale` is the owner's material_drop_scale (economyrules/), handed in by
+    the kill route the way the stirring lands' bag_scale is.
+    """
+    drops = enemy.get("material_drops") or []
+    if not isinstance(drops, list):
+        return []
+    try:
+        scale = max(0.0, float(scale))
+    except (TypeError, ValueError):
+        scale = 1.0
+    found = {}
+    order = []
+    for drop in drops:
+        if not isinstance(drop, dict):
+            continue
+        item_id = str(drop.get("item_id", ""))
+        try:
+            chance = float(drop.get("chance", 0.0) or 0.0)
+            low = int(drop.get("min", 1) or 1)
+            high = int(drop.get("max", low) or low)
+        except (TypeError, ValueError):
+            continue
+        if not has_item(item_id) or not 0.0 < chance <= 1.0 or low < 1 or high < low:
+            continue
+        if _rng.random() >= min(1.0, chance * scale):
+            continue
+        if item_id not in found:
+            order.append(item_id)
+            found[item_id] = 0
+        found[item_id] += _rng.randint(low, high)      # Godot: randi_range, inclusive
+    return [{"item_id": item_id, "quantity": found[item_id]} for item_id in order]
+
+
+# THE LOOT PANEL'S CELLS: loot/services.py's LOOT_BAG_CAPACITY (the game's
+# lootbaginventory.gd LOOT_SIZE), copied so fold_coins() can be asked of a roll
+# here, as killwatch.py copies kill/'s numbers; test_larder.py holds the two
+# copies equal.
+LOOT_BAG_CELLS = 9
+
+
+def fold_coins(contents, cells=LOOT_BAG_CELLS):
+    """
+    The same bag, its coins folded together until it fits `cells` - or until
+    one coin entry is left - with not one coin's worth lost.
+
+    WHY (0.74.0). A boss's bag was already near the panel's nine cells - its
+    gear, a potion, a pet, a mythic and up to five coins of change - and its
+    two materials now push it past them, where the cut falls on the smallest
+    coins (rarest_first()). A material must never be a reason for MORE gold to
+    drop, and it must not be a reason for less to arrive either. So the two
+    smallest coins become one stack of the smaller - three silver and four
+    copper are thirty-four copper - which is exact because every rung of the
+    ladder divides the one above it (make_change()); a pair that does not
+    divide is left alone. Called by roll_kill_rewards() only when materials
+    are in the bag, so a bag without them is exactly the bag it was.
+    """
+    if len(contents) <= cells:
+        return contents
+    worth = dict(gold_denominations())
+    out = [dict(entry) for entry in contents]
+    while len(out) > cells:
+        coins = sorted((i for i, e in enumerate(out) if worth.get(e["item_id"], 0) > 0),
+                       key=lambda i: worth[out[i]["item_id"]])
+        if len(coins) < 2:
+            break
+        low, high = coins[0], coins[1]
+        small, big = worth[out[low]["item_id"]], worth[out[high]["item_id"]]
+        if big % small:
+            break
+        out[low]["quantity"] = int(out[low]["quantity"]) + int(out[high]["quantity"]) * (big // small)
+        del out[high]
+    return out
+
+
+def roll_kill_rewards(enemy_id, class_id="", bag_scale=1.0, xp_scale=1.0, material_drop_scale=1.0):
     """
     The whole reward for one kill. Port of BaseEnemy._die() plus
     _roll_and_spawn_loot(), minus everything to do with spawning a node.
@@ -1982,6 +2320,11 @@ def roll_kill_rewards(enemy_id, class_id="", bag_scale=1.0, xp_scale=1.0):
     kill; nothing else about the roll changes - the tier, the items, the pet
     and the mythic odds are the monster's own.
 
+    material_drop_scale is the owner's (economyrules/, 0.74.0): times every
+    material drop's chance - see roll_material_drops(). NOT A PORT: the game
+    never rolled materials, because by the time they existed the roll was the
+    server's.
+
     Returns:
         {
           "enemy_id":   str,
@@ -1989,12 +2332,16 @@ def roll_kill_rewards(enemy_id, class_id="", bag_scale=1.0, xp_scale=1.0):
           "attack_xp":  int,
           "pet_won":    bool,
           "mythic":     str,    the mythic item_id in the bag, or ""
+          "materials":  [{"item_id": str, "quantity": int}, ...]  in the bag
           "contents":   [{"item_id": str, "quantity": int}, ...],
         }
 
     An empty `contents` is a normal outcome, not a failure - most kills drop
     nothing at all. A mythic, like a pet, makes a bag even when the bag roll
-    said no.
+    said no - and so do materials, but a bag made by materials alone holds
+    the materials and NOTHING ELSE: no gold, no items. The bag's gold is the
+    bag roll's; a material must never be a reason for more gold to drop, or
+    giving a monster an ore would quietly raise what it pays.
     """
     enemy = ENEMIES.get(enemy_id)
     if enemy is None:
@@ -2018,7 +2365,19 @@ def roll_kill_rewards(enemy_id, class_id="", bag_scale=1.0, xp_scale=1.0):
             contents.append({"item_id": pick_pet_id(enemy), "quantity": 1})
         if mythic:
             contents.append({"item_id": mythic, "quantity": 1})
+
+    # THE MATERIALS, LAST: rolled after everything above, so the bag's own
+    # dice are the ones they always were. They join a bag that dropped, or
+    # make one of their own that holds only them - never build_bag_contents(),
+    # whose first act is the gold.
+    materials = roll_material_drops(enemy, material_drop_scale)
+    contents.extend(dict(entry) for entry in materials)
+    if contents:
         contents = rarest_first(contents)
+    if materials:
+        # ...and the materials never push a coin out of the panel: see
+        # fold_coins(). Coins stay last, so the order holds.
+        contents = rarest_first(fold_coins(contents))
 
     return {
         "enemy_id": enemy_id,
@@ -2026,5 +2385,6 @@ def roll_kill_rewards(enemy_id, class_id="", bag_scale=1.0, xp_scale=1.0):
         "attack_xp": int(enemy.get("attack_xp_reward", 0)),
         "pet_won": pet_won,
         "mythic": mythic,
+        "materials": materials,
         "contents": contents,
     }

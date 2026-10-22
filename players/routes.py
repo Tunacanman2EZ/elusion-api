@@ -201,6 +201,18 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, ca
         }
 
         now = int(time.time())
+        # THE MEAL IN FORCE (0.74.0), for the books: a MIGHT meal raises the
+        # biggest hit and the damage a second this character is held to
+        # (gamedata.might_percent()), because a real buffed kill must never
+        # look too big. Only while it lasts, and only then is the key here - a
+        # character who has eaten nothing has the ticket it always had. The
+        # game renews its ticket every minute, so the books hear of a meal
+        # within one, and the bounds' SLACK covers the minute itself.
+        buff = data.food_buff(db, user_id, slot, now)
+        if buff is not None:
+            identity["buff"] = {"item_id": str(buff["item_id"]), "kind": str(buff["kind"]),
+                                "amount": int(buff["amount"]), "ends_at": int(buff["ends_at"])}
+
         raw = secrets.token_urlsafe(32)
         data.issue_ticket(db, token_hash(raw), token_hash(bearer_token()), user_id, slot,
                           json.dumps(identity, separators=(",", ":")), now,

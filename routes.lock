@@ -7,7 +7,9 @@ GET /api/auth/session  session_info  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/character  read_character  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/chat  read_chat  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/chat/image/<image_id>  chat_read_image  auth  rank=-  fresh=-  lock=yes  doc=yes
+GET /api/cooking/recipes  cooking_recipes  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/economy/kingdom  economy_kingdom  auth  rank=-  fresh=-  lock=yes  doc=yes
+GET /api/economy/rules  economy_rules  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/economy/supply  economy_supply  auth  rank=dev  fresh=-  lock=yes  doc=yes
 GET /api/friends  friends_list  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/guild  guild_read  auth  rank=-  fresh=-  lock=yes  doc=yes
@@ -17,6 +19,9 @@ GET /api/kills  kills_mine  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/kills/everyone  kills_everyone  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/loot/bag  read_loot_bag  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/metrics  metrics  auth  rank=coowner  fresh=-  lock=yes  doc=yes
+GET /api/owner/economy/canary  owner_canary_status  auth  rank=coowner  fresh=-  lock=yes  doc=yes
+GET /api/owner/economy/flow  owner_economy_flow  auth  rank=coowner  fresh=-  lock=yes  doc=yes
+GET /api/owner/economy/rules  owner_economy_rules  auth  rank=coowner  fresh=-  lock=yes  doc=yes
 GET /api/party  party_read  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/party/voice  party_voice  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/player/status  player_status  auth  rank=-  fresh=-  lock=yes  doc=yes
@@ -29,6 +34,7 @@ GET /api/server/insights  read_insights  auth  rank=coowner  fresh=-  lock=yes  
 GET /api/server/stats  read_player_stats  auth  rank=coowner  fresh=-  lock=yes  doc=yes
 GET /api/server/world  read_world  auth  rank=coowner  fresh=-  lock=yes  doc=yes
 GET /api/shop/<shop_id>  shop_catalogue  auth  rank=-  fresh=-  lock=yes  doc=yes
+GET /api/smith/status  smith_status  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/staff/actions  staff_action_log  auth  rank=mod  fresh=-  lock=yes  doc=yes
 GET /api/staff/gifts  staff_gifts  auth  rank=coowner  fresh=-  lock=yes  doc=yes
 GET /api/staff/powers  staff_powers  auth  rank=mod  fresh=-  lock=yes  doc=yes
@@ -81,6 +87,7 @@ POST /api/chat/send  chat_send  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/chat/upload  chat_upload_image  auth  rank=-  fresh=-  lock=no  doc=yes
 POST /api/combat/kill  combat_kill  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/cooking/cook  cooking_cook  auth  rank=-  fresh=-  lock=yes  doc=yes
+POST /api/cooking/recipe  cooking_recipe  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/fishing/catch  fishing_catch  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/friends/remove  friends_remove  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/friends/request  friends_request  auth  rank=-  fresh=-  lock=yes  doc=yes
@@ -94,7 +101,9 @@ POST /api/guild/rank  guild_set_rank  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/guild/respond  guild_respond  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/ignores  add_ignore  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/ignores/remove  remove_ignore  auth  rank=-  fresh=-  lock=yes  doc=yes
+POST /api/kingdom/donate  kingdom_donate  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/loot/take  take_loot  auth  rank=-  fresh=-  lock=yes  doc=yes
+POST /api/owner/economy/canary  owner_canary_check  auth  rank=coowner  fresh=-  lock=no  doc=yes
 POST /api/party/invite  party_invite  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/party/kick  party_kick  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/party/lead  party_lead  auth  rank=-  fresh=-  lock=yes  doc=yes
@@ -114,6 +123,9 @@ POST /api/server/world/stir  stir_world  auth  rank=coowner  fresh=yes  lock=yes
 POST /api/shop/buy  shop_buy  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/shop/sell  shop_sell  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/skill/train  train_skills  auth  rank=-  fresh=-  lock=yes  doc=yes
+POST /api/smith/certify  smith_certify  auth  rank=-  fresh=-  lock=yes  doc=yes
+POST /api/smith/quote  smith_quote  auth  rank=-  fresh=-  lock=yes  doc=yes
+POST /api/smith/temper  smith_temper  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/staff/ban  ban_account  auth  rank=mod  fresh=yes  lock=yes  doc=yes
 POST /api/staff/gold  staff_gold  auth  rank=coowner  fresh=yes  lock=yes  doc=yes
 POST /api/staff/grant  staff_grant  auth  rank=coowner  fresh=yes  lock=yes  doc=yes
@@ -141,6 +153,7 @@ PUT /api/account/lusions  write_lusions  auth  rank=-  fresh=-  lock=yes  doc=ye
 PUT /api/account/name-colour  set_name_colour  auth  rank=-  fresh=-  lock=yes  doc=yes
 PUT /api/character/inventory  write_inventory  auth  rank=-  fresh=-  lock=yes  doc=yes
 PUT /api/character/skills  write_skills  auth  rank=-  fresh=-  lock=yes  doc=yes
+PUT /api/owner/economy/rules  set_economy_rule  auth  rank=owner  fresh=yes  lock=yes  doc=yes
 PUT /api/player/status  write_player_status  auth  rank=-  fresh=-  lock=yes  doc=yes
 PUT /api/save  write_save  auth  rank=-  fresh=-  lock=yes  doc=yes
 PUT /api/staff/role  set_account_role  auth  rank=mod  fresh=yes  lock=yes  doc=yes

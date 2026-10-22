@@ -203,8 +203,10 @@ for _n in range(80):
                        json={"slot": 0, "enemy_id": ROSTER[_n % len(ROSTER)]}).get_json() or {}
     if not body.get("bag_id"):
         continue
+    # MONEY BY WHAT THE SERVER PAYS FOR IT, not by "gold" in the id: since
+    # 0.74.0 the smith's Royal Gold is a material, not a coin.
     piles = [c for c in body.get("contents", [])
-             if "gold" in str(c.get("item_id", ""))]
+             if app_module.gold_item_value(str(c.get("item_id", ""))) > 0]
     if piles:
         found = (body["bag_id"], piles[0])
         break
@@ -383,7 +385,7 @@ for _n in range(250):
     if not killed.get("bag_id"):
         continue
     piles = [c for c in killed.get("contents", [])
-             if "gold" in str(c.get("item_id", ""))]
+             if app_module.gold_item_value(str(c.get("item_id", ""))) > 0]
     if piles:
         client.post("/api/loot/take", headers=H,
                     json={"bag_id": killed["bag_id"], "position": piles[0]["position"]})

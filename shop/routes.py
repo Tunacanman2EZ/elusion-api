@@ -32,6 +32,11 @@ register() is handed app.py's own pieces - it never imports app.py:
                       named cells replaced (carry/'s)
     resync            (user_id, slot) -> the 409 with the carry and the purse
                       the server holds (carry/'s)
+    terms             (db, shop_id) -> the owner's numbers for this shop's
+                      prices, as keyword arguments for the catalogue's three
+                      pricing functions - {} when the owner has set none
+                      (economyrules/, 0.74.0). Left out, every price is the
+                      catalogue's own, as it was before the owner could set one.
 
 THE ENDPOINT NAMES ARE app.py's - shop_buy, shop_sell, shop_catalogue - and
 routes.lock holds them.
@@ -43,7 +48,20 @@ from . import data, services
 
 def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, slot_exists, catalogue, stack_limit,
              add_to_backpack, bag_cells, place_trade_hold, gold_delta, inventory_of, carry_request, parse_grid_cell,
-             carry_cells, grid_cells, grid_rewrite, resync):
+             carry_cells, grid_cells, grid_rewrite, resync, terms=None):
+
+    # THE OWNER'S NUMBERS (0.74.0). The owner, of the fifth economy idea:
+    # "Today, changing the trade tax or a price means a new version. If those
+    # numbers lived on the server, you could adjust them in a minute." They do
+    # now - economyrules/ - and every price below is asked with them: the till,
+    # the buy-back and the shelf the panel draws, so the three can never
+    # disagree. Asked per request, from economyrules/'s short cache, so a change
+    # is at the till within its window. Nothing set, nothing passed: the
+    # catalogue's own number, exactly as before.
+    def shop_terms(db, shop_id):
+        if terms is None:
+            return {}
+        return dict(terms(db, shop_id) or {})
 
     def shop_buy():
         """
@@ -135,9 +153,11 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, sl
             # always means gamedata.json is stale on one side.
             return bad_request("Unknown shop '%s'. Is gamedata.json current?" % shop_id)
 
-        # PRICED BY THE SERVER, FROM THE SERVER'S CATALOGUE. The request does not
-        # carry a price and would not be believed if it did.
-        unit_price = catalogue.shop_price(shop_id, item_id)
+        # PRICED BY THE SERVER, FROM THE SERVER'S CATALOGUE - at the owner's
+        # markup when one is set (0.74.0). The request does not carry a price
+        # and would not be believed if it did.
+        db = get_db()
+        unit_price = catalogue.shop_price(shop_id, item_id, **shop_terms(db, shop_id))
         if unit_price is None:
             return bad_request("'%s' does not stock '%s'." % (shop_id, item_id))
 
@@ -147,7 +167,6 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, sl
         # the plain piece. See gamedata.is_free() for why that is not a faucet.
         free = item_id in (catalogue.SHOPS[shop_id].get("free") or [])
 
-        db = get_db()
         if free:
             name = (catalogue.item_row(item_id) or {}).get("display_name", item_id)
             if quantity != 1:
@@ -298,7 +317,7 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, sl
         if catalogue.is_free(item_id):
             return bad_request(services.free_words(
                 (catalogue.item_row(item_id) or {}).get("display_name", item_id)))
-        unit_price = catalogue.shop_sell_price(shop_id, item_id)
+        unit_price = catalogue.shop_sell_price(shop_id, item_id, **shop_terms(get_db(), shop_id))
         if unit_price is None:
             return bad_request("The shop does not buy that.")
 
@@ -374,6 +393,8 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, sl
         #
         # WHAT IT GIVES AWAY FIRST (0.69.0), flagged free at price 0, so the
         # panel heads them on their own shelf above everything for gold.
+        # AT THE OWNER'S NUMBERS (0.74.0), asked once for the whole shelf.
+        owner_terms = shop_terms(get_db(), shop["shop_id"])
         stock = []
         for item_id in shop.get("free") or []:
             definition = catalogue.item_row(item_id)
@@ -385,7 +406,7 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, sl
             if definition is None:
                 continue
             stock.append(services.stock_row(item_id, definition,
-                                            catalogue.shop_price(shop["shop_id"], item_id)))
+                                            catalogue.shop_price(shop["shop_id"], item_id, **owner_terms)))
 
         # WHAT THE SHOP PAYS, for every item it would buy, from the same function
         # /api/shop/sell prices with - so the Sell list shows the number the till
@@ -397,7 +418,7 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, sl
         # named in free_ids, and the panel leaves those out.
         sell_prices = {}
         for item_id in catalogue.ITEMS:
-            price = catalogue.vendor_pays(shop["shop_id"], item_id)
+            price = catalogue.vendor_pays(shop["shop_id"], item_id, **owner_terms)
             if price is not None:
                 sell_prices[item_id] = price
         free_ids = sorted({item_id for any_shop in catalogue.SHOPS.values()
@@ -407,7 +428,13 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, sl
             "shop_id": shop["shop_id"],
             "display_name": shop.get("display_name", "Shop"),
             "stock": stock,
-            "sell_multiplier": float(shop.get("sell_multiplier", 0.0) or 0.0),
+            # THE TWO MULTIPLIERS IN FORCE, the owner's where set (0.74.0):
+            # the panel says what share the shop pays, and whether the prices
+            # are the usual ones.
+            "sell_multiplier": float(owner_terms.get("sell_multiplier",
+                                                     shop.get("sell_multiplier", 0.0) or 0.0)),
+            "price_multiplier": float(owner_terms.get("price_multiplier",
+                                                      shop.get("price_multiplier", 1.0))),
             "sell_prices": sell_prices,
             "free_ids": free_ids,
         }, 200

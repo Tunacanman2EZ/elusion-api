@@ -240,7 +240,9 @@ section("C  boot the real files with nothing but a .env")
 # its own for the same reason.
 
 CODE = scratch("code", "x")[:-2]
-for name in ("app.py", "envfile.py", "gamedata.py", "wsgi.py"):
+# mailer.py and canary.py since 0.74.0: app.py's send_mail() speaks SMTP
+# through mailer.py, and the GM panel's canary routes run canary.py's checks.
+for name in ("app.py", "envfile.py", "gamedata.py", "wsgi.py", "mailer.py", "canary.py"):
     shutil.copy(os.path.join(HERE, name), os.path.join(CODE, name))
 # And the feature packages app.py imports (game 0.47.0, playerstats/ the
 # first; events/ in 0.48.0, insights/ in 0.50.0, killrecord/ the first taken

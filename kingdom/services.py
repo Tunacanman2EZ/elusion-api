@@ -117,4 +117,59 @@ def my_line(board, username, deaths):
         if entry["username"] == username:
             return dict(entry)
     return {"username": username, "contributed": 0, "lusions": 0,
-            "deaths": deaths, "lost": 0, "rank": None}
+            "deaths": deaths, "lost": 0, "rank": None, "title": ""}
+
+
+# =============================================================================
+# PATRONAGE (0.74.0)
+# =============================================================================
+# The owner's third economy idea: "things players choose to spend gold on:
+# cosmetics on the kingdom board". A gift to the crown is burned - reason
+# donation - and buys nothing but a TITLE beside the giver's name, by what the
+# ACCOUNT has given in all: Patron, Benefactor, Noble Patron, Royal Patron
+# (GameConstants, through gamedata.json's patron_titles). Nothing a title does
+# can be traded back into gold, which is what makes it a sink and not a shop.
+#
+# A GIFT IS ALSO GOLD GIVEN. The board already sums every coin destroyed, so a
+# donor climbs the ranking as well as earning the title - one figure, not a
+# second scoreboard to keep in step with the first.
+#
+# THE ACCOUNT, NOT THE CHARACTER: the board is a board of players, and a title
+# earned on the warrior is worn by the mage. The gold leaves one character's
+# purse; the ledger row names the account.
+
+def patron_titles(constants):
+    """[(at, title)] from the catalogue's patron_titles, lowest first. A
+    catalogue from before patronage has none, and nobody has a title."""
+    out = []
+    for entry in (constants.get("patron_titles") or []) if isinstance(constants, dict) else []:
+        try:
+            at, title = int(entry["at"]), str(entry["title"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if at > 0 and title:
+            out.append((at, title))
+    return sorted(out)
+
+
+def donation_minimum(constants):
+    """The smallest gift the crown takes, in gold - never below 1, so a gift of
+    nothing is never a ledger row."""
+    try:
+        return max(1, int((constants or {}).get("donation_minimum", 1) or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def title_for(donated, titles):
+    """(title, next_title, next_at) for an account that has given `donated` in
+    all: the highest title reached ("" below the first), the next one and the
+    lifetime total it is reached at ("" and 0 past the last)."""
+    title, next_title, next_at = "", "", 0
+    for at, name in titles:
+        if donated >= at:
+            title = name
+        else:
+            next_title, next_at = name, at
+            break
+    return title, next_title, next_at

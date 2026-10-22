@@ -70,7 +70,7 @@ def register(app, *, require_auth, get_db, parse_slot, max_slot, bad_request, sl
                 slot: {type: integer, example: 0}
         responses:
           200:
-            description: What was caught, and the state it landed in
+            description: What was caught, the bait it took (the best carried), and the state it landed in
           400:
             description: Bad slot
           403:
@@ -100,11 +100,17 @@ def register(app, *, require_auth, get_db, parse_slot, max_slot, bad_request, sl
         # anything the client said. fishingspot.gd runs the same two checks so
         # it can refuse early and explain why, but that copy is a courtesy -
         # this one decides.
-        rod_tier = services.best_rod_tier(data.carried_ids(db, user_id, slot), item_row)
+        carried = data.carried_ids(db, user_id, slot)
+        rod_tier = services.best_rod_tier(carried, item_row)
         if rod_tier <= 0:
             return {"error": "Forbidden", "message": "You need a fishing rod."}, 403
 
-        if data.held(db, user_id, slot, services.FISHING_BAIT_ID) <= 0:
+        # THE BEST BAIT CARRIED (0.74.0): the most rolls, a tie to the first id
+        # - services.best_bait(). The worm is one roll, a lugworm two, a
+        # glowgrub three. None at all is the refusal it always was, in its
+        # words, because the worm is still the bait most players hold.
+        bait, rolls = services.best_bait(carried, item_row)
+        if rolls <= 0 or data.held(db, user_id, slot, bait) <= 0:
             return {"error": "Forbidden", "message": "You need worms for bait."}, 403
 
         # Refill then spend, exactly as /api/combat/kill does.
@@ -120,7 +126,12 @@ def register(app, *, require_auth, get_db, parse_slot, max_slot, bad_request, sl
         skills = skills_of(user_id, slot)
         fishing_level = int(skills.get("fishing", {}).get("level", 1))
 
-        catch = roll_catch(rod_tier, fishing_level)
+        # A BETTER BAIT ROLLS THE CATCH MORE THAN ONCE and keeps the best fish
+        # - the highest tier, a tie to the first rolled (services.best_catch()).
+        # The same roll each time, so a glowgrub cannot reach a fish the rod
+        # and the skill cannot: it only makes the top of the reach likelier.
+        # One roll is exactly the cast it always was.
+        catch = services.best_catch([roll_catch(rod_tier, fishing_level) for _ in range(rolls)], item_row)
         if catch is None:
             # No FISH-typed items in the catalogue at all. A server
             # misconfiguration rather than a player problem, and it must not
@@ -131,7 +142,7 @@ def register(app, *, require_auth, get_db, parse_slot, max_slot, bad_request, sl
             }, 409
 
         # ---- everything above this line is validation; everything below commits
-        if not take_from_backpack(user_id, slot, services.FISHING_BAIT_ID, 1):
+        if not take_from_backpack(user_id, slot, bait, 1):
             # Re-checked inside the transaction. The count above was read
             # before the roll, and two casts racing would both have seen the
             # last worm.
@@ -150,7 +161,7 @@ def register(app, *, require_auth, get_db, parse_slot, max_slot, bad_request, sl
         db.commit()
 
         return services.caught(catch, written, levels_gained, level, status_of(user_id, slot),
-                               inventory_of(user_id, slot), skills_of(user_id, slot)), 200
+                               inventory_of(user_id, slot), skills_of(user_id, slot), bait=bait), 200
 
     def cooking_cook():
         """

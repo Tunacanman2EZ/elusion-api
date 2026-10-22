@@ -37,6 +37,56 @@ def best_rod_tier(item_ids, item_row):
     return best
 
 
+def rolls_of(item_id, item_row):
+    """How many times a cast with this bait rolls the catch: the catalogue's
+    bait_rolls (ItemData, 0.74.0), and 0 for anything that is not bait.
+
+    THE WORM IS ALWAYS BAIT, AT ONE ROLL AT LEAST. It was the only bait for
+    seventy releases and the game sets its bait_rolls to 1; a catalogue from
+    before the field says nothing about it, and the worm must not stop being
+    bait because a number was missing."""
+    row = item_row(item_id) or {}
+    try:
+        rolls = max(0, int(row.get("bait_rolls", 0) or 0))
+    except (TypeError, ValueError):
+        rolls = 0
+    if item_id == FISHING_BAIT_ID:
+        rolls = max(rolls, 1)
+    return rolls
+
+
+def best_bait(item_ids, item_row):
+    """(item_id, rolls) of the best bait among these carried ids - the most
+    rolls, a tie to the first id in order - or ("", 0) for none.
+
+    THE SERVER CHOOSES, NOT THE CLIENT (0.74.0): a client that named its own
+    bait would name the cheapest thing it had and say it was the best. Best
+    first because bait is bought to be used: a glowgrub in the bag is a player
+    who wants three rolls, and the worms underneath are the fallback."""
+    best = ("", 0)
+    for item_id in sorted(set(item_ids)):
+        rolls = rolls_of(item_id, item_row)
+        if rolls > best[1]:
+            best = (item_id, rolls)
+    return best
+
+
+def best_catch(catches, item_row):
+    """The catch kept from a cast that rolled more than once: the highest-tier
+    fish, a tie to the first rolled. None only when nothing was rolled."""
+    best, best_tier = None, None
+    for catch in catches:
+        if catch is None:
+            continue
+        try:
+            tier = int((item_row(catch["item_id"]) or {}).get("tier", 0) or 0)
+        except (TypeError, ValueError):
+            tier = 0
+        if best is None or tier > best_tier:
+            best, best_tier = catch, tier
+    return best
+
+
 def refilled(tokens, last_cast_at_ms, now_ms):
     """The cast bucket now: what it held at the last cast, and what has
     dripped in since, never past CAST_BUCKET_CAPACITY. Refill then spend,
@@ -48,13 +98,14 @@ def refilled(tokens, last_cast_at_ms, now_ms):
     )
 
 
-def caught(catch, written, levels_gained, level, status, inventory, skills):
-    """The answer to a landed fish: what it was, the cells it went into, the
-    skill, and the totals."""
+def caught(catch, written, levels_gained, level, status, inventory, skills, bait=FISHING_BAIT_ID):
+    """The answer to a landed fish: what it was, the bait it took (0.74.0), the
+    cells it went into, the skill, and the totals."""
     return {
         "item_id": catch["item_id"],
         "quantity": catch["quantity"],
         "xp": catch["xp"],
+        "bait": bait,
         "carry_positions": written,
         "levelled_up": levels_gained > 0,
         "fishing_level": level,
@@ -66,7 +117,8 @@ def caught(catch, written, levels_gained, level, status, inventory, skills):
 
 def cooked(item_id, outcome, written, levels_gained, level, status, inventory, skills):
     """The answer to a fish on the fire: burnt or not, what came of it, the
-    skill, and the totals."""
+    skill, and the totals. A meal's answer (larder/, 0.74.0) is this one with
+    what it took added."""
     return {
         "item_id": item_id,
         "burnt": outcome["burnt"],

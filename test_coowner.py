@@ -187,8 +187,11 @@ powers = client.get("/api/staff/powers", headers=bearer(co_t)).get_json()
 check("the powers list knows him: a co-owner, who may make mods and devs",
       powers["you_are"] == "coowner" and powers["you_may_grant"] == ["player", "mod", "dev"], powers["you_are"])
 rung = {r["rank"]: [x["path"] for x in r["routes"]] for r in powers["ladder"]}
-check("  the owner's routes are listed on the co-owner's rung, the switch on the owner's",
-      "/api/staff/grant" in rung["coowner"] and rung["owner"] == ["/api/server/coowners"], rung["owner"])
+# THE OWNER'S ALONE: the co-owners' switch, and since 0.74.0 a change to the
+# economy's numbers (PUT /api/owner/economy/rules) - a co-owner reads those.
+check("  the owner's routes are listed on the co-owner's rung, the switch and the economy's numbers on the owner's",
+      "/api/staff/grant" in rung["coowner"] and "/api/owner/economy/rules" in rung["coowner"]
+      and sorted(rung["owner"]) == ["/api/owner/economy/rules", "/api/server/coowners"], rung)
 check("  and the rank cannot be granted", [r["grantable"] for r in powers["ladder"]
                                           if r["rank"] == "coowner"] == [False])
 with app_module.app.test_request_context():

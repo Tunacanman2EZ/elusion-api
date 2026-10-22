@@ -297,9 +297,11 @@ captured = []
 real_roll = gamedata.roll_kill_rewards
 
 
-def spy(enemy_id, class_id="", bag_scale=1.0, xp_scale=1.0):
+def spy(enemy_id, class_id="", bag_scale=1.0, xp_scale=1.0, material_drop_scale=1.0):
+    # material_drop_scale (0.74.0) is the owner's economy number, not an
+    # event's: passed through as the kill route sent it.
     captured.append((bag_scale, xp_scale))
-    return real_roll(enemy_id, class_id, bag_scale, xp_scale)
+    return real_roll(enemy_id, class_id, bag_scale, xp_scale, material_drop_scale=material_drop_scale)
 
 
 def kill(enemy_id):

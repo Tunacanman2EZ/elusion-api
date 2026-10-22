@@ -92,9 +92,9 @@ def explored(raw):
     return out
 
 
-def slot_view(row, equipment, explored_map):
+def slot_view(row, equipment, explored_map, food_buff=None):
     """One slot as GET /api/save lists it - the row, with its two JSON columns
-    already read back."""
+    already read back, and its meal in force (food_buff_view()) or None."""
     return {
         "slot": row["slot"],
         "class_id": row["class_id"],
@@ -105,7 +105,20 @@ def slot_view(row, equipment, explored_map):
         "equipment": equipment,
         "explored": explored_map,
         "updated_at": row["updated_at"],
+        "food_buff": food_buff,
     }
+
+
+def food_buff_view(row):
+    """A food_buffs row as the character's load carries it, or None: {"item_id",
+    "kind" (the name), "amount", "ends_at"}. THE SAME SHAPE AS THE CONSUME
+    ANSWER'S (consuming/services.py food_buff_view(), which writes the row) -
+    test_larder.py holds the two equal, since a package cannot import
+    another's."""
+    if row is None:
+        return None
+    return {"item_id": str(row["item_id"]), "kind": str(row["kind"]),
+            "amount": int(row["amount"]), "ends_at": int(row["ends_at"])}
 
 
 def confirmed(typed, name):

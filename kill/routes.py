@@ -30,6 +30,10 @@ register() is handed app.py's own pieces - it never imports app.py:
                        owner's switch, app.py's RECEIPTS_KEY) - asked on every
                        call
     client_build       () -> the build of the game that sent this request
+    material_scale     (db) -> times every material drop's chance: the owner's
+                       material_drop_scale (economyrules/, 0.74.0) - asked on
+                       every kill, so a number the owner changes is the next
+                       kill's
 
 THE ENDPOINT NAME IS app.py's - combat_kill - and routes.lock holds it.
 """
@@ -42,7 +46,7 @@ from . import data, services
 
 def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, catalogue, stir_for, derived_stats,
              levelup_grant_id, proficient_amount, grant_skill_xp, post_broadcast, create_loot_bag,
-             note_refill, receipts_on, client_build):
+             note_refill, receipts_on, client_build, material_scale):
 
     def combat_kill():
         """
@@ -198,7 +202,12 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, ca
         # THE STIRRING LANDS: a monster of the land stirring now drops loot more
         # often and gives more XP, as the owner has set it (world/'s stir_for()).
         bag_scale, xp_scale = stir_for(db, enemy_id)
-        rewards = catalogue.roll_kill_rewards(enemy_id, row["class_id"], bag_scale, xp_scale)
+        # AND THE MATERIALS (0.74.0): ore, essences, produce and bone, each at
+        # its own chance times the owner's material_drop_scale. They join the
+        # bag, or make one that holds only them - never more gold
+        # (gamedata.roll_kill_rewards()).
+        rewards = catalogue.roll_kill_rewards(enemy_id, row["class_id"], bag_scale, xp_scale,
+                                              material_drop_scale=material_scale(db))
 
         level, xp, xp_to_next, levels_gained = catalogue.apply_xp(
             int(row["level"]), int(row["xp"]), int(row["xp_to_next"]), rewards["xp"]
