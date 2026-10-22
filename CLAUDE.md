@@ -1684,9 +1684,15 @@ finds. `test_combatbook.py` holds the books, `test_presence.py` P-8 the wiring.
   spike 30 once a second (it was 9 every 0.45 s) and scaled every staff and
   the Meteorite up to match, so a critical spike is far past the old bound:
   deploy this WITH the 0.71.0 game, never after. Its third cast's three
-  spikes and the ice shards round each (frostring.gd) share what the cast has
-  hit, so one monster still takes one hit a cast and need nothing more; a
-  catalogue without the crit crits nothing. Each class's formula is written out above the code;
+  spikes share what the cast has hit, so one monster takes one spike a cast;
+  a catalogue without the crit crits nothing. Since game 0.71.1 the ice
+  shards round each spike (frostring.gd) hit what they touch, the spike's
+  mark too, and are spent on it: the row carries `shard_hits_each` (2 a
+  monster a cast, after the spike) and `shard_share` (0.2 of a spike), and
+  the rate is `unit * haste * max(casts, crit_mult * (1 + shard_hits_each *
+  shard_share)) / cooldown`; the biggest hit is unchanged. That is 1.4 times
+  0.71.0's rate, past SLACK on a long fight - deploy it WITH the 0.71.1 game.
+  These counts are one caster's: every player's hits on a monster are booked. Each class's formula is written out above the code;
   the game's suite (`_test_combat_bounds_match_the_game`) holds the exported
   numbers to the game's own. Every bound gets `SLACK` (1.5) while watching.
 - **Hits**: one over the biggest is booked at the cap and waits

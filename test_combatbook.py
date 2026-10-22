@@ -262,15 +262,27 @@ m = cls_rows["mage"]
 b1 = gamedata.combat_bounds({"cls": "mage", "lvl": 30, "gear": ["emberstaff"], "skills": {}, "pets": []})
 b2 = gamedata.combat_bounds({"cls": "mage", "lvl": 30, "gear": ["meteorite"], "skills": {}, "pets": []})
 crit = m.get("crit_mult", 1.0) if m.get("crit_chance", 0) > 0 else 1.0
-check("a mage casts once a cooldown, and every cast may be critical (game 0.71.0)",
-      m.get("crit_chance", 0) > 0 and crit == 2.0
+shards = m.get("shard_hits_each", 0) * m.get("shard_share", 0.0)
+check("a mage casts once a cooldown, every cast may be critical (game 0.71.0) and two shards follow the spike (0.71.1)",
+      m.get("crit_chance", 0) > 0 and crit == 2.0 and m.get("shard_hits_each") == 2 and abs(shards - 0.4) < 1e-9
       and b1["max_hit"] == math.ceil(hit_of(m["base"], "emberstaff") * crit)
-      and abs(b1["dps"] - hit_of(m["base"], "emberstaff") * crit / m["cooldown"]) < 0.05, [b1, m])
+      and abs(b1["dps"] - hit_of(m["base"], "emberstaff") * crit * (1 + shards) / m["cooldown"]) < 0.05, [b1, m])
 check("  the Meteorite twice, and its crater's burn on top (0.12.0)",
       m.get("meteor_burn_share", 0) > 0
-      and abs(b2["dps"] - hit_of(m["base"], "meteorite") * (max(2, crit) / m["cooldown"] + m["meteor_burn_share"] / m["meteor_burn_every"])) < 0.05,
+      and abs(b2["dps"] - hit_of(m["base"], "meteorite") * (max(2, crit * (1 + shards)) / m["cooldown"] + m["meteor_burn_share"] / m["meteor_burn_every"])) < 0.05,
       [b2, m])
-_no_crit = dict(m)
+_no_shards = dict(m)
+for key in ("shard_hits_each", "shard_share"):
+    _no_shards.pop(key, None)
+cls_rows["mage"] = _no_shards
+try:
+    bs = gamedata.combat_bounds({"cls": "mage", "lvl": 30, "gear": ["emberstaff"], "skills": {}, "pets": []})
+finally:
+    cls_rows["mage"] = m
+check("  a catalogue from game 0.71.0 crits, and throws no shard on one monster",
+      bs["max_hit"] == math.ceil(hit_of(m["base"], "emberstaff") * crit)
+      and abs(bs["dps"] - hit_of(m["base"], "emberstaff") * crit / m["cooldown"]) < 0.05, bs)
+_no_crit = dict(_no_shards)
 for key in ("crit_chance", "crit_mult"):
     _no_crit.pop(key, None)
 cls_rows["mage"] = _no_crit

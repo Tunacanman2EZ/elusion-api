@@ -433,20 +433,28 @@ print("      (class dps in ember, relative to the warrior: %s)" % ", ".join(
 # class may out-damage the warrior on a single target at any tier, and none may
 # fall below two thirds of its swing.
 #
-# THE WARRIOR IS ITS SWING AND ITS WAVE (game 0.38.0): every swing's wave hits
-# wave_ratio of it again, so that is what a class is measured against - the
-# mage's heavy spike (game 0.71.0) is a quarter above the swing alone. And the
-# mage counts its critical spike, crit_chance of its casts crit_mult as hard.
+# THE WARRIOR IS ITS SWING, ITS WAVE AND ITS FAN: every swing's wave hits
+# wave_ratio of it again (game 0.38.0), one in finisher_every finisher_mult as
+# hard, and every sword swing flings sword_fan_orbs at sword_fan_share of it
+# (0.39.0). That is what a class is measured against - the mage's heavy spike
+# (game 0.71.0) is a quarter above the swing alone. And the mage counts its
+# critical spike, crit_chance of its casts crit_mult as hard, and since game
+# 0.71.1 the shard_hits_each ice shards a monster takes after the spike.
 _classes = C._GD.get("combat", {}).get("classes", {}) or {}
-WAVE = float(_classes.get("warrior", {}).get("wave_ratio", 0.0))
+_w = _classes.get("warrior", {})
+WAVE = float(_w.get("wave_ratio", 0.0))
+FINISHED_WAVE = WAVE * (1.0 + (float(_w.get("finisher_mult", 1.0)) - 1.0) / max(int(_w.get("finisher_every", 1) or 1), 1))
+FAN = int(_w.get("sword_fan_orbs", 0)) * float(_w.get("sword_fan_share", 0.0))
+WARRIOR_WHOLE = 1.0 + FINISHED_WAVE + FAN
 MAGE_CRIT = 1.0 + float(_mage_row.get("crit_chance", 0.0)) * (float(_mage_row.get("crit_mult", 1.0)) - 1.0)
-check("the warrior's wave and the mage's crit are exported, for the guard below",
-      WAVE > 0 and MAGE_CRIT > 1.0, [WAVE, MAGE_CRIT])
+MAGE_SHARDS = 1.0 + int(_mage_row.get("shard_hits_each", 0)) * float(_mage_row.get("shard_share", 0.0))
+check("the warrior's wave and fan and the mage's crit and shards are exported, for the guard below",
+      WAVE > 0 and FAN > 0 and MAGE_CRIT > 1.0 and MAGE_SHARDS > 1.0, [WAVE, FAN, MAGE_CRIT, MAGE_SHARDS])
 for tier in TIERS:
     spread = {c: dps(c, tier) / dps("warrior", tier) for c in BASE}
-    whole = {c: dps(c, tier) * (MAGE_CRIT if c == "mage" else 1.0) / (dps("warrior", tier) * (1.0 + WAVE))
+    whole = {c: dps(c, tier) * (MAGE_CRIT * MAGE_SHARDS if c == "mage" else 1.0) / (dps("warrior", tier) * WARRIOR_WHOLE)
              for c in BASE if c != "warrior"}
-    check("no class out-damages the warrior's swing and wave single-target in %s" % tier,
+    check("no class out-damages the warrior's swing, wave and fan single-target in %s" % tier,
           max(whole.values()) <= 1.0 + 1e-9, whole)
     check("and none is left behind in %s" % tier,
           min(spread.values()) >= 0.63, spread)
