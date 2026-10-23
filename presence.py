@@ -62,8 +62,11 @@ seeing everybody walk about.
 THE WIRE (JSON text frames):
 
   game -> here
-    {"t": "hello", "ticket": "...", "v": 2}              first, within HELLO_SECONDS; "v" 2
-                                                         = speaks shared monsters
+    {"t": "hello", "ticket": "...", "v": 2, "xt": 1}     first, within HELLO_SECONDS; "v" 2
+                                                         = speaks shared monsters; "xt" 1 (game
+                                                         0.76.0) = takes others' attacks inside
+                                                         the tick's moves - see ATTACKS RIDE THE
+                                                         TICK
     {"t": "s", "a": "field", "x": 1471.0, "y": 1090.5,
      "m": "walkdown", "fx": ["ring"], "pet": "petsniper",
      "ts": 81234, "aim": 344, "hp": 87}                  where I am, when it changes; "ts" (0.19.0,
@@ -90,11 +93,13 @@ THE WIRE (JSON text frames):
     {"t": "vc", "to": 40, "d": {...}}                    a voice call's setup, for 40 (0.43.0)
 
   here -> game
-    {"t": "welcome", "id": 12, "v": 2, "books": true, "x": 1}
+    {"t": "welcome", "id": 12, "v": 2, "books": true, "x": 2}
                                                          you are in; this server shares monsters,
                                                          and keeps books on them (0.10.0): send
                                                          the world even alone, own hits inside it;
-                                                         and passes on attacks and levers ("x")
+                                                         and passes on attacks and levers ("x"; 2:
+                                                         and puts attacks in the tick for a game
+                                                         that said "xt")
     {"t": "join", "p": [{id, name, cls, lvl, role, hue, guild, x, y, m, fx, pet, ts, aim, hp}]}
                                                          people now in your area
     {"t": "moves", "p": [[id, x, y, m, fx, pet, ts, aim, hp], ...]}
@@ -102,7 +107,14 @@ THE WIRE (JSON text frames):
                                                          in it, in order (yourself included; skip
                                                          it); ts, aim and hp -1 for a game that
                                                          sends none
-    {"t": "x", "id": 40, "e": [[kind, ts, ...], ...]}    40's attacks, checked, to everyone else
+    {"t": "moves", "p": [...], "x": [[40, [[kind, ts, ...], ...]], ...]}
+                                                         (a game that said "xt") the same, with
+                                                         the attacks made since the last tick:
+                                                         who made them and what, in order - a
+                                                         game's own come back to it too; skip
+                                                         them. "p" may be empty
+    {"t": "x", "id": 40, "e": [[kind, ts, ...], ...]}    (any other game) 40's attacks, checked,
+                                                         to everyone else, as they arrive
     {"t": "l", "id": 40, "n": "...", "on": true}         40 pulled a lever, to everyone else
     {"t": "levers", "p": [["...", true], ...]}           (arriving, or sync) the levers pulled in
                                                          this area since it was last empty, the
@@ -189,6 +201,7 @@ import sqlite3
 import time
 
 from websockets.asyncio.server import broadcast, serve
+from websockets.extensions.permessage_deflate import ServerPerMessageDeflateFactory
 from websockets.exceptions import ConnectionClosed
 
 # THE BOOKS ARE OPTIONAL. gamedata.py raises at import without a gamedata.json,
@@ -233,6 +246,22 @@ MAX_SOCKET_BYTES = MAX_WORLD_BYTES
 # room for a renew.
 RATE_PER_SECOND = 40.0
 BURST = 80.0
+# A LEADER ANSWERING IS NOT A GAME GOING TOO FAST (0.76.0). Every game that
+# walks into an area makes this server ask its leader for everything ("need"),
+# and the leader answers with what changed and then the whole area, 60
+# monsters a message (monstersync.gd RECORDS_PER_PART): the Big Field's 366
+# are eight messages. On top of its own thirty a second, the bucket above had
+# room for about ten arrivals at once and one a second after that - so when a
+# crowd walked in together (swarm.py, 128 bots arriving over six seconds; or
+# everyone coming back after a restart) the leader was dropped "too fast",
+# the next in line took the monsters and every need, and was dropped too.
+# Now each need this server sends a leader comes with NEED_MESSAGES messages
+# of allowance, spent only once the bucket is empty, for NEED_CREDIT_SECONDS
+# after the last need - the server asked for them, so they are not a flood.
+# At most MAX_NEED_CREDIT: 128 arrivals' worth.
+NEED_MESSAGES = 16
+NEED_CREDIT_SECONDS = 10.0
+MAX_NEED_CREDIT = NEED_MESSAGES * 128
 # PARTY VOICE (0.43.0): a call's description (SDP) is a few kilobytes; its
 # candidates a few hundred bytes each. A call to three others is about twenty
 # messages; this allows several times that at once, and a steady few a second.
@@ -240,6 +269,17 @@ VOICE_MAX_BYTES = 16384
 VOICE_BURST = 60.0
 VOICE_RATE_PER_SECOND = 6.0
 MAX_CONNECTIONS = 1000
+
+# A BROWSER'S SOCKET IS COMPRESSED (permessage-deflate; Godot's own is not),
+# one stream per connection, so every frame is squeezed once for every
+# browser that hears it. At zlib's default level a 128-player moves frame
+# (7 KB) took 269 us to squeeze - for each browser in the area, ten times a
+# second; at level 1 it takes 78 us and comes out 9% bigger (3.4 to 1, not
+# 3.8). Measured: swarm.py --deflate 1, and the frame on its own. Window and
+# memory as websockets' own defaults.
+DEFLATE_LEVEL = 1
+DEFLATE = ServerPerMessageDeflateFactory(server_max_window_bits=12, client_max_window_bits=12,
+                                         compress_settings={"memLevel": 5, "level": DEFLATE_LEVEL})
 
 # The shared-monster wire. A game says which it speaks in its hello.
 SHARED_VERSION = 2
@@ -325,8 +365,23 @@ MAX_ATTACK_FLAGS = 255
 # may remember.
 LEVER_PATTERN = re.compile(r"^[A-Za-z0-9_/-]{1,128}$")
 MAX_LEVERS_PER_AREA = 32
-# Said in the welcome: this server passes attacks and levers on.
-RELAY_VERSION = 1
+# Said in the welcome: this server passes attacks and levers on (1), and
+# puts attacks inside the tick for a game that asks (2, game 0.76.0).
+RELAY_VERSION = 2
+
+# ATTACKS RIDE THE TICK (game 0.76.0). Every attack picture went to everyone
+# else in the area the moment it came in, a frame of its own to each: with N
+# players fighting that is N x N frames a second for every attack each makes,
+# and at 128 bots in one area (swarm.py) it was 16,000 frames a second, 44% of
+# this process and most of the rest in the socket writes under them. The
+# moves already go out once a tick, one frame to each player; the attacks
+# made since the last tick now go inside it ("x"), so N players cost N frames
+# a tick however hard they fight. Nothing is later than its picture needs:
+# the other games play attacks back on the maker's own clock, PLAYBACK_DELAY
+# (two ticks) behind, exactly as they play the steps that already waited for
+# the tick (remoteplayer.gd). A game says it can in its hello ("xt": 1); any
+# other is sent every attack on its own, as it came, as before.
+TICK_ATTACKS = 1
 
 # THE AURA'S HEALS (game 0.40.0). A healer's aura heals every player standing
 # in its ring, and sends green blobs that heal the players outside it within
@@ -633,10 +688,15 @@ class Player:
         self.dropped = False
         self.tokens = BURST
         self.stamp = time.monotonic()
+        # A LEADER ANSWERING: allowance for the needs this server sent it.
+        self.need_credit = 0.0
+        self.need_credit_until = 0.0
         # The shared-monster wire this game speaks (0: none), and when it
         # walked into its current area - the leader is the earliest.
         self.version = 0
         self.joined_at = 0.0
+        # ATTACKS RIDE THE TICK: this game takes them inside the moves.
+        self.tick_attacks = False
         # PARTY VOICE: in it, and the party it was in when it last checked.
         self.voice = False
         self.voice_party = 0
@@ -648,14 +708,23 @@ class Player:
         return self.version >= SHARED_VERSION
 
     def allow(self):
-        """Token bucket: False once the game sends faster than it ever would."""
+        """Token bucket: False once the game sends faster than it ever would -
+        less what this server asked a leader for (A LEADER ANSWERING)."""
         now = time.monotonic()
         self.tokens = min(BURST, self.tokens + (now - self.stamp) * RATE_PER_SECOND)
         self.stamp = now
         if self.tokens < 1.0:
+            if self.need_credit >= 1.0 and now < self.need_credit_until:
+                self.need_credit -= 1.0
+                return True
             return False
         self.tokens -= 1.0
         return True
+
+    def asked_for_world(self):
+        """This server just sent this game a "need": allowance to answer it."""
+        self.need_credit = min(MAX_NEED_CREDIT, self.need_credit + NEED_MESSAGES)
+        self.need_credit_until = time.monotonic() + NEED_CREDIT_SECONDS
 
     def allow_voice(self):
         """PARTY VOICE's own bucket, beside allow()."""
@@ -868,6 +937,13 @@ class PresenceServer:
         self._stirred_at = -1e9
         # THE AURA'S HEALS not yet written: (user_id, slot, share).
         self._heals = []
+        # ATTACKS RIDE THE TICK: area -> [[maker id, attacks], ...] since the
+        # last tick, for the games that take them there.
+        self._tick_attacks = {}
+        # The beats the tick has run, and the ones it fell a whole beat
+        # behind on (tick_loop).
+        self.ticks = 0
+        self.late_ticks = 0
 
     # ---- sending -------------------------------------------------------------
 
@@ -951,6 +1027,7 @@ class PresenceServer:
         leader = self.leaders.get(area)
         if leader is None or leader is player or not player.shares:
             return
+        leader.asked_for_world()
         broadcast([leader.ws], json.dumps({"t": "need", "id": player.user_id}, separators=(",", ":")))
 
     # ---- the books (combatbook.py) --------------------------------------------
@@ -994,6 +1071,7 @@ class PresenceServer:
             # The leader talked about monsters these books never saw (they
             # began after it did): it sends everything to "game 0", which is
             # nobody's - only the books read it.
+            player.asked_for_world()
             broadcast([player.ws], json.dumps({"t": "need", "id": 0}, separators=(",", ":")))
 
     def _book_hits(self, player, hits):
@@ -1052,7 +1130,14 @@ class PresenceServer:
         attacks = clean_attacks(msg, (player.x, player.y))
         if attacks is None:
             return False
-        self._room_broadcast(player.area, {"t": "x", "id": player.user_id, "e": attacks}, skip=player)
+        room = self.rooms.get(player.area, ())
+        # ATTACKS RIDE THE TICK for the games that take them there; any other
+        # hears each as it comes, never its own.
+        if any(p.tick_attacks and p is not player for p in room):
+            self._tick_attacks.setdefault(player.area, []).append([player.user_id, attacks])
+        old = [p.ws for p in room if not p.tick_attacks and p is not player]
+        if old:
+            broadcast(old, json.dumps({"t": "x", "id": player.user_id, "e": attacks}, separators=(",", ":")))
         for attack in attacks:
             if attack[0] == "heal":
                 self.note_heal(player, attack[4], attack[5])
@@ -1298,6 +1383,7 @@ class PresenceServer:
             and 0 <= version <= 1000 else 0
         if player.fighter is not None:
             player.fighter.reports_hits = player.version >= BOOKS_VERSION
+        player.tick_attacks = msg.get("xt") == TICK_ATTACKS and not isinstance(msg.get("xt"), bool)
         self.players[user_id] = player
         await self._send(player, {"t": "welcome", "id": user_id, "v": SHARED_VERSION, "books": BOOKS,
                                   "x": RELAY_VERSION})
@@ -1361,20 +1447,52 @@ class PresenceServer:
     # ---- the clocks ----------------------------------------------------------
 
     async def tick_loop(self):
+        """ON THE BEAT (game 0.76.0). This slept a tick AFTER each tick, so the
+        beat was a tick plus whatever the tick and everything else on the core
+        took: at 128 bots in one area, sharing the core with the API, it came
+        8.2 times a second, not ten, and the games playing the steps back
+        (two ticks behind) were short of them. Now each tick has its moment,
+        a tick after the last one's, whatever this one took. One that falls a
+        whole beat behind (a stall: a slow disk, a busy core) starts the beat
+        again from now - the missed ones are not fired back to back, which
+        would only send the same steps in smaller pieces."""
+        loop = asyncio.get_running_loop()
+        due = loop.time()
         while True:
-            await asyncio.sleep(self.tick_seconds)
+            due += self.tick_seconds
+            wait = due - loop.time()
+            if wait < -self.tick_seconds:
+                self.late_ticks += 1
+                due = loop.time()
+                wait = 0.0
+            await asyncio.sleep(max(0.0, wait))
             self.tick()
 
     def tick(self):
+        self.ticks += 1
+        attacks_by_area, self._tick_attacks = self._tick_attacks, {}
         for area, room in list(self.rooms.items()):
+            attacks = attacks_by_area.get(area)
             movers = [p for p in room if p.dirty]
-            if not movers:
+            if not movers and not attacks:
                 continue
             steps = []
             for p in movers:
                 p.dirty = False
                 steps.extend(p.take_steps())
-            self._room_broadcast(area, {"t": "moves", "p": steps})
+            if not attacks:
+                self._room_broadcast(area, {"t": "moves", "p": steps})
+                continue
+            # ATTACKS RIDE THE TICK: one frame each, steps and attacks, for the
+            # games that take them; the steps alone for any other (which had
+            # its attacks as they came).
+            riders = [p.ws for p in room if p.tick_attacks]
+            others = [p.ws for p in room if not p.tick_attacks]
+            if riders:
+                broadcast(riders, json.dumps({"t": "moves", "p": steps, "x": attacks}, separators=(",", ":")))
+            if others and steps:
+                broadcast(others, json.dumps({"t": "moves", "p": steps}, separators=(",", ":")))
+        # Attacks waiting for an area nobody is in any more go with it.
         if BOOKS:
             self._book_safely(self.tick_books, time.time())
 
@@ -1518,7 +1636,7 @@ async def main():
     server = PresenceServer()
     server.start_clocks()
     async with serve(server.handler, HOST, PORT, max_size=MAX_SOCKET_BYTES,
-                     ping_interval=20, ping_timeout=20) as ws_server:
+                     ping_interval=20, ping_timeout=20, extensions=[DEFLATE]) as ws_server:
         print("[PRESENCE] listening on ws://%s:%d%s (database %s)" % (HOST, PORT, PATH, DB_PATH), flush=True)
         print("[PRESENCE] books on the monsters: %s" % (
             "on, %d areas mapped" % len(gamedata.AREAS) if BOOKS else "off"), flush=True)

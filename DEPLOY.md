@@ -976,6 +976,60 @@ concurrency where 2xx is still ~100% — above that the spawn ceiling starts
 (correctly) returning 429 as a handful of test accounts out-kill the world.
 **It mutates what it points at, so never aim `--url` at production.**
 
+## Playing it: the bot swarm (`swarm.py`)
+
+`loadtest.py` finds a route's ceiling. **`swarm.py` plays the game**: bots
+that hold a presence socket each, walk ten steps a second, swing, report
+hits and kills, lead an area's monsters and answer every newcomer the way
+the game does, and make the HTTP calls a game in the world makes, at the
+game's own rates. On Linux it launches a scratch server - gunicorn as the
+live box runs it, presence.py beside it, one throwaway database, the server
+pinned to one core and the bots to another - and deletes it all after:
+
+```
+# 8 to 128 players in one area, 30 s each:
+python3 swarm.py --launch
+
+# more, spread over four areas; every bot on a compressed socket (the browser build):
+python3 swarm.py --launch --levels 256,512 --areas 4
+python3 swarm.py --launch --levels 128 --deflate 1
+
+# a before and after: an older presence.py, the API opening a connection a request
+python3 swarm.py --launch --levels 128 --presence old/presence.py --env ELUSION_DB_FRESH=1
+```
+
+Each level prints how long a step took from one bot's socket to another's
+(the server's 100 ms tick is inside it, so p50 sits near 50 ms and p99 near
+100), how many of the steps sent arrived and how many moves a second each bot
+heard (10 is the tick), the same for attack pictures, each route's p50 / p95
+/ p99 and what was not 2xx, CPU and memory of presence.py, the API and the
+swarm itself - and, loudly, **any bot the server dropped and why**. The games
+play other players back 200 ms behind, so a p99 past 200 ms is somebody's
+picture stuttering. **It mutates what it points at: `--api`/`--ws` only ever
+at a test server you started, never production.**
+
+**Measured** (game 0.76.0's server, a container core - the live box's is
+similar or better; one area, every bot fighting):
+
+| players in one area | step p99 | moves/s | presence.py | API | to the games |
+|---|---|---|---|---|---|
+| 8 | 101 ms | 10.0 | 2% | 1% | 0.2 MB/s |
+| 32 | 101 ms | 10.0 | 4% | 3% | 1.3 MB/s |
+| 64 | 102 ms | 10.0 | 7% | 6% | 4.0 MB/s |
+| 128 | 104 ms | 10.0 | 13% | 12% | 13.4 MB/s |
+| 192 | 108 ms | 10.0 | 19% | 18% | 28.2 MB/s |
+| 256 | 118 ms | 10.0 | 25% | 24% | 48.0 MB/s |
+
+Before 0.76.0 the same 128 dropped ten or eleven leaders "too fast" as they
+walked in, heard 8.2 to 9.4 moves a second with a step's p99 up to 457 ms,
+and took 50-65% of the core (API CLAUDE.md, "A
+crowd of 128", has what changed). **The next ceiling is the network, not the
+core**: everybody in an area hears everybody, so what goes out grows with the
+square of the crowd - 13 MB/s (about 110 Mbit/s) at 128 in one area, 48 MB/s
+at 256, before a browser's compression (about 3.4 to 1). Spread over areas it
+is far less. Sending each game only the players near it is the step after
+this, when one area really holds that many.
+
 ## Watching latency (live)
 
 `loadtest.py` proves speed *before* you ship; **`GET /api/metrics`** watches it

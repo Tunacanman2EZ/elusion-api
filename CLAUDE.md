@@ -1470,7 +1470,9 @@ every rule.
   healer's ten orbs a second became ten more messages), 2 KB a message (64 KB for a leader's
   world message; anything else that big is closed with 1009, "too big"), 1000
   connections, hello within 5 seconds. Moves are relayed ten times a second
-  per area.
+  per area, on the beat (0.76.0). A leader is allowed `NEED_MESSAGES` more for
+  every "need" this server sends it (0.76.0: a crowd walking in had it
+  dropped "too fast") - "A crowd of 128", below.
 - **And, since 0.7.0, the monsters** - next section. PvP stays in "Decided,
   not built".
 - **THE AURA'S HEALS (game 0.40.0).** A healer's aura heals whoever stands in
@@ -1605,6 +1607,84 @@ running past them, "i noticed some lag wobble". `presence.py`'s header,
   of attack pictures a second.
 - **Deploy order: this first.** A game ahead of its server sends neither `x`
   nor `l` (its welcome has no `"x"`) and plays as 0.18.
+
+## A crowd of 128: swarm.py, and what it changed (game 0.76.0)
+
+The owner, 22 Oct, of a 16x stress test: "i need absolute masterclass help to
+get my server to accomplish this". `loadtest.py` measures a route's ceiling;
+it cannot see what PLAYERS cost - a socket each, ten steps a second relayed to
+everyone in the area, a leader streaming the monsters, an HTTP request about
+every second besides. **`swarm.py` plays that**: bots that do what a game in
+the world does, at the game's own rates (its header has the list), against a
+scratch API and presence on one database, the server pinned to one core as
+the live box is. DEPLOY.md, "Playing it", has how to run it and the table.
+
+What it found at 128 bots in one area, and what was done - in the order it
+mattered:
+
+- **A crowd walking in dropped the leader, then the next, then the next.**
+  Every arrival makes presence.py ask the leader for everything ("need"), and
+  the game answers with what changed and then the area 60 monsters a message
+  - eight messages for the Big Field. On top of its own thirty a second the
+  bucket had room for about ten arrivals at once: the leader was dropped
+  "too fast", the earliest arrival took the monsters and every need, and was
+  dropped in turn - ten leaders in a row at 128. Any crowd arriving together
+  does it: an event, everyone coming back after a restart. **A LEADER
+  ANSWERING IS NOT A GAME GOING TOO FAST**: each need comes with
+  `NEED_MESSAGES` (16) messages of allowance, spent only once the bucket is
+  empty, for `NEED_CREDIT_SECONDS` after the last, at most `MAX_NEED_CREDIT`.
+  `Player.asked_for_world()`; test_presence.py P-9c, four sabotages caught.
+- **Attacks were players x players frames.** Each attack picture went to
+  every other game in the area in a frame of its own: 16,000 frames a second
+  at 128, 44% of presence.py and most of the socket writes under the rest
+  (py-spy). **ATTACKS RIDE THE TICK**: a game that says `"xt": 1` in its hello
+  (game 0.76.0) gets the attacks made since the last tick inside that tick's
+  `moves` (`"x": [[maker, attacks], ...]`) - one frame a player a tick however
+  hard everybody fights. A game without it is sent each as before. Nothing
+  plays later than it would have: games play attacks back on the maker's
+  clock two ticks behind, as they do the steps in the same frame. A game's
+  own come back to it and it passes over them; with nobody else riding,
+  nothing is queued. Welcome `"x"` is 2. test_presence.py P-9b, seven
+  sabotages caught.
+- **The tick slept a tick after each tick**, so its beat was a tick plus
+  whatever the core was doing: 8.2 a second at 128, and the games playing
+  steps back two ticks behind were short of them. **`tick_loop()` keeps the
+  beat**: each tick a tick after the last one's moment; one that falls a
+  whole beat behind starts again from now rather than firing the missed ones
+  back to back (`late_ticks` counts them).
+- **A browser's socket is compressed, once for every browser that hears a
+  frame** (permessage-deflate is per connection; Godot's own socket does not
+  ask for it). At zlib's default a 7 KB moves frame took 269 us to squeeze;
+  **`DEFLATE_LEVEL` 1** takes 78 us and comes out 9% bigger. `DEFLATE` is
+  passed to `serve()` in `main()`.
+- **Every request parsed the whole schema.** The API opened a connection a
+  request; the first statement on a new one reads all 149 tables, indexes and
+  triggers - 0.8 ms, against 4 us for the query itself - and opening and
+  closing was a third of the API's time. **THE CONNECTION IS KEPT** (app.py):
+  each worker thread hands its connection on to its next request, handed on
+  only clean - every cursor the request made closed (a half-read one would
+  hold its snapshot, and the next request would read the past), any
+  transaction rolled back (the write lock with it), this process's and this
+  file's, a context inside a request taking its own. `ELUSION_DB_FRESH=1`
+  goes back. test_dbkeep.py, eight sabotages caught; the whole suite passes
+  on it.
+
+At 128 bots in one area, one core, before and after (swarm.py, 30 s):
+
+| | before | after |
+|---|---|---|
+| dropped by the server | 10-11 leaders, "too fast" | none |
+| moves a second, each game | 8.2-9.4 | 10.0 |
+| frames to the bots a second | 29,000-34,000 | 3,200 |
+| presence.py, plain sockets | 25-32% of the core | 13% |
+| presence.py, every socket compressed | 53-62% | 23% |
+| the API | 24-35% | 11% |
+| HTTP p99 | 23-52 ms | 6-9 ms |
+| a step, socket to socket, p99 | 133-457 ms | 104 ms (the tick's own wait) |
+
+**Deploy order: either.** A 0.76.0 game against an older server says `"xt"`
+to a server that ignores it and is sent each attack as before; an older game
+against this server is sent them as before too. Nothing to install.
 
 ## The books on every monster: the server watches (0.10.0)
 
@@ -2519,6 +2599,9 @@ presence.py     the presence socket, a second process: who stands where,
                 and every player's attack pictures and lever pulls
 combatbook.py   the books: the server's own count of every monster's health,
                 every hit held to what its character could do (0.10.0)
+loadtest.py     a route's ceiling: req/s and p99 on the read and write paths
+swarm.py        bots that PLAY, on a scratch server: what a crowd costs
+                (0.76.0; DEPLOY.md, "Playing it")
 test_*.py       discovered and run by run_tests.ps1, which prints how many.
                 No counts here on purpose - see above. What each one is FOR:
   api           the broad one; read its header before adding to it
@@ -2552,6 +2635,8 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
   killrecord    every paid kill counted per character and monster, kept for
                 good, and the two routes the Kills window reads
   concurrency   requests that arrive together: the write lock
+  dbkeep        a worker thread's connection, kept between requests and
+                handed on only clean (0.76.0)
   attackxp      attack XP banked at the kill, with the class specialty
   pacing        the level curve, the element bands, and the store's saving pace
   gathering     fishing and cooking - the item-minting endpoints
@@ -2562,7 +2647,8 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
   presence      the presence socket: tickets, areas, what the game may say,
                 limits, a login ended anywhere ending the connection, and
                 who leads each area's monsters (P-7), the books' wiring (P-8),
-                attacks, levers and every step's clock (P-9)
+                attacks, levers and every step's clock (P-9), attacks in
+                the tick and the beat (P-9b), a crowd walking in (P-9c)
   combatbook    the books themselves: the bounds, every hit, spawn and death
                 judged, and that nothing a leader sends breaks them
   tradegates    the owner's trade switch, and the hold on fresh mythic and

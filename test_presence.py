@@ -153,14 +153,17 @@ def last_lead(messages):
     return leads[-1] if leads else None
 
 
-async def enter(port, headers, area=None, v=None, **kw):
+async def enter(port, headers, area=None, v=None, xt=None, **kw):
     """A connected game: hello with a fresh ticket, welcome read, optionally
-    standing somewhere. v=2 is a game that shares monsters."""
+    standing somewhere. v=2 is a game that shares monsters; xt=1 one that
+    takes attacks inside the tick (game 0.76.0)."""
     raw, _ = ticket(headers)
     ws = await connect("ws://127.0.0.1:%d/ws/presence" % port, max_size=presence.MAX_SOCKET_BYTES)
     hello = {"t": "hello", "ticket": raw}
     if v is not None:
         hello["v"] = v
+    if xt is not None:
+        hello["xt"] = xt
     await ws.send(json.dumps(hello))
     welcome = json.loads(await asyncio.wait_for(ws.recv(), 2))
     if area:
@@ -1072,6 +1075,80 @@ async def run(port, server):
     await asyncio.sleep(0.1)
     check("an empty area is forgotten", not server.rooms, server.rooms)
 
+    # LAST, ON TICKETS OF THEIR OWN: the games above are two minutes old by
+    # here, and a ticket lives two (the sweep signs them out).
+    await attacks_ride_the_tick(port, server)
+    await a_crowd_walks_in(port, server)
+
+
+async def a_crowd_walks_in(port, server):
+    """A LEADER ANSWERING IS NOT A GAME GOING TOO FAST (0.76.0): see presence.py."""
+    section("P-9c A CROWD WALKS IN: THE LEADER SENDS EVERY ONE OF THEM EVERYTHING, AND STAYS")
+    quiet = presence.Player(None, 1, "hash", {}, time.time() + 60)
+    quiet.tokens, quiet.stamp = 0.0, time.monotonic() + 3600
+    check("a game with an empty bucket is refused", quiet.allow() is False)
+    quiet.asked_for_world()
+    granted = sum(1 for _ in range(presence.NEED_MESSAGES + 5) if quiet.allow())
+    check("  one this server just asked for the world may send NEED_MESSAGES (%d) more, and no more"
+          % presence.NEED_MESSAGES, granted == presence.NEED_MESSAGES, granted)
+    quiet.asked_for_world()
+    quiet.need_credit_until = time.monotonic() - 1
+    check("  for NEED_CREDIT_SECONDS after it was asked, not for ever", quiet.allow() is False)
+    for _ in range(400):
+        quiet.asked_for_world()
+    check("  and never more than MAX_NEED_CREDIT, however many walk in",
+          quiet.need_credit == presence.MAX_NEED_CREDIT, quiet.need_credit)
+    check("NEED_MESSAGES covers what the biggest area's leader sends a newcomer: what changed, and every "
+          "authored monster at monstersync.gd's 60 a message",
+          presence.NEED_MESSAGES >= 1 + math.ceil(max(len(a.get("spawns", [])) for a in
+                                                       json.load(open(os.path.join(HERE, "gamedata.json"),
+                                                                      encoding="utf-8"))["areas"].values()) / 60))
+
+    # ---- live: fourteen arrive together; the leader answers each with eight ----
+    PARTS = 8
+    lead_hdr = account("preslead")
+    crowd = [account("prescrowd%d" % n) for n in range(14)]
+    lead, _ = await enter(port, lead_hdr, "crowdtest", v=presence.BOOKS_VERSION, x=10.0, y=10.0)
+    answered = []
+    said = []
+
+    async def lead_plays():
+        clock = 0
+        try:
+            async for raw in lead:
+                msg = json.loads(raw)
+                if msg.get("t") == "bye":
+                    said.append(msg.get("why"))
+                if msg.get("t") == "need" and msg.get("id", 0) > 0:
+                    to = msg["id"]
+                    await lead.send(json.dumps({"t": "w", "d": {"snap": []}}))
+                    for part in range(PARTS - 1):
+                        await lead.send(json.dumps({"t": "w", "to": to, "d": {
+                            "full": True, "reset": False, "part": part, "parts": PARTS - 1, "spawn": [], "wave": 0}}))
+                    answered.append(to)
+                    clock += 100
+                    await lead.send(state("crowdtest", x=10.0 + len(answered), y=10.0, ts=clock))
+        except ConnectionClosed:
+            said.append("_closed")
+    player = asyncio.create_task(lead_plays())
+    arrivals = []
+    for hdr in crowd:
+        ws, _ = await enter(port, hdr, "crowdtest", v=presence.BOOKS_VERSION, x=20.0, y=20.0)
+        arrivals.append(ws)
+    for _ in range(40):
+        if len(answered) >= len(crowd) or said:
+            break
+        await asyncio.sleep(0.05)
+    fulls = [len([m for m in await collect(ws, 0.3) if m.get("t") == "w" and m.get("d", {}).get("full")])
+             for ws in arrivals]
+    check("fourteen walk in at once and the leader sends each of them everything (%d messages each), "
+          "and is not dropped \"too fast\"" % PARTS,
+          len(answered) == len(crowd) and not said, (len(answered), said))
+    check("  every one of them has its whole world", fulls == [PARTS - 1] * len(crowd), fulls)
+    player.cancel()
+    for ws in arrivals + [lead]:
+        await ws.close()
+
 
 async def kills_written_soon():
     """A DEATH IS WRITTEN SOONER (0.57.0): a game waits on it to be paid."""
@@ -1165,6 +1242,122 @@ async def positions_written():
     con.close()
     check("a database from before the table still gets the death the books judged, and says why it has no positions",
           kills_there == 1 and bool(presence._POSITIONS_TABLE_MISSING), (kills_there, presence._POSITIONS_TABLE_MISSING))
+
+
+def ridden(messages):
+    """[[maker, attacks], ...] from every moves frame in these messages."""
+    return [pair for m in of(messages, "moves") for pair in m.get("x", [])]
+
+
+async def attacks_ride_the_tick(port, server):
+    """P-9b ATTACKS RIDE THE TICK (game 0.76.0): see presence.py. h and i are
+    games from before (no "xt") in "town", j one in "elusion"."""
+    section("P-9b ATTACKS RIDE THE TICK: ONE FRAME A TICK FOR A GAME THAT SAYS IT CAN, HOWEVER HARD THEY FIGHT")
+    good = ["slash", 92000, 500.0, 500.0, 520.0, 500.0, 0, 0]
+    h, _ = await enter(port, account("presrh", "mage"), "town", x=500.0, y=500.0)
+    i, _ = await enter(port, account("presri", "tank"), "town", x=520.0, y=500.0)
+    j, _ = await enter(port, account("presrj"), "elusion", x=10.0, y=10.0)
+    LEE = account("presl")
+    MAY = account("presm", "mage")
+    lee, welcome = await enter(port, LEE, "town", x=530.0, y=500.0, xt=1)
+    check("the welcome says attacks can ride the tick (\"x\" %d)" % presence.RELAY_VERSION,
+          welcome.get("x") == presence.RELAY_VERSION >= 2, welcome)
+    await collect(h), await collect(i), await collect(j), await collect(lee)
+
+    await h.send(json.dumps({"t": "x", "e": [good]}))
+    got_lee, got_i, got_j = await collect(lee), await collect(i), await collect(j)
+    check("a game that said \"xt\" hears an attack inside the moves, who made it named",
+          ridden(got_lee) == [[uid("presrh"), [good]]] and not of(got_lee, "x"), got_lee)
+    check("  even from somebody standing still: the frame's steps may be none",
+          any(m.get("x") and not [e for e in m["p"] if e[0] == uid("presrh")] for m in of(got_lee, "moves")),
+          of(got_lee, "moves"))
+    check("  a game from before still hears it on its own, as it came",
+          [m["e"] for m in of(got_i, "x")] == [[good]] and not ridden(got_i), got_i)
+    check("  and another area hears neither", not of(got_j, "x") and not ridden(got_j), got_j)
+
+    for n in range(3):
+        await h.send(json.dumps({"t": "x", "e": [["slash", 93000 + n] + good[2:]]}))
+    got_lee, got_i = await collect(lee), await collect(i)
+    frames = [m for m in of(got_lee, "moves") if m.get("x")]
+    check("three attacks inside one tick are one frame (or two, across a tick), in the order made",
+          1 <= len(frames) <= 2 and [pair[1][0][1] for pair in ridden(got_lee)] == [93000, 93001, 93002], frames)
+    check("  where a game from before had a frame for each", len(of(got_i, "x")) == 3, got_i)
+
+    await lee.send(json.dumps({"t": "x", "e": [good]}))
+    got_lee, got_h = await collect(lee), await collect(h)
+    check("a rider's own attack, with nobody else riding, is not sent back to it at all",
+          not ridden(got_lee) and not of(got_lee, "x"), got_lee)
+    check("  and the games from before hear it as before", [m["id"] for m in of(got_h, "x")] == [uid("presl")], got_h)
+    may, _ = await enter(port, MAY, "town", x=540.0, y=510.0, xt=1)
+    await collect(lee), await collect(may), await collect(h), await collect(i)
+    await lee.send(json.dumps({"t": "x", "e": [good]}))
+    got_lee, got_may = await collect(lee), await collect(may)
+    check("with another rider there, it hears it in the tick",
+          ridden(got_may) == [[uid("presl"), [good]]], got_may)
+    check("  and the maker's own comes back in the same frame, for it to pass over (as its own steps do)",
+          ridden(got_lee) == [[uid("presl"), [good]]], got_lee)
+
+    odd, _ = await enter(port, account("presn"), "town", x=545.0, y=505.0, xt=True)
+    await collect(odd), await collect(h)
+    await h.send(json.dumps({"t": "x", "e": [good]}))
+    got_odd = await collect(odd)
+    check("\"xt\": true is not the number it asks for - that game hears attacks as before",
+          len(of(got_odd, "x")) == 1 and not ridden(got_odd), got_odd)
+    await odd.close()
+
+    server._tick_attacks["nowhere"] = [[uid("presrh"), [good]]]
+    server.tick()
+    check("attacks waiting for an area nobody is in any more go with it", "nowhere" not in server._tick_attacks,
+          server._tick_attacks)
+    await lee.close()
+    await may.close()
+    for ws in (h, i, j):
+        await ws.close()
+
+    # ---- ON THE BEAT ----
+    beat = presence.PresenceServer(tick_seconds=0.05)
+    stamps = []
+
+    def slow_tick():
+        stamps.append(time.monotonic())
+        time.sleep(0.02)
+    beat.tick = slow_tick
+    task = asyncio.create_task(beat.tick_loop())
+    await asyncio.sleep(1.0)
+    task.cancel()
+    check("a tick that takes time does not slow the beat: ~20 a second at a twentieth (it was 14)",
+          len(stamps) >= 18, len(stamps))
+    stamps.clear()
+
+    def stall_once():
+        stamps.append(time.monotonic())
+        time.sleep(0.25 if len(stamps) == 1 else 0.0)
+    beat.tick = stall_once
+    task = asyncio.create_task(beat.tick_loop())
+    await asyncio.sleep(0.6)
+    task.cancel()
+    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    check("  a stall is not made up for in a burst: the beat starts again from it",
+          len(gaps) >= 4 and min(gaps[:4]) >= 0.035 and beat.late_ticks >= 1,
+          ([round(g, 3) for g in gaps[:6]], beat.late_ticks))
+
+    # ---- A BROWSER'S SOCKET IS COMPRESSED, at level 1 ----
+    async def echo(ws):
+        async for raw in ws:
+            await ws.send(raw)
+    async with serve(echo, "127.0.0.1", 0, extensions=[presence.DEFLATE]) as squeezing:
+        squeeze_port = list(squeezing.sockets)[0].getsockname()[1]
+        async with connect("ws://127.0.0.1:%d" % squeeze_port, compression="deflate") as browser:
+            frame = json.dumps({"t": "moves", "p": [[n, 100.0 + n, 200.0, "walkdown", [], "", 1000 + n, 0, 100]
+                                                     for n in range(64)]})
+            await browser.send(frame)
+            echoed = await asyncio.wait_for(browser.recv(), 2)
+            agreed = [type(e).__name__ for e in browser.protocol.extensions]
+    check("a browser's socket is still compressed - the two agree on it, and a frame comes back whole",
+          agreed == ["PerMessageDeflate"] and echoed == frame, agreed)
+    check("  squeezed at level %d, not zlib's default (269 us a 7 KB frame at 6, 78 at 1)" % presence.DEFLATE_LEVEL,
+          presence.DEFLATE_LEVEL == 1 and presence.DEFLATE.compress_settings.get("level") == 1
+          and "extensions=[DEFLATE]" in open(presence.__file__, encoding="utf-8").read())
 
 
 async def main():

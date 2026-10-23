@@ -25,6 +25,7 @@ import re
 import sys
 import threading
 import unicodedata
+import weakref
 import math
 import smtplib
 import mailer
@@ -921,8 +922,9 @@ def _refuse_outdated_client():
 # A COMMIT DOES NOT LET GO OF IT. Some routes commit part-way and go on reading
 # and writing (write_save, the guild and friends routes). _WriteLockedConnection
 # takes the lock again straight after each commit, so the rest of the request is
-# still covered. Teardown closes the connection, which rolls back that last,
-# empty transaction and releases the lock.
+# still covered. Teardown rolls back that last, empty transaction and releases
+# the lock (THE CONNECTION IS KEPT, below - until 0.76.0 it closed it, which
+# did the same).
 #
 # test_concurrency.py fires real requests at once from threads against a real
 # server and checks nothing was lost: XP, gold between the bank and two
@@ -948,10 +950,61 @@ def _request_takes_write_lock():
     return view is not None and not getattr(view, "_elusion_no_write_lock", False)
 
 
+# THE CONNECTION IS KEPT (0.76.0). Every request opened a connection and
+# closed it in teardown. Opening is cheap; the FIRST STATEMENT on a new
+# connection is not - SQLite reads and parses the whole schema (149 tables,
+# indexes and triggers), and that was 0.8 ms of every request, against 4 us
+# for the query it was opened for. At 128 players (swarm.py) the API answered
+# 115 requests a second and spent about a third of its time opening and
+# closing connections (py-spy). Now each worker thread keeps its connection
+# between requests and hands it to the next one; the PRAGMAs are set once.
+#
+# HANDED ON CLEAN, OR NOT AT ALL. What made a fresh connection safe is kept:
+#   - EVERY CURSOR THE REQUEST MADE IS CLOSED. A statement left half read
+#     holds its read snapshot open, and the next request on that thread would
+#     read the database as it was then - a balance that had moved on, a ban
+#     that had not happened. Closing every cursor ends it.
+#   - ANY TRANSACTION STILL OPEN IS ROLLED BACK: the write lock a write request
+#     holds to its end (THE WRITE LOCK), and whatever a request that failed
+#     left uncommitted - what close() did.
+#   - IT IS THIS PROCESS'S, AND THIS FILE'S: a forked worker never uses its
+#     parent's, a different ELUSION_DB opens its own, and a database file put
+#     back from a backup (a new file at the same path) is opened afresh.
+#   - A REQUEST INSIDE A REQUEST (the suite's contexts, nested) takes a
+#     connection of its own: the kept one is out while it is in use.
+#   - Anything going wrong in all that closes it, and the next request opens
+#     a fresh one.
+# ELUSION_DB_FRESH=1 goes back to a connection a request. test_dbkeep.py.
+DB_FRESH = os.environ.get("ELUSION_DB_FRESH", "").strip() == "1"
+_KEPT = threading.local()
+
+
 class _WriteLockedConnection(sqlite3.Connection):
     """A connection that keeps the write lock for the rest of the request after
-    a commit. See THE WRITE LOCK above."""
+    a commit (see THE WRITE LOCK above), and knows every cursor made on it (THE
+    CONNECTION IS KEPT)."""
     keep_write_lock = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cursors = weakref.WeakSet()
+        self.opened_as = None
+
+    def cursor(self, *args, **kwargs):
+        made = super().cursor(*args, **kwargs)
+        self.cursors.add(made)
+        return made
+
+    # sqlite3's own execute() makes its cursor without calling cursor(), so
+    # these three make theirs here, where it is counted.
+    def execute(self, *args):
+        return self.cursor().execute(*args)
+
+    def executemany(self, *args):
+        return self.cursor().executemany(*args)
+
+    def executescript(self, *args):
+        return self.cursor().executescript(*args)
 
     def commit(self):
         super().commit()
@@ -959,9 +1012,70 @@ class _WriteLockedConnection(sqlite3.Connection):
             self.execute("BEGIN IMMEDIATE")
 
 
+def _db_identity():
+    """(process, path, device, inode) of the database a connection opened now
+    would open; None when the file cannot be read."""
+    try:
+        st = os.stat(DB_PATH)
+    except OSError:
+        return None
+    return (os.getpid(), DB_PATH, st.st_dev, st.st_ino)
+
+
+def _take_kept_connection():
+    """This thread's kept connection, taken out while a request uses it - or
+    None, when there is none or it is not one to use (THE CONNECTION IS KEPT)."""
+    db = getattr(_KEPT, "db", None)
+    _KEPT.db = None
+    if db is None:
+        return None
+    try:
+        identity = _db_identity()
+        if identity is None or db.opened_as != identity:
+            raise sqlite3.ProgrammingError("not this database")
+        db.total_changes  # raises on a closed connection
+        if db.in_transaction:
+            db.rollback()
+        return db
+    except Exception:  # noqa: BLE001
+        try:
+            db.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+
+def _keep_connection(db):
+    """Teardown: hand `db` on clean for this thread's next request, or close it."""
+    try:
+        for cursor in list(db.cursors):
+            cursor.close()
+        db.keep_write_lock = False
+        if db.in_transaction:
+            db.rollback()
+        db.row_factory = sqlite3.Row
+        if DB_FRESH or db.opened_as is None or db.opened_as != _db_identity() \
+                or getattr(_KEPT, "db", None) is not None:
+            raise sqlite3.ProgrammingError("not kept")
+        _KEPT.db = db
+    except Exception:  # noqa: BLE001
+        try:
+            db.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def get_db():
-    """One connection per request, closed automatically in teardown."""
+    """This request's connection: this thread's kept one, or a new one (THE
+    CONNECTION IS KEPT), handed on or closed in teardown."""
     if "db" not in g:
+        kept = None if DB_FRESH else _take_kept_connection()
+        if kept is not None:
+            g.db = kept
+            if _request_takes_write_lock():
+                g.db.keep_write_lock = True
+                g.db.execute("BEGIN IMMEDIATE")
+            return g.db
         g.db = sqlite3.connect(DB_PATH, factory=_WriteLockedConnection)
         g.db.row_factory = sqlite3.Row
         # enforce foreign keys - off by default in sqlite
@@ -1004,6 +1118,9 @@ def get_db():
         # makes the contender WAIT for the lock (up to 5s) and then proceed, so
         # overlap becomes a brief queue instead of an error. Per-connection.
         g.db.execute("PRAGMA busy_timeout = 5000")
+        # Which database this is, for THE CONNECTION IS KEPT - after the first
+        # statements, which made the file if it was not there.
+        g.db.opened_as = _db_identity()
 
         # Last, after the PRAGMAs: journal_mode cannot change inside a
         # transaction. See THE WRITE LOCK above.
@@ -1017,7 +1134,7 @@ def get_db():
 def close_db(exception):
     db = g.pop("db", None)
     if db is not None:
-        db.close()
+        _keep_connection(db)
 
 
 # THE PACKAGES' TABLES (19 Oct). A table whose rows one area adds keeps its
