@@ -2699,6 +2699,22 @@ the levels over a month, a new month, off, a restart), `test_serverhealth.py`
 (the budget, read back; H-4 the migration). Twelve sabotages, each caught by
 its own check.
 
+## Bosses that scale: the books take a raised boss (game 0.80.0)
+
+From game 0.80.0 a boss's health is set by who fights it - their levels
+above its band, how many they are, the Crowned's own 2.5 (the game's
+CLAUDE.md, "Bosses that scale") - on the game running it, and raised during
+a fight, never lowered in one. combatbook.py takes it: a boss (the catalogue's
+`slots_are_gear`, as killwatch.py's `is_boss()`) born with a raised `"mh"` is
+counted at it (`_scaled_boss()`), and a world event `{"k": "mh", "id", "mh",
+"hp"}` moves its maximum (`rescaled()`) - raised, the books' count raised by
+what was added; back down at home, held to the new maximum, so the books'
+count is never above the game's. Below the catalogue's, past
+`BOSS_RAISED_MOST` (400) times it, or on a monster that is not a boss: flagged
+`max_hp_differs` and left. Raising a boss is no gain to a cheat - more to kill
+for the same reward. **Deploy before the 0.80.0 game.** test_combatbook.py
+CB-12.
+
 ## Layout
 
 ```

@@ -855,6 +855,38 @@ book.world(lead, {"hits": [[555, 10, 0]]}, now + 1.0)
 check("a hit on a monster no message ever introduced is still counted for nothing", book.stray == 1, book.stray)
 
 
+# =============================================================================
+section("CB-12 BOSSES THAT SCALE (game 0.80.0): A BOSS'S HEALTH RAISED BY ITS FIGHT")
+# =============================================================================
+BOSS = "lightboss"
+CAT = gamedata.ENEMIES[BOSS]["max_hp"]
+book, lead = fresh_field(0.0)
+book.world(lead, {"ev": [{"k": "spawn", "r": record(900, BOSS, origin="", mh=CAT * 3, hp=CAT * 3)}]}, 1.0)
+born = kinds(book.take()[1])
+check("a boss born with its health raised by its fight is counted at it, not flagged",
+      900 in book.monsters and book.monsters[900].max_hp == CAT * 3 and "max_hp_differs" not in born
+      and combatbook.BOSS_RAISED_MOST >= 125, (born, book.monsters.get(900) and book.monsters[900].max_hp))
+book.world(lead, {"ev": [{"k": "spawn", "r": record(901, BOSS, origin="")}]}, 1.0)
+book.take()
+m = book.monsters[901]
+m.hp = CAT - 500
+book.world(lead, {"ev": [{"k": "mh", "id": 901, "mh": CAT * 2, "hp": CAT * 2 - 500}]}, 2.0)
+check("raised mid-fight ('mh'): the new maximum, and the damage the books counted kept",
+      (m.max_hp, m.hp) == (CAT * 2, CAT * 2 - 500) and not kinds(book.take()[1]), (m.max_hp, m.hp))
+book.world(lead, {"ev": [{"k": "mh", "id": 901, "mh": CAT, "hp": CAT}]}, 3.0)
+check("  back home and itself again: the books' count held to the new maximum, never above the game's",
+      (m.max_hp, m.hp) == (CAT, CAT) and not kinds(book.take()[1]), (m.max_hp, m.hp))
+book.world(lead, {"ev": [{"k": "mh", "id": 901, "mh": CAT - 1, "hp": CAT - 1},
+                         {"k": "mh", "id": 901, "mh": CAT * (combatbook.BOSS_RAISED_MOST + 1), "hp": 1}]}, 4.0)
+check("  below the catalogue's, or past BOSS_RAISED_MOST times it: flagged, and left as it was",
+      kinds(book.take()[1]) == ["max_hp_differs", "max_hp_differs"] and m.max_hp == CAT, m.max_hp)
+book.world(lead, {"ev": [{"k": "spawn", "r": record(902, "darksprite")}]}, 5.0)
+book.take()
+sprite_max = book.monsters[902].max_hp
+book.world(lead, {"ev": [{"k": "mh", "id": 902, "mh": sprite_max * 2, "hp": sprite_max * 2}]}, 6.0)
+check("  and only a boss: a normal monster raised so is flagged and left",
+      kinds(book.take()[1]) == ["max_hp_differs"] and book.monsters[902].max_hp == sprite_max)
+
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))
 print("=" * 60)

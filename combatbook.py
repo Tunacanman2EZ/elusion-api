@@ -77,6 +77,15 @@ AGREED_LEFT = 0.02
 # more). The leader's word for it is taken, and counted: more health than the
 # catalogue's only ever makes a death harder to agree, never easier.
 STIRRED_MAX_TIMES = 3
+# BOSSES THAT SCALE (game 0.80.0): a boss's health is raised by who fights it
+# (bossenemy.gd, scale_for() - the fighters' levels above its band, how many
+# they are, the Crowned's own 2.5), on the game that runs it, and told in a
+# world event ("mh") and in its records' "mh". Taken up to BOSS_RAISED_MOST
+# times the catalogue's - the game's most is 2.5 x 5 x 10 = 125, and a stir
+# on top of that - and never below it. Raising it is no gain to a cheat: it is
+# more to kill for the same reward. A boss is what the catalogue gives gear
+# (slots_are_gear), as killwatch.py's is_boss() reads it.
+BOSS_RAISED_MOST = 400
 # A large slime splits at half its health (poisonslime.gd split_hp_ratio).
 SPLIT_AT = 0.55
 # How long the smalls a split released may take to appear (the large flashes
@@ -380,6 +389,8 @@ class AreaBook:
                 self._died(event.get("id"), now)
             elif kind == "gone":
                 self._gone(event.get("id"))
+            elif kind == "mh":
+                self.rescaled(leader.user_id, event, now)
         for monster_id, waiting in later.items():
             for damage in waiting:
                 self.hit(leader, monster_id, damage, now)
@@ -468,7 +479,7 @@ class AreaBook:
             if int(enemy.get("split_count", 0) or 0) > 0 and enemy.get("splits_into"):
                 m.splitter = (int(enemy["split_count"]), str(enemy["splits_into"]))
             if sent_max is not None and sent_max != max_hp:
-                if self._stirred_max(enemy, max_hp, sent_max):
+                if self._stirred_max(enemy, max_hp, sent_max) or self._scaled_boss(enemy, max_hp, sent_max):
                     # BORN WHILE ITS LAND STIRS, with the health the stir gave
                     # it: counted at that, so its death agrees where the
                     # game's does.
@@ -483,6 +494,35 @@ class AreaBook:
                 m.hp = min(max_hp, hp) if hp is not None else max_hp
             self._judge_spawn(m, enemy, props, now, kind)
         self.monsters[monster_id] = m
+
+    @staticmethod
+    def _scaled_boss(enemy, catalogue_max, sent_max):
+        """Whether `sent_max` is a boss's health raised by its fight: more
+        than the catalogue's, no more than BOSS_RAISED_MOST times it."""
+        return bool(enemy.get("slots_are_gear")) and catalogue_max < sent_max <= catalogue_max * BOSS_RAISED_MOST
+
+    def rescaled(self, user_id, event, now):
+        """A boss's health changed by who is fighting it ("mh"): its maximum
+        to the new one and the damage the books have counted kept - raised by
+        what was added, or, back down at home, held to the new maximum (the
+        books' count is never above the game's). Anything else - not a boss,
+        below the catalogue, past BOSS_RAISED_MOST - is flagged and left."""
+        monster_id = event.get("id")
+        m = self.monsters.get(monster_id) if isinstance(monster_id, int) else None
+        new_max = _whole(event.get("mh"), 1, 10 ** 9)
+        if m is None or new_max is None or new_max == m.max_hp:
+            return
+        enemy = self.enemies.get(m.enemy_id) or {}
+        catalogue_max = max(1, int(enemy.get("max_hp", 1) or 1))
+        if not (bool(enemy.get("slots_are_gear")) and catalogue_max <= new_max <= catalogue_max * BOSS_RAISED_MOST):
+            self._flag(user_id, "max_hp_differs", "%s %d, the catalogue %d" % (m.enemy_id, new_max, catalogue_max),
+                       now)
+            return
+        if new_max > m.max_hp:
+            m.hp += new_max - m.max_hp
+        else:
+            m.hp = min(m.hp, new_max)
+        m.max_hp = new_max
 
     def _stirred_max(self, enemy, catalogue_max, sent_max):
         """Whether `sent_max` is a stirred monster's health: more than the
