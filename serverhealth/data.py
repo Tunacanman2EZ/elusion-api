@@ -10,7 +10,7 @@ import shutil
 import sqlite3
 
 _COLUMNS = ("at", "seconds", "connections", "players", "areas", "crowd", "ticks", "late_ticks", "frames_out",
-            "bytes_out", "net_out", "cpu", "load1", "mem_free_mb")
+            "bytes_out", "net_out", "cpu", "load1", "mem_free_mb", "guard", "month_used", "month_from", "affordable")
 _SELECT = "SELECT %s FROM presence_health" % ", ".join(_COLUMNS)
 
 

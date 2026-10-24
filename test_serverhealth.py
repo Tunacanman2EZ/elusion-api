@@ -15,7 +15,9 @@ Built like economywatch/, so each layer is held on its own:
        table, the disk
   H-3  routes.py, the edge: the owner's and a co-owner's, nobody else's; what
        presence.py wrote, read back; the receipts put to the real books,
-       killwatch.py's own count, kept five minutes unless asked fresh
+       killwatch.py's own count, kept five minutes unless asked fresh; the
+       data guard (0.79.0), as presence.py wrote it
+  H-4  a database from 0.78.0: presence_health gains the guard's columns
 
 presence.py's half - the row a minute - is test_presence.py P-13.
 
@@ -100,11 +102,12 @@ GIB = services.GIB
 
 
 def row(at, seconds=60.0, players=0, crowd=(), ticks=600, late=0, frames=0, sent=0, net=None, cpu=1.0,
-        load1=0.2, mem=400, connections=None):
+        load1=0.2, mem=400, connections=None, guard=0, month_used=0, month_from=None, affordable=None):
     return {"at": at, "seconds": seconds, "connections": players if connections is None else connections,
             "players": players, "areas": len(crowd), "crowd": json.dumps([list(pair) for pair in crowd]),
             "ticks": ticks, "late_ticks": late, "frames_out": frames, "bytes_out": sent, "net_out": net,
-            "cpu": cpu, "load1": load1, "mem_free_mb": mem}
+            "cpu": cpu, "load1": load1, "mem_free_mb": mem, "guard": guard, "month_used": month_used,
+            "month_from": month_from, "affordable": affordable}
 
 
 # =============================================================================
@@ -228,6 +231,18 @@ check("the routes: the slowest by p99, a route asked fewer than %d times left ou
       and routes["requests"] == 1200 and routes["uptime_seconds"] == 3600, routes)
 check("  and the server errors counted from each route's rate", routes["errors"] == 2, routes)
 check("  nothing to say is an empty list", services.routes(None)["slowest"] == [])
+guarded = services.budget({"guard": 2, "month_used": 3 * GIB, "month_from": NOW - DAY, "affordable": 380000.5}, 1000)
+check("THE DATA GUARD (0.79.0), as presence.py wrote it: on, its level and the crowd a room holds, the month",
+      guarded == {"on": True, "level": "crowd", "crowd_cap": 16, "allowance_gib": 1000, "used_gib": 3.0,
+                  "since": NOW - DAY, "affordable_per_second": 380000.5}, guarded)
+check("  alone is a room of one; before a minute counted, nothing used to say; switched off, off",
+      services.budget({"guard": 3, "month_used": 0, "month_from": NOW}, 1000)["crowd_cap"] == 1
+      and services.budget(None, 1000)["used_gib"] is None and services.budget(None, 1000)["level"] == "full"
+      and services.budget({"guard": 9}, 1000)["level"] == "full"
+      and services.budget({"guard": 2}, 0) == {"on": False, "level": "full", "crowd_cap": None, "allowance_gib": 0,
+                                                "used_gib": None, "since": None, "affordable_per_second": None})
+check("  the allowance read as presence.py reads it: 1,000 unless set, off or 0 none, junk the default",
+      [services.transfer_gib(x) for x in (None, "2000", "off", "0", "lots", "-5")] == [1000.0, 2000.0, 0.0, 0.0, 1000.0, 0.0])
 machine = services.machine({"load1": 0.4, "mem_free_mb": 512}, 1, 10 * GIB, 25 * GIB, 3 * 1024 * 1024)
 check("the machine: cores, the last minute's load and memory, the disk's free and total, the database's size",
       machine == {"cores": 1, "load1": 0.4, "mem_free_mb": 512, "disk_free_gb": 10.0, "disk_total_gb": 25.0,
@@ -264,7 +279,8 @@ body = res.get_json() or {}
 check("the owner, before presence.py has written a minute: every part there, nothing reporting",
       res.status_code == 200 and body["presence"]["reporting"] is False and body["presence"]["last"] is None
       and body["month"] is None and body["crowd"]["verdict"] == "unknown" and body["tick"]["verdict"] == "unknown"
-      and set(body) == {"now", "presence", "month", "crowd", "tick", "machine", "routes", "receipts"}, body)
+      and set(body) == {"now", "presence", "month", "budget", "crowd", "tick", "machine", "routes", "receipts"}
+      and body["budget"]["on"] is True and body["budget"]["used_gib"] is None, body)
 check("  the routes are this worker's /api/metrics: the health ask itself among them soon enough",
       isinstance(body["routes"]["slowest"], list) and body["routes"]["requests"] >= 1, body.get("routes"))
 check("  the machine's disk, read here", body["machine"]["disk_free_gb"] is not None
@@ -275,9 +291,10 @@ written = []
 for minute in range(60 * 24 * 7, 0, -30):        # a week, a row every half hour
     written.append(row(now - minute * 60, players=3, crowd=[("field", 3)], sent=6000, net=60000))
 written.append(row(now - 3 * DAY, players=40, crowd=[("field", 34), ("town", 6)], sent=600000, net=900000, late=3))
-written.append(row(now - 20, players=4, crowd=[("town", 4)], sent=12000, net=120000, load1=0.3, mem=444))
+written.append(row(now - 20, players=4, crowd=[("town", 4)], sent=12000, net=120000, load1=0.3, mem=444,
+                   guard=1, month_used=5 * GIB, month_from=now - 3 * DAY, affordable=390000.0))
 cols = ("at", "seconds", "connections", "players", "areas", "crowd", "ticks", "late_ticks", "frames_out",
-        "bytes_out", "net_out", "cpu", "load1", "mem_free_mb")
+        "bytes_out", "net_out", "cpu", "load1", "mem_free_mb", "guard", "month_used", "month_from", "affordable")
 sql("INSERT INTO presence_health (%s) VALUES (%s)" % (", ".join(cols), ", ".join("?" * len(cols))),
     many=[[r[c] for c in cols] for r in written])
 body = client.get("/api/server/health", headers=auth(owner)).get_json()
@@ -295,6 +312,15 @@ check("  the month from the machine's own network; the tick; the machine's load 
       body["month"]["source"] == "machine" and body["month"]["gib"] > 0 and body["tick"]["verdict"] == "steady"
       and body["machine"]["load1"] == 0.3 and body["machine"]["mem_free_mb"] == 444, (body["month"], body["tick"]))
 sql("UPDATE presence_health SET at = at - 600")
+budget_now = body["budget"]
+check("  the data guard from the newest minute: half, 5 GiB counted since three days ago, what it can still send",
+      budget_now["level"] == "half" and budget_now["used_gib"] == 5.0 and budget_now["since"] == now - 3 * DAY
+      and budget_now["affordable_per_second"] == 390000.0 and budget_now["allowance_gib"] == 1000.0, budget_now)
+os.environ["ELUSION_TRANSFER_GIB"] = "off"
+off = client.get("/api/server/health", headers=auth(owner)).get_json()
+os.environ.pop("ELUSION_TRANSFER_GIB", None)
+check("  ELUSION_TRANSFER_GIB off: the guard said off, and the month still measured against 1,000 GiB",
+      off["budget"]["on"] is False and off["month"]["allowance_gib"] == 1000, off["budget"])
 check("  and presence gone quiet - its newest minute ten minutes old - is said",
       client.get("/api/server/health", headers=auth(owner)).get_json()["presence"]["reporting"] is False)
 
@@ -348,6 +374,47 @@ finally:
 check("a week that cannot be read is no books, never a 500 - and the rest of the tab is still there",
       res.status_code == 200 and broken == [1] and res.get_json()["receipts"]["paid"] == 0
       and res.get_json()["presence"]["week"]["samples"] > 0, res.status_code)
+
+# =============================================================================
+section("H-4  a database from 0.78.0, before the data guard")
+OLD_DB = os.path.join(testdir.PATH, "elusion_serverhealth_078.db")
+if os.path.exists(OLD_DB):
+    os.remove(OLD_DB)
+old = sqlite3.connect(OLD_DB)
+old.executescript("""
+    CREATE TABLE presence_health (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, seconds REAL NOT NULL,
+        connections INTEGER NOT NULL DEFAULT 0, players INTEGER NOT NULL DEFAULT 0, areas INTEGER NOT NULL DEFAULT 0,
+        crowd TEXT NOT NULL DEFAULT '[]', ticks INTEGER NOT NULL DEFAULT 0, late_ticks INTEGER NOT NULL DEFAULT 0,
+        frames_out INTEGER NOT NULL DEFAULT 0, bytes_out INTEGER NOT NULL DEFAULT 0, net_out INTEGER, cpu REAL,
+        load1 REAL, mem_free_mb INTEGER);
+    CREATE INDEX idx_presence_health_at ON presence_health(at);
+""")
+old.execute("INSERT INTO presence_health (at, seconds, players, bytes_out) VALUES (?, 60, 3, 9000)", (int(time.time()) - 30,))
+old.commit()
+old.close()
+os.environ["ELUSION_DB"] = OLD_DB
+_spec = importlib.util.spec_from_file_location("elusion_app_078", os.path.join(HERE, "app.py"))
+booted = importlib.util.module_from_spec(_spec)
+try:
+    _spec.loader.exec_module(booted)
+    boot_error = None
+except Exception as exc:  # noqa: BLE001
+    boot_error = repr(exc)
+os.environ["ELUSION_DB"] = DB_PATH
+old = sqlite3.connect(OLD_DB)
+columns = [r[1] for r in old.execute("PRAGMA table_info(presence_health)")]
+kept = old.execute("SELECT players, bytes_out, guard, month_used, month_from, affordable FROM presence_health").fetchall()
+old.close()
+check("it boots, and presence_health gains the guard's four columns",
+      boot_error is None and columns[-4:] == ["guard", "month_used", "month_from", "affordable"], (boot_error, columns))
+check("  the minute already written is kept, and reads as full with nothing counted",
+      kept == [(3, 9000, 0, 0, None, None)], kept)
+old = sqlite3.connect(OLD_DB)
+old.row_factory = sqlite3.Row
+last = data.latest_health(old)
+old.close()
+check("  and the Health tab reads it: the guard full, the month not counted yet",
+      services.budget(last, 1000)["level"] == "full" and services.budget(last, 1000)["used_gib"] is None, last)
 
 routes_lock = open(os.path.join(HERE, "routes.lock"), encoding="utf-8").read()
 check("the route in routes.lock: GET, an owner's and a co-owner's, no password asked again",

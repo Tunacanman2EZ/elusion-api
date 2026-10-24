@@ -1372,6 +1372,179 @@ async def health_written():
         presence.NET_DEV_PATH, presence.MEMINFO_PATH = real_net, real_mem
 
 
+async def data_guard():
+    """THE DATA GUARD (game 0.79.0): the month held under the droplet's plan by
+    this process itself - half the steps, then a crowd cap, then everyone
+    alone - and the month taken up again after a restart."""
+    section("P-14 THE DATA GUARD: THE MONTH HELD UNDER THE PLAN, WHOEVER LOGS IN")
+    check("the allowance from ELUSION_TRANSFER_GIB: 1,000 GiB unless set, 'off' or 0 no guard, junk the default",
+          presence._transfer_gib(None) == 1000.0 and presence._transfer_gib("2000") == 2000.0
+          and presence._transfer_gib("off") == 0.0 and presence._transfer_gib("0") == 0.0
+          and presence._transfer_gib("lots") == 1000.0 and presence.TRANSFER_GIB == 1000.0)
+    check("  read the same as the API reads it for the Health tab (serverhealth's transfer_gib())",
+          all(presence._transfer_gib(x) == app_module.serverhealth_package.services.transfer_gib(x)
+              for x in (None, "", "1000", "2000", "off", "OFF", "0", "no", "false", "lots", "-5", "0.5")))
+    sent = []
+    real_broadcast = presence.broadcast
+    presence.broadcast = lambda connections, text: sent.append((list(connections), json.loads(text)))
+
+    class Game:
+        def __init__(self, uid):
+            self.uid = uid
+
+        async def send(self, text):
+            sent.append(([self], json.loads(text)))
+
+    def player(uid):
+        p = presence.Player(Game(uid), uid, "hash-%d" % uid, {"name": "p%d" % uid}, time.time() + 60, slot=0)
+        p.version = presence.SHARED_VERSION
+        return p
+
+    def heard(game, kind):
+        return [m for conns, m in sent if game in conns and m.get("t") == kind]
+
+    try:
+        # ---- THE HALF RATE ------------------------------------------------------
+        hub = presence.PresenceServer(sweep_seconds=5, tick_seconds=5)
+        walker = player(9301)
+        walker.anim, walker.fx, walker.pet = "walkdown", [], ""
+        kept_full = [hub.keeps_step(walker) for _ in range(4)]
+        hub.guard = 1
+        kept_half = [hub.keeps_step(walker) for _ in range(6)]
+        walker.anim = "idledown"
+        stop_kept = hub.keeps_step(walker)
+        walker.anim = "walkdown"
+        start_kept = hub.keeps_step(walker)
+        check("full: every step passed on; half: every other one", all(kept_full)
+              and kept_half.count(True) == 3 and kept_half.count(False) == 3, (kept_full, kept_half))
+        check("  but never the step that changes what the body does - a stop, setting off again",
+              stop_kept and start_kept)
+
+        # ---- THE CROWD CAP AND THE ROOMS ------------------------------------------
+        hub = presence.PresenceServer(sweep_seconds=5, tick_seconds=5)
+        games = [player(9310 + i) for i in range(3)]
+        for p in games:
+            hub.players[p.user_id] = p
+            await hub._enter_room(p, "field")
+            await asyncio.sleep(0.001)
+        check("no cap below the crowd level: one room, the area itself",
+              hub.crowd_cap is None and set(hub.rooms) == {"field"} and len(hub.rooms["field"]) == 3
+              and all(p.place == "field" for p in games))
+        hub.guard = 2
+        check("crowd: GUARD_CROWD (%d) to a room, the next in a second room of the area" % presence.GUARD_CROWD,
+              hub.crowd_cap == presence.GUARD_CROWD == 16 and hub._seat("field") == "field"
+              and hub._seat("field", {"field": 16}) == "field#2" and hub._seat("field", {"field": 16, "field#2": 16})
+              == "field#3")
+        sent.clear()
+        hub.guard = 3
+        moved = await hub.reseat()
+        first, second, third = sorted(games, key=lambda p: p.joined_at if p is games[0] else p.user_id)
+        check("alone: everyone seated in a room of their own - the earliest stays, the rest move",
+              moved == 2 and games[0].area == "field" and sorted(p.area for p in games) == ["field", "field#2", "field#3"]
+              and all(len(hub.rooms[r]) == 1 for r in hub.rooms), sorted(hub.rooms))
+        movers = [p for p in games if p.area != "field"]
+        check("  a game moved is told who left its screen - its scene is not changing - and still knows its area",
+              all(any(set(m["ids"]) >= {games[0].user_id} for m in heard(p.ws, "leave")) for p in movers)
+              and all(p.place == "field" and p.where == "field" for p in movers), [heard(p.ws, "leave") for p in movers])
+        check("  and runs its own monsters now: told it leads, in its area's name, with nobody to send to",
+              all(any(m["id"] == p.user_id and m["a"] == "field" and m["n"] == 0 for m in heard(p.ws, "lead"))
+                  for p in movers), [heard(p.ws, "lead") for p in movers])
+        sent.clear()
+        hub._tick_attacks = {}
+        for p in games:
+            p.steps = [p.move()]
+            p.dirty = True
+        hub.tick()
+        check("a room of one is sent no moves: a game passes over its own, so alone sends next to nothing",
+              not [m for _c, m in sent if m.get("t") == "moves"] and not any(p.steps or p.dirty for p in games))
+        sent.clear()
+        hub.guard = 0
+        moved = await hub.reseat()
+        check("looser again: the second rooms come back together, and each sees the others join",
+              moved == 2 and set(hub.rooms) == {"field"} and len(hub.rooms["field"]) == 3
+              and all(heard(p.ws, "join") for p in games), sorted(hub.rooms))
+        if presence.BOOKS and gamedata_areas():
+            area = sorted(gamedata_areas())[0]
+            book = hub._book(area + "#2")
+            check("a second room's books are its own, on the area's map, written down under the area's name",
+                  book is not None and book is not hub._book(area) and book.area == area)
+        else:
+            check("a second room's books (books off here: nothing to keep)", hub._book("field#2") is None)
+
+        # ---- THE MONTH, AND THE LEVELS ---------------------------------------------
+        hub = presence.PresenceServer(sweep_seconds=5, tick_seconds=5)
+        start, end = presence.month_bounds(time.time())
+        mid = start + (end - start) // 2
+        gib = presence.GIB
+        affordable_whole = 1000 * gib * presence.GUARD_SHARE / (end - start)
+        clock = [10000.0]
+
+        def minute(rate, at=None):
+            clock[0] += 60.0
+            return hub.guard_minute(60.0, int(rate * 60), mid if at is None else at, clock[0])
+
+        row = minute(1000.0, at=start + 60)
+        check("counting from the month's start: what is left of 95% of 1,000 GiB, over what is left of the month",
+              row["month_used"] == 60000 and row["month_from"] == start and row["guard"] == 0
+              and abs(row["affordable"] - (1000 * gib * 0.95 - 60000) / (end - start - 60)) < 1.0, row)
+        hub = presence.PresenceServer(sweep_seconds=5, tick_seconds=5)
+        row = minute(1000.0)
+        check("counting from the middle of the month: the half before taken as used at the allowance's pace",
+              row["month_from"] == mid - 60 and abs(row["affordable"] - affordable_whole) / affordable_whole < 0.01, row)
+        levels = []
+        for _ in range(16):
+            levels.append(minute(affordable_whole * 3)["guard"])
+        check("sending three times what is affordable: one level tighter, then one more each five minutes - "
+              "half, crowd, alone",
+              levels[0] == 1 and levels[4] == 1 and levels[5] == 2 and levels[10] == 3 and levels[-1] == 3, levels)
+        levels = []
+        for _ in range(100):
+            levels.append(minute(affordable_whole * 0.1)["guard"])
+        check("  sending a tenth of it: one level looser each half hour, back to full",
+              levels[0] == 3 and 2 in levels and 1 in levels and levels[-1] == 0
+              and levels.index(2) >= 20 and levels.index(1) - levels.index(2) >= 29
+              and levels.index(0) - levels.index(1) >= 29, levels[::10])
+        hub.month_used = int(1000 * gib)
+        row = minute(1.0)
+        check("the month's allowance spent: alone at once, whatever the clocks", row["guard"] == 3
+              and row["affordable"] < 0, row)
+        row = hub.guard_minute(60.0, 600, end + 60, clock[0] + 60)
+        check("a new month: counted from nothing again", row["month_used"] == 600 and row["month_from"] == end, row)
+        hub.transfer_gib = 0.0
+        hub.guard = 2
+        row = minute(1e9)
+        check("ELUSION_TRANSFER_GIB off: no guard - full, nothing affordable worked out",
+              row["guard"] == 0 and row["affordable"] is None, row)
+
+        # ---- A RESTART TAKES THE MONTH UP AGAIN -------------------------------------
+        now = time.time()
+        start, _end = presence.month_bounds(now)
+        con = sqlite3.connect(DB_PATH)
+        con.execute("INSERT INTO presence_health (at, seconds, guard, month_used, month_from) VALUES (?, 60, 2, ?, ?)",
+                    (int(now) + 5, 123456789, start + 3600))
+        con.commit()
+        con.close()
+        again = presence.PresenceServer(sweep_seconds=5, tick_seconds=5)
+        await again.take_up_month(now)
+        check("after a restart: the month's bytes, when counting began and the level, from the newest row",
+              (again.month_used, again.month_from, again.guard) == (123456789, start + 3600, 2),
+              (again.month_used, again.month_from, again.guard))
+        row = again.guard_minute(60.0, 1000, now, time.monotonic())
+        check("  and the next minute adds to it rather than starting the month again",
+              row["month_used"] == 123457789 and row["month_from"] == start + 3600, row)
+        # Gone again: the live server below takes the month up when it starts.
+        con = sqlite3.connect(DB_PATH)
+        con.execute("DELETE FROM presence_health WHERE month_used = 123456789")
+        con.commit()
+        con.close()
+    finally:
+        presence.broadcast = real_broadcast
+
+
+def gamedata_areas():
+    return getattr(getattr(presence, "gamedata", None), "AREAS", None) or {}
+
+
 def counted_live(server):
     """P-13, against the whole run: every frame the server sent, counted."""
     section("P-13 EVERY FRAME THE RUN SENT WAS COUNTED")
@@ -1504,6 +1677,7 @@ async def main():
     await kills_written_soon()
     await positions_written()
     await health_written()
+    await data_guard()
     presence.HELLO_SECONDS = 0.5
     combatbook.HOLD_SECONDS = 0.2
     combatbook.PENDING_SECONDS = 0.3

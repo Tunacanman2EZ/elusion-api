@@ -22,6 +22,24 @@ REPORTING_SECONDS = 180
 TRANSFER_ALLOWANCE_GIB = 1000
 OVERAGE_PER_GIB = 0.01
 
+# THE DATA GUARD (game 0.79.0; presence.py's header): its levels, and the crowd
+# a room holds at each. presence.py decides; this only reads what it wrote.
+GUARD_LEVELS = ("full", "half", "crowd", "alone")
+GUARD_CROWD = {"crowd": 16, "alone": 1}
+
+
+def transfer_gib(raw):
+    """ELUSION_TRANSFER_GIB as presence.py reads it (_transfer_gib(); the suite
+    holds the two to one answer): 1,000 unless set, "off" or 0 no guard."""
+    text = str(raw if raw is not None else "").strip().lower()
+    if text in ("off", "0", "no", "false"):
+        return 0.0
+    try:
+        value = float(text)
+    except ValueError:
+        return float(TRANSFER_ALLOWANCE_GIB)
+    return value if value > 0 else 0.0
+
 # WHEN ONE AREA NEEDS SENDING ONLY WHAT IS NEAR. swarm.py, game 0.76.0, one
 # area: 32 players sent 1.3 MB/s between them, 64 sent 4.0, 128 sent 13.4 -
 # the square of the crowd. From CROWD_WATCH in one area it is worth watching;
@@ -237,6 +255,22 @@ def routes(summary):
     rows.sort(key=lambda row: (-row["p99_ms"], row["route"]))
     return {"uptime_seconds": int(summary.get("uptime_seconds", 0)),
             "requests": int(summary.get("total_requests", 0)), "errors": errors, "slowest": rows[:API_SLOWEST]}
+
+
+def budget(last, allowance_gib):
+    """THE DATA GUARD as the Health tab shows it, from presence.py's newest
+    minute: whether it is on, its level and the crowd a room holds, the
+    month's GiB counted and since when, and what it can still send a second."""
+    if allowance_gib <= 0:
+        return {"on": False, "level": "full", "crowd_cap": None, "allowance_gib": 0, "used_gib": None,
+                "since": None, "affordable_per_second": None}
+    row = last or {}
+    index = int(row.get("guard") or 0)
+    level = GUARD_LEVELS[index] if 0 <= index < len(GUARD_LEVELS) else "full"
+    used = row.get("month_used")
+    return {"on": True, "level": level, "crowd_cap": GUARD_CROWD.get(level), "allowance_gib": allowance_gib,
+            "used_gib": round(int(used) / GIB, 2) if used is not None and row.get("month_from") is not None else None,
+            "since": row.get("month_from"), "affordable_per_second": row.get("affordable")}
 
 
 def machine(last, cores, free, total, db_bytes):

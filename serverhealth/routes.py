@@ -20,6 +20,8 @@ killwatch.py:
     min_client_build  () -> the oldest build allowed in
     receipt_build     the build a game must be to wait for a receipt
                       (kill/'s RECEIPT_BUILD)
+    transfer_gib      () -> the month's outbound allowance in GiB, 0 for no
+                      data guard (ELUSION_TRANSFER_GIB)
 
 READ ONLY, and so it asks for no password again: the owner and a co-owner
 alike. The switch it reports on is the Testing tab's and the Health tab's,
@@ -42,10 +44,11 @@ RECEIPTS_CACHE_SECONDS = 300
 
 
 def register(app, *, require_auth, require_owner, get_db, db_path, metrics_summary, receipts_backing,
-             receipts_days, receipts_on, min_client_build, receipt_build):
+             receipts_days, receipts_on, min_client_build, receipt_build, transfer_gib=None):
     """Add the route, and hand back cache_clear() - for the suites, which
     write books rows and then read the receipts."""
 
+    transfer_gib = transfer_gib or (lambda: services.TRANSFER_ALLOWANCE_GIB)
     cache = {"at": None, "backing": None}
     lock = threading.Lock()
 
@@ -86,7 +89,7 @@ def register(app, *, require_auth, require_owner, get_db, db_path, metrics_summa
             description: "1 reads the kill receipts now rather than from the last five minutes"
         responses:
           200:
-            description: "now, presence (reporting, last, day, week), month, crowd, tick, machine, routes and receipts"
+            description: "now, presence (reporting, last, day, week), month, budget (the data guard), crowd, tick, machine, routes and receipts"
           401:
             description: Missing, invalid or expired token
           404:
@@ -98,13 +101,15 @@ def register(app, *, require_auth, require_owner, get_db, db_path, metrics_summa
         last = services.last_minute(last_row, now)
         day = services.window(data.health_rows(db, now - services.DAY))
         week = services.window(data.health_rows(db, now - services.WEEK))
-        projected = services.month(week)
+        allowance = float(transfer_gib())
+        projected = services.month(week, allowance if allowance > 0 else services.TRANSFER_ALLOWANCE_GIB)
         backing, backing_at = backing_now(db, now, request.args.get("fresh") == "1")
         free, total, db_bytes = data.disk(str(db_path()))
         return {
             "now": now,
             "presence": {"reporting": bool(last and last["reporting"]), "last": last, "day": day, "week": week},
             "month": projected,
+            "budget": services.budget(last_row, allowance),
             "crowd": services.crowd_verdict(week, projected),
             "tick": services.tick_verdict(last, day),
             "machine": services.machine(last_row, os.cpu_count(), free, total, db_bytes),

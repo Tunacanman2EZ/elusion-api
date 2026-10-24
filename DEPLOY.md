@@ -1086,6 +1086,23 @@ minute while it is open:
 still the old process: `update_server.sh` restarts it; by hand,
 `sudo systemctl restart elusion-presence`.
 
+### The data guard (0.79.0)
+
+DigitalOcean's spend alerts only warn - set one anyway (**Billing** > **Spend
+alerts** > **Create alert**: a $7 monthly budget, an 80% threshold; it is
+free) - so presence.py holds the month under the plan itself. It counts the
+machine's data out each minute and works out what it can still send a second
+to the month's end (95% of the 1,000 GiB, less what is used). Over that, it
+steps down, one level every five minutes at most: **half** (other players'
+steps at half rate), **crowd** (and at most 16 players see each other in one
+area; the rest share a second room of it, with monsters of its own),
+**alone** (nobody sees anybody, and presence sends next to nothing - where it
+stays once the month is spent, until the 1st). Well under, it steps back up,
+one level every half hour. The Health tab's **Data** page says which level it
+is at and why. A bigger droplet includes more data: set it in the settings
+file, `ELUSION_TRANSFER_GIB=2000`, and restart presence; `off` turns the guard
+off.
+
 ## Watching latency (live)
 
 `loadtest.py` proves speed *before* you ship; **`GET /api/metrics`** watches it

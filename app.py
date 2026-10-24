@@ -1434,9 +1434,12 @@ def init_db():
         -- so once a minute it writes down how the minute went: who was
         -- connected, the biggest crowds, its ticks and the late ones, what it
         -- sent (frames, and bytes before compression), the machine's own
-        -- network out, its share of the core, the load and the memory free.
-        -- GET /api/server/health (serverhealth/) reads them for the GM
-        -- panel's Health tab. Kept two weeks; presence.py prunes them.
+        -- network out, its share of the core, the load and the memory free;
+        -- and since 0.79.0 THE DATA GUARD's level, the month's bytes counted
+        -- so far and since when, and what it can still afford a second
+        -- (presence.py's header). GET /api/server/health (serverhealth/)
+        -- reads them for the GM panel's Health tab. Kept two weeks;
+        -- presence.py prunes them - each row carries the month so far.
         CREATE TABLE IF NOT EXISTS presence_health (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             at           INTEGER NOT NULL,
@@ -1452,7 +1455,11 @@ def init_db():
             net_out      INTEGER,
             cpu          REAL,
             load1        REAL,
-            mem_free_mb  INTEGER
+            mem_free_mb  INTEGER,
+            guard        INTEGER NOT NULL DEFAULT 0,
+            month_used   INTEGER NOT NULL DEFAULT 0,
+            month_from   INTEGER,
+            affordable   REAL
         );
         CREATE INDEX IF NOT EXISTS idx_presence_health_at ON presence_health(at);
 
@@ -2152,6 +2159,15 @@ def init_db():
     _migrate_add_column(db, "users", "chat_muted_until", "INTEGER NOT NULL DEFAULT 0")
     _migrate_add_column(db, "users", "chat_mute_reason", "TEXT NOT NULL DEFAULT ''")
     _migrate_add_column(db, "users", "chat_muted_by", "TEXT NOT NULL DEFAULT ''")
+
+    # THE DATA GUARD (game 0.79.0) on presence_health, which 0.78.0 made
+    # without it: its level, the month counted so far and from when, and what
+    # it can still afford a second. A row from before reads as full, nothing
+    # counted - presence.py starts the month's count with its next minute.
+    _migrate_add_column(db, "presence_health", "guard", "INTEGER NOT NULL DEFAULT 0")
+    _migrate_add_column(db, "presence_health", "month_used", "INTEGER NOT NULL DEFAULT 0")
+    _migrate_add_column(db, "presence_health", "month_from", "INTEGER")
+    _migrate_add_column(db, "presence_health", "affordable", "REAL")
 
     # THE PACKAGES' OWN COLUMNS, for a database made before them - each after
     # its create() above, inside this one transaction (db.execute only), and
@@ -8876,6 +8892,9 @@ _SERVER_HEALTH = serverhealth_package.register(
     receipts_on=kill_receipts_on,
     min_client_build=min_client_build,
     receipt_build=kill_package.RECEIPT_BUILD,
+    # THE DATA GUARD's allowance (0.79.0), as presence.py reads it - asked on
+    # each call, so a suite can set it.
+    transfer_gib=lambda: serverhealth_package.services.transfer_gib(os.environ.get("ELUSION_TRANSFER_GIB", "1000")),
 )
 # For the suites, which write books rows and then read the receipts.
 _server_health_cache_clear = _SERVER_HEALTH.cache_clear

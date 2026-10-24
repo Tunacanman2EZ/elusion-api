@@ -185,6 +185,37 @@ the rows for the GM panel's Health tab; kept HEALTH_KEPT_SECONDS. Its own
 loop, books or no books; a database from before the table loses nothing else
 (write_health()). test_presence.py P-13.
 
+THE DATA GUARD (game 0.79.0). The owner, of what a crowd could cost: "i do not
+have that kind of budget i need to keep under specifications because i will go
+bankrupt fast". The droplet's plan includes TRANSFER_GIB of outbound data a
+month and bills past it, and what this process sends grows with the square of
+a crowd - so this process holds the month under the plan itself, whoever logs
+in. Every health minute it adds the minute's data out (the machine's own where
+it can be read, else its own frames) to the month's, and works out what it can
+still afford a second until the month ends (GUARD_SHARE of the allowance - the
+rest is the API, the browser build and a margin - less what is used; the days
+of the month before it started counting are taken as used at the allowance's
+pace). Sending more than that over the last GUARD_RATE_MINUTES, it tightens one
+level, at most every GUARD_STEP_SECONDS; sending well under (GUARD_RELAX_SHARE)
+for GUARD_RELAX_SECONDS, it loosens one:
+
+    0 full   as ever
+    1 half   other players' steps at half rate - every other one, and every
+             one that changes what the body does (a stop, an attack, a pet)
+    2 crowd  that, and at most GUARD_CROWD players see each other in one area:
+             the rest are seated in a second room of it, "field#2", with
+             monsters of its own (a channel)
+    3 alone  every player in a room of their own: nobody sees anybody, and
+             this process sends next to nothing. Where it stays, once the
+             month's allowance is spent, until the month ends.
+
+A player moved between rooms is told who left its screen and who is on it now,
+and who runs its monsters (_move_room()); its game takes the monsters over
+where they stand when it is alone, as it does when a leader leaves. The level
+is written with every health row and taken up again after a restart.
+ELUSION_TRANSFER_GIB sets the allowance (a bigger droplet comes with more);
+"off" switches the guard off. test_presence.py P-14.
+
 PARTY VOICE (game 0.43.0). The owner: "I really really want the option for voice
 chat in game for parties". The voice itself never comes here: each game's
 browser calls the others in its party directly - WebRTC, through a TURN relay,
@@ -206,6 +237,8 @@ import envfile
 envfile.load()
 
 import asyncio
+import calendar
+import collections
 import hashlib
 import json
 import math
@@ -345,6 +378,29 @@ POSITIONS_KEPT_SECONDS = 14 * 86400
 HEALTH_SECONDS = 60.0
 HEALTH_KEPT_SECONDS = 14 * 86400
 HEALTH_AREAS = 8
+# THE DATA GUARD (game 0.79.0; the header has why). The month's outbound
+# allowance in GiB - DigitalOcean's 1 GB droplet includes 1,000, pooled across
+# the account - from ELUSION_TRANSFER_GIB ("off" or 0: no guard).
+def _transfer_gib(raw):
+    text = str(raw if raw is not None else "").strip().lower()
+    if text in ("off", "0", "no", "false"):
+        return 0.0
+    try:
+        value = float(text)
+    except ValueError:
+        return 1000.0
+    return value if value > 0 else 0.0
+
+
+TRANSFER_GIB = _transfer_gib(os.environ.get("ELUSION_TRANSFER_GIB", "1000"))
+GIB = 1024 ** 3
+GUARD_SHARE = 0.95
+GUARD_RATE_MINUTES = 5
+GUARD_STEP_SECONDS = 300.0
+GUARD_RELAX_SECONDS = 1800.0
+GUARD_RELAX_SHARE = 0.4
+GUARD_CROWD = 16
+GUARD_LEVELS = ("full", "half", "crowd", "alone")
 # Where the machine's network counters are (Linux); anywhere else, none.
 NET_DEV_PATH = "/proc/net/dev"
 MEMINFO_PATH = "/proc/meminfo"
@@ -559,7 +615,8 @@ def write_positions(rows, prune_before=None):
 
 _HEALTH_TABLE_MISSING = []
 HEALTH_COLUMNS = ("at", "seconds", "connections", "players", "areas", "crowd", "ticks", "late_ticks",
-                  "frames_out", "bytes_out", "net_out", "cpu", "load1", "mem_free_mb")
+                  "frames_out", "bytes_out", "net_out", "cpu", "load1", "mem_free_mb", "guard", "month_used",
+                  "month_from", "affordable")
 
 
 def write_health(row, prune_before=None):
@@ -586,6 +643,36 @@ def write_health(row, prune_before=None):
                   "before it - start app.py once to add the table" % exc, flush=True)
     finally:
         conn.close()
+
+
+def month_bounds(now):
+    """(the first second of this UTC month, the first of the next)."""
+    t = time.gmtime(int(now))
+    start = int(calendar.timegm((t.tm_year, t.tm_mon, 1, 0, 0, 0)))
+    year, month = (t.tm_year + 1, 1) if t.tm_mon == 12 else (t.tm_year, t.tm_mon + 1)
+    return start, int(calendar.timegm((year, month, 1, 0, 0, 0)))
+
+
+def read_month(now):
+    """THE DATA GUARD, after a restart: (the month's bytes out counted, when
+    counting began, the guard's level) from the newest health row this month
+    - each row carries the month so far, so pruning old rows loses none of
+    it - or (0, None, 0) with none."""
+    start, _end = month_bounds(now)
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % DB_PATH, uri=True, timeout=5)
+    except sqlite3.OperationalError:
+        return 0, None, 0
+    try:
+        row = conn.execute("SELECT month_used, month_from, guard FROM presence_health WHERE at >= ?"
+                           " ORDER BY at DESC, id DESC LIMIT 1", (start,)).fetchone()
+    except sqlite3.OperationalError:
+        return 0, None, 0
+    finally:
+        conn.close()
+    if row is None or row[1] is None:
+        return 0, None, 0
+    return int(row[0] or 0), int(row[1]), int(row[2] or 0)
 
 
 def net_out_bytes(path=None):
@@ -767,9 +854,17 @@ class Player:
         self.fighter = combatbook.Fighter(user_id, slot) if BOOKS else None
         if self.fighter is not None:
             self.fighter.set_bounds(gamedata.combat_bounds(identity), time.time())
+        # The room it is in (game 0.79.0): its area, or a second room of it
+        # ("field#2") while THE DATA GUARD caps a crowd - and the area as its
+        # game knows it.
         self.area = ""
+        self.place = ""
         self.x = 0.0
         self.y = 0.0
+        # THE DATA GUARD's half rate: what its body was doing at its last step
+        # passed on, and its steps counted, for every other one.
+        self.look = None
+        self.parity = 0
         # Where its last position sample put it, (area, x, y) rounded; None
         # before the first (POSITION_SAMPLE_SECONDS).
         self.sampled = None
@@ -805,6 +900,11 @@ class Player:
     @property
     def shares(self):
         return self.version >= SHARED_VERSION
+
+    @property
+    def where(self):
+        """The area as its game knows it, whatever room it is in."""
+        return self.place or self.area.split("#", 1)[0]
 
     def allow(self):
         """Token bucket: False once the game sends faster than it ever would -
@@ -1051,6 +1151,17 @@ class PresenceServer:
         self.health_seconds = HEALTH_SECONDS
         self._health_mark = None
         self._health_pruned_at = 0.0
+        # THE DATA GUARD (game 0.79.0): its level (GUARD_LEVELS), when it last
+        # moved, the month's bytes out counted and from when, the last few
+        # minutes' rates, and what it can afford a second.
+        self.transfer_gib = TRANSFER_GIB
+        self.guard = 0
+        self._guard_moved = float("-inf")
+        self.month_start = None
+        self.month_used = 0
+        self.month_from = None
+        self._recent = collections.deque(maxlen=GUARD_RATE_MINUTES)
+        self.affordable = None
 
     # ---- sending -------------------------------------------------------------
     # EVERYTHING SENT IS COUNTED (game 0.78.0): a frame for each socket a text
@@ -1091,6 +1202,7 @@ class PresenceServer:
                 del self.rooms[area]
         self._room_broadcast(area, {"t": "leave", "ids": [player.user_id]})
         player.area = ""
+        player.place = ""
         if area not in self.rooms and area in self.books:
             # NOBODY LEFT: the next game in loads the scene afresh.
             self.books[area].emptied(time.time())
@@ -1109,11 +1221,16 @@ class PresenceServer:
         if player.shares:
             self._announce_lead(area)
 
-    async def _enter_room(self, player, area):
+    async def _enter_room(self, player, area, room_name=None):
+        # THE DATA GUARD: the room it is seated in - the area itself, unless
+        # the area is at the guard's crowd cap (_seat()).
+        place = area
+        area = room_name or self._seat(place)
         room = self.rooms.setdefault(area, set())
         others = [p.entry() for p in room if p is not player]
         room.add(player)
         player.area = area
+        player.place = place
         player.joined_at = time.monotonic()
         if others:
             await self._send(player, {"t": "join", "p": others})
@@ -1127,6 +1244,67 @@ class PresenceServer:
         self._announce_lead(area)
         self._ask_for_world(area, player)
 
+    @property
+    def crowd_cap(self):
+        """How many players one room holds at THE DATA GUARD's level: no cap,
+        GUARD_CROWD, or one."""
+        return {2: GUARD_CROWD, 3: 1}.get(self.guard)
+
+    @staticmethod
+    def room_name(place, n):
+        return place if n == 1 else "%s#%d" % (place, n)
+
+    def _seat(self, place, taken=None):
+        """The first room of this area with a seat: the area itself, then
+        "area#2", "area#3"... - counting `taken` (a plan's) when given, the
+        rooms as they are otherwise."""
+        cap = self.crowd_cap
+        if cap is None:
+            return place
+        n = 1
+        while True:
+            name = self.room_name(place, n)
+            held = taken.get(name, 0) if taken is not None else len(self.rooms.get(name, ()))
+            if held < cap:
+                return name
+            n += 1
+
+    async def _move_room(self, player, name):
+        """The same area, another room: the players it saw go from its screen
+        - its game is not changing scene, so nothing else would take them off
+        - and the new room's come on, with who runs its monsters now."""
+        place = player.place
+        gone = [q.user_id for q in self.rooms.get(player.area, ()) if q is not player]
+        self._leave_room(player)
+        if gone:
+            await self._send(player, {"t": "leave", "ids": gone})
+        player.steps = []
+        player.dirty = False
+        await self._enter_room(player, place, room_name=name)
+
+    async def reseat(self):
+        """Everyone where THE DATA GUARD's crowd cap would seat them now: per
+        area, the earliest arrivals first, in the area itself, the rest in its
+        second room and on. Tighter, the latest arrivals move out; looser,
+        the second rooms come back together. Returns how many moved."""
+        by_place = {}
+        for p in list(self.players.values()):
+            if p.area:
+                by_place.setdefault(p.place, []).append(p)
+        moved = 0
+        for place in sorted(by_place):
+            taken = {}
+            plan = []
+            for p in sorted(by_place[place], key=lambda q: (q.joined_at, q.user_id)):
+                name = self._seat(place, taken)
+                taken[name] = taken.get(name, 0) + 1
+                plan.append((p, name))
+            for p, name in plan:
+                if p.area and p.area != name:
+                    await self._move_room(p, name)
+                    moved += 1
+        return moved
+
     # ---- shared monsters ------------------------------------------------------
 
     def _announce_lead(self, area):
@@ -1138,7 +1316,8 @@ class PresenceServer:
         if not sharers:
             return
         leader = self.leaders.get(area)
-        message = {"t": "lead", "a": area, "id": leader.user_id if leader is not None else -1,
+        # THE AREA AS THE GAMES KNOW IT: a second room of it is still its area.
+        message = {"t": "lead", "a": area.split("#", 1)[0], "id": leader.user_id if leader is not None else -1,
                    "n": len(sharers) - 1 if leader is not None else 0}
         self._out([p.ws for p in sharers], json.dumps(message, separators=(",", ":")))
 
@@ -1153,13 +1332,16 @@ class PresenceServer:
     # ---- the books (combatbook.py) --------------------------------------------
 
     def _book(self, area):
-        """The books on this area's monsters, or None: books off, or an area
-        the catalogue has no map of."""
-        if not BOOKS or not area or area not in gamedata.AREAS:
+        """The books on this room's monsters, or None: books off, or an area
+        the catalogue has no map of. One a room - a second room of an area
+        (THE DATA GUARD) has monsters of its own - each with the area's map
+        and the area's name, which is what a death is written down under."""
+        place = area.split("#", 1)[0] if area else ""
+        if not BOOKS or not place or place not in gamedata.AREAS:
             return None
         book = self.books.get(area)
         if book is None:
-            book = self.books[area] = combatbook.AreaBook(area, gamedata.AREAS[area])
+            book = self.books[area] = combatbook.AreaBook(place, gamedata.AREAS[place])
             book.stirred_lands = self.stirred
         return book
 
@@ -1319,7 +1501,7 @@ class PresenceServer:
         state = clean_state(msg, player.identity.get("pets") or [])
         if state is None:
             return False
-        moved_area = state["area"] != player.area
+        moved_area = state["area"] != player.where
         player.x, player.y = state["x"], state["y"]
         if player.fighter is not None:
             self._book_safely(player.fighter.moved, state["area"], state["x"], state["y"],
@@ -1332,12 +1514,22 @@ class PresenceServer:
             self._leave_room(player)
             await self._enter_room(player, state["area"])
             player.dirty = False
-        else:
+        elif self.keeps_step(player):
             player.steps.append(player.move())
             if len(player.steps) > MAX_STEPS_PER_TICK:
                 del player.steps[0]
             player.dirty = True
         return True
+
+    def keeps_step(self, player):
+        """THE DATA GUARD's half rate: every other step, and every one that
+        changes what the body does - so a stop, an aura or a pet is never the
+        step left out. Below the half rate, every step."""
+        look = (player.anim, tuple(player.fx), player.pet)
+        changed = look != player.look
+        player.look = look
+        player.parity += 1
+        return self.guard < 1 or changed or player.parity % 2 == 0
 
     # ---- the connection ------------------------------------------------------
 
@@ -1593,6 +1785,14 @@ class PresenceServer:
         attacks_by_area, self._tick_attacks = self._tick_attacks, {}
         for area, room in list(self.rooms.items()):
             attacks = attacks_by_area.get(area)
+            if len(room) < 2:
+                # NOBODY ELSE TO TELL (0.79.0): a game passes over its own steps,
+                # so a room of one is sent none - THE DATA GUARD's "alone" is
+                # every room of one.
+                for p in room:
+                    p.dirty = False
+                    p.steps = []
+                continue
             movers = [p for p in room if p.dirty]
             if not movers and not attacks:
                 continue
@@ -1679,11 +1879,12 @@ class PresenceServer:
         for p in list(self.players.values()):
             if not p.area:
                 continue
-            here = (p.area, round(p.x), round(p.y))
+            place = p.where
+            here = (place, round(p.x), round(p.y))
             if here == p.sampled:
                 continue
             p.sampled = here
-            rows.append((int(now), int(p.user_id), int(p.slot), p.area, round(p.x, 1), round(p.y, 1)))
+            rows.append((int(now), int(p.user_id), int(p.slot), place, round(p.x, 1), round(p.y, 1)))
         return rows
 
     async def flush_positions(self, now):
@@ -1769,12 +1970,79 @@ class PresenceServer:
                 "ticks": mark["ticks"] - last["ticks"], "late_ticks": mark["late"] - last["late"],
                 "frames_out": mark["frames"] - last["frames"], "bytes_out": mark["bytes"] - last["bytes"],
                 "net_out": net, "cpu": round(100.0 * (mark["cpu"] - last["cpu"]) / seconds, 1),
-                "load1": load_one(), "mem_free_mb": mem_free_mb()}
+                "load1": load_one(), "mem_free_mb": mem_free_mb()} | self.guard_minute(
+                    seconds, net if net is not None else mark["bytes"] - last["bytes"], now, mark["mono"])
+
+    # ---- the data guard (game 0.79.0) ------------------------------------------
+
+    def guard_minute(self, seconds, sent, now, now_mono):
+        """A health minute's part in THE DATA GUARD: `sent` bytes in `seconds`
+        added to the month, what is affordable from here to the month's end,
+        and the level for the next minute. Returns the row's guard columns."""
+        start, end = month_bounds(now)
+        if self.month_start != start:
+            # A NEW MONTH, or the first minute counted in this one.
+            fresh = self.month_start is not None or self.month_from is None or self.month_from < start
+            self.month_start = start
+            if fresh:
+                self.month_used = 0
+                self.month_from = int(max(start, now - seconds))
+        self.month_used += int(sent)
+        self._recent.append((float(seconds), int(sent)))
+        if self.transfer_gib <= 0:
+            self.affordable = None
+        else:
+            allowance = self.transfer_gib * GIB * GUARD_SHARE
+            # The month before counting began, taken as used at the pace.
+            counted_share = (end - self.month_from) / float(end - start)
+            remaining = allowance * counted_share - self.month_used
+            self.affordable = remaining / max(1.0, end - now)
+        self.decide_guard(now_mono)
+        return {"guard": self.guard, "month_used": self.month_used, "month_from": self.month_from,
+                "affordable": round(self.affordable, 1) if self.affordable is not None else None}
+
+    def recent_rate(self):
+        seconds = sum(s for s, _b in self._recent)
+        return sum(b for _s, b in self._recent) / seconds if seconds > 0 else 0.0
+
+    def decide_guard(self, now_mono):
+        """One level tighter when the last minutes sent more than is
+        affordable (at most every GUARD_STEP_SECONDS), one looser when well
+        under it (GUARD_RELAX_SHARE, at most every GUARD_RELAX_SECONDS), and
+        alone at once when nothing is affordable. No guard: full."""
+        level = self.guard
+        if self.affordable is None:
+            target = 0
+        elif self.affordable <= 0:
+            target = len(GUARD_LEVELS) - 1
+        else:
+            since = now_mono - self._guard_moved
+            rate = self.recent_rate()
+            target = level
+            if rate > self.affordable and level < len(GUARD_LEVELS) - 1 and since >= GUARD_STEP_SECONDS:
+                target = level + 1
+            elif rate < self.affordable * GUARD_RELAX_SHARE and level > 0 and since >= GUARD_RELAX_SECONDS:
+                target = level - 1
+        if target != level:
+            self.guard = target
+            self._guard_moved = now_mono
+            print("[PRESENCE] the data guard: %s -> %s (sending %.0f B/s, %s affordable)" % (
+                GUARD_LEVELS[level], GUARD_LEVELS[target], self.recent_rate(),
+                "nothing" if self.affordable is None or self.affordable <= 0 else "%.0f B/s" % self.affordable),
+                flush=True)
+        return self.guard
 
     async def flush_health(self, now=None):
-        """Write how the last minute went, and prune the old rows hourly."""
+        """Write how the last minute went, and prune the old rows hourly - and
+        when THE DATA GUARD moved the crowd cap, seat everyone again."""
         now = time.time() if now is None else now
+        cap = self.crowd_cap
         row = self.take_health(now)
+        if self.crowd_cap != cap:
+            try:
+                await self.reseat()
+            except Exception as exc:  # noqa: BLE001
+                print("[PRESENCE] could not seat everyone again: %r" % exc, flush=True)
         prune = None
         if now - self._health_pruned_at >= 3600.0:
             self._health_pruned_at = now
@@ -1786,7 +2054,24 @@ class PresenceServer:
         except Exception as exc:  # noqa: BLE001
             print("[PRESENCE] could not write the server's health: %r" % exc, flush=True)
 
+    async def take_up_month(self, now=None):
+        """THE DATA GUARD after a restart: the month so far, and the level it
+        was at, from the newest health row."""
+        now = time.time() if now is None else now
+        try:
+            used, began, level = await asyncio.to_thread(read_month, now)
+        except Exception as exc:  # noqa: BLE001
+            print("[PRESENCE] could not read the month back: %r" % exc, flush=True)
+            return
+        if began is None:
+            return
+        self.month_start = month_bounds(now)[0]
+        self.month_used, self.month_from = used, began
+        self.guard = max(0, min(len(GUARD_LEVELS) - 1, level)) if self.transfer_gib > 0 else 0
+        self._guard_moved = time.monotonic()
+
     async def health_loop(self):
+        await self.take_up_month()
         # The first call only marks where the counters stand: the first row is
         # a whole minute's.
         self.take_health()

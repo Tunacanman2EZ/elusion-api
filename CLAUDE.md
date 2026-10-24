@@ -2641,6 +2641,64 @@ this measures it.
 `test_presence.py` P-13; the bare-app run in `test_packages.py`. Fourteen
 sabotages, each caught by the check meant for it.
 
+## The data guard: the month held under the plan (game 0.79.0)
+
+The owner, 24 Oct, of what a crowd could cost: "i do not have that kind of
+budget i need to keep under specifications because i will go bankrupt fast".
+DigitalOcean's spend alerts only warn ("A spend alert budget is not a
+spending cap"), so **presence.py holds the month under the plan itself**
+(its header, "THE DATA GUARD"):
+
+- **The month, counted.** Each health minute adds its data out - the
+  machine's own (`net_out`), else presence's frames - to `month_used`, from
+  `month_from` (when counting began this UTC month); both ride on every
+  `presence_health` row, so pruning old rows loses none of it and a restart
+  takes it up again from the newest (`read_month()`, `take_up_month()`).
+  What it can still afford a second (`affordable`): `GUARD_SHARE` (95%) of
+  `TRANSFER_GIB` - the rest is the API, the browser build and a margin -
+  less what is used, over what is left of the month; the part of the month
+  before counting began is taken as used at the allowance's pace.
+- **The levels** (`GUARD_LEVELS`): **full**; **half** - every other step of
+  each player passed on, and every step that changes what the body does
+  (`keeps_step()`: a stop is never the step left out); **crowd** - that, and
+  at most `GUARD_CROWD` (16) players to a room, the rest seated in a second
+  room of the area, `"field#2"`, with monsters and books of their own (a
+  channel); **alone** - a room each, and a room of one is sent no moves at
+  all (a game passes over its own), so presence sends next to nothing.
+- **When it moves**: one level tighter when the last `GUARD_RATE_MINUTES` (5)
+  sent more than is affordable, at most every `GUARD_STEP_SECONDS` (five
+  minutes); one looser when under `GUARD_RELAX_SHARE` (40%) of it, at most
+  every `GUARD_RELAX_SECONDS` (half an hour); alone at once when nothing is
+  affordable, until the month ends. From full to alone is fifteen minutes -
+  at 13 MB/s about 12 GB, a rounding error on the month.
+- **ROOMS (0.79.0).** `Player.area` is the ROOM - the area, or `"area#2"` -
+  and `Player.place` the area its game named (`Player.where` for either).
+  rooms, leaders, levers, books and the tick's attacks are keyed by room;
+  what the games are told (`"lead"`'s `"a"`), what the books write
+  (`AreaBook`'s name) and the position samples use the area. A crowd cap
+  that moves seats everyone again (`reseat()`): the earliest arrivals stay,
+  and a player moved is sent a `"leave"` for everyone it saw - its scene is
+  not changing, so nothing else would take them off its screen - then the
+  new room's joins and lead; alone, its game takes the monsters over where
+  they stand, as when a leader leaves. A '#' is never in a game's area name
+  (`AREA_PATTERN`).
+- **`ELUSION_TRANSFER_GIB`** sets the allowance (default 1000; a bigger
+  droplet comes with more), "off" or 0 switches the guard off.
+  presence.py's `_transfer_gib()` and serverhealth's `transfer_gib()` read it
+  alike (P-14 holds them to one answer). The Health tab's Data page shows the
+  level, the month counted and what it can still send (`budget`).
+
+- **A database from 0.78.0** has presence_health without the guard's four
+  columns: init_db() adds them (`_migrate_add_column`), and a row from
+  before reads as full with nothing counted. presence.py from 0.79.0 against
+  a table not yet migrated says it could not write the minute and tries
+  again the next.
+
+`test_presence.py` P-14 (the half rate, the rooms and moving between them,
+the levels over a month, a new month, off, a restart), `test_serverhealth.py`
+(the budget, read back; H-4 the migration). Twelve sabotages, each caught by
+its own check.
+
 ## Layout
 
 ```
@@ -2704,7 +2762,8 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
                 who leads each area's monsters (P-7), the books' wiring (P-8),
                 attacks, levers and every step's clock (P-9), attacks in
                 the tick and the beat (P-9b), a crowd walking in (P-9c),
-                where everyone stands (P-12), how each minute went (P-13)
+                where everyone stands (P-12), how each minute went (P-13),
+                the data guard and its rooms (P-14)
   combatbook    the books themselves: the bounds, every hit, spawn and death
                 judged, and that nothing a leader sends breaks them
   tradegates    the owner's trade switch, and the hold on fresh mythic and
@@ -2720,7 +2779,7 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
                 death, used once, and the switch that turns it on
   serverhealth  the GM panel's Health tab: presence.py's minutes read back,
                 the month's data, the crowd, and the receipts' verdict
-                against the real books (0.78.0)
+                against the real books (0.78.0), the data guard (0.79.0)
   deploy        what the first live deploy found: the .env read first, and
                 backups that are one file each
   guilds / friends / mail / map / teleport / recovery / settings /
