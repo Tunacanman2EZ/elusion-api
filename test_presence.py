@@ -1244,6 +1244,146 @@ async def positions_written():
           kills_there == 1 and bool(presence._POSITIONS_TABLE_MISSING), (kills_there, presence._POSITIONS_TABLE_MISSING))
 
 
+async def health_written():
+    """HOW ITS MINUTES WENT (game 0.78.0): a presence_health row a minute -
+    the minute's own counts, the biggest crowds, the machine's network out
+    and memory - beside the books, pruned after two weeks."""
+    section("P-13 HOW ITS MINUTES WENT: A HEALTH ROW A MINUTE, ITS OWN MINUTE'S COUNTS")
+    real_net, real_mem = presence.NET_DEV_PATH, presence.MEMINFO_PATH
+    net_file = os.path.join(testdir.PATH, "net_dev")
+    mem_file = os.path.join(testdir.PATH, "meminfo")
+
+    def net_dev(eth0, eth1=0, lo=999999):
+        with open(net_file, "w", encoding="ascii") as handle:
+            handle.write("Inter-|   Receive                                                |  Transmit\n"
+                         " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets\n"
+                         "    lo: 5000 10 0 0 0 0 0 0 %d 10 0 0 0 0 0 0\n"
+                         "  eth0: 7000 20 0 0 0 0 0 0 %d 30 0 0 0 0 0 0\n"
+                         "  eth1: 100 1 0 0 0 0 0 0 %d 1 0 0 0 0 0 0\n" % (lo, eth0, eth1))
+
+    with open(mem_file, "w", encoding="ascii") as handle:
+        handle.write("MemTotal:        1009000 kB\nMemFree:          100000 kB\nMemAvailable:     409600 kB\n")
+    net_dev(10000, 500)
+    presence.NET_DEV_PATH, presence.MEMINFO_PATH = net_file, mem_file
+    try:
+        check("the machine's network out: every interface's transmit bytes but loopback's",
+              presence.net_out_bytes() == 10500, presence.net_out_bytes())
+        check("  and memory available, in MB", presence.mem_free_mb() == 400, presence.mem_free_mb())
+        check("  neither where there is nothing to read (Windows, a Mac)",
+              presence.net_out_bytes(os.path.join(testdir.PATH, "nothing")) is None
+              and presence.mem_free_mb(os.path.join(testdir.PATH, "nothing")) is None)
+
+        hub = presence.PresenceServer(sweep_seconds=5, tick_seconds=5)
+        sent_to = []
+        real_broadcast = presence.broadcast
+        presence.broadcast = lambda connections, text: sent_to.append((list(connections), text))
+
+        class Quiet:
+            async def send(self, text):
+                sent_to.append((["one"], text))
+        try:
+            hub._out(["a", "b", "c"], "x" * 100)
+            hub._out([], "never sent")
+            await hub._send(presence.Player(Quiet(), 9100, "hash-9100", {}, time.time() + 60), {"t": "x"})
+        finally:
+            presence.broadcast = real_broadcast
+        check("everything sent is counted: a frame for each socket a text goes to, and its bytes for each",
+              (hub.frames_out, hub.bytes_out) == (3 + 1, 300 + len('{"t":"x"}'))
+              and [len(c) for c, _t in sent_to] == [3, 1], (hub.frames_out, hub.bytes_out, sent_to))
+        hub.frames_out = hub.bytes_out = 0
+        check("the first take only marks where the counters stand: no minute behind it yet",
+              hub.take_health(now=1000.0, now_mono=50.0) is None)
+        people = {}
+        for user_id, area in ((9101, "field"), (9102, "field"), (9103, "town"), (9104, "")):
+            p = presence.Player(None, user_id, "hash-%d" % user_id, {}, time.time() + 60, slot=0)
+            p.area = area
+            people[user_id] = p
+        hub.players = dict(people)
+        hub.rooms = {"field": {people[9101], people[9102]}, "town": {people[9103]}}
+        hub.ticks += 600
+        hub.late_ticks += 2
+        hub.frames_out += 30
+        hub.bytes_out += 4500
+        net_dev(250000, 500)
+        row = hub.take_health(now=1060.0, now_mono=110.0)
+        check("a minute's row: its length, who is connected and who is in an area, the areas and their crowds",
+              row["at"] == 1060 and row["seconds"] == 60.0 and row["connections"] == 4 and row["players"] == 3
+              and row["areas"] == 2 and json.loads(row["crowd"]) == [["field", 2], ["town", 1]], row)
+        check("  the minute's ticks and late ticks, frames and bytes sent, and the machine's network out",
+              (row["ticks"], row["late_ticks"], row["frames_out"], row["bytes_out"], row["net_out"])
+              == (600, 2, 30, 4500, 240000), row)
+        check("  this process's share of the core, the load and the memory",
+              isinstance(row["cpu"], float) and row["cpu"] >= 0.0 and row["mem_free_mb"] == 400
+              and (row["load1"] is None or isinstance(row["load1"], float)), row)
+        check("  and every column the table has", set(row) == set(presence.HEALTH_COLUMNS), sorted(row))
+        net_dev(90000, 500)
+        row = hub.take_health(now=1120.0, now_mono=170.0)
+        check("the next row is its own minute's: nothing sent, nothing counted - and a network counter that went "
+              "back (a reboot) is no number rather than a wrong one",
+              (row["ticks"], row["frames_out"], row["bytes_out"], row["net_out"]) == (0, 0, 0, None), row)
+        hub.rooms = {"area%02d" % i: {presence.Player(None, 9200 + i * 10 + j, "h", {}, time.time() + 60)
+                                       for j in range(i + 1)} for i in range(12)}
+        row = hub.take_health(now=1180.0, now_mono=230.0)
+        crowd = json.loads(row["crowd"])
+        check("the HEALTH_AREAS (%d) biggest crowds are named, biggest first; every player counted"
+              % presence.HEALTH_AREAS,
+              len(crowd) == presence.HEALTH_AREAS == 8 and crowd[0] == ["area11", 12] and crowd[-1] == ["area04", 5]
+              and row["players"] == sum(range(1, 13)) and row["areas"] == 12, (crowd, row["players"]))
+
+        # WRITTEN, AND PRUNED.
+        def health_rows():
+            return [tuple(r) for r in sql("SELECT at, players, bytes_out FROM presence_health ORDER BY id")]
+        before = len(health_rows())
+        hub.rooms = {"field": {people[9101]}}
+        hub.bytes_out += 777
+        await hub.flush_health(now=time.time())
+        rows = health_rows()
+        check("a row is written to presence_health", len(rows) == before + 1 and rows[-1][1:] == (1, 777), rows[-1:])
+        old = int(time.time()) - presence.HEALTH_KEPT_SECONDS - 60
+        con = sqlite3.connect(DB_PATH)
+        con.execute("INSERT INTO presence_health (at, seconds) VALUES (?, 60)", (old,))
+        con.commit()
+        con.close()
+        hub._health_pruned_at = 0.0
+        await hub.flush_health(now=time.time())
+        check("a row older than HEALTH_KEPT_SECONDS (two weeks) is pruned, the rest kept",
+              all(r[0] != old for r in health_rows()) and len(health_rows()) == before + 2
+              and presence.HEALTH_KEPT_SECONDS == 14 * 86400 and presence.HEALTH_SECONDS == 60.0, health_rows())
+
+        # A DATABASE FROM BEFORE THE TABLE: said once, nothing raised.
+        before_db = os.path.join(testdir.PATH, "before_health.db")
+        sqlite3.connect(before_db).close()
+        real_path = presence.DB_PATH
+        presence.DB_PATH = before_db
+        try:
+            await hub.flush_health(now=time.time())
+            await hub.flush_health(now=time.time())
+        finally:
+            presence.DB_PATH = real_path
+        check("a database from before the table: the server's health says why once, and nothing else stops",
+              len(presence._HEALTH_TABLE_MISSING) == 1, presence._HEALTH_TABLE_MISSING)
+
+        clocks = presence.PresenceServer(sweep_seconds=5, tick_seconds=5)
+        clocks.start_clocks()
+        names = [task.get_coro().__name__ for task in clocks._tasks]
+        clocks.stop_clocks()
+        check("its own clock, books or no books", "health_loop" in names, names)
+    finally:
+        presence.NET_DEV_PATH, presence.MEMINFO_PATH = real_net, real_mem
+
+
+def counted_live(server):
+    """P-13, against the whole run: every frame the server sent, counted."""
+    section("P-13 EVERY FRAME THE RUN SENT WAS COUNTED")
+    check("frames and bytes sent, through _out() and _send() - the run's welcomes, joins and moves",
+          server.frames_out > 50 and server.bytes_out > 20 * server.frames_out, (server.frames_out, server.bytes_out))
+    source = open(presence.__file__, encoding="utf-8").read()
+    check("  and nothing goes out past them: broadcast() is called in _out() alone, ws.send() in _send() and"
+          " the ticket's refusal",
+          source.count("broadcast(connections, text)") == 1 and source.count(" broadcast(") == 1
+          and source.count(".send(") == 2, (source.count(" broadcast("), source.count(".send(")))
+
+
 def ridden(messages):
     """[[maker, attacks], ...] from every moves frame in these messages."""
     return [pair for m in of(messages, "moves") for pair in m.get("x", [])]
@@ -1363,6 +1503,7 @@ async def attacks_ride_the_tick(port, server):
 async def main():
     await kills_written_soon()
     await positions_written()
+    await health_written()
     presence.HELLO_SECONDS = 0.5
     combatbook.HOLD_SECONDS = 0.2
     combatbook.PENDING_SECONDS = 0.3
@@ -1377,6 +1518,7 @@ async def main():
             await run(port, server)
         finally:
             server.stop_clocks()
+    counted_live(server)
 
 
 asyncio.run(main())

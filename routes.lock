@@ -30,6 +30,7 @@ GET /api/players/online  players_online  auth  rank=-  fresh=-  lock=yes  doc=ye
 GET /api/save  list_saves  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/server/broadcasts  read_broadcasts  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/server/coowners  read_co_owners  auth  rank=coowner  fresh=-  lock=yes  doc=yes
+GET /api/server/health  read_server_health  auth  rank=coowner  fresh=-  lock=yes  doc=yes
 GET /api/server/insights  read_insights  auth  rank=coowner  fresh=-  lock=yes  doc=yes
 GET /api/server/stats  read_player_stats  auth  rank=coowner  fresh=-  lock=yes  doc=yes
 GET /api/server/world  read_world  auth  rank=coowner  fresh=-  lock=yes  doc=yes

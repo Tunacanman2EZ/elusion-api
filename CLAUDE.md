@@ -2586,6 +2586,61 @@ Tests: `test_larder.py`, `test_smith.py`, `test_patronage.py`,
 runs of the new packages in `test_packages.py`. Every new check was watched
 failing with its fault put back.
 
+## The server's health: the GM panel's Health tab (game 0.78.0)
+
+The owner, 24 Oct, of four next steps after the 128-player swarm - send each
+game only the players near it, watch the live server, test on the real
+machine, let the server referee every kill: "work on this or if you have a
+even better idea lets hear it". Two of them were numbers only SSH could read
+(`/api/metrics` with a token, killwatch.py's `receipts:` line), and the first
+needed one nobody had: what the server really sends. **The droplet's plan
+includes 1,000 GiB of outbound data a month** (pooled across the account's
+droplets; $0.01 a GiB past it - DigitalOcean's "Bandwidth Billing"), and
+swarm.py's 13.4 MB/s at 128 in one area is about 32 TiB held for a month. So
+the trigger for sending only what is near is the bill before the core, and
+this measures it.
+
+- **presence.py writes how each minute went** (its header, "HOW ITS MINUTES
+  WENT"): one `presence_health` row every `HEALTH_SECONDS` (60) -
+  connections, players in an area, the `HEALTH_AREAS` (8) biggest crowds,
+  ticks and late ticks, frames and bytes it sent (before a browser's
+  compression), the machine's network out (`/proc/net/dev`, every interface
+  but loopback: what the host bills - None on Windows, or across a reboot),
+  its share of the core, the load, the memory available. Everything sent
+  goes through `_out()` (every broadcast) or `_send()`, which count it - and
+  P-13 holds that nothing goes out past them. Its own loop, books or no
+  books; kept two weeks; a database from before the table says so once.
+- **`GET /api/server/health`** (serverhealth/, owner and co-owner, read only)
+  reads them: the last minute (and whether presence still reports - a row
+  more than `REPORTING_SECONDS`, three minutes, old says it stopped), today
+  and the week; **the month** - the week's rate held thirty days, from the
+  machine's own network where it was read, against `TRANSFER_ALLOWANCE_GIB`
+  and what the rest would cost; **the crowd** - "fine", "watch" (from
+  `CROWD_WATCH`, 32, in one area this week, or half the allowance) or "now"
+  (from `CROWD_NOW`, 96, or all of it); the tick (steady at 9.5 a second or
+  more with no late beat); the machine (cores, load, memory, the database's
+  disk and size); this worker's slowest routes from `_metrics_summary()`.
+- **The kill receipts, with a verdict.** killwatch.py's own
+  `receipts_backing()` is handed in (app.py imports killwatch.py now; so does
+  test_deploy's copy of the code), so the panel and the command line are one
+  count. `services.receipts()`: "on"; else "no_books", "young" (the books
+  have not run the whole week), "few" (under `RECEIPTS_MIN_KILLS`, 200),
+  "short" (under `RECEIPTS_READY_SHARE`, 98%, backed), "monster" (one monster
+  never seen more than 1% of the kills, or 3) or "ready" - DEPLOY.md's "near
+  100%, and no monster in the never-seen list with many kills", written down.
+  And `min_build_low` while the oldest build allowed in is below
+  `RECEIPT_BUILD`. The week is kept `RECEIPTS_CACHE_SECONDS` (five minutes)
+  per worker - the tab asks every half minute - and `?fresh=1` (Refresh)
+  reads it now. A week that cannot be read is no books, never a 500.
+- **Deploy order: the server first.** A 0.78.0 game against an older server
+  reads a 404 and says to update it; an older presence.py against the new
+  table writes nothing, and the tab says presence has not written a minute.
+  Restart presence (update_server.sh does) for the rows to start.
+
+`test_serverhealth.py` (services, data, the route against real books) and
+`test_presence.py` P-13; the bare-app run in `test_packages.py`. Fourteen
+sabotages, each caught by the check meant for it.
+
 ## Layout
 
 ```
@@ -2648,7 +2703,8 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
                 limits, a login ended anywhere ending the connection, and
                 who leads each area's monsters (P-7), the books' wiring (P-8),
                 attacks, levers and every step's clock (P-9), attacks in
-                the tick and the beat (P-9b), a crowd walking in (P-9c)
+                the tick and the beat (P-9b), a crowd walking in (P-9c),
+                where everyone stands (P-12), how each minute went (P-13)
   combatbook    the books themselves: the bounds, every hit, spawn and death
                 judged, and that nothing a leader sends breaks them
   tradegates    the owner's trade switch, and the hold on fresh mythic and
@@ -2662,6 +2718,9 @@ test_*.py       discovered and run by run_tests.ps1, which prints how many.
                 own source, so a new one that forgets ELUSION_DB fails
   receipts      kill receipts: a kill is paid only against the books' agreed
                 death, used once, and the switch that turns it on
+  serverhealth  the GM panel's Health tab: presence.py's minutes read back,
+                the month's data, the crowd, and the receipts' verdict
+                against the real books (0.78.0)
   deploy        what the first live deploy found: the .env read first, and
                 backups that are one file each
   guilds / friends / mail / map / teleport / recovery / settings /

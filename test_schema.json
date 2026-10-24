@@ -206,6 +206,18 @@
   ],
   [
    "table",
+   "presence_health",
+   "presence_health",
+   "CREATE TABLE presence_health (\n            id           INTEGER PRIMARY KEY AUTOINCREMENT,\n            at           INTEGER NOT NULL,\n            seconds      REAL    NOT NULL,\n            connections  INTEGER NOT NULL DEFAULT 0,\n            players      INTEGER NOT NULL DEFAULT 0,\n            areas        INTEGER NOT NULL DEFAULT 0,\n            crowd        TEXT    NOT NULL DEFAULT '[]',\n            ticks        INTEGER NOT NULL DEFAULT 0,\n            late_ticks   INTEGER NOT NULL DEFAULT 0,\n            frames_out   INTEGER NOT NULL DEFAULT 0,\n            bytes_out    INTEGER NOT NULL DEFAULT 0,\n            net_out      INTEGER,\n            cpu          REAL,\n            load1        REAL,\n            mem_free_mb  INTEGER\n        )"
+  ],
+  [
+   "index",
+   "idx_presence_health_at",
+   "presence_health",
+   "CREATE INDEX idx_presence_health_at ON presence_health(at)"
+  ],
+  [
+   "table",
    "lusion_ledger",
    "lusion_ledger",
    "CREATE TABLE lusion_ledger (\n            id      INTEGER PRIMARY KEY AUTOINCREMENT,\n            at      INTEGER NOT NULL,\n            user_id INTEGER,\n            slot    INTEGER,\n            delta   INTEGER NOT NULL,\n            reason  TEXT    NOT NULL,\n            detail  TEXT    NOT NULL DEFAULT '',\n            -- SET NULL rather than CASCADE, same as gold_ledger: deleting a\n            -- user must not rewrite the history of what existed.\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL\n        )"
@@ -4734,6 +4746,148 @@
     ],
     [
      "idx_position_samples_user",
+     0,
+     "c",
+     0
+    ]
+   ]
+  },
+  "presence_health": {
+   "columns": [
+    [
+     0,
+     "id",
+     "INTEGER",
+     0,
+     null,
+     1
+    ],
+    [
+     1,
+     "at",
+     "INTEGER",
+     1,
+     null,
+     0
+    ],
+    [
+     2,
+     "seconds",
+     "REAL",
+     1,
+     null,
+     0
+    ],
+    [
+     3,
+     "connections",
+     "INTEGER",
+     1,
+     "0",
+     0
+    ],
+    [
+     4,
+     "players",
+     "INTEGER",
+     1,
+     "0",
+     0
+    ],
+    [
+     5,
+     "areas",
+     "INTEGER",
+     1,
+     "0",
+     0
+    ],
+    [
+     6,
+     "crowd",
+     "TEXT",
+     1,
+     "'[]'",
+     0
+    ],
+    [
+     7,
+     "ticks",
+     "INTEGER",
+     1,
+     "0",
+     0
+    ],
+    [
+     8,
+     "late_ticks",
+     "INTEGER",
+     1,
+     "0",
+     0
+    ],
+    [
+     9,
+     "frames_out",
+     "INTEGER",
+     1,
+     "0",
+     0
+    ],
+    [
+     10,
+     "bytes_out",
+     "INTEGER",
+     1,
+     "0",
+     0
+    ],
+    [
+     11,
+     "net_out",
+     "INTEGER",
+     0,
+     null,
+     0
+    ],
+    [
+     12,
+     "cpu",
+     "REAL",
+     0,
+     null,
+     0
+    ],
+    [
+     13,
+     "load1",
+     "REAL",
+     0,
+     null,
+     0
+    ],
+    [
+     14,
+     "mem_free_mb",
+     "INTEGER",
+     0,
+     null,
+     0
+    ]
+   ],
+   "foreign_keys": [],
+   "index_info": {
+    "idx_presence_health_at": [
+     [
+      0,
+      1,
+      "at"
+     ]
+    ]
+   },
+   "indexes": [
+    [
+     "idx_presence_health_at",
      0,
      "c",
      0

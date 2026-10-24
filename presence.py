@@ -171,6 +171,20 @@ the next game in loads the scene afresh. At most MAX_LEVERS_PER_AREA names per
 area, each a node path in the scene (LEVER_PATTERN) that each game looks up in
 its own copy.
 
+HOW ITS MINUTES WENT (game 0.78.0). Everything this process knows about the
+server's load - who is connected and where, the tick and its late beats, what
+it sends - lives in its memory, and gunicorn's workers cannot see it. So once a
+minute (HEALTH_SECONDS) it writes one presence_health row: connections,
+players in an area, the biggest crowds (HEALTH_AREAS of them), ticks and late
+ticks, frames and bytes it sent (bytes before a browser's compression - JSON
+is ASCII, so a character is a byte), and the machine's own: its network out
+(/proc/net/dev, every interface but loopback - what the host bills), this
+process's share of the core, the load, the memory available. Everything sent
+goes through _out() or _send(), which count it. GET /api/server/health reads
+the rows for the GM panel's Health tab; kept HEALTH_KEPT_SECONDS. Its own
+loop, books or no books; a database from before the table loses nothing else
+(write_health()). test_presence.py P-13.
+
 PARTY VOICE (game 0.43.0). The owner: "I really really want the option for voice
 chat in game for parties". The voice itself never comes here: each game's
 browser calls the others in its party directly - WebRTC, through a TURN relay,
@@ -325,6 +339,15 @@ STIR_GRACE_SECONDS = 3600
 # one tester, a few thousand a day.
 POSITION_SAMPLE_SECONDS = 15.0
 POSITIONS_KEPT_SECONDS = 14 * 86400
+# HOW ITS MINUTES WENT (game 0.78.0; the header has why): a presence_health row
+# every HEALTH_SECONDS, naming the HEALTH_AREAS biggest crowds, kept two weeks
+# like the positions - 20,160 rows at most.
+HEALTH_SECONDS = 60.0
+HEALTH_KEPT_SECONDS = 14 * 86400
+HEALTH_AREAS = 8
+# Where the machine's network counters are (Linux); anywhere else, none.
+NET_DEV_PATH = "/proc/net/dev"
+MEMINFO_PATH = "/proc/meminfo"
 
 # What a body may claim to be doing: the player scenes' own animation names.
 ANIM_PATTERN = re.compile(r"^(idle|walk|attack|death|hitflash)(up|down|left|right)$")
@@ -532,6 +555,82 @@ def write_positions(rows, prune_before=None):
                   "before them - start app.py once to add the table" % exc, flush=True)
     finally:
         conn.close()
+
+
+_HEALTH_TABLE_MISSING = []
+HEALTH_COLUMNS = ("at", "seconds", "connections", "players", "areas", "crowd", "ticks", "late_ticks",
+                  "frames_out", "bytes_out", "net_out", "cpu", "load1", "mem_free_mb")
+
+
+def write_health(row, prune_before=None):
+    """Write one presence_health row (a dict of HEALTH_COLUMNS) and drop those
+    older than prune_before, in a transaction of its own. Runs in a thread; a
+    database from before the table says so once and loses nothing else."""
+    if row is None and prune_before is None:
+        return
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    try:
+        if row is not None:
+            conn.execute("INSERT INTO presence_health (%s) VALUES (%s)" % (
+                ", ".join(HEALTH_COLUMNS), ", ".join("?" * len(HEALTH_COLUMNS))),
+                [row.get(name) for name in HEALTH_COLUMNS])
+        if prune_before is not None:
+            conn.execute("DELETE FROM presence_health WHERE at < ?", (int(prune_before),))
+        conn.commit()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
+        if not _HEALTH_TABLE_MISSING:
+            _HEALTH_TABLE_MISSING.append(str(exc))
+            print("[PRESENCE] the server's health cannot be written (%s): this database is from "
+                  "before it - start app.py once to add the table" % exc, flush=True)
+    finally:
+        conn.close()
+
+
+def net_out_bytes(path=None):
+    """Bytes the machine has sent since it booted, every interface but
+    loopback - the number the host bills (outbound) - or None where there is
+    no /proc/net/dev to read (Windows, a Mac)."""
+    try:
+        with open(path or NET_DEV_PATH, "r", encoding="ascii", errors="replace") as handle:
+            lines = handle.read().splitlines()[2:]
+    except OSError:
+        return None
+    total = 0
+    seen = False
+    for line in lines:
+        name, _, counters = line.partition(":")
+        fields = counters.split()
+        if name.strip() == "lo" or len(fields) < 9:
+            continue
+        try:
+            total += int(fields[8])   # receive has eight columns; transmit bytes is the ninth
+        except ValueError:
+            continue
+        seen = True
+    return total if seen else None
+
+
+def mem_free_mb(path=None):
+    """MemAvailable in whole MB - what a new process could have without
+    swapping - or None where there is no /proc/meminfo."""
+    try:
+        with open(path or MEMINFO_PATH, "r", encoding="ascii", errors="replace") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def load_one():
+    """The machine's one-minute load average, or None (Windows)."""
+    try:
+        return round(os.getloadavg()[0], 2)
+    except (AttributeError, OSError):
+        return None
 
 
 def aura_numbers():
@@ -944,19 +1043,40 @@ class PresenceServer:
         # behind on (tick_loop).
         self.ticks = 0
         self.late_ticks = 0
+        # HOW ITS MINUTES WENT (game 0.78.0): every frame sent and its bytes,
+        # counted by _out() and _send(); and where the last health row left
+        # each counter, so a row holds its own minute (take_health()).
+        self.frames_out = 0
+        self.bytes_out = 0
+        self.health_seconds = HEALTH_SECONDS
+        self._health_mark = None
+        self._health_pruned_at = 0.0
 
     # ---- sending -------------------------------------------------------------
+    # EVERYTHING SENT IS COUNTED (game 0.78.0): a frame for each socket a text
+    # goes to and its length for each, before compression - the Health tab's
+    # "data out", and the number that says when one area needs sending only
+    # what is near (DEPLOY.md, "Playing it").
+
+    def _out(self, connections, text):
+        if connections:
+            self.frames_out += len(connections)
+            self.bytes_out += len(text) * len(connections)
+            broadcast(connections, text)
 
     async def _send(self, player, message):
+        text = json.dumps(message, separators=(",", ":"))
+        self.frames_out += 1
+        self.bytes_out += len(text)
         try:
-            await player.ws.send(json.dumps(message, separators=(",", ":")))
+            await player.ws.send(text)
         except ConnectionClosed:
             pass
 
     def _room_broadcast(self, area, message, skip=None):
         members = [p.ws for p in self.rooms.get(area, ()) if p is not skip]
         if members:
-            broadcast(members, json.dumps(message, separators=(",", ":")))
+            self._out(members, json.dumps(message, separators=(",", ":")))
 
     # ---- rooms -------------------------------------------------------------
 
@@ -1020,7 +1140,7 @@ class PresenceServer:
         leader = self.leaders.get(area)
         message = {"t": "lead", "a": area, "id": leader.user_id if leader is not None else -1,
                    "n": len(sharers) - 1 if leader is not None else 0}
-        broadcast([p.ws for p in sharers], json.dumps(message, separators=(",", ":")))
+        self._out([p.ws for p in sharers], json.dumps(message, separators=(",", ":")))
 
     def _ask_for_world(self, area, player):
         """The leader sends `player` everything: the monsters as they stand."""
@@ -1028,7 +1148,7 @@ class PresenceServer:
         if leader is None or leader is player or not player.shares:
             return
         leader.asked_for_world()
-        broadcast([leader.ws], json.dumps({"t": "need", "id": player.user_id}, separators=(",", ":")))
+        self._out([leader.ws], json.dumps({"t": "need", "id": player.user_id}, separators=(",", ":")))
 
     # ---- the books (combatbook.py) --------------------------------------------
 
@@ -1072,7 +1192,7 @@ class PresenceServer:
             # began after it did): it sends everything to "game 0", which is
             # nobody's - only the books read it.
             player.asked_for_world()
-            broadcast([player.ws], json.dumps({"t": "need", "id": 0}, separators=(",", ":")))
+            self._out([player.ws], json.dumps({"t": "need", "id": 0}, separators=(",", ":")))
 
     def _book_hits(self, player, hits):
         book = self._book(player.area)
@@ -1103,7 +1223,7 @@ class PresenceServer:
         else:
             targets = [p.ws for p in room if p.shares and p is not player]
         if targets:
-            broadcast(targets, raw)
+            self._out(targets, raw)
         return True
 
     def relay_hits(self, player, msg):
@@ -1116,7 +1236,7 @@ class PresenceServer:
         if hits is None:
             return False
         self._book_safely(self._book_hits, player, hits)
-        broadcast([leader.ws], json.dumps({"t": "h", "from": player.user_id, "p": hits},
+        self._out([leader.ws], json.dumps({"t": "h", "from": player.user_id, "p": hits},
                                           separators=(",", ":")))
         return True
 
@@ -1137,7 +1257,7 @@ class PresenceServer:
             self._tick_attacks.setdefault(player.area, []).append([player.user_id, attacks])
         old = [p.ws for p in room if not p.tick_attacks and p is not player]
         if old:
-            broadcast(old, json.dumps({"t": "x", "id": player.user_id, "e": attacks}, separators=(",", ":")))
+            self._out(old, json.dumps({"t": "x", "id": player.user_id, "e": attacks}, separators=(",", ":")))
         for attack in attacks:
             if attack[0] == "heal":
                 self.note_heal(player, attack[4], attack[5])
@@ -1267,10 +1387,10 @@ class PresenceServer:
         player.voice = False
         player.voice_party = 0
         if mates:
-            broadcast([p.ws for p in mates], json.dumps({"t": "vs", "left": player.user_id},
+            self._out([p.ws for p in mates], json.dumps({"t": "vs", "left": player.user_id},
                                                         separators=(",", ":")))
         if why is not None and not player.dropped:
-            broadcast([player.ws], json.dumps({"t": "vs", "off": why}, separators=(",", ":")))
+            self._out([player.ws], json.dumps({"t": "vs", "off": why}, separators=(",", ":")))
 
     async def voice_state(self, player, msg):
         """In or out of the party's voice. In: told who is already there (it
@@ -1295,7 +1415,7 @@ class PresenceServer:
         mates = self._voice_mates(player)
         await self._send(player, {"t": "vs", "in": [p.voice_entry() for p in mates]})
         if mates:
-            broadcast([p.ws for p in mates], json.dumps({"t": "vs", "join": player.voice_entry()},
+            self._out([p.ws for p in mates], json.dumps({"t": "vs", "join": player.voice_entry()},
                                                         separators=(",", ":")))
 
     async def voice_signal(self, player, msg):
@@ -1489,9 +1609,9 @@ class PresenceServer:
             riders = [p.ws for p in room if p.tick_attacks]
             others = [p.ws for p in room if not p.tick_attacks]
             if riders:
-                broadcast(riders, json.dumps({"t": "moves", "p": steps, "x": attacks}, separators=(",", ":")))
+                self._out(riders, json.dumps({"t": "moves", "p": steps, "x": attacks}, separators=(",", ":")))
             if others and steps:
-                broadcast(others, json.dumps({"t": "moves", "p": steps}, separators=(",", ":")))
+                self._out(others, json.dumps({"t": "moves", "p": steps}, separators=(",", ":")))
         # Attacks waiting for an area nobody is in any more go with it.
         if BOOKS:
             self._book_safely(self.tick_books, time.time())
@@ -1621,8 +1741,62 @@ class PresenceServer:
                 await self.drop(p, "signed out", 1008)
         await self.sweep_voice()
 
+    # ---- how its minutes went (game 0.78.0) ----------------------------------
+
+    def _health_counters(self, now_mono):
+        return {"mono": now_mono, "ticks": self.ticks, "late": self.late_ticks, "frames": self.frames_out,
+                "bytes": self.bytes_out, "net": net_out_bytes(), "cpu": time.process_time()}
+
+    def take_health(self, now=None, now_mono=None):
+        """The presence_health row for the time since the last call (a dict of
+        HEALTH_COLUMNS), or None on the first: there is no minute behind it
+        yet. Every count is this window's own; the machine's network out is
+        None where it cannot be read or went backwards (a reboot)."""
+        now = time.time() if now is None else now
+        mark = self._health_counters(time.monotonic() if now_mono is None else now_mono)
+        last, self._health_mark = self._health_mark, mark
+        if last is None:
+            return None
+        seconds = max(0.001, mark["mono"] - last["mono"])
+        net = None
+        if mark["net"] is not None and last["net"] is not None and mark["net"] >= last["net"]:
+            net = mark["net"] - last["net"]
+        crowd = sorted(((area, len(room)) for area, room in self.rooms.items() if room),
+                       key=lambda pair: (-pair[1], pair[0]))
+        return {"at": int(now), "seconds": round(seconds, 3), "connections": len(self.players),
+                "players": sum(n for _area, n in crowd), "areas": len(crowd),
+                "crowd": json.dumps([[area, n] for area, n in crowd[:HEALTH_AREAS]], separators=(",", ":")),
+                "ticks": mark["ticks"] - last["ticks"], "late_ticks": mark["late"] - last["late"],
+                "frames_out": mark["frames"] - last["frames"], "bytes_out": mark["bytes"] - last["bytes"],
+                "net_out": net, "cpu": round(100.0 * (mark["cpu"] - last["cpu"]) / seconds, 1),
+                "load1": load_one(), "mem_free_mb": mem_free_mb()}
+
+    async def flush_health(self, now=None):
+        """Write how the last minute went, and prune the old rows hourly."""
+        now = time.time() if now is None else now
+        row = self.take_health(now)
+        prune = None
+        if now - self._health_pruned_at >= 3600.0:
+            self._health_pruned_at = now
+            prune = now - HEALTH_KEPT_SECONDS
+        if row is None and prune is None:
+            return
+        try:
+            await asyncio.to_thread(write_health, row, prune)
+        except Exception as exc:  # noqa: BLE001
+            print("[PRESENCE] could not write the server's health: %r" % exc, flush=True)
+
+    async def health_loop(self):
+        # The first call only marks where the counters stand: the first row is
+        # a whole minute's.
+        self.take_health()
+        while True:
+            await asyncio.sleep(self.health_seconds)
+            await self.flush_health()
+
     def start_clocks(self):
-        self._tasks = [asyncio.create_task(self.tick_loop()), asyncio.create_task(self.sweep_loop())]
+        self._tasks = [asyncio.create_task(self.tick_loop()), asyncio.create_task(self.sweep_loop()),
+                       asyncio.create_task(self.health_loop())]
         if BOOKS:
             self._tasks.append(asyncio.create_task(self.flush_loop()))
 

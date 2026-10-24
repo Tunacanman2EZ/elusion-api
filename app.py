@@ -1365,8 +1365,9 @@ def init_db():
         -- presence.py keeps its own count of every monster's health from what
         -- the area's leader says and every hit any game sends (combatbook.py),
         -- and writes down what it saw here. Those two tables, the aura's heal
-        -- grants (consume_grants) and where everyone stands (position_samples,
-        -- below) are all that process writes. killwatch.py matches
+        -- grants (consume_grants), where everyone stands (position_samples,
+        -- below) and how its minutes went (presence_health, below that) are
+        -- all that process writes. killwatch.py matches
         -- kill_reports against combat_kills ("THE BOOKS"), and since 0.57.0
         -- (step 2) the owner's receipts switch makes a kill need an agreed
         -- row (kill/, "Kill receipts" in CLAUDE.md); off, a kill is paid as it
@@ -1427,6 +1428,33 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_position_samples_at ON position_samples(at);
         CREATE INDEX IF NOT EXISTS idx_position_samples_user ON position_samples(user_id, slot, at);
+
+        -- THE SERVER'S HEALTH, A MINUTE AT A TIME (game 0.78.0). presence.py
+        -- holds every socket in memory and gunicorn's workers cannot see it,
+        -- so once a minute it writes down how the minute went: who was
+        -- connected, the biggest crowds, its ticks and the late ones, what it
+        -- sent (frames, and bytes before compression), the machine's own
+        -- network out, its share of the core, the load and the memory free.
+        -- GET /api/server/health (serverhealth/) reads them for the GM
+        -- panel's Health tab. Kept two weeks; presence.py prunes them.
+        CREATE TABLE IF NOT EXISTS presence_health (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            at           INTEGER NOT NULL,
+            seconds      REAL    NOT NULL,
+            connections  INTEGER NOT NULL DEFAULT 0,
+            players      INTEGER NOT NULL DEFAULT 0,
+            areas        INTEGER NOT NULL DEFAULT 0,
+            crowd        TEXT    NOT NULL DEFAULT '[]',
+            ticks        INTEGER NOT NULL DEFAULT 0,
+            late_ticks   INTEGER NOT NULL DEFAULT 0,
+            frames_out   INTEGER NOT NULL DEFAULT 0,
+            bytes_out    INTEGER NOT NULL DEFAULT 0,
+            net_out      INTEGER,
+            cpu          REAL,
+            load1        REAL,
+            mem_free_mb  INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_presence_health_at ON presence_health(at);
 
         -- EVERY CONSUMABLE THE SERVER AUTHORISED, one row each.
         --
@@ -8821,6 +8849,36 @@ land_insights = insights_package.register(
     left_out_names=lambda: (OWNER_USERNAME,) + tuple(CO_OWNER_USERNAMES),
     next_stir=world_next_stir,
 )
+
+
+# =============================================================================
+# THE SERVER'S HEALTH (game 0.78.0) - the serverhealth/ package
+# =============================================================================
+# The GM panel's Health tab: presence.py's minutes (presence_health - who is
+# connected, the crowds, the tick, data out, the machine), the month that data
+# adds up to, the routes' timings (/api/metrics, this worker's), the disk, and
+# the kill receipts put to the books - killwatch.py's own receipts_backing(),
+# so the tab and the command line are one count. GET /api/server/health, owner
+# and co-owner, read only.
+import killwatch  # noqa: E402
+import serverhealth as serverhealth_package  # noqa: E402
+
+_SERVER_HEALTH = serverhealth_package.register(
+    app,
+    require_auth=require_auth,
+    require_owner=require_owner,
+    get_db=get_db,
+    # LOOKED UP ON EACH CALL: the suites point DB_PATH at their own database.
+    db_path=lambda: DB_PATH,
+    metrics_summary=_metrics_summary,
+    receipts_backing=lambda db: killwatch.receipts_backing(db, days=killwatch.RECEIPTS_DAYS),
+    receipts_days=killwatch.RECEIPTS_DAYS,
+    receipts_on=kill_receipts_on,
+    min_client_build=min_client_build,
+    receipt_build=kill_package.RECEIPT_BUILD,
+)
+# For the suites, which write books rows and then read the receipts.
+_server_health_cache_clear = _SERVER_HEALTH.cache_clear
 
 
 # =============================================================================

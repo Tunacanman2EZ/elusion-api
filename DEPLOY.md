@@ -872,6 +872,10 @@ Before switching it on, read the `receipts:` line killwatch.py prints under
 sudo -u elusion /opt/elusion/venv/bin/python /opt/elusion/api/killwatch.py --db /var/lib/elusion/elusion.db --limit 0
 ```
 
+Or, since 0.78.0, the GM panel's **Health** tab, **Receipts**: the same count
+with a verdict - ready, or what it waits for (a week of books, 200 kills,
+98% backed, no monster the books never see).
+
 `receipts: of 412 kills paid in the last 7 days, 405 (98.3%) had the books'
 receipt; 2 short, 0 not due, 5 never seen (...)` says what switching on would
 have done to the last week (`--days` to change it): the backed kills would be
@@ -1029,6 +1033,58 @@ square of the crowd - 13 MB/s (about 110 Mbit/s) at 128 in one area, 48 MB/s
 at 256, before a browser's compression (about 3.4 to 1). Spread over areas it
 is far less. Sending each game only the players near it is the step after
 this, when one area really holds that many.
+
+**And the bill comes before the core.** The droplet's plan includes 1,000 GiB
+of outbound data a month (pooled across the account's droplets; $0.01 a GiB
+past it, inbound free). 0.4 MB/s held all month is the whole allowance; the
+13.4 MB/s of 128 in one area, held, is about 32 TiB. The GM panel's **Health
+tab** (below) shows what the machine really sends and the month it adds up
+to, and says when sending only what is near is worth planning (32 in one
+area in a week, or half the allowance) and when it is needed (96, or all of
+it).
+
+### On a copy of the live machine
+
+The table above is a container's core. To measure the droplet's own, run the
+swarm on a COPY of it - never on the live one, which it would load while
+players are on, and never at `api.elusionrpg.com`. It costs cents and is
+gone after:
+
+1. DigitalOcean, **Droplets** > `elusion-1` > **Backups & Snapshots** >
+   **Take live snapshot**. Name it `swarm-copy`.
+2. When it is done, the snapshot's **More** > **Create Droplet**. Pick **2
+   vCPUs** (the swarm pins the server to one core, as live, and its bots to
+   the other) and your SSH key. Note the NEW droplet's address.
+3. `ssh root@<the new address>` - check the prompt is the copy, not
+   `elusion-1`. Stop what the copy would otherwise do as if it were live,
+   the mail and backup timers with it:
+   `systemctl stop elusion-api elusion-presence cron caddy`
+4. `cd /opt/elusion/api && sudo -u elusion /opt/elusion/venv/bin/python swarm.py --launch --levels 8,32,64,128`
+   - a scratch server on a throwaway database, as on any machine.
+5. Copy the table it prints, then **Destroy** the copy and delete the
+   snapshot (the droplet's page, **Destroy**). Billing stops when it is gone.
+
+## Watching the live server: the Health tab (0.78.0)
+
+The GM panel's **Health** tab (owner and co-owner; `GET /api/server/health`)
+is this page's numbers without SSH. presence.py writes a row a minute
+(`presence_health`, kept two weeks), and the tab reads them every half
+minute while it is open:
+
+- **Players**: online now, the biggest crowd and where, the most today and
+  this week; what the machine sends a second and the game's sockets' share;
+  the month that adds up to at this week's rate, against the 1,000 GiB; and
+  whether one area needs sending only what is near yet.
+- **Machine**: the tick (ten a second and no late beats is steady), the load,
+  memory, the disk and the database's size; the slowest routes by p99 (one
+  worker's, as `/api/metrics` below).
+- **Receipts**: the kill receipts' week put to the books - killwatch.py's
+  own count, the `receipts:` line below - with a verdict, and the switch
+  beside it (**Kill receipts**, above).
+
+"presence.py has not written a minute" after an update means presence is
+still the old process: `update_server.sh` restarts it; by hand,
+`sudo systemctl restart elusion-presence`.
 
 ## Watching latency (live)
 

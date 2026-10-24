@@ -4,8 +4,9 @@ Every feature package (ARCHITECTURE.md) - playerstats/, events/, insights/,
 and killrecord/, friends/, gathering/, loot/, guilds/, parties/, chat/, trade/, kingdom/, world/, moderation/,
 staffdesk/, equipment/, consuming/, death/, bank/, carry/, skills/, saves/, status/, shop/, players/,
 switches/, kill/, ownertools/,
-accountsettings/ and auth/, taken out of app.py - and larder/ and smith/, built
-outside it (0.74.0) - is built the BE105 way: each has a
+accountsettings/ and auth/, taken out of app.py - and larder/, smith/,
+economyrules/ and economywatch/ (0.74.0) and serverhealth/ (0.78.0), built
+outside it - is built the BE105 way: each has a
 register(app, ...) that is HANDED the app, its login checks and its database,
 and never imports app.py. The source of each is checked for that elsewhere
 (test_stats.py); this RUNS them without it - the "application factory"
@@ -77,6 +78,7 @@ import smith as smith_package  # noqa: E402
 import economyrules  # noqa: E402
 import economyrules.schema as economyrules_schema  # noqa: E402
 import economywatch  # noqa: E402
+import serverhealth  # noqa: E402
 
 # Found, not listed: what app.py imports that has a routes.py (codemap.py).
 PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
@@ -84,7 +86,8 @@ PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
 RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathering", "loot", "guilds", "parties",
             "chat", "trade", "kingdom", "world", "moderation", "staffdesk", "equipment", "consuming",
             "death", "bank", "carry", "skills", "saves", "status", "shop", "players", "switches", "kill",
-            "ownertools", "accountsettings", "auth", "larder", "smith", "economyrules", "economywatch")
+            "ownertools", "accountsettings", "auth", "larder", "smith", "economyrules", "economywatch",
+            "serverhealth")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -1289,6 +1292,19 @@ def bare_app(name):
         read_canary=lambda: app.config.get("canary_status"),
         run_canary=lambda: app.config["canary_asked"].append(name) or {
             "checked_at": 1234, "ok": True, "failures": [], "checks": [{"name": "stand-in", "ok": True, "detail": ""}]})
+
+    # serverhealth/ (0.78.0): presence.py's minutes in this database (none
+    # yet), stand-ins for the metrics and the week's receipts, the switch
+    # whatever app.config holds.
+    app.config["receipts_asked"] = []
+    serverhealth.register(
+        app, require_auth=require_auth, require_owner=owner_or_co, get_db=get_db, db_path=lambda: path,
+        metrics_summary=lambda: {"uptime_seconds": 60, "total_requests": 30, "endpoints": {
+            "GET read_server_health": {"count": 30, "error_rate": 0.0, "p99_ms": 4.5}}},
+        receipts_backing=lambda _db: app.config["receipts_asked"].append(name) or {
+            "paid": 300, "backed": 300, "short": 0, "not_due": 0, "never": 0, "since": 0, "never_by_enemy": {}},
+        receipts_days=7, receipts_on=lambda: bool(app.config.get("receipts_on")),
+        min_client_build=lambda: 7, receipt_build=7)
     return app, said, logged, path
 
 
@@ -1708,7 +1724,9 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/smith/quote", "/api/smith/temper", "/api/smith/certify",
                        # economyrules/ and economywatch/ (0.74.0)
                        "/api/economy/rules", "/api/owner/economy/rules", "/api/owner/economy/rules",
-                       "/api/owner/economy/flow", "/api/owner/economy/canary", "/api/owner/economy/canary"]), rules)
+                       "/api/owner/economy/flow", "/api/owner/economy/canary", "/api/owner/economy/canary",
+                       # serverhealth/ (0.78.0)
+                       "/api/server/health"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -4426,6 +4444,23 @@ check("  a player gets the bare 404 from both, and nobody without a login gets i
                                                       "/api/owner/economy/flow", "/api/owner/economy/canary")]
       + [client_a.post("/api/owner/economy/canary").status_code,
          client_a.put("/api/owner/economy/rules", json={}).status_code] == [401] * 6)
+# THE SERVER'S HEALTH (0.78.0): serverhealth/, on the bare app as on the real
+# server - presence.py has written nothing here, so nothing reports.
+res = client_a.get("/api/server/health", headers=who("boss"))
+health = res.get_json() or {}
+check("server health: the owner reads it - no minute written, the routes and the week handed in",
+      res.status_code == 200 and health["presence"]["reporting"] is False and health["presence"]["last"] is None
+      and health["routes"]["slowest"] == [{"route": "GET read_server_health", "p99_ms": 4.5, "count": 30}]
+      and health["receipts"]["verdict"] == "ready" and health["receipts"]["paid"] == 300
+      and app_a.config["receipts_asked"] == ["a"] and app_b.config["receipts_asked"] == [], health.get("receipts"))
+app_a.config["receipts_on"] = True
+switched = client_a.get("/api/server/health", headers=who("boss")).get_json()["receipts"]
+app_a.config["receipts_on"] = False
+check("  the switch read on each ask, the week kept: on, and the week not asked again",
+      switched["verdict"] == "on" and app_a.config["receipts_asked"] == ["a"], switched)
+check("  a player gets the bare 404, and nobody without a login gets in",
+      client_a.get("/api/server/health", headers=who("ann")).status_code == 404
+      and client_a.get("/api/server/health").status_code == 401)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")
