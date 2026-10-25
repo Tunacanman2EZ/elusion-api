@@ -489,6 +489,14 @@ TICK_ATTACKS = 1
 METER_ROLES = ("owner", "coowner")
 METER_TICKS = 10            # ticks between reports: one a second
 METER_MOST_HITS = 2000      # hits kept for one room in one report; past it, counted
+# THE FIGHT LOG (game 0.82.0): a report also says which monster each hit
+# landed on ("m": id -> [enemy id, name, its maximum health now]) and which
+# died since the last ("k"), so a game can time every kill; each hit's element
+# (Element.Type, -1 unknown); and what changed the fight ("e"): a boss's health
+# raised or lowered by who is fighting it, a player walking in or out, a
+# player falling (METER_EVENTS, METER_MOST_EVENTS a report).
+METER_EVENTS = ("grew", "shrank", "joined", "left", "fell")
+METER_MOST_EVENTS = 64
 
 HEAL_GRANT_ID = "__spellheal__"
 HEAL_REACH_SLACK = 1.25
@@ -1181,6 +1189,13 @@ class PresenceServer:
         self._dealt = {}
         self._metered = set()
         self._dealt_over = {}
+        # THE FIGHT LOG (0.82.0): room -> {monster id: [enemy id, name, max
+        # health]} for every monster hit or killed this report, and room ->
+        # [[monster id, boss], ...] for the deaths.
+        self._dealt_monsters = {}
+        self._killed = {}
+        # room -> [[kind, id, detail], ...]: METER_EVENTS since the last report.
+        self._events = {}
 
     # ---- sending -------------------------------------------------------------
     # EVERYTHING SENT IS COUNTED (game 0.78.0): a frame for each socket a text
@@ -1220,6 +1235,7 @@ class PresenceServer:
             if not room:
                 del self.rooms[area]
         self._room_broadcast(area, {"t": "leave", "ids": [player.user_id]})
+        self.metered_event(area, "left", player.user_id, str(player.identity.get("name", "")))
         player.area = ""
         player.place = ""
         if area not in self.rooms and area in self.books:
@@ -1255,6 +1271,7 @@ class PresenceServer:
             await self._send(player, {"t": "join", "p": others})
         await self._send_levers(player)
         self._room_broadcast(area, {"t": "join", "p": [player.entry()]}, skip=player)
+        self.metered_event(area, "joined", player.user_id, str(player.identity.get("name", "")))
         if not player.shares:
             return
         leader = self.leaders.get(area)
@@ -1362,8 +1379,11 @@ class PresenceServer:
         if book is None:
             book = self.books[area] = combatbook.AreaBook(place, gamedata.AREAS[place])
             book.stirred_lands = self.stirred
-            book.on_hit = lambda user_id, booked, claimed, boss, room=area: \
-                self.dealt(room, user_id, booked, claimed, boss)
+            book.on_hit = lambda user_id, booked, claimed, boss, monster=None, element=None, room=area: \
+                self.dealt(room, user_id, booked, claimed, boss, monster, element)
+            book.on_kill = lambda monster, boss, room=area: self.killed(room, monster, boss)
+            book.on_rescale = lambda monster, before, after, room=area: self.metered_event(
+                room, "grew" if after > before else "shrank", monster.id, [before, after])
         return book
 
     def set_stirred(self, lands):
@@ -1402,8 +1422,8 @@ class PresenceServer:
         if book is None or player.fighter is None:
             return
         now = time.time()
-        for monster, damage, _element in hits:
-            book.hit(player.fighter, monster, damage, now)
+        for monster, damage, element in hits:
+            book.hit(player.fighter, monster, damage, now, element)
 
     # ---- the damage meter (game 0.81.0) -----------------------------------
 
@@ -1419,16 +1439,50 @@ class PresenceServer:
         player.meter = on
         self._metered = {p.area for p in self.players.values() if p.meter and p.area}
 
-    def dealt(self, room, user_id, booked, claimed, boss):
+    def dealt(self, room, user_id, booked, claimed, boss, monster=None, element=None):
         """A hit the books in `room` counted (AreaBook.on_hit). Kept only while
-        somebody there is metering, and only METER_MOST_HITS a report."""
+        somebody there is metering, and only METER_MOST_HITS a report. With
+        the monster (0.82.0) the hit says which it landed on."""
         if room not in self._metered:
             return
         hits = self._dealt.setdefault(room, [])
         if len(hits) >= METER_MOST_HITS:
             self._dealt_over[room] = self._dealt_over.get(room, 0) + 1
             return
-        hits.append([user_id, int(booked), int(claimed), 1 if boss else 0])
+        hit = [user_id, int(booked), int(claimed), 1 if boss else 0]
+        if monster is not None:
+            hit.append(int(monster.id))
+            self._remember_monster(room, monster)
+            hit.append(element if isinstance(element, int) and not isinstance(element, bool)
+                       and 0 <= element <= MAX_ELEMENT else -1)
+        hits.append(hit)
+
+    def metered_event(self, room, kind, subject, detail=None):
+        """Something that changed a metered room's fight (METER_EVENTS): a
+        boss's health (subject its monster id, detail [before, after]), or a
+        player in, out or down (subject its user id, detail its name)."""
+        if room not in self._metered or kind not in METER_EVENTS:
+            return
+        events = self._events.setdefault(room, [])
+        if len(events) < METER_MOST_EVENTS:
+            events.append([kind, int(subject), detail])
+
+    def killed(self, room, monster, boss):
+        """A death the books in `room` saw (AreaBook.on_kill), for the fight
+        log's kill times - kept, like the hits, only while it is metered."""
+        if room not in self._metered:
+            return
+        deaths = self._killed.setdefault(room, [])
+        if len(deaths) < METER_MOST_HITS:
+            deaths.append([int(monster.id), 1 if boss else 0])
+            self._remember_monster(room, monster)
+
+    def _remember_monster(self, room, monster):
+        seen = self._dealt_monsters.setdefault(room, {})
+        if monster.id not in seen:
+            row = gamedata.ENEMIES.get(monster.enemy_id) or {} if gamedata is not None else {}
+            seen[monster.id] = [str(monster.enemy_id), str(row.get("display_name", "") or monster.enemy_id),
+                                int(monster.max_hp)]
 
     def meter_report(self):
         """Once a second (METER_TICKS): each metering game gets its room's
@@ -1437,7 +1491,9 @@ class PresenceServer:
         the biggest single hit). Sent even when nobody hit anything, so an
         open meter knows it is live."""
         dealt, over = self._dealt, self._dealt_over
+        monsters, deaths, events = self._dealt_monsters, self._killed, self._events
         self._dealt, self._dealt_over = {}, {}
+        self._dealt_monsters, self._killed, self._events = {}, {}, {}
         watchers = [p for p in self.players.values() if p.meter and p.area and not p.dropped]
         self._metered = {p.area for p in watchers}
         for room in self._metered:
@@ -1453,7 +1509,10 @@ class PresenceServer:
                                      int(ident.get("lvl", 1) or 1), int(round(float(bounds.get("dps", 0) or 0))),
                                      int(bounds.get("max_hit", 0) or 0)]
             text = json.dumps({"t": "dm", "a": room.split("#", 1)[0], "h": hits,
-                               "over": over.get(room, 0), "who": who}, separators=(",", ":"))
+                               "over": over.get(room, 0), "who": who,
+                               "m": {str(k): v for k, v in monsters.get(room, {}).items()},
+                               "k": deaths.get(room, []), "e": events.get(room, [])},
+                              separators=(",", ":"))
             self._out([p.ws for p in watchers if p.area == room], text)
 
     def relay_world(self, player, raw, msg):
@@ -1578,6 +1637,8 @@ class PresenceServer:
         if player.fighter is not None:
             self._book_safely(player.fighter.moved, state["area"], state["x"], state["y"],
                               time.time(), moved_area)
+        if state["anim"].startswith("death") and not player.anim.startswith("death") and not moved_area:
+            self.metered_event(player.area, "fell", player.user_id, str(player.identity.get("name", "")))
         player.anim, player.fx, player.pet = state["anim"], state["fx"], state["pet"]
         player.clock = state["ts"]
         player.aim, player.hp = state["aim"], state["hp"]
@@ -1856,7 +1917,7 @@ class PresenceServer:
 
     def tick(self):
         self.ticks += 1
-        if self.ticks % METER_TICKS == 0 and (self._metered or self._dealt):
+        if self.ticks % METER_TICKS == 0 and (self._metered or self._dealt or self._killed or self._events):
             self.meter_report()
         attacks_by_area, self._tick_attacks = self._tick_attacks, {}
         for area, room in list(self.rooms.items()):

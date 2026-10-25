@@ -899,8 +899,9 @@ book.take()
 cap = lead.bounds["max_hit"]
 book.hit(lead, 950, 5, 2.0)
 book.hit(lead, 951, 7, 2.5)
-check("every hit counted is heard: who, booked, claimed, and whether a boss took it",
-      heard == [(1, 5, 5, False), (1, 7, 7, True)], heard)
+check("every hit counted is heard: who, booked, claimed, whether a boss took it, and which monster",
+      [h[:4] for h in heard] == [(1, 5, 5, False), (1, 7, 7, True)]
+      and [h[4].id for h in heard] == [950, 951] and heard[1][4].enemy_id == BOSS, heard)
 heard.clear()
 book.hit(lead, 950, int(cap * combatbook.SLACK) + 1000, 10.0)
 check("  a hit past its character's bounds: heard as claimed, and booked as the books held it",
@@ -912,7 +913,25 @@ check("  a hit on a monster the books never saw (stray): not heard - nothing was
       heard == [] and book.stray >= 1, heard)
 quiet, _ = fresh_field(0.0)
 check("  and a book nobody listens to has no ear (on_hit None) and books as before",
-      quiet.on_hit is None)
+      quiet.on_hit is None and quiet.on_kill is None)
+deaths = []
+book.on_kill = lambda monster, boss: deaths.append((monster.id, monster.enemy_id, boss))
+book.world(lead, {"ev": [{"k": "die", "id": 951, "x": 0, "y": 0}, {"k": "die", "id": 424242, "x": 0, "y": 0}]}, 12.0)
+check("THE FIGHT LOG (0.82.0): every death the books see is heard, the monster and whether a boss",
+      deaths == [(951, BOSS, True)], deaths)
+heard.clear()
+book.world(lead, {"hits": [[950, 3, 4]]}, 13.0)
+check("  a hit's element, as the game sent it, is heard too (None from a follower's old path)",
+      len(heard) == 1 and heard[0][5] == 4 and heard[0][4].id == 950, heard)
+grown = []
+book.on_rescale = lambda monster, before, after: grown.append((monster.id, before, after))
+book.world(lead, {"ev": [{"k": "spawn", "r": record(952, BOSS, origin="")}]}, 14.0)
+book.take()
+book.world(lead, {"ev": [{"k": "mh", "id": 952, "mh": CAT * 2, "hp": CAT * 2}]}, 15.0)
+book.world(lead, {"ev": [{"k": "mh", "id": 952, "mh": CAT * 2, "hp": CAT * 2}]}, 16.0)
+book.world(lead, {"ev": [{"k": "mh", "id": 952, "mh": CAT, "hp": CAT}]}, 17.0)
+check("  and every boss its fight raised or lowered, from what to what - not a no-change",
+      grown == [(952, CAT, CAT * 2), (952, CAT * 2, CAT)], grown)
 
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))

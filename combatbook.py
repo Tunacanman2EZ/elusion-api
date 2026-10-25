@@ -324,9 +324,14 @@ class AreaBook:
         # last read them (stirred_lands()); nothing stirs in a book alone.
         self.stirred_lands = frozenset()
         # THE DAMAGE METER (game 0.81.0): presence.py's ear on every hit these
-        # books count - on_hit(user_id, booked, claimed, boss) - or None. The
-        # books decide nothing by it; they only say what they booked.
+        # books count - on_hit(user_id, booked, claimed, boss, monster,
+        # element) - and (0.82.0, THE FIGHT LOG) on every death - on_kill(
+        # monster, boss) - and every boss whose health its fight changed -
+        # on_rescale(monster, before, after) - or None. The books decide
+        # nothing by them; they only say what they saw.
         self.on_hit = None
+        self.on_kill = None
+        self.on_rescale = None
 
     # ---- what the leader says ------------------------------------------------
 
@@ -352,17 +357,17 @@ class AreaBook:
         # or the smalls are not owed and come out NOT DUE.
         later = {}
         hits = clean_hit_list(d.get("hits", []))
-        for monster_id, damage, _element in hits or ():
+        for monster_id, damage, element in hits or ():
             if monster_id in self.monsters or monster_id in self.dying:
-                self.hit(leader, monster_id, damage, now)
+                self.hit(leader, monster_id, damage, now, element)
             else:
-                later.setdefault(monster_id, []).append(damage)
+                later.setdefault(monster_id, []).append((damage, element))
 
         def landed(record):
             """The waiting hits on a monster this message has just introduced."""
             monster_id = _whole(record.get("id"), 0, 2 ** 31 - 1) if isinstance(record, dict) else None
-            for damage in later.pop(monster_id, ()):
-                self.hit(leader, monster_id, damage, now)
+            for damage, element in later.pop(monster_id, ()):
+                self.hit(leader, monster_id, damage, now, element)
 
         if d.get("full") is True:
             reset = d.get("reset") is True
@@ -396,8 +401,8 @@ class AreaBook:
             elif kind == "mh":
                 self.rescaled(leader.user_id, event, now)
         for monster_id, waiting in later.items():
-            for damage in waiting:
-                self.hit(leader, monster_id, damage, now)
+            for damage, element in waiting:
+                self.hit(leader, monster_id, damage, now, element)
         snap = d.get("snap")
         for row in snap if isinstance(snap, list) else ():
             if not isinstance(row, list) or len(row) != 5:
@@ -522,6 +527,8 @@ class AreaBook:
             self._flag(user_id, "max_hp_differs", "%s %d, the catalogue %d" % (m.enemy_id, new_max, catalogue_max),
                        now)
             return
+        if self.on_rescale is not None:
+            self.on_rescale(m, int(m.max_hp), int(new_max))
         if new_max > m.max_hp:
             m.hp += new_max - m.max_hp
         else:
@@ -603,6 +610,8 @@ class AreaBook:
                 self.want_full = True
             return
         m.dead_at = now
+        if self.on_kill is not None:
+            self.on_kill(m, self._is_boss(m))
         if m.origin in self.spawns:
             self.deaths[m.origin] = now
         if m.splitter:
@@ -637,9 +646,10 @@ class AreaBook:
 
     # ---- hits ----------------------------------------------------------------
 
-    def hit(self, fighter, monster_id, damage, now):
+    def hit(self, fighter, monster_id, damage, now, element=None):
         """One hit from one player. Booked, held to their bounds, and counted
-        as theirs."""
+        as theirs. Its element (Element.Type, as the game sent it) is only
+        passed on to on_hit."""
         m = self.monsters.get(monster_id)
         late = False
         if m is None:
@@ -679,8 +689,10 @@ class AreaBook:
         if not late:
             m.hp -= booked
         if self.on_hit is not None:
-            boss = bool((self.enemies.get(m.enemy_id) or {}).get("slots_are_gear"))
-            self.on_hit(fighter.user_id, booked, damage, boss)
+            self.on_hit(fighter.user_id, booked, damage, self._is_boss(m), m, element)
+
+    def _is_boss(self, m):
+        return bool((self.enemies.get(m.enemy_id) or {}).get("slots_are_gear"))
 
     def credit(self, fighter, monster_id, extra):
         """The rest of a hit a fresh ticket showed was possible after all."""

@@ -1631,6 +1631,50 @@ def damage_meter():
             book.on_hit(9503, 6, 6, False)
             check("  a book the server makes has the meter's ear (AreaBook.on_hit)",
                   hub._dealt.get("bigfield#2") == [[9503, 6, 6, 0]], hub._dealt)
+
+            class Beast:
+                def __init__(self, mid, enemy_id, max_hp):
+                    self.id, self.enemy_id, self.max_hp = mid, enemy_id, max_hp
+
+            boss_id = next((k for k, v in presence.gamedata.ENEMIES.items() if v.get("slots_are_gear")), "boss")
+            beast = Beast(77, boss_id, 123456)
+            book.on_hit(9502, 40, 40, True, beast)
+            book.on_hit(9502, 2, 2, False, Beast(78, "slime", 90))
+            book.on_kill(beast, True)
+            sent.clear()
+            hub.meter_report()
+            got = reports(owner)
+            name = str(presence.gamedata.ENEMIES.get(boss_id, {}).get("display_name", "") or boss_id)
+            check("THE FIGHT LOG (0.82.0): each hit says which monster, and the report names them and its deaths",
+                  len(got) == 1 and got[0]["h"][-2:] == [[9502, 40, 40, 1, 77, -1], [9502, 2, 2, 0, 78, -1]]
+                  and got[0]["m"].get("77") == [boss_id, name, 123456] and "78" in got[0]["m"]
+                  and got[0]["k"] == [[77, 1]], got)
+            sent.clear()
+            hub.meter_report()
+            check("  each report its own: the next names nothing it has not seen",
+                  [(m["m"], m["k"]) for m in reports(owner)] == [({}, [])], reports(owner))
+            book.on_hit(9502, 5, 5, False, Beast(79, "slime", 90), 3)
+            book.on_hit(9502, 5, 5, False, Beast(79, "slime", 90), "fire")
+            book.on_rescale(beast, 100, 250)
+            hub.metered_event("bigfield#2", "joined", 9503, "m9503")
+            hub.metered_event("bigfield#2", "danced", 9503, "m9503")
+            plain.area = "bigfield#2"
+            hub.rooms["bigfield#2"] = {plain}
+            hub._leave_room(plain)
+            sent.clear()
+            hub.meter_report()
+            got = reports(owner)
+            check("  each hit's element (-1 when it is not one), and what changed the fight: a boss grown, "
+                  "a player in and out - nothing else",
+                  len(got) == 1 and [h[5] for h in got[0]["h"]] == [3, -1]
+                  and got[0]["e"] == [["grew", 77, [100, 250]], ["joined", 9503, "m9503"], ["left", 9503, "m9503"]],
+                  got)
+            owner.meter = False
+            hub.meter_report()
+            book.on_kill(beast, True)
+            hub.metered_event("bigfield#2", "fell", 9503, "m9503")
+            check("  and a death or an event in a room nobody meters is not even kept",
+                  hub._killed == {} and hub._events == {}, (hub._killed, hub._events))
     finally:
         presence.METER_MOST_HITS = real_most
         presence.broadcast = real_broadcast

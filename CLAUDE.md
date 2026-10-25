@@ -2739,6 +2739,22 @@ follower's. The books see them all, so the meter is the books' count.
   shut meter costs the data bill nothing. P-15.
 - **Deploy order: either.** An older server passes over "dm" as an unknown
   message (the meter waits, saying so); an older game never sends it.
+- **THE FIGHT LOG (game 0.82.0)**: `on_hit` also passes the Monster, and
+  `AreaBook.on_kill(monster, boss)` hears every death (`_died()`). A hit in a
+  report gains a fifth element, the monster's id; the report gains `"m"` (id ->
+  [enemy id, display name, its max_hp now - a boss's raised one]) for every
+  monster hit or killed in it, and `"k"` ([[id, boss], ...]) for the deaths -
+  kept only for metered rooms, like the hits. CB-13, P-15. Deploy order:
+  either - an older game reads the first four of a hit and ignores the rest.
+- **Elements and events (game 0.82.0)**: `AreaBook.hit()` takes the hit's
+  element (the third of a hit, as the game sent it) and passes it to `on_hit`;
+  a report's hit gains it sixth (-1 when it is not an Element.Type).
+  `AreaBook.on_rescale(monster, before, after)` hears a boss raised or lowered
+  by its fight ("mh", not a no-change). `metered_event(room, kind, subject,
+  detail)` keeps METER_EVENTS for metered rooms only, at most
+  METER_MOST_EVENTS a report, sent as `"e"`: grew/shrank (a monster id,
+  [before, after]), joined/left (`_enter_room` / `_leave_room`, a user id and
+  name) and fell (a state whose animation turns to a death one).
 
 ## Layout
 
