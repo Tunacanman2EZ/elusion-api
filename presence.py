@@ -480,6 +480,16 @@ TICK_ATTACKS = 1
 #                    the healer's last is passed on as a picture and granted
 #                    nothing.
 #   HEAL_ROUNDING    hp over the share: the game rounds each tick up.
+# THE DAMAGE METER (game 0.81.0): every hit the books count in a room, sent
+# once a second to an owner or co-owner there who has the meter open - and to
+# nobody else, so it costs the bill nothing while it is shut. What a player
+# claimed and what the books booked both go, so the meter shows a hit held to
+# its character's bounds. The books are the only source: a hit they never see
+# (an area with no map, the books off) is not on the meter either.
+METER_ROLES = ("owner", "coowner")
+METER_TICKS = 10            # ticks between reports: one a second
+METER_MOST_HITS = 2000      # hits kept for one room in one report; past it, counted
+
 HEAL_GRANT_ID = "__spellheal__"
 HEAL_REACH_SLACK = 1.25
 HEAL_REACH_PAD = 48.0
@@ -891,6 +901,9 @@ class Player:
         self.joined_at = 0.0
         # ATTACKS RIDE THE TICK: this game takes them inside the moves.
         self.tick_attacks = False
+        # THE DAMAGE METER (0.81.0): this game has it open. Only an owner's or
+        # a co-owner's can (METER_ROLES).
+        self.meter = False
         # PARTY VOICE: in it, and the party it was in when it last checked.
         self.voice = False
         self.voice_party = 0
@@ -1162,6 +1175,12 @@ class PresenceServer:
         self.month_from = None
         self._recent = collections.deque(maxlen=GUARD_RATE_MINUTES)
         self.affordable = None
+        # THE DAMAGE METER (game 0.81.0): room -> [[user id, booked, claimed,
+        # boss], ...] since the last report, kept only for the rooms someone is
+        # metering; the hits past METER_MOST_HITS in a report, counted.
+        self._dealt = {}
+        self._metered = set()
+        self._dealt_over = {}
 
     # ---- sending -------------------------------------------------------------
     # EVERYTHING SENT IS COUNTED (game 0.78.0): a frame for each socket a text
@@ -1343,6 +1362,8 @@ class PresenceServer:
         if book is None:
             book = self.books[area] = combatbook.AreaBook(place, gamedata.AREAS[place])
             book.stirred_lands = self.stirred
+            book.on_hit = lambda user_id, booked, claimed, boss, room=area: \
+                self.dealt(room, user_id, booked, claimed, boss)
         return book
 
     def set_stirred(self, lands):
@@ -1383,6 +1404,57 @@ class PresenceServer:
         now = time.time()
         for monster, damage, _element in hits:
             book.hit(player.fighter, monster, damage, now)
+
+    # ---- the damage meter (game 0.81.0) -----------------------------------
+
+    def meter_switch(self, player, msg):
+        """{"t": "dm", "on": true|false} - open or shut this game's meter. An
+        owner or a co-owner only (the ticket's role); anybody else's is
+        passed over, as an unknown message is."""
+        on = msg.get("on")
+        if not isinstance(on, bool):
+            return
+        if on and str(player.identity.get("role", "")) not in METER_ROLES:
+            return
+        player.meter = on
+        self._metered = {p.area for p in self.players.values() if p.meter and p.area}
+
+    def dealt(self, room, user_id, booked, claimed, boss):
+        """A hit the books in `room` counted (AreaBook.on_hit). Kept only while
+        somebody there is metering, and only METER_MOST_HITS a report."""
+        if room not in self._metered:
+            return
+        hits = self._dealt.setdefault(room, [])
+        if len(hits) >= METER_MOST_HITS:
+            self._dealt_over[room] = self._dealt_over.get(room, 0) + 1
+            return
+        hits.append([user_id, int(booked), int(claimed), 1 if boss else 0])
+
+    def meter_report(self):
+        """Once a second (METER_TICKS): each metering game gets its room's
+        hits since the last report, and who dealt them - name, class, level,
+        and the bounds the books hold that character to (damage a second,
+        the biggest single hit). Sent even when nobody hit anything, so an
+        open meter knows it is live."""
+        dealt, over = self._dealt, self._dealt_over
+        self._dealt, self._dealt_over = {}, {}
+        watchers = [p for p in self.players.values() if p.meter and p.area and not p.dropped]
+        self._metered = {p.area for p in watchers}
+        for room in self._metered:
+            hits = dealt.get(room, [])
+            who = {}
+            for user_id in {hit[0] for hit in hits}:
+                dealer = self.players.get(user_id)
+                if dealer is None:
+                    continue
+                bounds = (dealer.fighter.bounds if dealer.fighter is not None else None) or {}
+                ident = dealer.identity
+                who[str(user_id)] = [str(ident.get("name", "")), str(ident.get("cls", "")),
+                                     int(ident.get("lvl", 1) or 1), int(round(float(bounds.get("dps", 0) or 0))),
+                                     int(bounds.get("max_hit", 0) or 0)]
+            text = json.dumps({"t": "dm", "a": room.split("#", 1)[0], "h": hits,
+                               "over": over.get(room, 0), "who": who}, separators=(",", ":"))
+            self._out([p.ws for p in watchers if p.area == room], text)
 
     def relay_world(self, player, raw, msg):
         """A world message from the area's leader, passed on exactly as sent -
@@ -1751,6 +1823,8 @@ class PresenceServer:
                     await self.voice_state(player, message)
                 elif kind == "vc":
                     await self.voice_signal(player, message)
+                elif kind == "dm":
+                    self.meter_switch(player, message)
         except ConnectionClosed:
             pass
         finally:
@@ -1782,6 +1856,8 @@ class PresenceServer:
 
     def tick(self):
         self.ticks += 1
+        if self.ticks % METER_TICKS == 0 and (self._metered or self._dealt):
+            self.meter_report()
         attacks_by_area, self._tick_attacks = self._tick_attacks, {}
         for area, room in list(self.rooms.items()):
             attacks = attacks_by_area.get(area)

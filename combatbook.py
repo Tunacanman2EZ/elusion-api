@@ -323,6 +323,10 @@ class AreaBook:
         # The lands (Element.Type 1-7) stirring now or lately, as presence.py
         # last read them (stirred_lands()); nothing stirs in a book alone.
         self.stirred_lands = frozenset()
+        # THE DAMAGE METER (game 0.81.0): presence.py's ear on every hit these
+        # books count - on_hit(user_id, booked, claimed, boss) - or None. The
+        # books decide nothing by it; they only say what they booked.
+        self.on_hit = None
 
     # ---- what the leader says ------------------------------------------------
 
@@ -674,6 +678,9 @@ class AreaBook:
         m.damage[fighter.user_id] = m.damage.get(fighter.user_id, 0) + booked
         if not late:
             m.hp -= booked
+        if self.on_hit is not None:
+            boss = bool((self.enemies.get(m.enemy_id) or {}).get("slots_are_gear"))
+            self.on_hit(fighter.user_id, booked, damage, boss)
 
     def credit(self, fighter, monster_id, extra):
         """The rest of a hit a fresh ticket showed was possible after all."""

@@ -2715,6 +2715,31 @@ count is never above the game's. Below the catalogue's, past
 for the same reward. **Deploy before the 0.80.0 game.** test_combatbook.py
 CB-12.
 
+## The damage meter: every hit the books count, to an owner who asked (game 0.81.0)
+
+The owner, 25 Oct: "i need a way to measure all players dps maybe make a
+filter just for player damage testing that i can use in game". A game sees its
+own hits and the leader sees everyone's; a follower never sees another
+follower's. The books see them all, so the meter is the books' count.
+
+- **`AreaBook.on_hit`** (combatbook.py): None, or a callable the book calls with
+  `(user_id, booked, claimed, boss)` for every hit it books - booked after the
+  character's bounds, claimed as the game sent it, boss from the catalogue's
+  `slots_are_gear` (as killwatch reads it). A stray hit (no such monster) books
+  nothing and is not heard. The books decide nothing by it. CB-13.
+- **presence.py**: every book `_book()` makes gets `on_hit` -> `dealt(room, ...)`.
+  A game says `{"t": "dm", "on": true|false}`; only a ticket whose role is in
+  `METER_ROLES` (owner, coowner) can open it - anyone else's is passed over.
+  Hits are kept only for rooms somebody is metering, at most `METER_MOST_HITS`
+  (2000) a report (the rest counted, `"over"`). Every `METER_TICKS` (10) ticks,
+  `meter_report()` sends each metering game its room's hits since the last:
+  `{"t": "dm", "a": area, "h": [[id, booked, claimed, boss 0/1], ...], "over": n,
+  "who": {"id": [name, cls, lvl, dps bound, max_hit]}}` - even when empty, so an
+  open meter knows it is live. Nothing goes to anybody who has not asked, so a
+  shut meter costs the data bill nothing. P-15.
+- **Deploy order: either.** An older server passes over "dm" as an unknown
+  message (the meter waits, saying so); an older game never sends it.
+
 ## Layout
 
 ```

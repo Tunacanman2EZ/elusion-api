@@ -1541,6 +1541,101 @@ async def data_guard():
         presence.broadcast = real_broadcast
 
 
+def damage_meter():
+    """P-15: who may open the meter, what it hears, and that only they do."""
+    section("P-15 THE DAMAGE METER: EVERY HIT THE BOOKS COUNT, ONCE A SECOND, TO AN OWNER WHO ASKED")
+    sent = []
+    real_broadcast = presence.broadcast
+    presence.broadcast = lambda connections, text: sent.append((list(connections), json.loads(text)))
+    real_most = presence.METER_MOST_HITS
+
+    class Game:
+        def __init__(self, uid):
+            self.uid = uid
+
+    hub = presence.PresenceServer(sweep_seconds=5, tick_seconds=5)
+
+    def player(uid, role, area="bigfield"):
+        p = presence.Player(Game(uid), uid, "hash-%d" % uid, {"name": "m%d" % uid, "cls": "mage", "lvl": 7,
+                                                             "role": role}, time.time() + 60, slot=0)
+        p.area = area
+        if p.fighter is not None:
+            p.fighter.bounds = {"dps": 123.4, "max_hit": 50}
+        hub.players[uid] = p
+        return p
+
+    def reports(p):
+        return [m for conns, m in sent if p.ws in conns and m.get("t") == "dm"]
+
+    try:
+        owner, co, plain = player(9501, "owner"), player(9502, "coowner"), player(9503, "player")
+        other = player(9504, "owner", area="field")
+        hub.meter_switch(plain, {"t": "dm", "on": True})
+        hub.meter_switch(owner, {"t": "dm", "on": "yes"})
+        check("a player who is not owner or co-owner cannot open it; 'on' must be true or false",
+              not plain.meter and not owner.meter and not hub._metered)
+        hub.dealt("bigfield", 9503, 10, 10, False)
+        check("  and with nobody metering, no hit is even kept", hub._dealt == {}, hub._dealt)
+        hub.meter_switch(owner, {"t": "dm", "on": True})
+        hub.meter_switch(other, {"t": "dm", "on": True})
+        check("an owner opens it: its room is metered", owner.meter and hub._metered == {"bigfield", "field"},
+              hub._metered)
+        hub.dealt("bigfield", 9503, 40, 40, False)
+        hub.dealt("bigfield", 9502, 50, 900, True)
+        hub.dealt("field", 9504, 3, 3, False)
+        hub.meter_report()
+        mine = reports(owner)
+        check("the report: its room's hits, booked and claimed, boss marked", len(mine) == 1
+              and mine[0]["h"] == [[9503, 40, 40, 0], [9502, 50, 900, 1]] and mine[0]["a"] == "bigfield"
+              and mine[0]["over"] == 0, mine)
+        who = mine[0]["who"] if mine else {}
+        check("  and who dealt them: name, class, level, and the bounds the books hold them to",
+              who.get("9503") == ["m9503", "mage", 7, 123, 50] and set(who) == {"9503", "9502"}, who)
+        check("  only to those metering, each its own room: the plain player and the co-owner hear nothing",
+              not reports(plain) and not reports(co)
+              and [m["h"] for m in reports(other)] == [[[9504, 3, 3, 0]]], reports(other))
+        sent.clear()
+        hub.meter_report()
+        check("  a quiet second still reports (empty), so an open meter knows it is live",
+              [m["h"] for m in reports(owner)] == [[]], reports(owner))
+        presence.METER_MOST_HITS = 3
+        for n in range(5):
+            hub.dealt("bigfield", 9503, 1, 1, False)
+        sent.clear()
+        hub.meter_report()
+        got = reports(owner)
+        check("  past METER_MOST_HITS in a second: kept to it, the rest counted",
+              len(got) == 1 and len(got[0]["h"]) == 3 and got[0]["over"] == 2, got)
+        presence.METER_MOST_HITS = real_most
+        owner.area = "bigfield#2"
+        hub.meter_report()
+        hub.dealt("bigfield", 9503, 9, 9, False)
+        hub.dealt("bigfield#2", 9502, 8, 8, False)
+        sent.clear()
+        hub.meter_report()
+        check("  it follows its owner into a second room (THE DATA GUARD), named by its area",
+              [(m["a"], m["h"]) for m in reports(owner)] == [("bigfield", [[9502, 8, 8, 0]])], reports(owner))
+        hub.meter_switch(owner, {"t": "dm", "on": False})
+        hub.meter_switch(other, {"t": "dm", "on": False})
+        sent.clear()
+        hub.meter_report()
+        check("shut: nothing sent, nothing metered", not sent and not hub._metered, sent)
+        hub.meter_switch(owner, {"t": "dm", "on": True})
+        sent.clear()
+        hub.ticks = 0
+        for _ in range(presence.METER_TICKS * 2):
+            hub.tick()
+        check("on the tick: one report every METER_TICKS ticks", len(reports(owner)) == 2, len(reports(owner)))
+        if presence.BOOKS and "bigfield" in gamedata_areas():
+            book = hub._book("bigfield#2")
+            book.on_hit(9503, 6, 6, False)
+            check("  a book the server makes has the meter's ear (AreaBook.on_hit)",
+                  hub._dealt.get("bigfield#2") == [[9503, 6, 6, 0]], hub._dealt)
+    finally:
+        presence.METER_MOST_HITS = real_most
+        presence.broadcast = real_broadcast
+
+
 def gamedata_areas():
     return getattr(getattr(presence, "gamedata", None), "AREAS", None) or {}
 
@@ -1678,6 +1773,7 @@ async def main():
     await positions_written()
     await health_written()
     await data_guard()
+    damage_meter()
     presence.HELLO_SECONDS = 0.5
     combatbook.HOLD_SECONDS = 0.2
     combatbook.PENDING_SECONDS = 0.3

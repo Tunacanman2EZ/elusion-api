@@ -887,6 +887,33 @@ book.world(lead, {"ev": [{"k": "mh", "id": 902, "mh": sprite_max * 2, "hp": spri
 check("  and only a boss: a normal monster raised so is flagged and left",
       kinds(book.take()[1]) == ["max_hp_differs"] and book.monsters[902].max_hp == sprite_max)
 
+# =============================================================================
+section("CB-13 THE DAMAGE METER (game 0.81.0): THE BOOKS SAY WHAT THEY BOOKED")
+# =============================================================================
+book, lead = fresh_field(0.0)
+heard = []
+book.on_hit = lambda *hit: heard.append(hit)
+book.world(lead, {"ev": [{"k": "spawn", "r": record(950, "darksprite")},
+                         {"k": "spawn", "r": record(951, BOSS, origin="")}]}, 1.0)
+book.take()
+cap = lead.bounds["max_hit"]
+book.hit(lead, 950, 5, 2.0)
+book.hit(lead, 951, 7, 2.5)
+check("every hit counted is heard: who, booked, claimed, and whether a boss took it",
+      heard == [(1, 5, 5, False), (1, 7, 7, True)], heard)
+heard.clear()
+book.hit(lead, 950, int(cap * combatbook.SLACK) + 1000, 10.0)
+check("  a hit past its character's bounds: heard as claimed, and booked as the books held it",
+      len(heard) == 1 and heard[0][2] == int(cap * combatbook.SLACK) + 1000 and heard[0][1] < heard[0][2],
+      heard)
+heard.clear()
+book.hit(lead, 999999, 5, 11.0)
+check("  a hit on a monster the books never saw (stray): not heard - nothing was booked",
+      heard == [] and book.stray >= 1, heard)
+quiet, _ = fresh_field(0.0)
+check("  and a book nobody listens to has no ear (on_hit None) and books as before",
+      quiet.on_hit is None)
+
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))
 print("=" * 60)
