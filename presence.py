@@ -497,6 +497,19 @@ METER_MOST_HITS = 2000      # hits kept for one room in one report; past it, cou
 # player falling (METER_EVENTS, METER_MOST_EVENTS a report).
 METER_EVENTS = ("grew", "shrank", "joined", "left", "fell")
 METER_MOST_EVENTS = 64
+# THE ENEMY METER, PHASE 1 (game 0.83.0): DAMAGE TAKEN. Each state carries
+# running totals - "dt" taken, "dh" healed, "dr" regen, "dte" taken by element
+# (only when it changed) - "dx" the biggest hit since the game's last state, and
+# "hpa"/"hpm" its real health and most. All optional; a bad one is dropped, the
+# state kept. This server turns totals into what each second added: a total
+# that goes DOWN is a new character or a restarted game - a new baseline,
+# counting nothing - and no one state may add more than METER_TAKEN_MARGIN
+# times the most health. Kept only for metered rooms, and never passed on in a
+# move or a join: the report's "tk" (user id -> [taken, healed, regen, biggest,
+# lowest health, most health, {element: taken}]) is the only place it goes.
+METER_TOTAL_MOST = 10 ** 12
+METER_HEALTH_MOST = 10 ** 7
+METER_TAKEN_MARGIN = 4
 
 HEAL_GRANT_ID = "__spellheal__"
 HEAL_REACH_SLACK = 1.25
@@ -912,6 +925,15 @@ class Player:
         # THE DAMAGE METER (0.81.0): this game has it open. Only an owner's or
         # a co-owner's can (METER_ROLES).
         self.meter = False
+        # THE ENEMY METER (0.83.0): its last totals ([taken, healed, regen], None
+        # before the first), its last by element (None before the first), its
+        # real health and most (-1 unknown), and this second's share
+        # (took_now(), None while nothing is kept).
+        self.totals = None
+        self.by_element = None
+        self.hpa = -1
+        self.hpm = -1
+        self.took = None
         # PARTY VOICE: in it, and the party it was in when it last checked.
         self.voice = False
         self.voice_party = 0
@@ -1040,6 +1062,38 @@ def clean_state(msg, allowed_pets):
             if value is None:
                 return None
             out[key] = value
+    out.update(clean_taken(msg))
+    return out
+
+
+def clean_taken(msg):
+    """THE ENEMY METER's fields of a state (game 0.83.0), each checked on its
+    own: a bad one is left out and the rest kept - a meter is not worth losing
+    a player's step over."""
+    out = {}
+    for key in ("dt", "dh", "dr"):
+        if key in msg:
+            value = _whole(msg.get(key), 0, METER_TOTAL_MOST)
+            if value is not None:
+                out[key] = value
+    most = _whole(msg.get("hpm"), 1, METER_HEALTH_MOST) if "hpm" in msg else None
+    if most is not None:
+        health = _whole(msg.get("hpa"), 0, most)
+        if health is not None:
+            out["hpm"], out["hpa"] = most, health
+    if "dx" in msg:
+        value = _whole(msg.get("dx"), 0, METER_TOTAL_MOST)
+        if value is not None:
+            out["dx"] = value
+    raw = msg.get("dte")
+    if isinstance(raw, dict) and len(raw) <= MAX_ELEMENT + 1:
+        elements = {}
+        for key, value in raw.items():
+            element = _whole(int(key) if isinstance(key, str) and key.isdigit() else key, 0, MAX_ELEMENT)
+            value = _whole(value, 0, METER_TOTAL_MOST)
+            if element is not None and value is not None:
+                elements[element] = value
+        out["dte"] = elements
     return out
 
 
@@ -1496,10 +1550,24 @@ class PresenceServer:
         self._dealt_monsters, self._killed, self._events = {}, {}, {}
         watchers = [p for p in self.players.values() if p.meter and p.area and not p.dropped]
         self._metered = {p.area for p in watchers}
+        for p in self.players.values():
+            if p.area not in self._metered:
+                p.took = None
         for room in self._metered:
             hits = dealt.get(room, [])
+            # THE ENEMY METER (0.83.0): everyone in the room with a health,
+            # each second - quiet or not, so the log has their health through
+            # the fight - and the share is begun again.
+            taken = {}
+            for p in self.rooms.get(room, ()):
+                if p.hpm > 0:
+                    took = self.took_now(p)
+                    took[4] = p.hpa if took[4] < 0 else took[4]
+                    took[5] = p.hpm
+                    taken[str(p.user_id)] = took[:6] + [{str(k): v for k, v in sorted(took[6].items())}]
+                p.took = None
             who = {}
-            for user_id in {hit[0] for hit in hits}:
+            for user_id in {hit[0] for hit in hits} | {int(k) for k in taken}:
                 dealer = self.players.get(user_id)
                 if dealer is None:
                     continue
@@ -1511,7 +1579,7 @@ class PresenceServer:
             text = json.dumps({"t": "dm", "a": room.split("#", 1)[0], "h": hits,
                                "over": over.get(room, 0), "who": who,
                                "m": {str(k): v for k, v in monsters.get(room, {}).items()},
-                               "k": deaths.get(room, []), "e": events.get(room, [])},
+                               "k": deaths.get(room, []), "e": events.get(room, []), "tk": taken},
                               separators=(",", ":"))
             self._out([p.ws for p in watchers if p.area == room], text)
 
@@ -1633,15 +1701,24 @@ class PresenceServer:
         if state is None:
             return False
         moved_area = state["area"] != player.where
+        was_at = (player.x, player.y)
         player.x, player.y = state["x"], state["y"]
         if player.fighter is not None:
             self._book_safely(player.fighter.moved, state["area"], state["x"], state["y"],
                               time.time(), moved_area)
         if state["anim"].startswith("death") and not player.anim.startswith("death") and not moved_area:
             self.metered_event(player.area, "fell", player.user_id, str(player.identity.get("name", "")))
+        look_was = (player.anim, player.fx, player.pet, player.aim, player.hp)
         player.anim, player.fx, player.pet = state["anim"], state["fx"], state["pet"]
         player.clock = state["ts"]
         player.aim, player.hp = state["aim"], state["hp"]
+        # THE ENEMY METER (0.83.0): a state sent only because a total moved (a
+        # point of regen, a hit that did not change the percent) is nothing new
+        # to the others, and is not passed on.
+        if self.took_state(player, state) and not moved_area \
+                and look_was == (player.anim, player.fx, player.pet, player.aim, player.hp) \
+                and was_at == (state["x"], state["y"]):
+            return True
         if moved_area:
             player.steps = []
             self._leave_room(player)
@@ -1653,6 +1730,52 @@ class PresenceServer:
                 del player.steps[0]
             player.dirty = True
         return True
+
+    def took_state(self, player, state):
+        """THE ENEMY METER (0.83.0): what this state's totals add since the
+        last, into this second's share when its room is metered. True when a
+        total moved."""
+        if player.area in self._metered:
+            # Begun with the health it had BEFORE this state: the lowest of a
+            # second a heal ended is the one it started on.
+            self.took_now(player)
+        if "hpm" in state:
+            player.hpa, player.hpm = state["hpa"], state["hpm"]
+        if not all(key in state for key in ("dt", "dh", "dr")):
+            return False
+        now = [state["dt"], state["dh"], state["dr"]]
+        last, player.totals = player.totals, now
+        if last is None or any(n < l for n, l in zip(now, last)):
+            player.by_element = state.get("dte", {}) if "dte" in state else None
+            if player.took is not None:
+                # A new character: the old one's health is no lowest of its.
+                player.took[4], player.took[5] = player.hpa, player.hpm
+            return last is not None and now != last
+        if now == last and "dte" not in state:
+            return False
+        cap = max(player.hpm, 1) * METER_TAKEN_MARGIN
+        added = [min(n - l, cap) for n, l in zip(now, last)]
+        elements = {}
+        if "dte" in state:
+            seen, player.by_element = player.by_element, state["dte"]
+            if seen is not None and all(v >= seen.get(k, 0) for k, v in state["dte"].items()):
+                elements = {k: min(v - seen.get(k, 0), cap) for k, v in state["dte"].items() if v > seen.get(k, 0)}
+        if player.area in self._metered:
+            took = self.took_now(player)
+            for i in range(3):
+                took[i] += added[i]
+            took[3] = max(took[3], min(state.get("dx", 0), added[0]))
+            if player.hpa >= 0:
+                took[4] = player.hpa if took[4] < 0 else min(took[4], player.hpa)
+            for k, v in elements.items():
+                took[6][k] = took[6].get(k, 0) + v
+        return now != last
+
+    @staticmethod
+    def took_now(player):
+        if player.took is None:
+            player.took = [0, 0, 0, 0, player.hpa, player.hpm, {}]
+        return player.took
 
     def keeps_step(self, player):
         """THE DATA GUARD's half rate: every other step, and every one that

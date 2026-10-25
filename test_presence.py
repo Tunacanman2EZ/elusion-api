@@ -1812,12 +1812,98 @@ async def attacks_ride_the_tick(port, server):
           and "extensions=[DEFLATE]" in open(presence.__file__, encoding="utf-8").read())
 
 
+async def damage_taken():
+    """P-16: the enemy meter's first phase - damage TAKEN, from running totals."""
+    section("P-16 THE ENEMY METER: WHAT EACH PLAYER TOOK, HEALED AND REGENERATED, ONCE A SECOND")
+    sent = []
+    real_broadcast = presence.broadcast
+    presence.broadcast = lambda connections, text: sent.append((list(connections), json.loads(text)))
+
+    class Game:
+        def __init__(self, uid):
+            self.uid = uid
+
+    hub = presence.PresenceServer(sweep_seconds=5, tick_seconds=5)
+
+    def player(uid, role):
+        p = presence.Player(Game(uid), uid, "hash-%d" % uid, {"name": "t%d" % uid, "cls": "tank", "lvl": 9,
+                                                             "role": role}, time.time() + 60, slot=0)
+        p.area = "bigfield"
+        hub.players[uid] = p
+        hub.rooms.setdefault("bigfield", set()).add(p)
+        return p
+
+    def st(x=10.0, **more):
+        return dict(json.loads(state(area="bigfield", x=x, y=20.0)), **more)
+
+    async def apply(p, msg):
+        return await hub.apply_state(p, msg)
+
+    def report(p):
+        sent.clear()
+        hub.meter_report()
+        got = [m for conns, m in sent if p.ws in conns and m.get("t") == "dm"]
+        return got[0] if got else {}
+
+    try:
+        clean = presence.clean_state(st(dt=5, dh="x", dr=-1, dx=3, hpa=500, hpm=400,
+                                        dte={"6": 5, "99": 1, "2": "a"}), [])
+        check("a bad meter field is dropped and the state kept: health over its most, a total not whole",
+              clean is not None and clean.get("dt") == 5 and "dh" not in clean and "dr" not in clean
+              and "hpa" not in clean and clean.get("dx") == 3 and clean.get("dte") == {6: 5}, clean)
+        check("  and a game from before sends none: the state is what it was",
+              not set(presence.clean_state(st(), [])) & {"dt", "dh", "dr", "dx", "dte", "hpa", "hpm"})
+        owner, tank = player(9601, "owner"), player(9602, "player")
+        await apply(tank, st(dt=1000, dh=50, dr=7, hpa=300, hpm=400, dte={"6": 1000}))
+        hub.meter_switch(owner, {"t": "dm", "on": True})
+        got = report(owner)
+        check("the first state is a baseline: everything before it counts nothing",
+              got.get("tk", {}).get("9602") == [0, 0, 0, 0, 300, 400, {}], got.get("tk"))
+        await apply(tank, st(dt=1040, dh=50, dr=7, dx=30, hpa=260, hpm=400, dte={"6": 1030, "0": 10}))
+        await apply(tank, st(dt=1040, dh=70, dr=9, hpa=282, hpm=400))
+        got = report(owner)
+        check("then each second: taken, healed, regen, biggest hit, lowest and most health, by element",
+              got.get("tk", {}).get("9602") == [40, 20, 2, 30, 260, 400, {"0": 10, "6": 30}], got.get("tk"))
+        check("  and whoever took it is named, like a dealer",
+              (got.get("who", {}).get("9602") or [""])[0] == "t9602", got.get("who"))
+        got = report(owner)
+        check("  a quiet second: nothing taken, still their health",
+              got.get("tk", {}).get("9602") == [0, 0, 0, 0, 282, 400, {}], got.get("tk"))
+        await apply(tank, st(dt=12, dh=0, dr=0, hpa=388, hpm=400, dte={"6": 12}))
+        await apply(tank, st(dt=20, dh=0, dr=0, dx=8, hpa=380, hpm=400, dte={"6": 20}))
+        got = report(owner)
+        check("a total that goes DOWN (a new character) is a new baseline, never a negative",
+              got.get("tk", {}).get("9602") == [8, 0, 0, 8, 380, 400, {"6": 8}], got.get("tk"))
+        await apply(tank, st(dt=999999, dh=0, dr=0, dx=999999, hpa=0, hpm=400))
+        got = report(owner)
+        check("  and no state adds more than METER_TAKEN_MARGIN times the most health",
+              got.get("tk", {}).get("9602", [0])[0] == 400 * presence.METER_TAKEN_MARGIN
+              and got["tk"]["9602"][3] == 400 * presence.METER_TAKEN_MARGIN, got.get("tk"))
+        watcher = player(9603, "player")
+        await apply(watcher, st(x=50.0))
+        tank.dirty, tank.steps = False, []
+        await apply(tank, st(dt=1000010, dh=0, dr=3, hpa=3, hpm=400))
+        check("a state that only moved a total is not passed on to the others",
+              not tank.dirty and not tank.steps, (tank.dirty, tank.steps))
+        await apply(tank, st(x=11.0, dt=1000010, dh=0, dr=3, hpa=3, hpm=400))
+        check("  one that moved them is, and carries no meter field",
+              tank.dirty and len(tank.steps) == 1 and len(tank.steps[0]) == len(tank.move())
+              and not set(map(str, tank.entry())) & {"dt", "hpa"}, tank.steps)
+        hub.meter_switch(owner, {"t": "dm", "on": False})
+        hub.meter_report()
+        await apply(tank, st(x=11.0, dt=1000050, dh=0, dr=3, hpa=3, hpm=400))
+        check("shut: nothing kept", tank.took is None, tank.took)
+    finally:
+        presence.broadcast = real_broadcast
+
+
 async def main():
     await kills_written_soon()
     await positions_written()
     await health_written()
     await data_guard()
     damage_meter()
+    await damage_taken()
     presence.HELLO_SECONDS = 0.5
     combatbook.HOLD_SECONDS = 0.2
     combatbook.PENDING_SECONDS = 0.3

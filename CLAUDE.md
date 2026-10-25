@@ -2755,6 +2755,25 @@ follower's. The books see them all, so the meter is the books' count.
   METER_MOST_EVENTS a report, sent as `"e"`: grew/shrank (a monster id,
   [before, after]), joined/left (`_enter_room` / `_leave_room`, a user id and
   name) and fell (a state whose animation turns to a death one).
+- **Damage TAKEN (game 0.83.0, the enemy meter's phase 1)**: a state may carry
+  running totals - `dt` taken, `dh` healed, `dr` regen, `dte` taken by element
+  (only when it moved) - `dx` the biggest hit since the game's last state, and
+  `hpa`/`hpm` real health and most. `clean_taken()` reads each on its own: a
+  bad one is dropped and the state kept (whole numbers, totals to
+  `METER_TOTAL_MOST`, health to `METER_HEALTH_MOST` and never over its most,
+  elements to `MAX_ELEMENT`). `took_state()` keeps each player's last totals
+  and adds what a state added since into this second's share (`player.took`,
+  only for metered rooms): a total that goes DOWN is a new character or a
+  restarted game - a new baseline, counting nothing; the first state is one
+  too; no state adds more than `METER_TAKEN_MARGIN` (4) times the most health.
+  The share's lowest health starts at what it had before the second's first
+  state. The report gains `"tk"`: user id -> [taken, healed, regen, biggest,
+  lowest health, most health, {element: taken}] for everyone in the room with a
+  health, quiet or not, and `"who"` names them like dealers. **Never relayed**:
+  a state that only moved a total (a point of regen) is not passed on as a
+  move, and no move or join carries a meter field. P-16. **Deploy order:
+  server first** - an older server ignores the fields, so nothing breaks, but
+  the meter has no taken until it is updated.
 
 ## Layout
 
