@@ -9,6 +9,9 @@ server: the API and the presence socket together, the way a game uses them.
 
     python3 swarm.py --launch --levels 128 --duration 120 --areas 3
 
+    # spread over a Big Field, so each game is sent only who is near (0.89.0):
+    python3 swarm.py --launch --levels 128 --spread 2400
+
     # every bot on a compressed socket, as the browser build is:
     python3 swarm.py --launch --levels 128 --deflate 1
 
@@ -248,7 +251,11 @@ class Bot:
         self.user_id = None
         self.leader = False
         self.world = area_world(area)
-        self.centre = (random.uniform(-200, 200), random.uniform(-200, 200))
+        # Where its circle is: within --spread of the middle, across and up and
+        # down (400, everyone on one screen; ONLY WHAT IS NEAR, 0.89.0, sends a
+        # game only the players near it, so a spread crowd costs less).
+        half = args.spread / 2.0
+        self.centre = (random.uniform(-half, half), random.uniform(-half, half))
         self.phase = random.uniform(0, math.tau)
         self.stop = False
         self.frames = 0
@@ -551,6 +558,9 @@ def report(n, stats, elapsed, before, after, leaders, http, args):
     expected = listeners * stats.steps_sent / max(1, min(args.areas, n)) * (per_area - 1) / per_area
     print("          %5.1f moves frames/s a listener (the tick is 10/s)   %5.1f%% of the steps sent arrived" % (
         stats.moves_frames / elapsed / listeners, 100.0 * stats.steps_seen / max(1.0, expected)))
+    if args.spread > 2 * 480.0:
+        print("          (spread %d px: each game is sent only who is near it - ONLY WHAT IS NEAR in"
+              " presence.py - so under 100%% is the saving, not a loss)" % args.spread)
     a = stats.attack_relay
     print("  attacks p50 %6.1f  p95 %6.1f  p99 %6.1f  max %7.1f ms   %7.0f pictures/s seen by listeners" % (
         pct(a, .5), pct(a, .95), pct(a, .99), max(a) if a else 0.0, len(a) / elapsed))
@@ -584,6 +594,8 @@ def main():
     ap.add_argument("--warmup", type=float, default=8.0, help="seconds before measuring")
     ap.add_argument("--ramp", type=float, default=6.0, help="seconds to bring a level's bots in")
     ap.add_argument("--areas", type=int, default=1, help="how many areas the bots spread across")
+    ap.add_argument("--spread", type=float, default=400.0,
+                    help="how far apart the bots stand, px across and down (Big Field is about 2400)")
     ap.add_argument("--movers", type=int, default=60, help="monsters a leader says moved each tick")
     ap.add_argument("--kill-seconds", type=float, default=4.0, help="each bot reports a kill this often")
     ap.add_argument("--listeners", type=int, default=8, help="bots that time the relay")

@@ -22,6 +22,8 @@ killwatch.py:
                       (kill/'s RECEIPT_BUILD)
     transfer_gib      () -> the month's outbound allowance in GiB, 0 for no
                       data guard (ELUSION_TRANSFER_GIB)
+    near              () -> whether presence.py sends each game only the
+                      players near it (ELUSION_NEAR, game 0.89.0)
 
 READ ONLY, and so it asks for no password again: the owner and a co-owner
 alike. The switch it reports on is the Testing tab's and the Health tab's,
@@ -44,11 +46,12 @@ RECEIPTS_CACHE_SECONDS = 300
 
 
 def register(app, *, require_auth, require_owner, get_db, db_path, metrics_summary, receipts_backing,
-             receipts_days, receipts_on, min_client_build, receipt_build, transfer_gib=None):
+             receipts_days, receipts_on, min_client_build, receipt_build, transfer_gib=None, near=None):
     """Add the route, and hand back cache_clear() - for the suites, which
     write books rows and then read the receipts."""
 
     transfer_gib = transfer_gib or (lambda: services.TRANSFER_ALLOWANCE_GIB)
+    near = near or (lambda: False)
     cache = {"at": None, "backing": None}
     lock = threading.Lock()
 
@@ -110,7 +113,7 @@ def register(app, *, require_auth, require_owner, get_db, db_path, metrics_summa
             "presence": {"reporting": bool(last and last["reporting"]), "last": last, "day": day, "week": week},
             "month": projected,
             "budget": services.budget(last_row, allowance),
-            "crowd": services.crowd_verdict(week, projected),
+            "crowd": services.crowd_verdict(week, projected, bool(near())),
             "tick": services.tick_verdict(last, day),
             "machine": services.machine(last_row, os.cpu_count(), free, total, db_bytes),
             "routes": services.routes(metrics_summary()),

@@ -174,10 +174,19 @@ def month(week, allowance_gib=TRANSFER_ALLOWANCE_GIB):
     }
 
 
-def crowd_verdict(week, projected):
+def near_on(value):
+    """ELUSION_NEAR as presence.py reads it: on unless it says off."""
+    return str(value if value is not None else "on").strip().lower() not in ("off", "0", "no", "false")
+
+
+def crowd_verdict(week, projected, near=False):
     """Whether one area needs sending only what is near: "unknown" before any
     minute, then "fine", "watch" or "now" by the week's biggest crowd and the
-    month's data - and which of the two said so."""
+    month's data - and which of the two said so. "on" once presence.py sends
+    each game only the players near it (ONLY WHAT IS NEAR, game 0.89.0):
+    there is nothing left to plan."""
+    if near:
+        return {"verdict": "on", "by": "", "watch_at": CROWD_WATCH, "now_at": CROWD_NOW}
     if not week or not week.get("samples"):
         return {"verdict": "unknown", "by": "", "watch_at": CROWD_WATCH, "now_at": CROWD_NOW}
     crowd = int(week.get("peak_area_players") or 0)

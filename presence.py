@@ -103,7 +103,9 @@ THE WIRE (JSON text frames):
                                                          and puts attacks in the tick for a game
                                                          that said "xt")
     {"t": "join", "p": [{id, name, cls, lvl, role, hue, guild, x, y, m, fx, pet, ts, aim, hp}]}
-                                                         people now in your area
+                                                         people now in your area - NEAR you
+                                                         (0.89.0: ONLY WHAT IS NEAR), so also
+                                                         someone walking up
     {"t": "moves", "p": [[id, x, y, m, fx, pet, ts, aim, hp], ...]}
                                                          who moved this tick, every step each sent
                                                          in it, in order (yourself included; skip
@@ -126,7 +128,8 @@ THE WIRE (JSON text frames):
                                                          moved this tick - id, health, maximum - and
                                                          the monsters it brought to zero: dead,
                                                          whatever the leader says
-    {"t": "leave", "ids": [12, 40]}                      gone from your area
+    {"t": "leave", "ids": [12, 40]}                      gone from your area, or gone far
+                                                         from you (0.89.0)
     {"t": "lead", "a": "field", "id": 12, "n": 2}        who runs this area's monsters, and how
                                                          many others share them (-1: nobody)
     {"t": "need", "id": 40}                              (to the leader) send 40 everything;
@@ -414,6 +417,29 @@ GUARD_RELAX_SECONDS = 1800.0
 GUARD_RELAX_SHARE = 0.4
 GUARD_CROWD = 16
 GUARD_LEVELS = ("full", "half", "crowd", "alone")
+
+# ONLY WHAT IS NEAR (game 0.89.0). The owner, of the server's cost: "the weak
+# spot is data, which grows fast when players crowd one area" - every step went
+# to everybody in the area, wherever they stood, so a crowd of n cost n x n.
+# Now a game is sent the steps and attacks of the players NEAR it: within
+# NEAR_X across and NEAR_Y up or down of where it stands - the camera at its
+# widest (2x zoom of 1280 x 720) shows 320 and 180 each way, so this is half a
+# screen and more of warning. Once drawn, a player stays drawn until it is past
+# FAR_X or FAR_Y, so one standing on the edge does not blink in and out. The
+# game draws a player on "join" and takes it off on "leave", as it always has,
+# so this needs nothing from the game: every version since presence began
+# takes it. Always drawn, wherever they stand: the area's leader sees everyone
+# (its game runs the monsters, which chase anybody), staff see everyone (Go
+# to), and party members see each other (the party window's health). Looked at
+# again every VIEW_TICKS ticks. ELUSION_NEAR=off sends everybody everything, as
+# before. test_presence.py P-20.
+NEAR_X = 480.0
+NEAR_Y = 300.0
+FAR_X = 640.0
+FAR_Y = 400.0
+VIEW_TICKS = 3
+NEAR = os.environ.get("ELUSION_NEAR", "on").strip().lower() not in ("off", "0", "no", "false")
+SEES_ALL_ROLES = ("owner", "coowner", "mod", "dev")
 # Where the machine's network counters are (Linux); anywhere else, none.
 NET_DEV_PATH = "/proc/net/dev"
 MEMINFO_PATH = "/proc/meminfo"
@@ -1002,6 +1028,11 @@ class Player:
         self.voice_party = 0
         self.voice_tokens = VOICE_BURST
         self.voice_stamp = time.monotonic()
+        # ONLY WHAT IS NEAR (0.89.0): the others its game draws now - sent a
+        # "join" and no "leave" since - and its party (0: none), read at hello
+        # and every sweep.
+        self.sees = set()
+        self.party = 0
 
     @property
     def shares(self):
@@ -1329,6 +1360,9 @@ class PresenceServer:
         self._killed = {}
         # room -> [[kind, id, detail], ...]: METER_EVENTS since the last report.
         self._events = {}
+        # ONLY WHAT IS NEAR (0.89.0): on, and how often the views are looked at.
+        self.near = NEAR
+        self.view_ticks = VIEW_TICKS
 
     # ---- sending -------------------------------------------------------------
     # EVERYTHING SENT IS COUNTED (game 0.78.0): a frame for each socket a text
@@ -1367,6 +1401,11 @@ class PresenceServer:
             room.discard(player)
             if not room:
                 del self.rooms[area]
+            for q in room:
+                q.sees.discard(player.user_id)
+        player.sees = set()
+        # To everyone, drawn or not: a leave for a body a game does not draw
+        # takes nothing off, and it keeps every screen right whatever happened.
         self._room_broadcast(area, {"t": "leave", "ids": [player.user_id]})
         self.metered_event(area, "left", player.user_id, str(player.identity.get("name", "")))
         player.area = ""
@@ -1387,6 +1426,8 @@ class PresenceServer:
             allowed = [p for p in heirs if not self.lead_banned(area, p.user_id)]
             if heirs:
                 self.leaders[area] = min(allowed or heirs, key=lambda p: (p.joined_at, p.user_id))
+                # The new leader's game runs the monsters: it sees everyone.
+                self.look(area)
         if player.shares:
             self._announce_lead(area)
 
@@ -1396,21 +1437,32 @@ class PresenceServer:
         place = area
         area = room_name or self._seat(place)
         room = self.rooms.setdefault(area, set())
-        others = [p.entry() for p in room if p is not player]
         room.add(player)
         player.area = area
         player.place = place
         player.joined_at = time.monotonic()
-        if others:
-            await self._send(player, {"t": "join", "p": others})
+        player.sees = set()
+        if player.shares:
+            leader = self.leaders.get(area)
+            if leader is None or leader.area != area:
+                # Before anybody is drawn: the leader sees everyone.
+                self.leaders[area] = player
+        # ONLY WHAT IS NEAR: the ones near it drawn on its screen, and it on
+        # the screens of those near it (everyone, with ELUSION_NEAR off).
+        seen = self._wanted(player)
+        player.sees = {q.user_id for q in seen}
+        if seen:
+            await self._send(player, {"t": "join", "p": [q.entry() for q in seen]})
         await self._send_levers(player)
-        self._room_broadcast(area, {"t": "join", "p": [player.entry()]}, skip=player)
+        watchers = [q for q in room if q is not player and self._wants(q, player)]
+        for q in watchers:
+            q.sees.add(player.user_id)
+        if watchers:
+            self._out([q.ws for q in watchers], json.dumps({"t": "join", "p": [player.entry()]},
+                                                            separators=(",", ":")))
         self.metered_event(area, "joined", player.user_id, str(player.identity.get("name", "")))
         if not player.shares:
             return
-        leader = self.leaders.get(area)
-        if leader is None or leader.area != area:
-            self.leaders[area] = player
         self._announce_lead(area)
         self._ask_for_world(area, player)
 
@@ -1732,9 +1784,10 @@ class PresenceServer:
         room = self.rooms.get(player.area, ())
         # ATTACKS RIDE THE TICK for the games that take them there; any other
         # hears each as it comes, never its own.
-        if any(p.tick_attacks and p is not player for p in room):
+        # ONLY WHAT IS NEAR: a game draws no attack of a player it does not draw.
+        if any(p.tick_attacks and p is not player and player.user_id in p.sees for p in room):
             self._tick_attacks.setdefault(player.area, []).append([player.user_id, attacks])
-        old = [p.ws for p in room if not p.tick_attacks and p is not player]
+        old = [p.ws for p in room if not p.tick_attacks and p is not player and player.user_id in p.sees]
         if old:
             self._out(old, json.dumps({"t": "x", "id": player.user_id, "e": attacks}, separators=(",", ":")))
         for attack in attacks:
@@ -2023,7 +2076,10 @@ class PresenceServer:
         if changed and player.area:
             # A level, a guild, a colour or a pet list changed: everyone in the
             # area redraws the plate.
-            self._room_broadcast(player.area, {"t": "join", "p": [player.entry()]}, skip=player)
+            # Only to the games drawing it: a join draws a body that is not there.
+            watchers = [q.ws for q in self.rooms.get(player.area, ()) if player.user_id in q.sees]
+            if watchers:
+                self._out(watchers, json.dumps({"t": "join", "p": [player.entry()]}, separators=(",", ":")))
             if player.pet and player.pet not in (identity.get("pets") or []):
                 player.pet = ""
         return True
@@ -2068,6 +2124,11 @@ class PresenceServer:
         player.tick_attacks = msg.get("xt") == TICK_ATTACKS and not isinstance(msg.get("xt"), bool)
         player.server_health = msg.get("sh") == SERVER_HEALTH and not isinstance(msg.get("sh"), bool)
         self.players[user_id] = player
+        if self.near:
+            try:
+                player.party = (await asyncio.to_thread(parties_of, [user_id])).get(user_id, 0)
+            except Exception as exc:  # noqa: BLE001
+                print("[PRESENCE] could not read a party: %r" % exc, flush=True)
         await self._send(player, {"t": "welcome", "id": user_id, "v": SHARED_VERSION, "books": BOOKS,
                                   "x": RELAY_VERSION, "sh": SERVER_HEALTH if BOOKS else 0})
 
@@ -2096,8 +2157,10 @@ class PresenceServer:
                 elif kind == "renew":
                     await self.renew(player, message)
                 elif kind == "sync" and player.area:
-                    others = [p.entry() for p in self.rooms.get(player.area, ()) if p is not player]
-                    await self._send(player, {"t": "join", "p": others})
+                    # A new world has nobody in it: whoever is near, afresh.
+                    seen = self._wanted(player, fresh=True)
+                    player.sees = {q.user_id for q in seen}
+                    await self._send(player, {"t": "join", "p": [q.entry() for q in seen]})
                     await self._send_levers(player)
                     # The game rebuilt its world: tell it again who leads, and
                     # have the leader send it the monsters again.
@@ -2168,29 +2231,142 @@ class PresenceServer:
                     p.dirty = False
                     p.steps = []
                 continue
+            if self.ticks % self.view_ticks == 0:
+                # Also with ELUSION_NEAR off, when everyone is wanted: a look
+                # that finds nothing to change sends nothing.
+                self.look(area)
             movers = [p for p in room if p.dirty]
             if not movers and not attacks:
                 continue
-            steps = []
-            for p in movers:
-                p.dirty = False
-                steps.extend(p.take_steps())
-            if not attacks:
-                self._room_broadcast(area, {"t": "moves", "p": steps})
-                continue
-            # ATTACKS RIDE THE TICK: one frame each, steps and attacks, for the
-            # games that take them; the steps alone for any other (which had
-            # its attacks as they came).
-            riders = [p.ws for p in room if p.tick_attacks]
-            others = [p.ws for p in room if not p.tick_attacks]
-            if riders:
-                self._out(riders, json.dumps({"t": "moves", "p": steps, "x": attacks}, separators=(",", ":")))
-            if others and steps:
-                self._out(others, json.dumps({"t": "moves", "p": steps}, separators=(",", ":")))
+            self.send_moves(room, movers, attacks or [])
         # Attacks waiting for an area nobody is in any more go with it.
         if BOOKS:
             self._book_safely(self.tick_books, time.time())
             self._book_safely(self.tell_health, time.time())
+
+    def send_moves(self, room, movers, attacks):
+        """THE TICK'S STEPS (and ATTACKS RIDE THE TICK), to each game in `room`:
+        the steps of the movers it draws, and its own (which it passes over);
+        a game that said "xt" gets the attacks of the ones it draws in the same
+        frame, any other the steps alone (it had its attacks as they came).
+        Games that draw the same people get the same frame, made once - with
+        everyone drawing everyone, one frame for the room, as before."""
+        pieces = {}
+        for p in movers:
+            p.dirty = False
+            pieces[p.user_id] = json.dumps(p.take_steps(), separators=(",", ":"))[1:-1]
+        rank = {p.user_id: i for i, p in enumerate(movers)}
+        moved = rank.keys()
+        everyone = tuple(p.user_id for p in movers)
+        made = [json.dumps(pair, separators=(",", ":")) for pair in attacks]
+        frames = {}
+        for r in room:
+            # The movers it draws (a set's & is C, not a Python loop over
+            # every mover for every game), in the tick's order.
+            seen = r.sees & moved
+            got = tuple(i for i, pair in enumerate(attacks) if pair[0] == r.user_id or pair[0] in r.sees) \
+                if r.tick_attacks and attacks else ()
+            if not seen and not any(attacks[i][0] != r.user_id for i in got):
+                continue    # nothing but its own: it passes over those
+            if r.user_id in rank:
+                seen.add(r.user_id)
+            ids = everyone if len(seen) == len(everyone) else tuple(sorted(seen, key=rank.__getitem__))
+            frames.setdefault((ids, got), []).append(r.ws)
+        for (ids, got), sockets in frames.items():
+            text = '{"t":"moves","p":[' + ",".join(pieces[u] for u in ids) + "]"
+            if got:
+                text += ',"x":[' + ",".join(made[i] for i in got) + "]"
+            self._out(sockets, text + "}")
+
+    # ---- only what is near (game 0.89.0) ---------------------------------------
+
+    def sees_all(self, viewer):
+        """ONLY WHAT IS NEAR: a game drawing everyone in its room wherever
+        they stand - all of them with ELUSION_NEAR off, the leader's, staff's."""
+        return (not self.near or self.leaders.get(viewer.area) is viewer
+                or str(viewer.identity.get("role", "player")) in SEES_ALL_ROLES)
+
+    def _wants(self, viewer, other, all_of=None):
+        """Whether `viewer`'s game should draw `other` now: same room, and
+        near it - or always, for a party member or a game that sees all."""
+        if other is viewer or not viewer.area or other.area != viewer.area:
+            return False
+        if (self.sees_all(viewer) if all_of is None else all_of) \
+                or (viewer.party and viewer.party == other.party):
+            return True
+        if other.user_id in viewer.sees:
+            return abs(other.x - viewer.x) <= FAR_X and abs(other.y - viewer.y) <= FAR_Y
+        return abs(other.x - viewer.x) <= NEAR_X and abs(other.y - viewer.y) <= NEAR_Y
+
+    def _wanted(self, viewer, fresh=False):
+        """The players `viewer`'s game should draw now; `fresh`: as if it drew
+        nobody (a new world, so nobody is held by FAR_X)."""
+        if fresh:
+            viewer.sees = set()
+        all_of = self.sees_all(viewer)
+        return [q for q in self.rooms.get(viewer.area, ()) if self._wants(viewer, q, all_of)]
+
+    def look(self, area):
+        """ONLY WHAT IS NEAR: every game in `area`'s room told who came near
+        ("join") and who went far ("leave") since the last look. Players are
+        put in squares FAR_X by FAR_Y, so each game is held against the nine
+        squares round it (and its party, and everyone for a game that sees
+        all) - not the whole room. Returns how many joins and leaves went."""
+        room = self.rooms.get(area)
+        if not room or len(room) < 2:
+            return 0
+        squares = {}
+        for q in room:
+            squares.setdefault((int(q.x // FAR_X), int(q.y // FAR_Y)), []).append(q)
+        by_party = {}
+        for q in room:
+            if q.party:
+                by_party.setdefault(q.party, []).append(q)
+        told = 0
+        for viewer in room:
+            all_of = self.sees_all(viewer)
+            if all_of:
+                near = room
+            else:
+                cx, cy = int(viewer.x // FAR_X), int(viewer.y // FAR_Y)
+                near = [q for dx in (-1, 0, 1) for dy in (-1, 0, 1) for q in squares.get((cx + dx, cy + dy), ())]
+                near += by_party.get(viewer.party, []) if viewer.party else []
+            if all_of:
+                now = {q.user_id: q for q in near if q is not viewer}
+            else:
+                # _wants() written out: this runs for every pair near each
+                # other, three times a second.
+                vx, vy, held, party = viewer.x, viewer.y, viewer.sees, viewer.party
+                now = {}
+                for q in near:
+                    if q is viewer:
+                        continue
+                    dx, dy = abs(q.x - vx), abs(q.y - vy)
+                    if (dx <= FAR_X and dy <= FAR_Y) if q.user_id in held else (dx <= NEAR_X and dy <= NEAR_Y):
+                        now[q.user_id] = q
+                    elif party and q.party == party:
+                        now[q.user_id] = q
+            came = [q for u, q in now.items() if u not in viewer.sees]
+            went = [u for u in viewer.sees if u not in now]
+            if not came and not went:
+                continue
+            viewer.sees = set(now)
+            if went:
+                self._out([viewer.ws], json.dumps({"t": "leave", "ids": sorted(went)}, separators=(",", ":")))
+            if came:
+                self._out([viewer.ws], json.dumps({"t": "join", "p": [q.entry() for q in came]},
+                                                  separators=(",", ":")))
+            told += len(came) + len(went)
+        return told
+
+    async def read_parties(self):
+        """Every player's party, again (the sweep): who is always drawn."""
+        players = list(self.players.values())
+        if not players:
+            return
+        parties = await asyncio.to_thread(parties_of, [p.user_id for p in players])
+        for p in players:
+            p.party = parties.get(p.user_id, 0)
 
     def tick_books(self, now):
         """Judge the deaths that have waited, and gather what every book and
@@ -2245,6 +2421,7 @@ class PresenceServer:
         self.lead_bans[key] = at + LEAD_BAN_SECONDS
         self.strikes_for.pop(key, None)
         self.leaders[area] = min(heirs, key=lambda p: (p.joined_at, p.user_id))
+        self.look(area)     # the new leader's game runs the monsters: it sees everyone
         self._gather([(int(user_id), area.split("#", 1)[0], "lost_lead", why, at)])
         print("[PRESENCE] %s lost the lead of %s: %s" % (leader.identity.get("name", user_id), area, why),
               flush=True)
@@ -2384,6 +2561,11 @@ class PresenceServer:
             if p.ticket_hash not in valid and self.players.get(p.user_id) is p:
                 await self.drop(p, "signed out", 1008)
         await self.sweep_voice()
+        if self.near:
+            try:
+                await self.read_parties()
+            except Exception as exc:  # noqa: BLE001
+                print("[PRESENCE] could not read the parties: %r" % exc, flush=True)
 
     # ---- how its minutes went (game 0.78.0) ----------------------------------
 

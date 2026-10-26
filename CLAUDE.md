@@ -2866,6 +2866,63 @@ fast" - and asked for the 9. Two gaps let a breakage reach players unseen.
   `test_clienterrors.py`, test_packages (on a bare app), test_ownership (the
   prune is on the allowlist).
 
+## Only what is near: each game is sent the players near it (game 0.89.0)
+
+The owner rated the server's cost 8 of 10 - "the weak spot is data, which
+grows fast when players crowd one area" - and said "upgrade this". Every step
+went to everybody in the area, wherever they stood: n players, n x n steps.
+
+- **The rule** (presence.py, ONLY WHAT IS NEAR): a game draws a player within
+  `NEAR_X` (480) across and `NEAR_Y` (300) up or down of where it stands -
+  the camera at its widest (2x zoom) shows 320 and 180 each way - and keeps
+  drawing it until it is past `FAR_X` (640) or `FAR_Y` (400), so one on the
+  edge does not blink. `Player.sees` is the set each game draws; `look()`
+  brings every room's sets up to date every `VIEW_TICKS` (3) ticks, putting
+  players in squares FAR_X by FAR_Y so each game is held against the nine
+  squares round it, not the whole room. **Always drawn**: everyone, for the
+  area's leader (its game runs the monsters, which chase anybody - a new
+  leader is looked at at once) and for staff (`SEES_ALL_ROLES`: Go to); and
+  party members of each other (`Player.party`, read at hello and every sweep -
+  the party window's health and the map's party rings).
+- **No new wire.** A game is told who came near with the "join" it always
+  had and who went far with "leave", so every game since presence began takes
+  it; the game needed no change (its CLAUDE.md says what that means there).
+  Everything that put one player on another's screen goes through `sees`:
+  `_enter_room()`, `sync` (afresh), a renewed ticket's new plate (only to the
+  games drawing it - a join draws a body), an attack picture (`relay_attacks()`
+  and ATTACKS RIDE THE TICK - a game draws no attack of a player it does not
+  draw). A leave still goes to the whole room: one for a body a game does not
+  draw takes nothing off.
+- **`send_moves()`** builds each mover's steps once, then each game's frame
+  from the movers it draws (a set's `&`, in C) and its own; games drawing the
+  same people share one frame, so a room where everyone draws everyone is
+  still one frame. A frame of nothing but a game's own steps or attacks is
+  not sent at all (P-9b's check says so now; the game passed over them).
+- **What stays the whole room's**: the leader's world ("w"), the books'
+  health ("hp"), levers and "lead" - the monsters are the area's. That is
+  most of what is left: the next lever, if one is wanted, is the monsters
+  near each game.
+- **`ELUSION_NEAR=off`** sends everyone everything, as before (envfile.KNOWN,
+  .env.example). The Health tab's crowd verdict is `"on"` while it is on
+  (serverhealth `crowd_verdict(..., near=True)`, game 0.89.0 says so in words).
+- **Measured** (swarm.py `--spread`, 128 bots in one area, one core, 30 s):
+
+  | | before | after |
+  |---|---|---|
+  | spread over a Big Field (2,400 px), data to the games | 13.6 MB/s | 4.0 MB/s |
+  | bunched on one spot (400 px), data to the games | 13.3 MB/s | 12.6 MB/s |
+  | presence.py | 17% of a core | 21-23% |
+  | a step, socket to socket, p99 | 106-110 ms | 110-118 ms |
+  | dropped | none | none |
+
+  A crowd costs what is near each player now, not the square of the area.
+  The core it costs is set by the frames each game is sent; there is room on
+  it (the API 16% beside it).
+- test_presence.py P-20 (near and far, the edge, sync, the leader, a new
+  leader, staff, a party and its end, attacks, steps, off), seven sabotages
+  caught: everyone near, no far edge, the leader held to near, no party,
+  attacks or steps to the whole room. test_serverhealth.py, the "on" verdict.
+
 ## Layout
 
 ```

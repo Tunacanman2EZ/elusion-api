@@ -48,6 +48,8 @@ client = app_module.app.test_client()
 import killwatch  # noqa: E402
 from serverhealth import data, services  # noqa: E402
 
+HERE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 passed = 0
 failed = 0
 failures = []
@@ -174,6 +176,14 @@ check("  now from %d in one area, or the whole allowance" % services.CROWD_NOW,
       and services.crowd_verdict({"samples": 1, "peak_area_players": 0}, {"share": 1.2})["by"] == "data"
       and services.crowd_verdict({"samples": 1, "peak_area_players": 200}, {"share": 0.1})["by"] == "crowd")
 check("  unknown with no minute to go by", services.crowd_verdict(empty, None)["verdict"] == "unknown")
+check("  'on' once presence.py sends each game only who is near (ONLY WHAT IS NEAR, 0.89.0), whatever the crowd",
+      services.crowd_verdict({"samples": 1, "peak_area_players": 200}, {"share": 1.2}, near=True)["verdict"] == "on"
+      and services.crowd_verdict(empty, None, near=True)["verdict"] == "on")
+check("  ELUSION_NEAR read as presence.py reads it: on unless it says off",
+      all(services.near_on(v) for v in (None, "", "on", "1", "yes", "anything"))
+      and not any(services.near_on(v) for v in ("off", "OFF", "0", "no", "false"))
+      and any(line.startswith("NEAR = ") and 'not in ("off", "0", "no", "false")' in line
+              for line in open(os.path.join(HERE_DIR, "presence.py"), encoding="utf-8")))
 
 tick = services.tick_verdict(last, {"late_ticks": 4})
 check("the tick: steady at ten a second with no late beat; the day's late ones counted",
@@ -278,9 +288,14 @@ res = client.get("/api/server/health", headers=auth(owner))
 body = res.get_json() or {}
 check("the owner, before presence.py has written a minute: every part there, nothing reporting",
       res.status_code == 200 and body["presence"]["reporting"] is False and body["presence"]["last"] is None
-      and body["month"] is None and body["crowd"]["verdict"] == "unknown" and body["tick"]["verdict"] == "unknown"
+      and body["month"] is None and body["crowd"]["verdict"] == "on" and body["tick"]["verdict"] == "unknown"
       and set(body) == {"now", "presence", "month", "budget", "crowd", "tick", "machine", "routes", "receipts"}
       and body["budget"]["on"] is True and body["budget"]["used_gib"] is None, body)
+os.environ["ELUSION_NEAR"] = "off"
+off_body = client.get("/api/server/health", headers=auth(owner)).get_json() or {}
+os.environ.pop("ELUSION_NEAR", None)
+check("  with ELUSION_NEAR off, the crowd is judged as before (unknown, before a minute)",
+      off_body.get("crowd", {}).get("verdict") == "unknown", off_body.get("crowd"))
 check("  the routes are this worker's /api/metrics: the health ask itself among them soon enough",
       isinstance(body["routes"]["slowest"], list) and body["routes"]["requests"] >= 1, body.get("routes"))
 check("  the machine's disk, read here", body["machine"]["disk_free_gb"] is not None
@@ -306,8 +321,13 @@ check("  the week: the biggest crowd three days ago, where it was; the day: not 
       pres["week"]["peak_area"] == "field" and pres["week"]["peak_area_players"] == 34
       and pres["day"]["peak_area_players"] == 4 and pres["day"]["samples"] < pres["week"]["samples"],
       (pres["week"]["peak_area_players"], pres["day"]["peak_area_players"]))
-check("  so one area is worth watching (%d or more in it), by the crowd" % services.CROWD_WATCH,
-      body["crowd"]["verdict"] == "watch" and body["crowd"]["by"] == "crowd", body["crowd"])
+check("  with presence.py sending only what is near (ELUSION_NEAR on, as it ships), the crowd line says on",
+      body["crowd"]["verdict"] == "on", body["crowd"])
+os.environ["ELUSION_NEAR"] = "off"
+off_crowd = (client.get("/api/server/health", headers=auth(owner)).get_json() or {}).get("crowd", {})
+os.environ.pop("ELUSION_NEAR", None)
+check("  with it off, one area is worth watching (%d or more in it), by the crowd" % services.CROWD_WATCH,
+      off_crowd.get("verdict") == "watch" and off_crowd.get("by") == "crowd", off_crowd)
 check("  the month from the machine's own network; the tick; the machine's load and memory from the last minute",
       body["month"]["source"] == "machine" and body["month"]["gib"] > 0 and body["tick"]["verdict"] == "steady"
       and body["machine"]["load1"] == 0.3 and body["machine"]["mem_free_mb"] == 444, (body["month"], body["tick"]))

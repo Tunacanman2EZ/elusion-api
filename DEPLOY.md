@@ -1076,17 +1076,19 @@ crowd of 128", has what changed). **The next ceiling is the network, not the
 core**: everybody in an area hears everybody, so what goes out grows with the
 square of the crowd - 13 MB/s (about 110 Mbit/s) at 128 in one area, 48 MB/s
 at 256, before a browser's compression (about 3.4 to 1). Spread over areas it
-is far less. Sending each game only the players near it is the step after
-this, when one area really holds that many.
+is far less. **Since game 0.89.0 each game is sent only the players near it**
+(presence.py, ONLY WHAT IS NEAR): 128 spread over a Big Field send 4.0 MB/s,
+not 13.6 (`--spread 2400`; bunched on one spot it is still 12.6). What is left
+is mostly the area's monsters, which every game in it draws.
 
 **And the bill comes before the core.** The droplet's plan includes 1,000 GiB
 of outbound data a month (pooled across the account's droplets; $0.01 a GiB
 past it, inbound free). 0.4 MB/s held all month is the whole allowance; the
 13.4 MB/s of 128 in one area, held, is about 32 TiB. The GM panel's **Health
 tab** (below) shows what the machine really sends and the month it adds up
-to, and says when sending only what is near is worth planning (32 in one
-area in a week, or half the allowance) and when it is needed (96, or all of
-it).
+to, and that sending only what is near is on (0.89.0; with `ELUSION_NEAR=off`
+it says again when it would be worth planning - 32 in one area in a week, or
+half the allowance - and when it is needed - 96, or all of it).
 
 ### On a copy of the live machine
 
@@ -1119,7 +1121,7 @@ minute while it is open:
 - **Players**: online now, the biggest crowd and where, the most today and
   this week; what the machine sends a second and the game's sockets' share;
   the month that adds up to at this week's rate, against the 1,000 GiB; and
-  whether one area needs sending only what is near yet.
+  whether one area needs sending only what is near yet ("on" since 0.89.0).
 - **Machine**: the tick (ten a second and no late beats is steady), the load,
   memory, the disk and the database's size; the slowest routes by p99 (one
   worker's, as `/api/metrics` below).

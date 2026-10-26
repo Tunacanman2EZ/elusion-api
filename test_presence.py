@@ -2060,8 +2060,10 @@ async def attacks_ride_the_tick(port, server):
     got_lee, got_may = await collect(lee), await collect(may)
     check("with another rider there, it hears it in the tick",
           ridden(got_may) == [[uid("presl"), [good]]], got_may)
-    check("  and the maker's own comes back in the same frame, for it to pass over (as its own steps do)",
-          ridden(got_lee) == [[uid("presl"), [good]]], got_lee)
+    # ONLY WHAT IS NEAR (0.89.0): a frame holding nothing but a game's own
+    # steps and attacks is not sent at all - it passed over every one of them.
+    check("  and the maker is sent no frame of nothing but its own (it would pass over all of it)",
+          not ridden(got_lee), got_lee)
 
     odd, _ = await enter(port, account("presn"), "town", x=545.0, y=505.0, xt=True)
     await collect(odd), await collect(h)
@@ -2280,6 +2282,118 @@ async def what_hit_me():
         presence.broadcast = real_broadcast
 
 
+async def only_what_is_near():
+    """P-20: ONLY WHAT IS NEAR (game 0.89.0) - a game is sent the steps and
+    attacks of the players near it, drawn on "join" and taken off on "leave"."""
+    section("P-20 ONLY WHAT IS NEAR: A GAME IS SENT THE PLAYERS NEAR IT, AND EVERYONE IT MUST SEE")
+    NX, NY, FX = presence.NEAR_X, presence.NEAR_Y, presence.FAR_X
+    check("near is half a screen and more at the widest zoom, and far is further (no blinking at the edge)",
+          NX >= 320 and NY >= 180 and presence.FAR_X > NX and presence.FAR_Y > NY, (NX, NY))
+    A, B, C, D, E, M = (account("neara"), account("nearb", "mage"), account("nearc", "tank"),
+                        account("neard"), account("neare", "healer"), account("nearm"))
+    sql("UPDATE users SET role = 'mod' WHERE username = 'nearm'")
+    server = presence.PresenceServer(sweep_seconds=60, tick_seconds=0.05)
+    server.view_ticks = 1
+    server.start_clocks()
+    async with serve(server.handler, "127.0.0.1", 0, max_size=presence.MAX_SOCKET_BYTES) as ws_server:
+        port = list(ws_server.sockets)[0].getsockname()[1]
+        try:
+            a, _ = await enter(port, A, "field", x=100.0, y=200.0)
+            await collect(a)
+            b, _ = await enter(port, B, "field", x=100.0 + NX + 900, y=200.0)
+            got_a, got_b = await collect(a), await collect(b)
+            check("two players far apart in one area are not drawn on each other's screens",
+                  uid("nearb") not in joined(got_a) and uid("neara") not in joined(got_b), (got_a, got_b))
+            await b.send(state("field", x=100.0 + NX + 900, y=260.0, m="walkdown"))
+            await a.send(json.dumps({"t": "x", "e": [["slash", 5000, 100.0, 200.0, 140.0, 200.0, 0, 0]]}))
+            got_a, got_b = await collect(a), await collect(b)
+            check("  nor sent each other's steps", uid("nearb") not in moved(got_a), got_a)
+            check("  nor each other's attacks", not of(got_b, "x") and not ridden(got_b), got_b)
+            check("  and a game that sees nobody is sent no frame of its own steps",
+                  not of(got_b, "moves"), got_b)
+
+            await b.send(state("field", x=100.0 + NX - 20, y=260.0, m="walkleft"))
+            got_a, got_b = await collect(a), await collect(b)
+            check("walking near, each is drawn on the other's screen, with where it stands",
+                  uid("nearb") in joined(got_a) and uid("neara") in joined(got_b)
+                  and joined(got_a)[uid("nearb")]["x"] == 100.0 + NX - 20, (got_a, got_b))
+            await b.send(state("field", x=100.0 + NX - 30, y=260.0, m="walkleft"))
+            got_a = await collect(a)
+            check("  and its steps come", moved(got_a).get(uid("nearb"), [0, 0])[1] == 100.0 + NX - 30, got_a)
+            await a.send(json.dumps({"t": "x", "e": [["slash", 5001, 100.0, 200.0, 140.0, 200.0, 0, 0]]}))
+            got_b = await collect(b)
+            check("  and its attacks", [m["id"] for m in of(got_b, "x")] == [uid("neara")], got_b)
+
+            await b.send(state("field", x=100.0 + (NX + FX) / 2, y=260.0, m="walkright"))
+            got_a = await collect(a)
+            check("past near but not far, it stays drawn (no blinking on the edge)",
+                  uid("nearb") not in left(got_a) and uid("nearb") in moved(got_a), got_a)
+            await b.send(state("field", x=100.0 + FX + 40, y=260.0, m="walkright"))
+            got_a, got_b = await collect(a), await collect(b)
+            check("past far, it is taken off the other's screen with a leave, both ways",
+                  uid("nearb") in left(got_a) and uid("neara") in left(got_b), (got_a, got_b))
+            await b.send(state("field", x=100.0 + FX + 50, y=260.0, m="walkright"))
+            got_a = await collect(a)
+            check("  and its steps stop", uid("nearb") not in moved(got_a), got_a)
+
+            await b.send(json.dumps({"t": "sync"}))
+            got_b = await collect(b)
+            joins = of(got_b, "join")
+            check("a game that rebuilt its world (sync) is told who is near: nobody here",
+                  joins and not joined(got_b), got_b)
+
+            # ---- WHO IS ALWAYS DRAWN -------------------------------------------------
+            c, _ = await enter(port, C, "bigfield", x=0.0, y=0.0, v=2)
+            await collect(c)
+            d, _ = await enter(port, D, "bigfield", x=2500.0, y=1800.0, v=2)
+            got_c, got_d = await collect(c), await collect(d)
+            check("the area's leader sees everyone, wherever they stand (its game runs the monsters)",
+                  uid("neard") in joined(got_c), got_c)
+            check("  while the far one does not see the leader", uid("nearc") not in joined(got_d), got_d)
+            await c.close()
+            got_d = await collect(d, 0.5)
+            check("  and the next leader sees everyone too", (last_lead(got_d) or {}).get("id") == uid("neard"),
+                  got_d)
+            e, _ = await enter(port, E, "bigfield", x=0.0, y=0.0, v=2)
+            got_d, got_e = await collect(d), await collect(e)
+            check("  - a new arrival far off is drawn on the leader's screen at once",
+                  uid("neare") in joined(got_d) and uid("neard") not in joined(got_e), (got_d, got_e))
+
+            m, _ = await enter(port, M, "bigfield", x=1200.0, y=-900.0)
+            got_m = await collect(m)
+            check("staff see everyone (Go to finds them)",
+                  {uid("neard"), uid("neare")} <= set(joined(got_m)), got_m)
+
+            now = int(time.time())
+            sql("INSERT INTO parties (created_at) VALUES (?)", (now,))
+            party = int(sql("SELECT MAX(id) AS id FROM parties")[0]["id"])
+            for who, lead in (("neara", 1), ("nearb", 0)):
+                sql("INSERT INTO party_members (user_id, party_id, is_leader, joined_at) VALUES (?, ?, ?, ?)",
+                    (uid(who), party, lead, now))
+            await server.read_parties()
+            got_a, got_b = await collect(a), await collect(b)
+            check("party members see each other wherever they stand (the party window's health)",
+                  uid("nearb") in joined(got_a) and uid("neara") in joined(got_b), (got_a, got_b))
+            await b.send(state("field", x=100.0 + FX + 60, y=260.0, m="walkright"))
+            got_a = await collect(a)
+            check("  and their steps", uid("nearb") in moved(got_a), got_a)
+            sql("DELETE FROM party_members WHERE party_id = ?", (party,))
+            await server.read_parties()
+            got_a = await collect(a)
+            check("  until the party is gone", uid("nearb") in left(got_a), got_a)
+
+            server.near = False
+            got_a, got_b = await collect(a), await collect(b)
+            check("ELUSION_NEAR off: everybody is sent everybody again, as before",
+                  uid("nearb") in joined(got_a) or uid("nearb") in moved(got_a), got_a)
+            server.near = True
+            for w in (a, b, d, e, m):
+                await w.close()
+        finally:
+            server.stop_clocks()
+    check("ELUSION_NEAR reads on unless it says off", presence.NEAR is True)
+
+
 async def main():
     await kills_written_soon()
     await positions_written()
@@ -2290,6 +2404,7 @@ async def main():
     await what_hit_me()
     await kills_survive_a_failed_write()
     await server_owns_health()
+    await only_what_is_near()
     presence.HELLO_SECONDS = 0.5
     combatbook.HOLD_SECONDS = 0.2
     combatbook.PENDING_SECONDS = 0.3

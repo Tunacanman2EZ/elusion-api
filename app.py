@@ -8908,6 +8908,7 @@ _SERVER_HEALTH = serverhealth_package.register(
     # THE DATA GUARD's allowance (0.79.0), as presence.py reads it - asked on
     # each call, so a suite can set it.
     transfer_gib=lambda: serverhealth_package.services.transfer_gib(os.environ.get("ELUSION_TRANSFER_GIB", "1000")),
+    near=lambda: serverhealth_package.services.near_on(os.environ.get("ELUSION_NEAR")),
 )
 # For the suites, which write books rows and then read the receipts.
 _server_health_cache_clear = _SERVER_HEALTH.cache_clear
