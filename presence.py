@@ -510,6 +510,15 @@ METER_MOST_EVENTS = 64
 METER_TOTAL_MOST = 10 ** 12
 METER_HEALTH_MOST = 10 ** 7
 METER_TAKEN_MARGIN = 4
+# WHAT HIT ME (game 0.85.0, the enemy meter's phase 2): a state may also carry
+# "dts", "<monster>:<attack>" -> [hits, damage] all told (only when it moved),
+# turned into each second's share like the other totals. At most
+# METER_SOURCES_MOST names, each SOURCE_PATTERN; a state adds at most
+# METER_HITS_MOST hits to one. The report's "tk" row gains it eighth, and "sn"
+# names the monsters (enemy id -> display name).
+METER_SOURCES_MOST = 48
+METER_HITS_MOST = 200
+SOURCE_PATTERN = re.compile(r"\A[a-z0-9_]{1,24}:[a-z0-9_]{1,24}\Z")
 
 HEAL_GRANT_ID = "__spellheal__"
 HEAL_REACH_SLACK = 1.25
@@ -931,6 +940,8 @@ class Player:
         # (took_now(), None while nothing is kept).
         self.totals = None
         self.by_element = None
+        # WHAT HIT ME (0.85.0): its last "<monster>:<attack>" totals.
+        self.by_source = None
         self.hpa = -1
         self.hpm = -1
         self.took = None
@@ -1094,6 +1105,18 @@ def clean_taken(msg):
             if element is not None and value is not None:
                 elements[element] = value
         out["dte"] = elements
+    raw = msg.get("dts")
+    if isinstance(raw, dict) and len(raw) <= METER_SOURCES_MOST:
+        sources = {}
+        for key, value in raw.items():
+            if not isinstance(key, str) or not SOURCE_PATTERN.match(key):
+                continue
+            if not isinstance(value, list) or len(value) != 2:
+                continue
+            hits, damage = _whole(value[0], 0, METER_TOTAL_MOST), _whole(value[1], 0, METER_TOTAL_MOST)
+            if hits is not None and damage is not None:
+                sources[key] = (hits, damage)
+        out["dts"] = sources
     return out
 
 
@@ -1531,6 +1554,18 @@ class PresenceServer:
             deaths.append([int(monster.id), 1 if boss else 0])
             self._remember_monster(room, monster)
 
+    @staticmethod
+    def _source_names(names):
+        """WHAT HIT ME (0.85.0): enemy id -> the catalogue's display name, for
+        the monsters a report's "tk" names."""
+        out = {}
+        for enemy_id in names:
+            row = (gamedata.ENEMIES.get(enemy_id) or {}) if gamedata is not None else {}
+            name = str(row.get("display_name", "") or "")
+            if name:
+                out[enemy_id] = name
+        return out
+
     def _remember_monster(self, room, monster):
         seen = self._dealt_monsters.setdefault(room, {})
         if monster.id not in seen:
@@ -1559,12 +1594,16 @@ class PresenceServer:
             # each second - quiet or not, so the log has their health through
             # the fight - and the share is begun again.
             taken = {}
+            names = {}
             for p in self.rooms.get(room, ()):
                 if p.hpm > 0:
                     took = self.took_now(p)
                     took[4] = p.hpa if took[4] < 0 else took[4]
                     took[5] = p.hpm
-                    taken[str(p.user_id)] = took[:6] + [{str(k): v for k, v in sorted(took[6].items())}]
+                    taken[str(p.user_id)] = took[:6] + [{str(k): v for k, v in sorted(took[6].items())},
+                                                        dict(sorted(took[7].items()))]
+                    for source in took[7]:
+                        names[source.split(":", 1)[0]] = None
                 p.took = None
             who = {}
             for user_id in {hit[0] for hit in hits} | {int(k) for k in taken}:
@@ -1579,7 +1618,8 @@ class PresenceServer:
             text = json.dumps({"t": "dm", "a": room.split("#", 1)[0], "h": hits,
                                "over": over.get(room, 0), "who": who,
                                "m": {str(k): v for k, v in monsters.get(room, {}).items()},
-                               "k": deaths.get(room, []), "e": events.get(room, []), "tk": taken},
+                               "k": deaths.get(room, []), "e": events.get(room, []), "tk": taken,
+                               "sn": self._source_names(names)},
                               separators=(",", ":"))
             self._out([p.ws for p in watchers if p.area == room], text)
 
@@ -1746,12 +1786,15 @@ class PresenceServer:
         now = [state["dt"], state["dh"], state["dr"]]
         last, player.totals = player.totals, now
         if last is None or any(n < l for n, l in zip(now, last)):
-            player.by_element = state.get("dte", {}) if "dte" in state else None
+            # A game sends every element and source again on a new link, so
+            # one that sends none has none yet: an empty baseline, not none.
+            player.by_element = state.get("dte", {})
+            player.by_source = state.get("dts", {})
             if player.took is not None:
                 # A new character: the old one's health is no lowest of its.
                 player.took[4], player.took[5] = player.hpa, player.hpm
             return last is not None and now != last
-        if now == last and "dte" not in state:
+        if now == last and "dte" not in state and "dts" not in state:
             return False
         cap = max(player.hpm, 1) * METER_TAKEN_MARGIN
         added = [min(n - l, cap) for n, l in zip(now, last)]
@@ -1760,8 +1803,21 @@ class PresenceServer:
             seen, player.by_element = player.by_element, state["dte"]
             if seen is not None and all(v >= seen.get(k, 0) for k, v in state["dte"].items()):
                 elements = {k: min(v - seen.get(k, 0), cap) for k, v in state["dte"].items() if v > seen.get(k, 0)}
+        sources = {}
+        if "dts" in state:
+            seen, player.by_source = player.by_source, state["dts"]
+            if seen is not None and all(h >= seen.get(k, (0, 0))[0] and d >= seen.get(k, (0, 0))[1]
+                                        for k, (h, d) in state["dts"].items()):
+                for k, (h, d) in state["dts"].items():
+                    was = seen.get(k, (0, 0))
+                    if d > was[1] or h > was[0]:
+                        sources[k] = (min(h - was[0], METER_HITS_MOST), min(d - was[1], cap))
         if player.area in self._metered:
             took = self.took_now(player)
+            for k, (h, d) in sources.items():
+                row = took[7].setdefault(k, [0, 0])
+                row[0] += h
+                row[1] += d
             for i in range(3):
                 took[i] += added[i]
             took[3] = max(took[3], min(state.get("dx", 0), added[0]))
@@ -1774,7 +1830,7 @@ class PresenceServer:
     @staticmethod
     def took_now(player):
         if player.took is None:
-            player.took = [0, 0, 0, 0, player.hpa, player.hpm, {}]
+            player.took = [0, 0, 0, 0, player.hpa, player.hpm, {}, {}]
         return player.took
 
     def keeps_step(self, player):

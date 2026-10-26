@@ -2775,6 +2775,17 @@ follower's. The books see them all, so the meter is the books' count.
   server first** - an older server ignores the fields, so nothing breaks, but
   the meter has no taken until it is updated.
 
+- **What hit me (game 0.85.0, phase 2)**: a state may also carry `dts`,
+  "<monster>:<attack>" -> [hits, damage] all told (only when it moved),
+  `SOURCE_PATTERN`, at most `METER_SOURCES_MOST`; a bad name is dropped.
+  `took_state()` turns it into each second's share like the other totals (a
+  source that goes down is a new baseline; a state adds at most
+  `METER_HITS_MOST` hits and the damage margin to one). A first state with no
+  `dte`/`dts` is an empty baseline - the game sends them again on every new
+  link - so the first hits of a session count. The report's `"tk"` row gains
+  the sources eighth, and `"sn"` names their monsters (catalogue display
+  names). P-17. Deploy order: server first.
+
 ## Layout
 
 ```

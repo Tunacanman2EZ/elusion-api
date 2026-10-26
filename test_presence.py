@@ -1858,22 +1858,23 @@ async def damage_taken():
         hub.meter_switch(owner, {"t": "dm", "on": True})
         got = report(owner)
         check("the first state is a baseline: everything before it counts nothing",
-              got.get("tk", {}).get("9602") == [0, 0, 0, 0, 300, 400, {}], got.get("tk"))
+              got.get("tk", {}).get("9602") == [0, 0, 0, 0, 300, 400, {}, {}], got.get("tk"))
         await apply(tank, st(dt=1040, dh=50, dr=7, dx=30, hpa=260, hpm=400, dte={"6": 1030, "0": 10}))
         await apply(tank, st(dt=1040, dh=70, dr=9, hpa=282, hpm=400))
         got = report(owner)
-        check("then each second: taken, healed, regen, biggest hit, lowest and most health, by element",
-              got.get("tk", {}).get("9602") == [40, 20, 2, 30, 260, 400, {"0": 10, "6": 30}], got.get("tk"))
+        check("then each second: taken, healed, regen, biggest hit, lowest and most health, by element "
+              "(and by source, 0.85.0)",
+              got.get("tk", {}).get("9602") == [40, 20, 2, 30, 260, 400, {"0": 10, "6": 30}, {}], got.get("tk"))
         check("  and whoever took it is named, like a dealer",
               (got.get("who", {}).get("9602") or [""])[0] == "t9602", got.get("who"))
         got = report(owner)
         check("  a quiet second: nothing taken, still their health",
-              got.get("tk", {}).get("9602") == [0, 0, 0, 0, 282, 400, {}], got.get("tk"))
+              got.get("tk", {}).get("9602") == [0, 0, 0, 0, 282, 400, {}, {}], got.get("tk"))
         await apply(tank, st(dt=12, dh=0, dr=0, hpa=388, hpm=400, dte={"6": 12}))
         await apply(tank, st(dt=20, dh=0, dr=0, dx=8, hpa=380, hpm=400, dte={"6": 20}))
         got = report(owner)
         check("a total that goes DOWN (a new character) is a new baseline, never a negative",
-              got.get("tk", {}).get("9602") == [8, 0, 0, 8, 380, 400, {"6": 8}], got.get("tk"))
+              got.get("tk", {}).get("9602") == [8, 0, 0, 8, 380, 400, {"6": 8}, {}], got.get("tk"))
         await apply(tank, st(dt=999999, dh=0, dr=0, dx=999999, hpa=0, hpm=400))
         got = report(owner)
         check("  and no state adds more than METER_TAKEN_MARGIN times the most health",
@@ -1897,6 +1898,74 @@ async def damage_taken():
         presence.broadcast = real_broadcast
 
 
+async def what_hit_me():
+    """P-17: the enemy meter's phase 2 - which monster and which attack."""
+    section("P-17 WHAT HIT ME: EACH SECOND'S DAMAGE TAKEN BY MONSTER AND ATTACK")
+    sent = []
+    real_broadcast = presence.broadcast
+    presence.broadcast = lambda connections, text: sent.append((list(connections), json.loads(text)))
+
+    class Game:
+        def __init__(self, uid):
+            self.uid = uid
+
+    hub = presence.PresenceServer(sweep_seconds=5, tick_seconds=5)
+
+    def player(uid, role):
+        p = presence.Player(Game(uid), uid, "hash-%d" % uid, {"name": "w%d" % uid, "cls": "tank", "lvl": 9,
+                                                             "role": role}, time.time() + 60, slot=0)
+        p.area = "bigfield"
+        hub.players[uid] = p
+        hub.rooms.setdefault("bigfield", set()).add(p)
+        return p
+
+    def st(**more):
+        return dict(json.loads(state(area="bigfield", x=10.0, y=20.0)), **more)
+
+    def report(p):
+        sent.clear()
+        hub.meter_report()
+        got = [m for conns, m in sent if p.ws in conns and m.get("t") == "dm"]
+        return got[0] if got else {}
+
+    try:
+        clean = presence.clean_state(st(dt=5, dh=0, dr=0, dts={"icesprite:frost": [2, 30], "Bad Key": [1, 1],
+                                                                 "a:b": [1], "x:y": ["1", 2]}), [])
+        check("a source is '<monster>:<attack>', lower case, with [hits, damage]; a bad one is dropped",
+              clean is not None and clean.get("dts") == {"icesprite:frost": (2, 30)}, clean)
+        many = {"m%d:a" % n: [1, 1] for n in range(presence.METER_SOURCES_MOST + 1)}
+        check("  too many names, and none are read", "dts" not in presence.clean_state(st(dts=many), []))
+        owner, tank = player(9701, "owner"), player(9702, "player")
+        hub.meter_switch(owner, {"t": "dm", "on": True})
+        await hub.apply_state(tank, st(dt=0, dh=0, dr=0, hpa=400, hpm=400))
+        report(owner)
+        await hub.apply_state(tank, st(dt=40, dh=0, dr=0, dx=30, hpa=360, hpm=400,
+                                       dts={"icesprite:frost": [2, 30], "lightbushsniper:arrow": [1, 10]}))
+        got = report(owner)
+        row = got.get("tk", {}).get("9702", [])
+        check("the first hits after an empty start count: frost 2 for 30, an arrow 1 for 10",
+              len(row) == 8 and row[7] == {"icesprite:frost": [2, 30], "lightbushsniper:arrow": [1, 10]}, row)
+        names = got.get("sn", {})
+        check("  and the report names the monsters it can (the catalogue's display names)",
+              all(isinstance(v, str) and v for v in names.values()), names)
+        await hub.apply_state(tank, st(dt=55, dh=0, dr=0, hpa=345, hpm=400,
+                                       dts={"icesprite:frost": [3, 45], "lightbushsniper:arrow": [1, 10]}))
+        got = report(owner)
+        check("then each second only what it added", got["tk"]["9702"][7] == {"icesprite:frost": [1, 15]},
+              got["tk"]["9702"])
+        await hub.apply_state(tank, st(dt=60, dh=0, dr=0, hpa=340, hpm=400, dts={"icesprite:frost": [1, 5]}))
+        got = report(owner)
+        check("  a source that goes down is a new baseline, counting nothing",
+              got["tk"]["9702"][7] == {}, got["tk"]["9702"])
+        await hub.apply_state(tank, st(dt=70, dh=0, dr=0, hpa=330, hpm=400, dts={"icesprite:frost": [999, 10**9]}))
+        got = report(owner)
+        check("  and no state adds more than METER_HITS_MOST hits or the margin of damage",
+              got["tk"]["9702"][7] == {"icesprite:frost": [presence.METER_HITS_MOST,
+                                                           400 * presence.METER_TAKEN_MARGIN]}, got["tk"]["9702"])
+    finally:
+        presence.broadcast = real_broadcast
+
+
 async def main():
     await kills_written_soon()
     await positions_written()
@@ -1904,6 +1973,7 @@ async def main():
     await data_guard()
     damage_meter()
     await damage_taken()
+    await what_hit_me()
     presence.HELLO_SECONDS = 0.5
     combatbook.HOLD_SECONDS = 0.2
     combatbook.PENDING_SECONDS = 0.3
