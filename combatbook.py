@@ -732,6 +732,9 @@ class AreaBook:
                     "refused": int(m.refused.get(user_id, 0)),
                     "hp_left": max(0, int(math.ceil(m.hp))), "max_hp": int(m.max_hp),
                     "seconds": round(m.dead_at - m.born, 2),
+                    # Which death, so a write tried again is still one row
+                    # (app.py, ONE DEATH IS ONE ROW).
+                    "death": "%s:%d:%d" % (self.area, monster_id, int(round(m.dead_at * 1000))),
                 })
         if self.empty_since is not None and now - self.empty_since >= EMPTY_KEEP:
             self.monsters.clear()

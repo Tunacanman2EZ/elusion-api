@@ -2083,6 +2083,17 @@ def init_db():
     # it - the MIGRATION section starts from exactly that shape.
     db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_seen ON sessions(last_seen_at)")
 
+    # ONE DEATH IS ONE ROW (0.86.1). presence.py keeps a batch of judged
+    # deaths it could not write and tries again (KILLS_KEPT_MOST), and a write
+    # that failed after its commit reached the disk would write them twice -
+    # two receipts for one death. Each row names its death ("area:monster:ms",
+    # combatbook.py tick()) and the index takes it once per player; the write
+    # is INSERT OR IGNORE. A row from before has '' and is left out of it.
+    # After the column, for the reason idx_sessions_seen is.
+    _migrate_add_column(db, "combat_kills", "death", "TEXT NOT NULL DEFAULT ''")
+    db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_combat_kills_death ON combat_kills(death, user_id)"
+               " WHERE death != ''")
+
     # THE CHAT FLOOD BUCKET, on the account rather than on a character.
     #
     # Deliberately NOT sharing the kill or cast buckets: those are per-character

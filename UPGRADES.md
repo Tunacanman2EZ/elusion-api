@@ -11,45 +11,24 @@ go at the end of **Open**.
 
 ## Open
 
-### 12. One startup check for every setting - low, before launch
-
-19 Oct, from the owner's lesson on settings and secrets. Not needed while
-the owner is the only one who sets up a server; worth doing before 1.0, or
-as soon as anyone else runs one.
-
-What is already right: every setting comes from the environment (envfile.py,
-a real variable winning over .env), .env is gitignored, there is no signing
-secret to leak (a token is random and stored as a hash), no password or key
-reaches a log, and wsgi.py's preflight refuses ELUSION_DEBUG.
-
-What is missing, each checked:
-
-- **No `.env.example`.** The settings' names are spread over app.py's
-  comments and DEPLOY.md. One committed file with every `ELUSION_...` key and
-  fake values, and a test that fails when the code reads a key it does not
-  list.
-- **Two "this computer only" switches are not refused on a server.**
-  `ELUSION_MAIL_CONSOLE=1` writes login and reset codes into the log, and
-  `ELUSION_VOICE_DIRECT=on` shows players each other's addresses. app.py and
-  DEPLOY.md both say "never on a public server"; nothing stops it. wsgi.py
-  should refuse them as it refuses ELUSION_DEBUG.
-- **Half-set settings.** Mail with a host and no From address turns staff
-  login codes off (boot prints a line, nothing stops it) - refuse. A voice
-  key with no token turns voice off - warn. `ELUSION_SMTP_PORT` or
-  `ELUSION_PRESENCE_PORT` that is not a number crashes inside app.py's import
-  with a bare ValueError - refuse, naming the setting.
-
-The shape: `envfile.check_env(environ) -> (problems, warnings)`, pure, so a
-test hands it a dict instead of booting wsgi.py once per case. wsgi.py calls
-it first; the gamedata export check stays in wsgi.py (it needs an import).
-Refuse what is unsafe, warn about what only switches a feature off - a
-refusal during an update is the server down.
-
-**Before it ships**, check the live settings file holds neither switch, with
-a command that answers yes or no and prints no values - or the update that
-brings the refusal stops the server. About half a day with its tests.
+Nothing open.
 
 ## Done
+
+### 12. One startup check for every setting - done 25 Oct (0.86.1)
+
+`envfile.check_env(environ) -> (problems, warnings)`, pure, and wsgi.py runs
+it before anything else; its own copies of the debug, owner, proxy and
+database checks went into it. Refused: `ELUSION_DEBUG`, `ELUSION_MAIL_CONSOLE=1`,
+`ELUSION_VOICE_DIRECT=on`, a mail host with no From address, a port or proxy
+count that is not a number, a database in a web-served folder. Warned: the
+other half-set mail and voice settings, staff codes off, an unreadable rate
+limit or data allowance, no owner, no proxies, and any `ELUSION_` name not in
+`envfile.KNOWN` (a typo). `.env.example` lists every setting, all commented
+out. test_deploy.py section G (every case, no secret repeated, the list held
+to the code both ways, two real boots); test_security.py's preflight checks
+gained the two switches, and blank them otherwise so a developer's own .env
+cannot fail the run. DEPLOY.md has the yes/no command for the live file.
 
 ### 1. The API docs page was blank - fixed 18 Oct
 

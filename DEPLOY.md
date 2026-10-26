@@ -40,7 +40,29 @@ python presence.py              # 127.0.0.1:5001, path /ws/presence
 | `ELUSION_SMTP_HOST`, `ELUSION_SMTP_PORT`, `ELUSION_SMTP_USER`, `ELUSION_SMTP_PASSWORD`, `ELUSION_MAIL_FROM` | your mail provider's | Recovery codes **and staff login codes**. Without them a staff login has no second step |
 | `ELUSION_STAFF_LOGIN_CODES` | **unset** (on) | `off` only to get back in when mail has broken - see below |
 
-`wsgi.py` checks all of these at boot and says which one is wrong.
+`wsgi.py` checks every setting at boot (`envfile.check_env()`, 0.86.1) and says
+which one is wrong. **It refuses to start** for `ELUSION_DEBUG`,
+`ELUSION_MAIL_CONSOLE=1` (login codes into the log), `ELUSION_VOICE_DIRECT=on`
+(players' addresses), a mail host with no `ELUSION_MAIL_FROM` (staff logins
+would take no code), a port or proxy count that is not a number, and a
+database in a web-served folder. **It warns and starts** for the rest: a From
+address with no host, half a mail login or voice key, staff codes off, a rate
+limit or data allowance it cannot read, no owner, no proxy count, and any
+`ELUSION_` name it does not know - usually a typo. No line repeats a secret's
+value. `.env.example` lists every setting with made-up values, all commented
+out; `test_deploy.py` section G fails when the code reads one it does not list.
+The mail console and direct voice still work with `python app.py` on your own
+computer - only the real server's entry point refuses them.
+
+**Before an update that brings the check**, ask the live settings file whether
+it holds either switch - this prints a count, never a value, and 0 is safe:
+
+```
+ssh root@api.elusionrpg.com "grep -cE '^[[:space:]]*ELUSION_(MAIL_CONSOLE|VOICE_DIRECT|DEBUG)=' /etc/elusion/elusion.env"
+```
+
+Anything above 0: open the file (`sudo nano /etc/elusion/elusion.env`), take
+those lines out, then update.
 
 **Where they go.** On a server, in the environment the service manager gives
 the process - the live box uses systemd's `EnvironmentFile` (below). On a PC, a

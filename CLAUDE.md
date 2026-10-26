@@ -212,6 +212,13 @@ app.py and come before the preflight in wsgi.py. **Nothing goes above them.**
 A real environment variable still wins over the file. `test_deploy.py` checks
 the order with `ast` and boots a copy of both files with nothing but a `.env`.
 
+**Every setting is checked in one place** (0.86.1): `envfile.check_env()`,
+pure, run first by wsgi.py - refusing what leaks (the mail console, direct
+voice, debug) or would crash (a port that is not a number), warning about what
+only switches a feature off, and naming any `ELUSION_` key nobody reads. **A
+new setting goes in `envfile.KNOWN` and `.env.example`**, or test_deploy.py
+section G fails naming it.
+
 ### A WAL database copied is a WAL database
 
 The live database runs in WAL mode, and SQLite's backup API copies the mode with
@@ -1807,6 +1814,20 @@ finds. `test_combatbook.py` holds the books, `test_presence.py` P-8 the wiring.
   and says so once. `ELUSION_BOOKS=off` turns all of it off; the welcome says
   `"books"` either way, and a game only sends its world alone, or its own hits,
   to a server whose welcome says true.
+- **A kill write that fails is tried again, and a death is one row (0.86.1).**
+  A reviewer's point, checked in the code: `flush_kills()` and `flush_books()`
+  took the queue and, on any error, printed and dropped it - a locked
+  database or a full disk was every kill in that quarter second never paid.
+  Now `keep_kills()` puts the batch back ahead of what came after, the newest
+  `KILLS_KEPT_MOST` (5,000) kept, and the next flush tries again. A retry must
+  not pay twice, so every row names its death - `death`, "area:monster:ms"
+  (combatbook.py `tick()`), one per player who hit it - and
+  `idx_combat_kills_death` (UNIQUE on death and user_id, WHERE death != '')
+  with `INSERT OR IGNORE` takes it once. Not a queue between the two
+  processes: the database already is one, and `kill_receipts` already stops
+  one row paying twice. **Deploy order: either.** A database app.py has not
+  migrated yet is written as before, unnamed, and says so once in the log.
+  test_presence.py P-18, test_combatbook ("each row names its death").
 - **THE BOOKS NEVER BREAK THE RELAY.** `_book_safely()` catches anything a
   book cannot read and the message goes on exactly as it would have.
 - **Born in the message that hits it (game 0.21.2).** The first live week

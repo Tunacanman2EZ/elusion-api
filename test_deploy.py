@@ -34,6 +34,8 @@ THE SECTIONS
   D  backups are one file, the live database stays WAL
   E  prune and tidy: sidecars, leftovers, other databases' files
   F  restore_drill.py restores one of the new single-file copies
+  G  every setting checked before the server starts (envfile.check_env),
+     run after C because it boots the same copy
 
 No network, no real database: everything is built in a temp directory.
 """
@@ -355,6 +357,118 @@ check("a real environment variable beats the .env in app.py", seen.get("hops") =
 result = boot_wsgi(clean_env(ELUSION_TRUSTED_PROXIES="2"))
 check("...and in wsgi.py's preflight",
       "preflight passed (trusted proxy hops: 2)" in result.stderr, result.stderr[-600:])
+
+
+# =============================================================================
+section("G  every setting checked before the server starts (envfile.check_env)")
+# =============================================================================
+# UPGRADES.md item 12. check_env() is pure, so each case is a dict; two boots
+# of the real wsgi.py prove it is what the preflight runs.
+
+import re  # noqa: E402
+
+GOOD = {"ELUSION_OWNER": "boss", "ELUSION_TRUSTED_PROXIES": "1", "ELUSION_DB": "/var/lib/elusion/x.db",
+        "ELUSION_SMTP_HOST": "smtp.example.com", "ELUSION_SMTP_PORT": "587",
+        "ELUSION_SMTP_USER": "u@example.com", "ELUSION_SMTP_PASSWORD": "pw",
+        "ELUSION_MAIL_FROM": "Elusion <u@example.com>", "ELUSION_PRESENCE_PORT": "5001"}
+
+
+def checked(**changes):
+    env = dict(GOOD)
+    for key, value in changes.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+    return envfile.check_env(env)
+
+
+problems, warnings = envfile.check_env(GOOD)
+check("a live server's settings pass with nothing to say", problems == [] and warnings == [],
+      (problems, warnings))
+
+REFUSED = [
+    ("ELUSION_DEBUG on", {"ELUSION_DEBUG": "1"}, "ELUSION_DEBUG"),
+    ("the mail console (login codes into the log)", {"ELUSION_MAIL_CONSOLE": "1"}, "ELUSION_MAIL_CONSOLE"),
+    ("direct voice (players' addresses)", {"ELUSION_VOICE_DIRECT": "on"}, "ELUSION_VOICE_DIRECT"),
+    ("a mail host with no From address", {"ELUSION_MAIL_FROM": None}, "ELUSION_MAIL_FROM"),
+    ("a mail port that is not a number", {"ELUSION_SMTP_PORT": "five"}, "ELUSION_SMTP_PORT"),
+    ("a presence port out of range", {"ELUSION_PRESENCE_PORT": "70000"}, "ELUSION_PRESENCE_PORT"),
+    ("a proxy count that is not a whole number", {"ELUSION_TRUSTED_PROXIES": "one"}, "ELUSION_TRUSTED_PROXIES"),
+    ("a database in a web-served folder", {"ELUSION_DB": "/var/www/elusion.db"}, "ELUSION_DB"),
+]
+for label, changes, key in REFUSED:
+    problems, _warnings = checked(**changes)
+    check("refused: %s, naming %s" % (label, key), len(problems) == 1 and key in problems[0], problems)
+
+problems, _warnings = checked(ELUSION_MAIL_CONSOLE="0", ELUSION_VOICE_DIRECT="off", ELUSION_DEBUG="")
+check("  the two this-computer switches set off, and debug empty, are not refused", problems == [], problems)
+
+WARNED = [
+    ("a From address with no mail host", {"ELUSION_SMTP_HOST": None}, "ELUSION_SMTP_HOST"),
+    ("a mail login with no password", {"ELUSION_SMTP_PASSWORD": None}, "ELUSION_SMTP_PASSWORD"),
+    ("a voice key with no token", {"ELUSION_TURN_KEY_ID": "abcdefgh12"}, "ELUSION_TURN_KEY_TOKEN"),
+    ("a voice key id that is not one", {"ELUSION_TURN_KEY_ID": "bad id", "ELUSION_TURN_KEY_TOKEN": "t"},
+     "ELUSION_TURN_KEY_ID"),
+    ("staff login codes switched off", {"ELUSION_STAFF_LOGIN_CODES": "off"}, "ELUSION_STAFF_LOGIN_CODES"),
+    ("a rate limit that cannot be read", {"ELUSION_RATE_LIMIT": "lots"}, "ELUSION_RATE_LIMIT"),
+    ("a data allowance that is not a number", {"ELUSION_TRANSFER_GIB": "plenty"}, "ELUSION_TRANSFER_GIB"),
+    ("no owner", {"ELUSION_OWNER": None}, "ELUSION_OWNER"),
+    ("no proxy count", {"ELUSION_TRUSTED_PROXIES": "0"}, "ELUSION_TRUSTED_PROXIES"),
+    ("a misspelt setting", {"ELUSION_SMPT_HOST": "x"}, "ELUSION_SMPT_HOST"),
+]
+for label, changes, key in WARNED:
+    problems, warnings = checked(**changes)
+    check("warned, not refused: %s" % label, problems == [] and any(key in w for w in warnings),
+          (problems, warnings))
+problems, warnings = checked(ELUSION_RATE_LIMIT="600 per minute", ELUSION_TRANSFER_GIB="off")
+check("  a rate limit and an allowance written the way DEPLOY.md does are read fine",
+      problems == [] and warnings == [], (problems, warnings))
+
+SECRETS = {"ELUSION_SMTP_PASSWORD": "pw-not-real-8812", "ELUSION_TURN_KEY_TOKEN": "tok-not-real-8812",
+           "ELUSION_SMTP_USER": "user-not-real-8812", "ELUSION_MAIL_FROM": "from-not-real-8812",
+           "ELUSION_SMTP_HOST": "host-not-real-8812", "ELUSION_TURN_KEY_ID": "id not real 8812"}
+said = []
+for drop in (None, "ELUSION_SMTP_HOST", "ELUSION_MAIL_FROM", "ELUSION_SMTP_PASSWORD",
+             "ELUSION_SMTP_USER", "ELUSION_TURN_KEY_TOKEN"):
+    env = dict(SECRETS)
+    env.pop(drop, None)
+    problems, warnings = envfile.check_env(env)
+    said.extend(problems + warnings)
+check("no line ever repeats a mail or voice setting's value, whatever is half set",
+      said and not any("not-real-8812" in line or "not real 8812" in line for line in said), said)
+
+# THE LIST AGAINST THE CODE. Every "ELUSION_..." the server's code names is in
+# envfile.KNOWN and in .env.example; a suite's own test-only names are not
+# settings, so test_*.py is left out.
+named = set()
+for root, dirs, files in os.walk(HERE):
+    dirs[:] = [d for d in dirs if d not in ("venv", ".git", "__pycache__", "node_modules")]
+    for name in files:
+        if name.endswith(".py") and not name.startswith("test_"):
+            with open(os.path.join(root, name), encoding="utf-8") as handle:
+                named |= set(re.findall(r"[\"'](ELUSION_[A-Z0-9_]+)[\"']", handle.read()))
+check("every setting the code reads is in envfile.KNOWN", named <= set(envfile.KNOWN),
+      sorted(named - set(envfile.KNOWN)))
+check("  and KNOWN holds nothing the code does not read", set(envfile.KNOWN) <= named,
+      sorted(set(envfile.KNOWN) - named))
+with open(os.path.join(HERE, ".env.example"), encoding="utf-8") as handle:
+    example = handle.read()
+listed = set(re.findall(r"^#?\s*(ELUSION_[A-Z0-9_]+)=", example, re.M))
+check(".env.example lists every setting, and only those", listed == set(envfile.KNOWN),
+      sorted(listed ^ set(envfile.KNOWN)))
+check("  with every line commented out, so a copy taken as it is sets nothing",
+      not re.search(r"^\s*ELUSION_", example, re.M) and not envfile.parse(example), envfile.parse(example))
+
+# THE REAL PREFLIGHT, twice: it refuses with the setting's name, not a trace.
+result = boot_wsgi(clean_env(ELUSION_MAIL_CONSOLE="1"))
+check("wsgi.py refuses to start with the mail console on, and says why",
+      result.returncode != 0 and "ELUSION_MAIL_CONSOLE" in result.stderr and "Traceback" not in result.stderr,
+      result.stderr[-600:])
+result = boot_wsgi(clean_env(ELUSION_SMTP_PORT="five"))
+check("wsgi.py refuses a mail port that is not a number by name, before app.py could crash on it",
+      result.returncode != 0 and "ELUSION_SMTP_PORT" in result.stderr and "ValueError" not in result.stderr,
+      result.stderr[-600:])
 
 
 # =============================================================================

@@ -1150,6 +1150,117 @@ async def a_crowd_walks_in(port, server):
         await ws.close()
 
 
+async def kills_survive_a_failed_write():
+    """P-18: a batch of judged deaths that could not be written is tried
+    again, and a death written twice is one row (ONE DEATH IS ONE ROW)."""
+    section("P-18 A KILL WRITE THAT FAILS IS TRIED AGAIN, AND A DEATH IS ONE ROW HOWEVER OFTEN IT IS WRITTEN")
+
+    def death(n, user_id=1):
+        return {"at": int(time.time()), "area": "field", "enemy_id": "lightslime", "origin": "o%d" % n,
+                "leader_id": 1, "user_id": user_id, "slot": 0, "verdict": "agreed", "damage": 10,
+                "refused": 0, "hp_left": 0, "max_hp": 10, "seconds": 1.0,
+                "death": "field:%d:%d" % (n, 1000 + n)}
+
+    def rows_for(origins):
+        con = sqlite3.connect(DB_PATH)
+        try:
+            marks = ",".join("?" * len(origins))
+            return con.execute("SELECT origin, user_id FROM combat_kills WHERE origin IN (%s)"
+                               " ORDER BY origin, user_id" % marks, origins).fetchall()
+        finally:
+            con.close()
+
+    one = death(9001)
+    presence.write_books([one, death(9001, user_id=2)], [])
+    presence.write_books([dict(one)], [])
+    got = rows_for(["o9001"])
+    check("the same death written twice is one row for each player who hit it",
+          got == [("o9001", 1), ("o9001", 2)], got)
+
+    unnamed = dict(death(9002), death="")
+    presence.write_books([unnamed], [])
+    presence.write_books([dict(unnamed)], [])
+    legacy = dict(death(9003))
+    del legacy["death"]
+    presence.write_books([legacy], [])
+    check("  a row with no death named is never held to it (rows from before, a book from before)",
+          len(rows_for(["o9002"])) == 2 and len(rows_for(["o9003"])) == 1,
+          (rows_for(["o9002"]), rows_for(["o9003"])))
+
+    real = presence.write_books
+    tries = []
+
+    def flaky(kills, flags, prune=None):
+        tries.append(len(kills))
+        if len(tries) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(kills, flags, prune)
+
+    presence.write_books = flaky
+    try:
+        quick = presence.PresenceServer(sweep_seconds=5, tick_seconds=5)
+        quick._kills = [death(9004), death(9005)]
+        await quick.flush_kills()
+        kept = len(quick._kills)
+        quick._kills.append(death(9006))
+        await quick.flush_kills()
+        left = len(quick._kills)
+    finally:
+        presence.write_books = real
+    check("a failed write keeps its deaths for the next flush, ahead of what came after",
+          kept == 2 and tries == [2, 3] and left == 0, (kept, tries, left))
+    got = rows_for(["o9004", "o9005", "o9006"])
+    check("  and the next flush writes every one of them, once",
+          [r[0] for r in got] == ["o9004", "o9005", "o9006"], got)
+
+    def broken(kills, flags, prune=None):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    presence.write_books = broken
+    keep_most = presence.KILLS_KEPT_MOST
+    presence.KILLS_KEPT_MOST = 3
+    try:
+        quick = presence.PresenceServer(sweep_seconds=5, tick_seconds=5)
+        quick._kills = [death(n) for n in range(9100, 9105)]
+        await quick.flush_kills()
+        capped = [k["origin"] for k in quick._kills]
+        quick._kills.append(death(9200))
+        quick._flags = {(1, "field", "too_fast"): [1, "x", 1, 1]}
+        await quick.flush_books()
+        after_books = [k["origin"] for k in quick._kills]
+    finally:
+        presence.write_books = real
+        presence.KILLS_KEPT_MOST = keep_most
+    check("  a write that keeps failing holds at most KILLS_KEPT_MOST, the newest",
+          capped == ["o9102", "o9103", "o9104"], capped)
+    check("  and the two-second flush keeps its deaths the same way",
+          after_books == ["o9103", "o9104", "o9200"], after_books)
+
+    bare = os.path.join(testdir.PATH, "elusion_presence_nodeath.db")
+    if os.path.exists(bare):
+        os.remove(bare)
+    con = sqlite3.connect(bare)
+    con.execute("CREATE TABLE combat_kills (id INTEGER PRIMARY KEY, at INTEGER, area TEXT, enemy_id TEXT,"
+                " origin TEXT, leader_id INTEGER, user_id INTEGER, slot INTEGER, verdict TEXT,"
+                " damage INTEGER, refused INTEGER, hp_left INTEGER, max_hp INTEGER, seconds REAL)")
+    con.commit()
+    con.close()
+    keep = presence.DB_PATH
+    presence.DB_PATH = bare
+    try:
+        quick = presence.PresenceServer(sweep_seconds=5, tick_seconds=5)
+        quick._kills = [death(9300)]
+        await quick.flush_kills()
+        waiting = len(quick._kills)
+    finally:
+        presence.DB_PATH = keep
+    con = sqlite3.connect(bare)
+    written = con.execute("SELECT COUNT(*) FROM combat_kills WHERE origin = 'o9300'").fetchone()[0]
+    con.close()
+    check("  a database app.py has not migrated yet still gets the death, as before (presence first)",
+          waiting == 0 and written == 1, (waiting, written))
+
+
 async def kills_written_soon():
     """A DEATH IS WRITTEN SOONER (0.57.0): a game waits on it to be paid."""
     calls = []
@@ -1974,6 +2085,7 @@ async def main():
     damage_meter()
     await damage_taken()
     await what_hit_me()
+    await kills_survive_a_failed_write()
     presence.HELLO_SECONDS = 0.5
     combatbook.HOLD_SECONDS = 0.2
     combatbook.PENDING_SECONDS = 0.3

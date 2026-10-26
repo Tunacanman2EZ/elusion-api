@@ -2129,6 +2129,12 @@ print("\n=== E-4b  THE DEPLOY PREFLIGHT ACTUALLY REFUSES ===\n")
 def preflight(env_overrides, gamedata_dir=None):
     """Import wsgi.py in a child and report (exit_code, stderr)."""
     env = dict(os.environ)
+    # THE TWO THIS-COMPUTER SWITCHES, blanked (0.86.1): wsgi.py refuses them
+    # now, and a developer's own .env beside app.py may well hold
+    # ELUSION_MAIL_CONSOLE=1. A real variable wins over the file, so an empty
+    # one keeps this machine's testing settings out of these checks.
+    env["ELUSION_MAIL_CONSOLE"] = ""
+    env["ELUSION_VOICE_DIRECT"] = ""
     env.update(env_overrides)
     env["ELUSION_DB"] = os.path.join(testdir.PATH, "elusion_preflight.db")
     run_in = gamedata_dir or HERE
@@ -2145,6 +2151,12 @@ def preflight(env_overrides, gamedata_dir=None):
 code, err = preflight({"ELUSION_DEBUG": "1"})
 check("ELUSION_DEBUG=1 stops the server booting", code != 0, code)
 check("and the refusal names the setting", "ELUSION_DEBUG" in err, err[-300:])
+code, err = preflight({"ELUSION_MAIL_CONSOLE": "1"})
+check("ELUSION_MAIL_CONSOLE=1 stops the server booting: it writes login codes into the log",
+      code != 0 and "ELUSION_MAIL_CONSOLE" in err, err[-300:])
+code, err = preflight({"ELUSION_VOICE_DIRECT": "on"})
+check("ELUSION_VOICE_DIRECT=on stops it too: it shows players each other's addresses",
+      code != 0 and "ELUSION_VOICE_DIRECT" in err, err[-300:])
 
 # THE NEW ONE. A gamedata.json with no equipment data means /api/save accepts
 # any item in any slot - proven against this codebase, where a level 1 warrior

@@ -443,7 +443,15 @@ for label, path, before in (("booted by the old code", BOOTED, booted_before),
     # sqlite_sequence too, but for the ledger's own counter where it opened
     sequence = [r for r in after.get("sqlite_sequence", []) if r["name"] != "gold_ledger" or path == BOOTED]
     after["sqlite_sequence"] = sequence
-    moved = [t for t in before if t not in ("saves", "accounts", "gold_ledger") and after.get(t) != before[t]]
+    # A column a migration adds (combat_kills.death, 0.86.1) is new, not a
+    # row touched: compare what each row held before, column by column.
+    def held(table, got):
+        if not before[table]:
+            return got
+        keys = set(before[table][0])
+        return sorted(({k: v for k, v in r.items() if k in keys} for r in got), key=repr)
+    moved = [t for t in before if t not in ("saves", "accounts", "gold_ledger")
+             and held(t, after.get(t) or []) != before[t]]
     check("%s: every other table's rows are untouched" % label, not moved, moved)
     check("%s: and its schema is now a fresh database's" % label,
           schema_diff(read_schema(path), fresh) == [], schema_diff(read_schema(path), fresh)[:3])

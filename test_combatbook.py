@@ -441,6 +441,9 @@ check("a death waits for late hits", not book.kills)
 book.tick(now + combatbook.HOLD_SECONDS)
 kills, flags = book.take()
 check("then it is judged: agreed", [k["verdict"] for k in kills] == ["agreed", "agreed"], kills)
+check("  each row names its death - area, monster, the moment - the same for both players"
+      " (presence.py writes a death tried twice once)",
+      len({k["death"] for k in kills}) == 1 and kills[0]["death"].startswith("field:1:"), kills)
 by_user = {k["user_id"]: k for k in kills}
 check("  one row per player who hit it, with their own damage and character",
       by_user[1]["damage"] == hp // 2 and by_user[2]["damage"] == hp - hp // 2

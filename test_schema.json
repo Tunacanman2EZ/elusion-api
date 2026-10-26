@@ -154,7 +154,7 @@
    "table",
    "combat_kills",
    "combat_kills",
-   "CREATE TABLE combat_kills (\n            id         INTEGER PRIMARY KEY AUTOINCREMENT,\n            at         INTEGER NOT NULL,\n            area       TEXT    NOT NULL,\n            enemy_id   TEXT    NOT NULL,\n            origin     TEXT    NOT NULL DEFAULT '',\n            leader_id  INTEGER NOT NULL DEFAULT 0,\n            user_id    INTEGER NOT NULL,\n            slot       INTEGER NOT NULL DEFAULT -1,\n            verdict    TEXT    NOT NULL,\n            damage     INTEGER NOT NULL DEFAULT 0,\n            refused    INTEGER NOT NULL DEFAULT 0,\n            hp_left    INTEGER NOT NULL DEFAULT 0,\n            max_hp     INTEGER NOT NULL DEFAULT 0,\n            seconds    REAL    NOT NULL DEFAULT 0\n        )"
+   "CREATE TABLE combat_kills (\n            id         INTEGER PRIMARY KEY AUTOINCREMENT,\n            at         INTEGER NOT NULL,\n            area       TEXT    NOT NULL,\n            enemy_id   TEXT    NOT NULL,\n            origin     TEXT    NOT NULL DEFAULT '',\n            leader_id  INTEGER NOT NULL DEFAULT 0,\n            user_id    INTEGER NOT NULL,\n            slot       INTEGER NOT NULL DEFAULT -1,\n            verdict    TEXT    NOT NULL,\n            damage     INTEGER NOT NULL DEFAULT 0,\n            refused    INTEGER NOT NULL DEFAULT 0,\n            hp_left    INTEGER NOT NULL DEFAULT 0,\n            max_hp     INTEGER NOT NULL DEFAULT 0,\n            seconds    REAL    NOT NULL DEFAULT 0\n        , death TEXT NOT NULL DEFAULT '')"
   ],
   [
    "index",
@@ -881,6 +881,12 @@
    "idx_sessions_seen",
    "sessions",
    "CREATE INDEX idx_sessions_seen ON sessions(last_seen_at)"
+  ],
+  [
+   "index",
+   "idx_combat_kills_death",
+   "combat_kills",
+   "CREATE UNIQUE INDEX idx_combat_kills_death ON combat_kills(death, user_id) WHERE death != ''"
   ],
   [
    "index",
@@ -2399,6 +2405,14 @@
      1,
      "0",
      0
+    ],
+    [
+     14,
+     "death",
+     "TEXT",
+     1,
+     "''",
+     0
     ]
    ],
    "foreign_keys": [],
@@ -2408,6 +2422,18 @@
       0,
       1,
       "at"
+     ]
+    ],
+    "idx_combat_kills_death": [
+     [
+      0,
+      14,
+      "death"
+     ],
+     [
+      1,
+      6,
+      "user_id"
      ]
     ],
     "idx_combat_kills_user": [
@@ -2429,6 +2455,12 @@
      0,
      "c",
      0
+    ],
+    [
+     "idx_combat_kills_death",
+     1,
+     "c",
+     1
     ],
     [
      "idx_combat_kills_user",

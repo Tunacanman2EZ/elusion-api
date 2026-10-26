@@ -76,55 +76,18 @@ envfile.load()
 # first means a misconfiguration is reported as a misconfiguration.
 #
 # The checks are deliberately noisy rather than fatal for most items: a server
-# that refuses to boot at 3am over a warning is its own outage. The one
-# genuinely unsafe combination does stop it.
-_problems = []
-_warnings = []
-
-# THE ONE THAT MUST NEVER SHIP. The Werkzeug debugger turns any unhandled
-# exception into arbitrary code execution on the box holding elusion.db and its
-# password hashes. Under a WSGI server the run block never executes, so this
-# flag would not take effect anyway - which is exactly why it is worth refusing
-# on: someone who set it believes it is doing something.
-if os.environ.get("ELUSION_DEBUG", "").strip().lower() in ("1", "true", "yes", "on"):
-    _problems.append(
-        "ELUSION_DEBUG is set. It does nothing under a WSGI server, and it means "
-        "this config was copied from a dev machine - check what else came with it."
-    )
-
-# WITHOUT AN OWNER THERE IS NO OWNER. app.py fails closed on this already, but
-# finding out from a staff route at 3am is worse than finding out at boot.
-if not os.environ.get("ELUSION_OWNER", "").strip():
-    _warnings.append(
-        "ELUSION_OWNER is not set - no account will hold the top rank. "
-        "Set it in the environment or in a .env beside app.py."
-    )
-
-# THE PROXY SETTING, AND WHY IT IS A WARNING IN BOTH DIRECTIONS.
+# that refuses to boot at 3am over a warning is its own outage. What leaks
+# something, or what the server would crash on anyway, does stop it.
 #
-# Left at 0 behind a proxy, request.remote_addr is the proxy for every player
-# alive, so the per-IP login throttle shares ONE bucket across the whole player
-# base and the first brute-force run locks everybody out.
-#
-# Set above 0 without a proxy, X-Forwarded-For is attacker-controlled: a spray
-# sets a fresh fake address per request, nothing ever trips, and the log fills
-# with invented addresses implicating people who did nothing.
-#
-# Nothing here can tell which is true, so this only says the setting exists and
-# what each value means. See client_ip() in app.py.
+# EVERY SETTING, CHECKED IN ONE PLACE (0.86.1): envfile.check_env() - the
+# debug flag, the two this-computer-only switches, half-set mail and voice,
+# numbers the server would crash on, the database's folder, the owner, the
+# proxy count, and any ELUSION_ name nobody reads. It is pure, so
+# test_deploy.py checks each case with a dict. What needs an import stays
+# below.
+_problems, _warnings = envfile.check_env(os.environ)
 _hops = os.environ.get("ELUSION_TRUSTED_PROXIES", "0").strip() or "0"
-try:
-    _hops_n = int(_hops)
-except ValueError:
-    _problems.append("ELUSION_TRUSTED_PROXIES must be an integer, got %r" % _hops)
-    _hops_n = 0
-
-if _hops_n == 0:
-    _warnings.append(
-        "ELUSION_TRUSTED_PROXIES is 0 - the per-IP throttle will read the socket "
-        "address. Correct ONLY if nothing proxies this app. Behind nginx or a "
-        "load balancer, set it to the number of proxies you run."
-    )
+_hops_n = int(_hops) if _hops.isdigit() else 0
 
 # A STALE EQUIPMENT EXPORT IS A SERVER WITH NO AUTHORITY OVER EQUIPMENT, and
 # that is a refusal rather than a warning.
@@ -160,16 +123,6 @@ else:
             "src/tools/exportgamedata.gd in the Godot editor, then copy the new "
             "gamedata.json beside app.py."
         )
-
-# The database should not live anywhere a web server might serve it. This
-# catches the obvious mistake, not every arrangement.
-_db = os.environ.get("ELUSION_DB", "")
-if any(part in _db.replace("\\", "/").lower().split("/")
-       for part in ("static", "public", "www", "htdocs", "wwwroot")):
-    _problems.append(
-        "ELUSION_DB (%s) is inside a directory that looks web-served. It holds "
-        "real password hashes and must never be fetchable over HTTP." % _db
-    )
 
 for _line in _warnings:
     print("[DEPLOY] warning: %s" % _line, file=sys.stderr)

@@ -355,6 +355,12 @@ BOOKS_KEPT_SECONDS = 14 * 86400
 # deaths judged are written every KILLS_FLUSH_SECONDS; the flags, the stirring
 # lands and the pruning keep FLUSH_SECONDS.
 KILLS_FLUSH_SECONDS = 0.25
+# A WRITE THAT FAILS IS TRIED AGAIN (0.86.1): the deaths of a batch that
+# could not be written (a locked database, a full disk, a column app.py has
+# not added yet) go back in the queue for the next flush, the newest
+# KILLS_KEPT_MOST kept - a game is waiting on each one to be paid. A death
+# written twice is still one row (app.py, ONE DEATH IS ONE ROW).
+KILLS_KEPT_MOST = 5000
 # THE STIRRING LANDS (game 0.46.0): how often the books learn which lands are
 # stirring (stirred_lands()), and how long after a stir ends its land still
 # counts - a monster born in its last minute lives on after it.
@@ -570,6 +576,7 @@ def lookup_ticket(raw, now=None):
 # app.py creates them (its schema block), and a database from before them is
 # not an error - the rows are dropped and the boot log says so once.
 _BOOK_TABLES_MISSING = []
+_DEATH_COLUMN_MISSING = []
 
 
 def stirred_lands(now=None):
@@ -601,11 +608,29 @@ def write_books(kills, flags, prune_before=None):
     conn = sqlite3.connect(DB_PATH, timeout=5)
     try:
         if kills:
-            conn.executemany(
-                "INSERT INTO combat_kills (at, area, enemy_id, origin, leader_id, user_id, slot,"
-                " verdict, damage, refused, hp_left, max_hp, seconds)"
-                " VALUES (:at, :area, :enemy_id, :origin, :leader_id, :user_id, :slot,"
-                " :verdict, :damage, :refused, :hp_left, :max_hp, :seconds)", kills)
+            rows = [k if "death" in k else dict(k, death="") for k in kills]
+            try:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO combat_kills (at, area, enemy_id, origin, leader_id, user_id,"
+                    " slot, verdict, damage, refused, hp_left, max_hp, seconds, death)"
+                    " VALUES (:at, :area, :enemy_id, :origin, :leader_id, :user_id, :slot,"
+                    " :verdict, :damage, :refused, :hp_left, :max_hp, :seconds, :death)", rows)
+            except sqlite3.OperationalError as exc:
+                # A database app.py has not migrated yet (ONE DEATH IS ONE
+                # ROW): the deaths are written as before, unnamed, so a
+                # restart of this process ahead of app.py pays every kill.
+                if "death" not in str(exc):
+                    raise
+                if not _DEATH_COLUMN_MISSING:
+                    _DEATH_COLUMN_MISSING.append(str(exc))
+                    print("[PRESENCE] combat_kills has no death column yet (%s): start app.py "
+                          "once to add it - until then a death tried twice may be two rows" % exc,
+                          flush=True)
+                conn.executemany(
+                    "INSERT INTO combat_kills (at, area, enemy_id, origin, leader_id, user_id, slot,"
+                    " verdict, damage, refused, hp_left, max_hp, seconds)"
+                    " VALUES (:at, :area, :enemy_id, :origin, :leader_id, :user_id, :slot,"
+                    " :verdict, :damage, :refused, :hp_left, :max_hp, :seconds)", rows)
         if flags:
             conn.executemany(
                 "INSERT INTO combat_flags (user_id, area, kind, count, detail, first_at, last_at)"
@@ -2187,6 +2212,17 @@ class PresenceServer:
             await asyncio.to_thread(write_books, kills, [], None)
         except Exception as exc:  # noqa: BLE001
             print("[PRESENCE] could not write the books: %r" % exc, flush=True)
+            self.keep_kills(kills)
+
+    def keep_kills(self, kills):
+        """Put deaths that could not be written back at the front of the
+        queue, the newest KILLS_KEPT_MOST kept (KILLS_KEPT_MOST)."""
+        waiting = kills + self._kills
+        if len(waiting) > KILLS_KEPT_MOST:
+            print("[PRESENCE] %d deaths could not be written and were dropped"
+                  % (len(waiting) - KILLS_KEPT_MOST), flush=True)
+            waiting = waiting[-KILLS_KEPT_MOST:]
+        self._kills = waiting
 
     def take_positions(self, now):
         """(at, user_id, slot, area, x, y) for every character in an area that
@@ -2239,6 +2275,7 @@ class PresenceServer:
                 await asyncio.to_thread(write_books, kills, flags, prune)
             except Exception as exc:  # noqa: BLE001
                 print("[PRESENCE] could not write the books: %r" % exc, flush=True)
+                self.keep_kills(kills)
         # After the books, never before them: a game may be waiting on a death.
         await self.flush_positions(now)
 
