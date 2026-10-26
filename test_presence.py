@@ -153,7 +153,7 @@ def last_lead(messages):
     return leads[-1] if leads else None
 
 
-async def enter(port, headers, area=None, v=None, xt=None, **kw):
+async def enter(port, headers, area=None, v=None, xt=None, sh=None, **kw):
     """A connected game: hello with a fresh ticket, welcome read, optionally
     standing somewhere. v=2 is a game that shares monsters; xt=1 one that
     takes attacks inside the tick (game 0.76.0)."""
@@ -164,6 +164,8 @@ async def enter(port, headers, area=None, v=None, xt=None, **kw):
         hello["v"] = v
     if xt is not None:
         hello["xt"] = xt
+    if sh is not None:
+        hello["sh"] = sh
     await ws.send(json.dumps(hello))
     welcome = json.loads(await asyncio.wait_for(ws.recv(), 2))
     if area:
@@ -216,7 +218,8 @@ async def run(port, server):
     a, welcome = await enter(port, ALICE)
     check("a real ticket is welcomed, by account id",
           welcome == {"t": "welcome", "id": uid("presa"), "v": presence.SHARED_VERSION,
-                      "books": presence.BOOKS, "x": presence.RELAY_VERSION}, welcome)
+                      "books": presence.BOOKS, "x": presence.RELAY_VERSION,
+                      "sh": presence.SERVER_HEALTH if presence.BOOKS else 0}, welcome)
     await a.close()
 
     # =========================================================================
@@ -1064,6 +1067,47 @@ async def run(port, server):
     await asyncio.sleep(0.1)
 
     # =========================================================================
+    section("P-19b THE SERVER OWNS THEIR HEALTH, OVER THE WIRE")
+    # =========================================================================
+    fire = presence.gamedata.ENEMIES["firesprite"]
+    spot = [s for s in presence.gamedata.AREAS["bigfield"]["spawns"] if s["e"] == "firesprite"][0]
+    lead_hdr, fol_hdr = account("preshl"), account("preshf", "mage")
+    lw, lwel = await enter(port, lead_hdr, "bigfield", v=presence.BOOKS_VERSION, sh=1, x=spot["x"] + 30, y=spot["y"])
+    fw, _ = await enter(port, fol_hdr, "bigfield", v=presence.BOOKS_VERSION, sh=1, x=spot["x"] - 30, y=spot["y"])
+    check("the welcome says the server owns the monsters' health", lwel.get("sh") == presence.SERVER_HEALTH, lwel)
+    await collect(lw)
+    await collect(fw)
+    record = {"id": 77, "o": spot["o"], "s": "res://scene/enemy/firesprite.tscn", "pp": "ysortworld",
+              "x": spot["x"], "y": spot["y"], "a": "idledown", "hp": fire["max_hp"], "mh": fire["max_hp"],
+              "p": {"ed": fire["resource"], "eo": -1, "lr": 250.0, "g": False}}
+    await lw.send(json.dumps({"t": "w", "d": {"full": True, "reset": True, "part": 0, "parts": 1,
+                                              "spawn": [record]}}))
+    await asyncio.sleep(0.25)
+    first = of(await collect(fw), "hp")
+    check("a follower hears the server's count of a monster the leader just showed it",
+          any([77, fire["max_hp"], fire["max_hp"]] in m["p"] for m in first), first)
+    await collect(lw)
+    fol_bounds = server.players[uid("preshf")].fighter.bounds
+    owed = fire["max_hp"]
+    while owed > 0:
+        n = min(fol_bounds["max_hit"], owed)
+        await fw.send(json.dumps({"t": "h", "p": [[77, n, 0]]}))
+        owed -= n
+        await asyncio.sleep(n / fol_bounds["dps"])
+    await asyncio.sleep(0.25)
+    got_f, got_l = of(await collect(fw), "hp"), of(await collect(lw), "hp")
+    check("its hits bring the count to zero, and both games hear the monster is dead",
+          any(77 in m.get("d", []) for m in got_f) and any(77 in m.get("d", []) for m in got_l), (got_f, got_l))
+    await asyncio.sleep(combatbook.HOLD_SECONDS + server.flush_seconds + 0.4)
+    row = sql("SELECT verdict, user_id FROM combat_kills WHERE area = 'bigfield' AND origin = ? AND user_id = ?",
+              (spot["o"], uid("preshf")))
+    check("  and its death is AGREED for the one who killed it, with no word from the leader",
+          row and row[-1]["verdict"] == "agreed", [dict(r) for r in row])
+    await lw.close()
+    await fw.close()
+    await asyncio.sleep(0.1)
+
+    # =========================================================================
     section("P-6 LEAVING")
     # =========================================================================
     await a.close()
@@ -1259,6 +1303,165 @@ async def kills_survive_a_failed_write():
     con.close()
     check("  a database app.py has not migrated yet still gets the death, as before (presence first)",
           waiting == 0 and written == 1, (waiting, written))
+
+
+async def server_owns_health():
+    """P-19: THE SERVER OWNS THEIR HEALTH (game 0.87.0)."""
+    section("P-19 THE SERVER OWNS THEIR HEALTH: EVERY GAME DRAWS THE BOOKS' COUNT, AND A COUNT AT ZERO IS DEAD")
+    sent = []
+    real_broadcast = presence.broadcast
+    presence.broadcast = lambda connections, text: sent.append((list(connections), json.loads(text)))
+
+    class Game:
+        def __init__(self, uid):
+            self.uid = uid
+
+    hub = presence.PresenceServer(sweep_seconds=5, tick_seconds=5)
+    area = "bigfield"
+    spots = [s for s in presence.gamedata.AREAS[area]["spawns"] if s["e"] == "firesprite"][:4]
+    fire = presence.gamedata.ENEMIES["firesprite"]
+    most = fire["max_hp"]
+
+    def rec(i, spot):
+        return {"id": i, "o": spot["o"], "s": "res://scene/enemy/firesprite.tscn", "pp": "ysortworld",
+                "x": spot["x"], "y": spot["y"], "a": "idledown", "hp": most,
+                "mh": most, "p": {"ed": fire["resource"], "eo": -1, "lr": 250.0, "g": False}}
+
+    def player(uid, health=True, joined=0.0):
+        p = presence.Player(Game(uid), uid, "hash-%d" % uid, {"name": "g%d" % uid, "cls": "warrior", "lvl": 22,
+                                                             "role": "player"}, time.time() + 60, slot=0)
+        p.version = presence.BOOKS_VERSION
+        p.fighter.reports_hits = True
+        p.fighter.bounds = {}         # held to nothing: this section is about the count, not the bounds
+        p.server_health = health
+        p.area = p.place = area
+        p.joined_at = joined
+        hub.players[uid] = p
+        hub.rooms.setdefault(area, set()).add(p)
+        return p
+
+    def world(p, d):
+        msg = {"t": "w", "d": d}
+        return hub.relay_world(p, json.dumps(msg), msg)
+
+    def hits(p, rows):
+        return hub.relay_hits(p, {"t": "h", "p": rows})
+
+    def frames(p):
+        return [m for conns, m in sent if p.ws in conns and m.get("t") == "hp"]
+
+    try:
+        lead, ann, old = player(9101, joined=1.0), player(9102, joined=2.0), player(9103, health=False, joined=3.0)
+        hub.leaders[area] = lead
+        world(lead, {"full": True, "reset": True, "part": 0, "parts": 1,
+                     "spawn": [rec(1, spots[0]), rec(2, spots[1]), rec(3, spots[2]), rec(4, spots[3])]})
+        book = hub.books[area]
+        check("an area's books own their monsters' health", book.owns_health is True)
+        sent.clear()
+        hub.tick()
+        first = frames(ann)
+        check("the games that draw it are told each monster's health as the books count it",
+              first and sorted(r[0] for r in first[0]["p"]) == [1, 2, 3, 4]
+              and all(r[1:] == [most, most] for r in first[0]["p"]), first)
+        check("  the leader too, and never a game that did not say it draws it",
+              frames(lead) and not frames(old), (frames(lead), frames(old)))
+
+        sent.clear()
+        hits(ann, [[1, 100, 0]])
+        world(lead, {"snap": [[1, 0.0, 0.0, "idledown", most]], "hits": []})
+        hub.tick()
+        got = frames(ann)
+        check("a hit moves the count every game shows; the leader's word on health moves nothing",
+              got and got[0]["p"] == [[1, most - 100, most]] and "d" not in got[0], got)
+        sent.clear()
+        hub.tick()
+        check("  and a tick where nothing moved sends nothing", not frames(ann), frames(ann))
+
+        sent.clear()
+        hits(ann, [[1, most - 100, 0]])
+        hub.tick()
+        got = frames(ann) + frames(lead)
+        check("the count reaching zero is a death, on every screen, whatever the leader says",
+              got and all(m.get("d") == [1] for m in got) and 1 not in book.monsters, got)
+        world(lead, {"ev": [{"k": "die", "id": 1, "x": 0, "y": 0}]})
+        await asyncio.sleep(0)
+        book.tick(time.time() + combatbook.HOLD_SECONDS + 0.1)
+        kills, _flags = book.take()
+        mine = [k for k in kills if k["origin"] == spots[0]["o"]]
+        check("  judged AGREED at once, one row for the game that hit it, and the leader's late word adds none",
+              len(mine) == 1 and mine[0]["user_id"] == 9102 and mine[0]["verdict"] == "agreed", mine)
+
+        sent.clear()
+        world(lead, {"snap": [[1, 5.0, 5.0, "idledown", 40]]})
+        check("  the leader's last word on it, still in flight, asks for nothing",
+              not [m for conns, m in sent if m.get("t") == "need"] and not book.want_full, sent)
+        later = time.time() + combatbook.IGNORED_DEATH_SECONDS + 0.5
+        book.world(lead.fighter, {"snap": [[1, 5.0, 5.0, "idledown", 40]]}, later)
+        book.world(lead.fighter, {"snap": [[1, 6.0, 6.0, "idledown", 40]]}, later + 1)
+        check("  but moving it on past IGNORED_DEATH_SECONDS is one strike against the leader, once",
+              [s[1] for s in book.take_strikes()] == [9101])
+
+        world(lead, {"ev": [{"k": "die", "id": 4, "x": 0, "y": 0}]})
+        book.tick(time.time() + combatbook.HOLD_SECONDS + 0.1)
+        book.take()
+        check("a leader saying a monster died the count still holds whole is a strike against it",
+              [s[1] for s in book.take_strikes()] == [9101])
+
+        # A large slime's death is its split, never the count's.
+        large = book.monsters[2]
+        large.splitter = (4, "lightslimesmall")
+        hits(ann, [[2, most, 0]])
+        check("a large slime brought to zero is left to its split", 2 in book.monsters and large.hp <= 0)
+
+        solo_hub_rooms = hub.rooms[area]
+        hub.rooms[area] = {lead}
+        sent.clear()
+        hits(lead, [[3, 50, 0]])
+        hub.tick()
+        check("a room of one is sent nothing (the leader alone draws its own)", not frames(lead), frames(lead))
+        hub.rooms[area] = solo_hub_rooms
+
+        # LEAD STRIKES: three deaths the count did not back hand the area on.
+        sent.clear()
+        now = time.time()
+        for i in range(presence.STRIKES_TO_LOSE):
+            hub.strike(area, 9101, "test strike %d" % i, now + i)
+        leads = [m for conns, m in sent if m.get("t") == "lead"]
+        check("STRIKES_TO_LOSE strikes hand the lead to the next game in line, and everyone hears",
+              hub.leaders[area] is ann and leads and leads[-1]["id"] == 9102, leads)
+        check("  the new leader is asked to send the old one everything",
+              any(m == {"t": "need", "id": 9101} for conns, m in sent if ann.ws in conns), sent)
+        check("  and the struck game may not lead here for LEAD_BAN_SECONDS",
+              hub.lead_banned(area, 9101, now + 10) and not hub.lead_banned(area, 9101,
+                                                                          now + presence.LEAD_BAN_SECONDS + 10))
+        hub.lead_bans[(area, 9101)] = time.time() + 60
+        hub.rooms[area].discard(ann)
+        heirs = [p for p in hub.rooms[area] if p.shares]
+        allowed = [p for p in heirs if not hub.lead_banned(area, p.user_id)]
+        check("  an heir is chosen from those not barred", allowed and lead not in allowed, allowed)
+
+        hub2 = presence.PresenceServer(sweep_seconds=5, tick_seconds=5)
+        hub2.rooms[area] = {lead}
+        hub2.leaders[area] = lead
+        for i in range(presence.STRIKES_TO_LOSE + 2):
+            hub2.strike(area, 9101, "alone", now + i)
+        check("a leader alone keeps the lead however it is struck: there is nobody to hand it to",
+              hub2.leaders[area] is lead)
+
+        # Stirred mid-life: the raise is counted, so the count reaches zero when the game's does.
+        b2 = combatbook.AreaBook(area, presence.gamedata.AREAS[area])
+        b2.owns_health = True
+        b2.stirred_lands = frozenset({int(fire.get("element", 0) or 0)})
+        f = combatbook.Fighter(9201, 0)
+        f.reports_hits = True
+        b2.world(f, {"full": True, "reset": True, "part": 0, "parts": 1, "spawn": [rec(7, spots[0])]}, now)
+        raised = int(most * 1.5)
+        b2.world(f, {"ev": [{"k": "mh", "id": 7, "mh": raised, "hp": raised}]}, now)
+        check("a stir raising a monster while it stands is counted, not flagged",
+              b2.monsters[7].max_hp == raised and b2.monsters[7].hp == raised and not b2.take()[1],
+              (b2.monsters[7].max_hp, b2.monsters[7].hp))
+    finally:
+        presence.broadcast = real_broadcast
 
 
 async def kills_written_soon():
@@ -2086,6 +2289,7 @@ async def main():
     await damage_taken()
     await what_hit_me()
     await kills_survive_a_failed_write()
+    await server_owns_health()
     presence.HELLO_SECONDS = 0.5
     combatbook.HOLD_SECONDS = 0.2
     combatbook.PENDING_SECONDS = 0.3

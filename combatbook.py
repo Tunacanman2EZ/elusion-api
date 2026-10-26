@@ -50,6 +50,7 @@ PURE: no sockets, no database, no clock of its own - every call is given
 `now`, so test_combatbook.py drives it to the hundredth of a second.
 """
 import math
+import time
 
 import gamedata
 
@@ -113,6 +114,15 @@ SPEED_WINDOW = 3.0
 EMPTY_KEEP = 30.0
 # How much a book holds, whatever a leader says.
 MAX_MONSTERS = 1000
+# THE SERVER OWNS THEIR HEALTH (game 0.87.0). The books' count is what every
+# game shows, and a monster it brings to zero is dead whatever the leader
+# says - presence.py tells the area (its "hp" frame). A leader still saying
+# where a monster it was told is dead stands this long after is ignoring the
+# server: a strike against its lead (presence.py, LEAD STRIKES).
+IGNORED_DEATH_SECONDS = 2.0
+# How long a death the server declared is remembered, to tell a leader still
+# talking about it from one that never heard.
+SERVER_KILLS_KEPT = 30.0
 
 VERDICTS = ("agreed", "short", "not_due")
 # Every kind of flag, and whose it is: a hitter's, a walker's or a leader's.
@@ -129,6 +139,7 @@ FLAG_KINDS = {
     "back_too_soon": "a monster back sooner than the area's respawn",
     "unaccounted_spawn": "a monster no spawn, split or twin explains",
     "split_early": "a large slime split while it still had over half its health",
+    "lost_lead": "a leader handed its area on for deaths the server's count did not back",
 }
 
 
@@ -271,7 +282,7 @@ class Fighter:
 
 class Monster:
     __slots__ = ("id", "enemy_id", "origin", "max_hp", "hp", "x", "y", "born", "not_due",
-                 "damage", "refused", "slots", "dead_at", "rewards", "splitter", "twins_left")
+                 "damage", "refused", "slots", "dead_at", "rewards", "splitter", "twins_left", "by_server")
 
     def __init__(self, monster_id, enemy_id, origin, max_hp, hp, x, y, born):
         self.id = monster_id
@@ -290,6 +301,7 @@ class Monster:
         self.rewards = True
         self.splitter = None    # (smalls, what they are) for a large slime
         self.twins_left = 0
+        self.by_server = False  # the books' own count brought it to zero
 
 
 class AreaBook:
@@ -332,6 +344,18 @@ class AreaBook:
         self.on_hit = None
         self.on_kill = None
         self.on_rescale = None
+        # THE SERVER OWNS THEIR HEALTH (game 0.87.0). Whether a count reaching
+        # zero is a death (presence.py turns it on; a book on its own only
+        # watches), the monsters whose count moved since presence.py last
+        # asked (take_health()), the deaths the count made (take_server_
+        # deaths()) and when, and the leader's strikes (take_strikes()):
+        # (at, user id, why) for a death the count did not back, a monster
+        # back too soon, or a death the leader went on ignoring.
+        self.owns_health = False
+        self.health_changed = set()
+        self.server_dead = []
+        self.server_killed = {}  # id -> when the books' count killed it
+        self.strikes = []
 
     # ---- what the leader says ------------------------------------------------
 
@@ -409,6 +433,16 @@ class AreaBook:
                 continue
             m = self.monsters.get(row[0]) if isinstance(row[0], int) else None
             if m is None:
+                killed_at = self.server_killed.get(row[0]) if isinstance(row[0], int) else None
+                if killed_at is not None:
+                    # DEAD BY THE SERVER'S COUNT, and the leader still moves
+                    # it: in flight for a moment, ignored past that - once.
+                    if killed_at >= 0 and now - killed_at > IGNORED_DEATH_SECONDS:
+                        self.server_killed[row[0]] = -1.0
+                        self._strike(now, "ignored a death the server's count made")
+                    continue
+                if row[0] in self.dying:
+                    continue
                 self.want_full = True
                 continue
             x, y = _num(row[1]), _num(row[2])
@@ -503,6 +537,7 @@ class AreaBook:
                 m.hp = min(max_hp, hp) if hp is not None else max_hp
             self._judge_spawn(m, enemy, props, now, kind)
         self.monsters[monster_id] = m
+        self.health_changed.add(monster_id)
 
     @staticmethod
     def _scaled_boss(enemy, catalogue_max, sent_max):
@@ -523,7 +558,11 @@ class AreaBook:
             return
         enemy = self.enemies.get(m.enemy_id) or {}
         catalogue_max = max(1, int(enemy.get("max_hp", 1) or 1))
-        if not (bool(enemy.get("slots_are_gear")) and catalogue_max <= new_max <= catalogue_max * BOSS_RAISED_MOST):
+        # A BOSS SCALED BY ITS FIGHT, or (game 0.87.0) any monster raised
+        # by a stir that began while it stood (BaseEnemy.raise_for_stir).
+        scaled = bool(enemy.get("slots_are_gear")) and catalogue_max <= new_max <= catalogue_max * BOSS_RAISED_MOST
+        stirred = new_max > m.max_hp and self._stirred_max(enemy, catalogue_max, new_max)
+        if not (scaled or stirred):
             self._flag(user_id, "max_hp_differs", "%s %d, the catalogue %d" % (m.enemy_id, new_max, catalogue_max),
                        now)
             return
@@ -534,6 +573,7 @@ class AreaBook:
         else:
             m.hp = min(m.hp, new_max)
         m.max_hp = new_max
+        self.health_changed.add(monster_id)
 
     def _stirred_max(self, enemy, catalogue_max, sent_max):
         """Whether `sent_max` is a stirred monster's health: more than the
@@ -571,6 +611,7 @@ class AreaBook:
                 m.not_due = True
                 self._flag(leader, "back_too_soon", "%s after %.1f s, the respawn is %d s"
                            % (m.enemy_id, now - died, self.respawn), now)
+                self._strike(now, "a %s back too soon" % m.enemy_id)
             if m.splitter and not props.get("du"):
                 m.twins_left = 1
             return
@@ -688,8 +729,24 @@ class AreaBook:
         m.damage[fighter.user_id] = m.damage.get(fighter.user_id, 0) + booked
         if not late:
             m.hp -= booked
+            self._counted(monster_id, m, now)
         if self.on_hit is not None:
             self.on_hit(fighter.user_id, booked, damage, self._is_boss(m), m, element)
+
+    def _counted(self, monster_id, m, now):
+        """The books' count of a living monster moved: news for every game,
+        and, at zero, its death (THE SERVER OWNS THEIR HEALTH) - not a large
+        slime's, whose death is its split, and not in an area whose leader
+        never sends its own hits (nothing it fights is counted whole)."""
+        self.health_changed.add(monster_id)
+        if not self.owns_health or m.hp > 0 or m.splitter or not self.leader_reports:
+            return
+        if self.monsters.get(monster_id) is not m:
+            return
+        self._died(monster_id, now)
+        m.by_server = True
+        self.server_dead.append(monster_id)
+        self.server_killed[monster_id] = now
 
     def _is_boss(self, m):
         return bool((self.enemies.get(m.enemy_id) or {}).get("slots_are_gear"))
@@ -701,6 +758,8 @@ class AreaBook:
         m = self.monsters.get(monster_id)
         if m is not None:
             m.hp -= extra
+            self._counted(monster_id, m, time.time())
+            m = self.monsters.get(monster_id) or self.dying.get(monster_id) or m
         else:
             m = self.dying.get(monster_id)
         if m is not None:
@@ -720,6 +779,9 @@ class AreaBook:
                 verdict = "agreed"
             else:
                 verdict = "short"
+                if self.owns_health and not m.by_server:
+                    self._strike(m.dead_at, "said a %s died with %d of %d left"
+                                 % (m.enemy_id, max(0, int(math.ceil(m.hp))), m.max_hp))
             helpers = sorted(set(m.damage) | set(m.refused))
             if not helpers:
                 helpers = [self.leader_id or 0]
@@ -742,6 +804,33 @@ class AreaBook:
         cutoff = now - max(self.respawn * 2.0, 60.0)
         for origin in [o for o, at in self.deaths.items() if at < cutoff]:
             del self.deaths[origin]
+        for monster_id in [i for i, at in self.server_killed.items() if 0 <= at < now - SERVER_KILLS_KEPT
+                           or (at < 0 and i not in self.dying and len(self.server_killed) > MAX_MONSTERS)]:
+            del self.server_killed[monster_id]
+
+    def _strike(self, now, why):
+        if self.owns_health and self.leader_id:
+            self.strikes.append((now, int(self.leader_id), why))
+
+    def take_health(self):
+        """[[id, health, maximum], ...] for every living monster whose count
+        moved since the last call - whole numbers, never below zero."""
+        changed, self.health_changed = self.health_changed, set()
+        rows = []
+        for monster_id in sorted(changed):
+            m = self.monsters.get(monster_id)
+            if m is not None:
+                rows.append([monster_id, max(0, int(math.ceil(m.hp))), int(m.max_hp)])
+        return rows
+
+    def take_server_deaths(self):
+        """The ids the books' count killed since the last call."""
+        dead, self.server_dead = self.server_dead, []
+        return dead
+
+    def take_strikes(self):
+        strikes, self.strikes = self.strikes, []
+        return strikes
 
     def take(self):
         """(kills, flags) found since the last call."""

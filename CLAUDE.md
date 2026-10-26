@@ -1559,7 +1559,9 @@ only who that is and who hears what. The game side is the game repo's
   roll - which is what "separate loot bags" means. The E-3 ceilings are per
   account, so two players sharing a kill each stay inside their own.
 - **The honest limit.** The leader is trusted with the monsters the way every
-  game is already trusted with its own kills (E-3): a cheating leader can move,
+  game is already trusted with its own kills (E-3) - since game 0.87.0 with
+  where they stand and not their health (THE SERVER OWNS THEIR HEALTH, below):
+  before that a cheating leader could move,
   heal or kill the monsters on everyone's screen, or set the game's own
   monsters on somebody, and nothing more than a cheating game could always do
   to its own. It cannot touch anyone's health, bag or gold - those stay on each
@@ -1828,6 +1830,27 @@ finds. `test_combatbook.py` holds the books, `test_presence.py` P-8 the wiring.
   one row paying twice. **Deploy order: either.** A database app.py has not
   migrated yet is written as before, unnamed, and says so once in the log.
   test_presence.py P-18, test_combatbook ("each row names its death").
+- **THE SERVER OWNS THEIR HEALTH (game 0.87.0).** The owner, of the leader
+  still being trusted with the monsters: "fix this" - the smaller of two
+  sizes: the server owns every monster's health and death, the leader's game
+  still moves them. Every book is `owns_health`: a hit that brings the count
+  to zero is a death (`_counted()` -> `_died()`, `by_server`), judged AGREED
+  the moment its hold ends, whatever the leader says; never a large slime's
+  (its death is its split) and never in an area whose leader sends none of its
+  own hits. Each tick `tell_health()` sends `{"t": "hp", "p": [[id, health,
+  maximum]], "d": [dead ids]}` to every game in a room of two or more that
+  said `"sh": 1` (`SERVER_HEALTH`; the welcome says it too): the games draw
+  that count, and kill what it killed. A stir raising a monster while it
+  stands ("mh") is counted now, not flagged (`rescaled()`), or the count would
+  reach zero a third early. **LEAD STRIKES**: a leader's death the count did
+  not back (SHORT), a monster back too soon, or one it goes on moving
+  `IGNORED_DEATH_SECONDS` after the count killed it, is a strike
+  (`_strike()`); `STRIKES_TO_LOSE` (3) in `STRIKE_WINDOW` (10 min) hands the
+  area to the next game in line, which is asked to send the struck one
+  everything, and the struck one cannot lead there for `LEAD_BAN_SECONDS` (10
+  min) - a `lost_lead` flag says why. Alone, a leader keeps it. Deploy this
+  before players have game 0.87.0; either order works (an old game is sent no
+  `hp`). test_presence.py P-19 (the hub) and P-19b (a real socket).
 - **THE BOOKS NEVER BREAK THE RELAY.** `_book_safely()` catches anything a
   book cannot read and the message goes on exactly as it would have.
 - **Born in the message that hits it (game 0.21.2).** The first live week

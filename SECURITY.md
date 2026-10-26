@@ -395,9 +395,14 @@ No comforting lies. These are known, named and open.
   server **watches** the fight (invariant 30) and writes down every kill its
   own count does not back up. Since 0.57.0 it can **refuse** them too - the
   owner's receipts switch pays a kill only against the books' own count of
-  that death (step 2, `test_receipts.py`) - and the switch ships off, until
-  killwatch.py's `receipts:` line shows honest play backed by the books. While
-  it is off, what a cheat mints is kept from spreading: the owner can switch
+  that death (step 2, `test_receipts.py`). **It is on, since 25 October
+  2026**, with the minimum build at 7: killwatch.py's `receipts:` line showed
+  all 1,370 kills paid in the week before backed by the books. So a kill is no
+  longer paid on the game's word. What is left open is narrower: a game alone in an area runs its monsters and reports its own hits, so a modified one can still invent a fight its character could really have fought - every hit inside that character's bounds (with their 1.5x slack), on a monster the map holds, at the area's respawn. That is
+  paid, at no more than an honest player's best pace, and is what step 3
+  (the server running the monsters) closes. A game whose presence link is down
+  earns nothing while the switch is on, by design. If the switch is ever
+  turned off, what a cheat mints is kept from spreading: the owner can switch
   trading off in one request, and a fresh mythic or Perfect find cannot be
   traded for 48 hours (`test_tradegates.py`). A game from before 0.10.0, or one
   whose presence link is down, is not seen by the books at all.
@@ -472,18 +477,24 @@ No comforting lies. These are known, named and open.
   owner lets him in, off takes effect on his next request, every gift is a
   row in the gifts ledger under his name and every give, level and rollback a
   line on the player's record, and he cannot touch the owner's own account.
-- **The monsters in a shared area are whatever the area's leader says.** Since
-  0.7.0 one game - the area's leader, the sharing game that walked in first -
-  runs the monsters for everyone there, and `presence.py` passes its messages
-  on exactly as sent. A modified game that becomes leader can move, heal or
-  kill those monsters on everybody's screen, or set the game's own monsters on
-  somebody. It cannot reach anyone's health, bag, gold or kills: every game
-  still builds each attack from its own copy of the monster, caps the few
-  numbers the leader sends, and reports its own kills under the same E-3
-  ceilings as before. Since 0.10.0 the server also reads what the leader says
-  into its books (invariant 30), so a monster killed without the hits to kill
-  it, or one the map does not hold, is written down against that leader - but
-  the books do not check where a leader says a monster stands.
+- **Where the monsters in a shared area stand is whatever the area's leader
+  says.** Since 0.7.0 one game - the area's leader, the sharing game that
+  walked in first - runs the monsters for everyone there, and `presence.py`
+  passes its messages on exactly as sent. **Since game 0.87.0 their health is
+  not the leader's to say**: every game that says `"sh"` draws the server's
+  own count (`test_presence.py` P-19, P-19b), the leader's monsters come down
+  to it, and a monster the count brings to zero dies on every screen and is
+  judged AGREED at once. So a modified leader can no longer heal a monster
+  past the hits that landed or kill one they did not, and three deaths in ten
+  minutes the count did not back, a monster back too soon, or one it keeps
+  moving after the count killed it, hand the area to the next game in line.
+  What it still can do: move the monsters, choose when they attack, set the
+  game's own monsters on somebody, and bring one back early (which pays
+  nothing and is a strike). It cannot reach anyone's health, bag, gold or
+  kills: every game still builds each attack from its own copy of the monster,
+  caps the few numbers the leader sends, and is paid only against the
+  server's count (E-3). A game older than 0.87.0 still shows the leader's
+  health.
 
 - **A rollback can make a second copy of an item.** It puts back what the
   character held when the snapshot was taken; an item traded, banked or sold

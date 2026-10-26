@@ -221,6 +221,12 @@ second; killwatch.py's `receipts:` line says what switching on would have done
 to the last week, and is what decides when it goes on. The bounds keep their
 slack for now: tightening them is its own decision, from the same numbers.
 
+**Switched on 25 October 2026.** killwatch.py: books since 12 Oct, and of
+1,370 kills paid in the last 7 days, 1,370 (100.0%) had the books' receipt -
+0 short, 0 not due, 0 never seen. The owner set the minimum build to 7 and
+turned the switch on, after 0.86.1 made a failed write of judged deaths retry
+instead of drop. What step 3 still has to close: a game alone in an area runs its monsters and reports its own hits, so a modified one can still invent a fight its character could really have fought - every hit inside that character's bounds (with their 1.5x slack), on a monster the map holds, at the area's respawn.
+
 **Step 3 - the rest of the list above:** the player's hp on the server (E-9),
 then server-side monster AI, which is what the world boss needs.
 

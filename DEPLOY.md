@@ -918,7 +918,13 @@ decides when the server starts refusing kills its count does not back up.
 
 These are real and named rather than hidden. Full detail in `SECURITY_NOTES.md`.
 
-**E-3 — the kill event is asserted, not verified.** The server rolls the
+**E-3 — mitigated since 25 Oct 2026: the receipts switch is on.** A kill is
+paid only against the server's own count of that death. What is still open:
+a game alone in an area runs its monsters and reports its own hits, so a modified one can still invent a fight its character could really have fought - every hit inside that character's bounds (with their 1.5x slack), on a monster the map holds, at the area's respawn - paid at no more than an honest player's best pace, until step 3. The
+paragraph below is how it stood before, and is still how it stands with the
+switch off.
+
+**Before the switch: the kill event is asserted, not verified.** The server rolls the
 rewards and rate-limits the reports, but never confirms a fight happened. A
 modified client can report kills it did not make, at the sustained token rate.
 This caps the *speed* of the fraud, not its existence, and it is the one that

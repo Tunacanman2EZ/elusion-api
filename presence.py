@@ -66,7 +66,9 @@ THE WIRE (JSON text frames):
                                                          = speaks shared monsters; "xt" 1 (game
                                                          0.76.0) = takes others' attacks inside
                                                          the tick's moves - see ATTACKS RIDE THE
-                                                         TICK
+                                                         TICK; "sh" 1 (game 0.87.0) =
+                                                         draws the books' count of the monsters'
+                                                         health - see THE SERVER OWNS THEIR HEALTH
     {"t": "s", "a": "field", "x": 1471.0, "y": 1090.5,
      "m": "walkdown", "fx": ["ring"], "pet": "petsniper",
      "ts": 81234, "aim": 344, "hp": 87}                  where I am, when it changes; "ts" (0.19.0,
@@ -93,7 +95,7 @@ THE WIRE (JSON text frames):
     {"t": "vc", "to": 40, "d": {...}}                    a voice call's setup, for 40 (0.43.0)
 
   here -> game
-    {"t": "welcome", "id": 12, "v": 2, "books": true, "x": 2}
+    {"t": "welcome", "id": 12, "v": 2, "books": true, "x": 2, "sh": 1}
                                                          you are in; this server shares monsters,
                                                          and keeps books on them (0.10.0): send
                                                          the world even alone, own hits inside it;
@@ -119,6 +121,11 @@ THE WIRE (JSON text frames):
     {"t": "levers", "p": [["...", true], ...]}           (arriving, or sync) the levers pulled in
                                                          this area since it was last empty, the
                                                          latest pulled last
+    {"t": "hp", "p": [[7, 412, 600], ...], "d": [9]}     (a game that said "sh", in a room of two or
+                                                         more) the books' count of every monster it
+                                                         moved this tick - id, health, maximum - and
+                                                         the monsters it brought to zero: dead,
+                                                         whatever the leader says
     {"t": "leave", "ids": [12, 40]}                      gone from your area
     {"t": "lead", "a": "field", "id": 12, "n": 2}        who runs this area's monsters, and how
                                                          many others share them (-1: nobody)
@@ -467,6 +474,24 @@ RELAY_VERSION = 2
 # the tick (remoteplayer.gd). A game says it can in its hello ("xt": 1); any
 # other is sent every attack on its own, as it came, as before.
 TICK_ATTACKS = 1
+
+# THE SERVER OWNS THEIR HEALTH (game 0.87.0). Every monster's health is the
+# books' count, not the leader's word: each tick, a room of two or more is sent
+# what changed - {"t": "hp", "p": [[monster, health, maximum], ...], "d":
+# [monster, ...]} - to every game that said "sh" in its hello. "d" is the
+# monsters the count brought to zero: dead on every screen, the leader's own
+# too, and judged AGREED at once, so everyone who hit them is paid. A leader
+# still says where its monsters stand, how they move and what they throw.
+SERVER_HEALTH = 1
+# LEAD STRIKES: a leader that says a monster died when the books still count
+# it alive, brings one back sooner than its respawn, or goes on moving one the
+# count killed, is struck (combatbook.py _strike()). STRIKES_TO_LOSE inside
+# STRIKE_WINDOW hands the area to the next game in line - if there is one -
+# and the struck game cannot lead it again for LEAD_BAN_SECONDS. Honest play
+# makes about one in a thousand deaths short.
+STRIKES_TO_LOSE = 3
+STRIKE_WINDOW = 600.0
+LEAD_BAN_SECONDS = 600.0
 
 # THE AURA'S HEALS (game 0.40.0). A healer's aura heals every player standing
 # in its ring, and sends green blobs that heal the players outside it within
@@ -956,6 +981,8 @@ class Player:
         self.joined_at = 0.0
         # ATTACKS RIDE THE TICK: this game takes them inside the moves.
         self.tick_attacks = False
+        # THE SERVER OWNS THEIR HEALTH: this game draws the books' count.
+        self.server_health = False
         # THE DAMAGE METER (0.81.0): this game has it open. Only an owner's or
         # a co-owner's can (METER_ROLES).
         self.meter = False
@@ -1250,6 +1277,10 @@ class PresenceServer:
         self._closing = set()
         # THE BOOKS: one per area that has a map, kept while the process runs.
         self.books = {}       # area -> combatbook.AreaBook
+        # LEAD STRIKES: (area, user id) -> when each strike in the window came,
+        # and (area, user id) -> until when that game may not lead there.
+        self.strikes_for = {}
+        self.lead_bans = {}
         self._kills = []      # combat_kills rows not yet written
         self._flags = {}      # (user_id, area, kind) -> [count, detail, first_at, last_at]
         self._pruned_at = 0.0
@@ -1353,8 +1384,9 @@ class PresenceServer:
             # one anybody could predict.
             del self.leaders[area]
             heirs = [p for p in self.rooms.get(area, ()) if p.shares]
+            allowed = [p for p in heirs if not self.lead_banned(area, p.user_id)]
             if heirs:
-                self.leaders[area] = min(heirs, key=lambda p: (p.joined_at, p.user_id))
+                self.leaders[area] = min(allowed or heirs, key=lambda p: (p.joined_at, p.user_id))
         if player.shares:
             self._announce_lead(area)
 
@@ -1481,6 +1513,7 @@ class PresenceServer:
         if book is None:
             book = self.books[area] = combatbook.AreaBook(place, gamedata.AREAS[place])
             book.stirred_lands = self.stirred
+            book.owns_health = True
             book.on_hit = lambda user_id, booked, claimed, boss, monster=None, element=None, room=area: \
                 self.dealt(room, user_id, booked, claimed, boss, monster, element)
             book.on_kill = lambda monster, boss, room=area: self.killed(room, monster, boss)
@@ -2033,9 +2066,10 @@ class PresenceServer:
         if player.fighter is not None:
             player.fighter.reports_hits = player.version >= BOOKS_VERSION
         player.tick_attacks = msg.get("xt") == TICK_ATTACKS and not isinstance(msg.get("xt"), bool)
+        player.server_health = msg.get("sh") == SERVER_HEALTH and not isinstance(msg.get("sh"), bool)
         self.players[user_id] = player
         await self._send(player, {"t": "welcome", "id": user_id, "v": SHARED_VERSION, "books": BOOKS,
-                                  "x": RELAY_VERSION})
+                                  "x": RELAY_VERSION, "sh": SERVER_HEALTH if BOOKS else 0})
 
         try:
             async for raw in ws:
@@ -2156,6 +2190,7 @@ class PresenceServer:
         # Attacks waiting for an area nobody is in any more go with it.
         if BOOKS:
             self._book_safely(self.tick_books, time.time())
+            self._book_safely(self.tell_health, time.time())
 
     def tick_books(self, now):
         """Judge the deaths that have waited, and gather what every book and
@@ -2169,6 +2204,61 @@ class PresenceServer:
             if player.fighter is not None:
                 player.fighter.tick(now)
                 self._gather(player.fighter.take_flags())
+
+    def tell_health(self, now):
+        """THE SERVER OWNS THEIR HEALTH: what each room's count did this tick,
+        to the games there that draw it, and the strikes it found."""
+        for area, book in list(self.books.items()):
+            health = book.take_health()
+            dead = book.take_server_deaths()
+            for at, user_id, why in book.take_strikes():
+                self.strike(area, user_id, why, at)
+            if not health and not dead:
+                continue
+            room = self.rooms.get(area, ())
+            if len(room) < 2:
+                continue
+            targets = [p.ws for p in room if p.server_health and p.shares]
+            if not targets:
+                continue
+            frame = {"t": "hp", "p": health}
+            if dead:
+                frame["d"] = dead
+            self._out(targets, json.dumps(frame, separators=(",", ":")))
+
+    def strike(self, area, user_id, why, at):
+        """LEAD STRIKES: one against `user_id` as `area`'s leader. Enough of
+        them hands the area on, when anybody else there can take it."""
+        key = (area, int(user_id))
+        times = [t for t in self.strikes_for.get(key, []) if t > at - STRIKE_WINDOW]
+        times.append(at)
+        self.strikes_for[key] = times
+        if len(times) < STRIKES_TO_LOSE:
+            return
+        leader = self.leaders.get(area)
+        if leader is None or leader.user_id != int(user_id):
+            return
+        heirs = [p for p in self.rooms.get(area, ()) if p.shares and p is not leader
+                 and not self.lead_banned(area, p.user_id, at)]
+        if not heirs:
+            return
+        self.lead_bans[key] = at + LEAD_BAN_SECONDS
+        self.strikes_for.pop(key, None)
+        self.leaders[area] = min(heirs, key=lambda p: (p.joined_at, p.user_id))
+        self._gather([(int(user_id), area.split("#", 1)[0], "lost_lead", why, at)])
+        print("[PRESENCE] %s lost the lead of %s: %s" % (leader.identity.get("name", user_id), area, why),
+              flush=True)
+        self._announce_lead(area)
+        self._ask_for_world(area, leader)
+
+    def lead_banned(self, area, user_id, now=None):
+        until = self.lead_bans.get((area, int(user_id)))
+        if until is None:
+            return False
+        if (time.time() if now is None else now) >= until:
+            self.lead_bans.pop((area, int(user_id)), None)
+            return False
+        return True
 
     def _gather(self, flags):
         # ONE ROW PER PLAYER, AREA AND KIND PER WRITE, with a count: a cheat

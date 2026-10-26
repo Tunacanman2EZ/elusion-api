@@ -24,7 +24,7 @@ lives.
 |---|---------|----------|--------|-------------------|-----|
 | E-1 | Inventory is client-authoritative | critical (economy) | **Closed** | A modified client can write any item into its bag or bank — the best gear in the game, in any quantity — on its next save. | **Server-side authority.** Every save was reconciled against what the server actually granted and fabricated items trimmed away (shadow mode first, enforced once proven). Since then the bag and bank are the server's outright: every move, bin and cashed pile is its own request, and a player's whole-bag write is ignored. |
 | E-2 | Skills are client-authoritative and uncapped | critical (balance) | **Closed** — all 6 skills server-owned | A player can claim any skill level and skip all progression — level-99 attack on a character made a minute ago. | **Server-side authority.** All six skills are granted only by the server and dropped from client saves. Fishing, cooking and attack ride their own events; defense, agility and magic report activity to `/api/skill/train`, which clamps each to a generous per-second ceiling × elapsed time and applies class proficiency itself. A client claim earns nothing. |
-| E-3 | The kill *event* is asserted, not verified | high | **Open** — named, rate-limited, watched; verified behind a switch since 0.57.0 | A script can report kills it never fought and farm XP and loot without playing. | **Rate limit + content bound — not a fix.** The server rolls its own rewards, refuses reward-less enemies, rate-limits with a token bucket, and caps kills at what the world's respawners can produce (18,000/hr down to 5,208). **Since 0.10.0 it watches** (option C, step 1): presence.py keeps its own count of every monster's health from the leader's world and every hit (combatbook.py), judges each death AGREED / SHORT / NOT DUE, and killwatch.py matches every paid kill to that - but a kill is still paid on the game's word until step 2. |
+| E-3 | The kill *event* is asserted, not verified | high → medium | **Mitigated** — verified against the server's count since 25 Oct 2026 (receipts on); open: a fight the game invents within its character's bounds | Before: a script could report kills it never fought. Now: a modified game alone in an area can still fake a fight its character could really have fought, and be paid at an honest player's best pace. | **Server-side check.** Since 25 Oct 2026 the receipts switch is on: `/api/combat/kill` pays only against an AGREED row of the server's own count of that death (step 2). Before that: **rate limit + content bound — not a fix.** The server rolls its own rewards, refuses reward-less enemies, rate-limits with a token bucket, and caps kills at what the world's respawners can produce (18,000/hr down to 5,208). **Since 0.10.0 it watches** (option C, step 1): presence.py keeps its own count of every monster's health from the leader's world and every hit (combatbook.py), judges each death AGREED / SHORT / NOT DUE, and killwatch.py matches every paid kill to that - but a kill is still paid on the game's word until step 2. |
 | E-4 | `app.run(debug=True)` | critical if exposed | **Closed** — every door, not only `python app.py` (E-4c) | Any crash on a reachable server hands an attacker a Python shell on the machine holding every password hash. | **Safe default + refusal.** The debugger is off unless `ELUSION_DEBUG=1`; the server refuses to start if `FLASK_DEBUG` or `flask run --debugger` asks for it instead, or if any debug flag is set behind a proxy; and it refuses every request if the interactive debugger is attached some other way. |
 | E-5 | No login throttling | medium | **Closed** — incl. E-5f, the throttle that fed itself | Passwords can be guessed at machine speed — one account at a time, or one common password across every account. | **Rate limit.** 8 misses lock an account for 15 minutes, checked before the password; per-address ceilings (6 usernames, 25 failures per 10 minutes) stop spraying. E-5f: the gate's own refusals no longer count as evidence, which had locked shared connections out indefinitely. |
 | E-6 | Long token with no credential rotation | low–medium | **Closed** | A leaked 30-day token keeps working for a month, and changing the password did not end it. | **Revocation + rotation.** Log out everywhere; a password change re-hashes, ends every session and issues one new token in a single transaction, and needs the current password — a token alone is not enough. |
@@ -44,7 +44,7 @@ lives.
 | E-20 | **A staff password was the only thing between a guesser and the moderation desk** | **high (moderation)** | **Closed** — with a named limit | Staff names are public (the crown, the MOD and DEV badges), so their passwords are the ones worth guessing; one guessed password gives bans, notes and IP addresses. | **Second factor.** A staff login with a confirmed recovery address answers 202 and emails a six-digit code; only the code gets a token. A computer that proved itself is trusted for 30 days, at the rank it was trusted at. With no address or no mail it stands aside and says so. `test_staffcode.py`. |
 | E-21 | **Session tokens were stored as issued** | **high (accounts)** | **Closed** | A copy of `elusion.db` - a backup, a leaked file - logged its holder in as every player signed in, for up to 30 days, with no password needed. | **Hashing at rest.** `sessions` keeps only each token's SHA-256 (`token_hash`) and every lookup hashes the token it is sent, as `trusted_devices` and `ended_sessions` already did and as passwords always were (scrypt). A boot migration hashed every stored token in place, so nobody was signed out. `test_accounts.py` A-5, `test_api.py` MIGRATION. |
 
-Nineteen findings: eighteen closed, one open. Plus E-15, an audit that went
+Nineteen findings: eighteen closed, one mitigated (E-3, since 25 Oct 2026). Plus E-15, an audit that went
 looking and came back empty — kept, because a search that finds nothing is
 still a result and the reasoning is the point.
 
@@ -196,9 +196,22 @@ existence is not. The caps are deliberately generous (tune *down* with playtest
 data, never up on a guess), because a tight cap is the very mistake this finding
 warned about.
 
-### E-3 — The kill event · OPEN
+### E-3 — The kill event · MITIGATED (receipts on, 25 Oct 2026)
 
-Unchanged, and deliberately last. `POST /api/combat/kill` still does the right
+**What changed on 25 October 2026.** The owner switched the receipts on
+(E3_SCOPE.md, step 2; api/CLAUDE.md, "Kill receipts") and set the minimum
+build to 7. The week before, killwatch.py's `receipts:` line had all 1,370
+paid kills backed by the server's count, none short, none not due, none
+unseen. From then on `/api/combat/kill` pays a kill only against an AGREED
+`combat_kills` row for that account, character and monster - the server's own
+count of the monster's health reaching zero from hits it checked against the
+character's bounds. **What is still open:** a game alone in an area runs its monsters and reports its own hits, so a modified one can still invent a fight its character could really have fought - every hit inside that character's bounds (with their 1.5x slack), on a monster the map holds, at the area's respawn. The books cannot tell that
+from real play, because a game leading an area alone is the only witness. That
+is paid, at no more than the honest best case, and step 3 - the server running
+the monsters - is what closes it. The rest of this section is the history
+before the switch, kept because the reasoning still holds.
+
+Unchanged until then, and deliberately last. `POST /api/combat/kill` still does the right
 things *around* the claim — the server rolls the rewards itself, refuses
 reward-less enemies (the slime-split exploit), and rate-limits with a token
 bucket — but it never verifies the fight happened.
