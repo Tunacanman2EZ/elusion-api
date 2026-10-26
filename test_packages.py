@@ -79,6 +79,8 @@ import economyrules  # noqa: E402
 import economyrules.schema as economyrules_schema  # noqa: E402
 import economywatch  # noqa: E402
 import serverhealth  # noqa: E402
+import clienterrors  # noqa: E402
+import clienterrors.schema as clienterrors_schema  # noqa: E402
 
 # Found, not listed: what app.py imports that has a routes.py (codemap.py).
 PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
@@ -87,7 +89,7 @@ RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathe
             "chat", "trade", "kingdom", "world", "moderation", "staffdesk", "equipment", "consuming",
             "death", "bank", "carry", "skills", "saves", "status", "shop", "players", "switches", "kill",
             "ownertools", "accountsettings", "auth", "larder", "smith", "economyrules", "economywatch",
-            "serverhealth")
+            "serverhealth", "clienterrors")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -1305,6 +1307,12 @@ def bare_app(name):
             "paid": 300, "backed": 300, "short": 0, "not_due": 0, "never": 0, "since": 0, "never_by_enemy": {}},
         receipts_days=7, receipts_on=lambda: bool(app.config.get("receipts_on")),
         min_client_build=lambda: 7, receipt_build=7)
+
+    # clienterrors/ (0.88.0): its table made here, as init_db() makes it.
+    with sqlite3.connect(path) as made:
+        clienterrors_schema.create(made)
+    clienterrors.register(app, require_auth=require_auth, require_owner=owner_or_co, get_db=get_db,
+                          bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400))
     return app, said, logged, path
 
 
@@ -1726,7 +1734,9 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/economy/rules", "/api/owner/economy/rules", "/api/owner/economy/rules",
                        "/api/owner/economy/flow", "/api/owner/economy/canary", "/api/owner/economy/canary",
                        # serverhealth/ (0.78.0)
-                       "/api/server/health"]), rules)
+                       "/api/server/health",
+                       # clienterrors/ (0.88.0)
+                       "/api/client/errors", "/api/server/client-errors"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -4461,6 +4471,18 @@ check("  the switch read on each ask, the week kept: on, and the week not asked 
 check("  a player gets the bare 404, and nobody without a login gets in",
       client_a.get("/api/server/health", headers=who("ann")).status_code == 404
       and client_a.get("/api/server/health").status_code == 401)
+# WHAT BROKE IN THE PLAYERS' GAMES (0.88.0): clienterrors/, on the bare app.
+res = client_a.post("/api/client/errors", headers=who("ann"), json={"version": "0.88.0", "area": "field",
+      "errors": [{"where": "res://src/x.gd:1", "what": "boom", "count": 2}]})
+seen = client_a.get("/api/server/client-errors", headers=who("boss")).get_json() or {}
+check("client errors: a game's report is kept, and the owner reads it, players counted, no name",
+      res.status_code == 200 and res.get_json() == {"kept": 1, "dropped": 0}
+      and [(e["where"], e["players"], e["times"]) for e in seen.get("errors", [])] == [("res://src/x.gd:1", 1, 2)]
+      and "ann" not in json.dumps(seen), seen)
+check("  a player gets the bare 404 for the list; no login, neither",
+      client_a.get("/api/server/client-errors", headers=who("ann")).status_code == 404
+      and client_a.get("/api/server/client-errors").status_code == 401
+      and client_a.post("/api/client/errors", json={}).status_code == 401)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")

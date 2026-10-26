@@ -877,6 +877,30 @@
    "CREATE INDEX idx_economy_rule_changes_at\n            ON economy_rule_changes(at)"
   ],
   [
+   "table",
+   "client_errors",
+   "client_errors",
+   "CREATE TABLE client_errors (\n            id          INTEGER PRIMARY KEY AUTOINCREMENT,\n            day         INTEGER NOT NULL,\n            user_id     INTEGER NOT NULL,\n            version     TEXT    NOT NULL DEFAULT '',\n            build       INTEGER NOT NULL DEFAULT 0,\n            where_at    TEXT    NOT NULL,\n            what        TEXT    NOT NULL,\n            area        TEXT    NOT NULL DEFAULT '',\n            times       INTEGER NOT NULL DEFAULT 1,\n            first_at    INTEGER NOT NULL,\n            last_at     INTEGER NOT NULL,\n            UNIQUE (day, user_id, version, where_at, what),\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
+  ],
+  [
+   "index",
+   "sqlite_autoindex_client_errors_1",
+   "client_errors",
+   null
+  ],
+  [
+   "index",
+   "idx_client_errors_last",
+   "client_errors",
+   "CREATE INDEX idx_client_errors_last\n            ON client_errors(last_at)"
+  ],
+  [
+   "index",
+   "idx_client_errors_user_day",
+   "client_errors",
+   "CREATE INDEX idx_client_errors_user_day\n            ON client_errors(user_id, day)"
+  ],
+  [
    "index",
    "idx_sessions_seen",
    "sessions",
@@ -2182,6 +2206,178 @@
     ],
     [
      "sqlite_autoindex_chat_reports_1",
+     1,
+     "u",
+     0
+    ]
+   ]
+  },
+  "client_errors": {
+   "columns": [
+    [
+     0,
+     "id",
+     "INTEGER",
+     0,
+     null,
+     1
+    ],
+    [
+     1,
+     "day",
+     "INTEGER",
+     1,
+     null,
+     0
+    ],
+    [
+     2,
+     "user_id",
+     "INTEGER",
+     1,
+     null,
+     0
+    ],
+    [
+     3,
+     "version",
+     "TEXT",
+     1,
+     "''",
+     0
+    ],
+    [
+     4,
+     "build",
+     "INTEGER",
+     1,
+     "0",
+     0
+    ],
+    [
+     5,
+     "where_at",
+     "TEXT",
+     1,
+     null,
+     0
+    ],
+    [
+     6,
+     "what",
+     "TEXT",
+     1,
+     null,
+     0
+    ],
+    [
+     7,
+     "area",
+     "TEXT",
+     1,
+     "''",
+     0
+    ],
+    [
+     8,
+     "times",
+     "INTEGER",
+     1,
+     "1",
+     0
+    ],
+    [
+     9,
+     "first_at",
+     "INTEGER",
+     1,
+     null,
+     0
+    ],
+    [
+     10,
+     "last_at",
+     "INTEGER",
+     1,
+     null,
+     0
+    ]
+   ],
+   "foreign_keys": [
+    [
+     0,
+     0,
+     "users",
+     "user_id",
+     "id",
+     "NO ACTION",
+     "CASCADE",
+     "NONE"
+    ]
+   ],
+   "index_info": {
+    "idx_client_errors_last": [
+     [
+      0,
+      10,
+      "last_at"
+     ]
+    ],
+    "idx_client_errors_user_day": [
+     [
+      0,
+      2,
+      "user_id"
+     ],
+     [
+      1,
+      1,
+      "day"
+     ]
+    ],
+    "sqlite_autoindex_client_errors_1": [
+     [
+      0,
+      1,
+      "day"
+     ],
+     [
+      1,
+      2,
+      "user_id"
+     ],
+     [
+      2,
+      3,
+      "version"
+     ],
+     [
+      3,
+      5,
+      "where_at"
+     ],
+     [
+      4,
+      6,
+      "what"
+     ]
+    ]
+   },
+   "indexes": [
+    [
+     "idx_client_errors_last",
+     0,
+     "c",
+     0
+    ],
+    [
+     "idx_client_errors_user_day",
+     0,
+     "c",
+     0
+    ],
+    [
+     "sqlite_autoindex_client_errors_1",
      1,
      "u",
      0

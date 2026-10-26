@@ -736,6 +736,9 @@ SWEEPS_ALLOWED = [
     # Your own invitations, by you as the one who asked: leaving takes back
     # every one you sent.
     ("party_invites", "from_id =", "the invitations you sent, as you leave"),
+    # the games' error reports (0.88.0, clienterrors/): every account's past
+    # DAYS_KEPT days go on the next report, the server acting on its own clock.
+    ("client_errors", "day <", "retention: games' error reports past DAYS_KEPT"),
 ]
 
 # THE PACKAGES' WRITES TOO. Since 16 Oct the areas moving out of app.py take

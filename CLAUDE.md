@@ -2830,6 +2830,42 @@ follower's. The books see them all, so the meter is the books' count.
   the sources eighth, and `"sn"` names their monsters (catalogue display
   names). P-17. Deploy order: server first.
 
+## Stability: a failed update undoes itself, and the games report what broke (game 0.88.0)
+
+The owner rated stability 8 of 10 - "rare live breakages, and fixes go out
+fast" - and asked for the 9. Two gaps let a breakage reach players unseen.
+
+- **`deploy/update_server.sh` takes back an update that does not come up.**
+  Healthy is `/api/status` answering AND presence.py logging `[PRESENCE]
+  listening` since the restart (`restart_and_check()`; the presence half was
+  nobody's check - a presence.py that would not start left the update
+  "healthy" and every player alone). On a pull that fails it, step 7 resets
+  the code to the last commit that came up healthy (`$DEPLOYED`), reinstalls
+  the requirements when they changed, restarts both and checks again, and
+  says which of "taken back" or "taken back and it did not come up either"
+  happened. **The database is never put back**: every save since the backup
+  would go with it, so that stays a person's decision. Exit 1 either way;
+  `--no-rollback` leaves a failed update in place. `test_deploy.py` section
+  H runs the real script in a sandbox (`ELUSION_DEPLOY_SANDBOX`, which only
+  the test sets) with a real git remote and stand-ins for systemctl, curl,
+  sudo and journalctl: a bad commit taken back, the next good one through, a
+  presence that will not listen, changed requirements put back,
+  `--no-rollback`. Sabotaged twice (no reset; presence never counted
+  healthy), red both times.
+- **`clienterrors/` (POST /api/client/errors, GET
+  /api/server/client-errors).** Each game sends the SCRIPT ERRORs it hits
+  once a minute - where (a `res://` script and line, or `<word>`), what, a
+  count, its version and area (game `errorreporter.gd`). One row per account,
+  day, version and error (`client_errors`, its own schema.py), the count
+  added; `ROWS_PER_DAY` (60) different errors an account a day, then only
+  those already kept count on; `REPORT_TIMES_MOST` a report and `TIMES_MOST`
+  a day; a bad line is dropped and said, never the report; pruned past
+  `DAYS_KEPT` (14) on the next write. The read is the owner's and a
+  co-owner's, grouped by error, worst first (players, then times, then
+  newest), at most `SHOWN` (50), **players counted and never named**.
+  `test_clienterrors.py`, test_packages (on a bare app), test_ownership (the
+  prune is on the allowlist).
+
 ## Layout
 
 ```

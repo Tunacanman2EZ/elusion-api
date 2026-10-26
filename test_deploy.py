@@ -36,6 +36,9 @@ THE SECTIONS
   F  restore_drill.py restores one of the new single-file copies
   G  every setting checked before the server starts (envfile.check_env),
      run after C because it boots the same copy
+  H  update_server.sh takes back an update that does not come up (0.88.0):
+     the real script in a sandbox, with a real git remote and stand-ins for
+     systemctl, curl, sudo and journalctl
 
 No network, no real database: everything is built in a temp directory.
 """
@@ -668,6 +671,155 @@ check("restore_drill.py passes on a backup of the database section C made",
 check("...and the copy it drilled was a single file",
       "[BACKUP] OK" in result.stdout and "WAL" not in result.stderr,
       result.stdout[-400:])
+
+
+section("H  an update that does not come up is taken back (update_server.sh)")
+
+DEPLOY_SCRIPT = os.path.join(HERE, "deploy", "update_server.sh")
+BASH = shutil.which("bash")
+GIT = shutil.which("git")
+
+
+def deploy_sandbox():
+    """A folder shaped like the droplet: api/ a clone of origin.git at a
+    healthy commit, the settings file with the names, a database file, and
+    bin/ with the stand-ins. "Healthy" is the word HEALTH=good in app.py: the
+    stand-in curl answers /api/status only then, and the stand-in journalctl
+    says presence is listening unless presence_down exists."""
+    root = scratch("deploy_%d" % int(time.time() * 1000))
+    os.makedirs(root, exist_ok=True)
+    def git(cwd, *args):
+        return subprocess.run([GIT, "-c", "user.email=t@example.com", "-c", "user.name=t", *args],
+                              cwd=cwd, capture_output=True, text=True, timeout=60)
+    origin = os.path.join(root, "origin.git")
+    git(root, "init", "-q", "--bare", "-b", "main", origin)
+    work = os.path.join(root, "work")
+    git(root, "clone", "-q", origin, work)
+    with open(os.path.join(work, "app.py"), "w") as f:
+        f.write("CURRENT_CLIENT_BUILD = 7\n# HEALTH=good\n")
+    with open(os.path.join(work, "backup_db.py"), "w") as f:
+        f.write("print('[BACKUP] stand-in')\n")
+    with open(os.path.join(work, "requirements.txt"), "w") as f:
+        f.write("flask\n")
+    git(work, "add", "-A")
+    git(work, "commit", "-q", "-m", "good")
+    git(work, "push", "-q", "origin", "HEAD:main")
+    git(root, "clone", "-q", "-b", "main", origin, os.path.join(root, "api"))
+    first = git(os.path.join(root, "api"), "rev-parse", "--short", "HEAD").stdout.strip()
+    with open(os.path.join(root, "deployed_commit"), "w") as f:
+        f.write(first + "\n")
+    with open(os.path.join(root, "elusion.env"), "w") as f:
+        f.write("ELUSION_OWNER=x\nELUSION_DB=y\nELUSION_TRUSTED_PROXIES=1\n")
+    os.makedirs(os.path.join(root, "db"))
+    with open(os.path.join(root, "db", "elusion.db"), "w") as f:
+        f.write("every save since the backup")
+    os.makedirs(os.path.join(root, "venv", "bin"))
+    with open(os.path.join(root, "venv", "bin", "pip"), "w") as f:
+        f.write("#!/bin/sh\necho pip \"$@\" >> \"$ELUSION_DEPLOY_SANDBOX/pip.log\"\n")
+    stubs = {
+        "sudo": '[ "$1" = "-u" ] && shift 2\nexec "$@"\n',
+        "id": 'echo 0\n',
+        "systemctl": 'echo "$@" >> "$ELUSION_DEPLOY_SANDBOX/systemctl.log"\n'
+                     '[ "$1" = "is-active" ] && echo active\nexit 0\n',
+        "curl": 'grep -q "HEALTH=good" "$ELUSION_DEPLOY_SANDBOX/api/app.py" || exit 7\n'
+                'echo \'{"ok":true}\'\n',
+        "journalctl": 'case "$*" in\n'
+                      '  *elusion-presence*) [ -e "$ELUSION_DEPLOY_SANDBOX/presence_down" ] || '
+                      'echo "[PRESENCE] listening on ws://127.0.0.1:5001/ws/presence" ;;\n'
+                      '  *) echo "[BOOT] stand-in" ;;\nesac\n',
+        "sleep": 'exit 0\n',
+    }
+    os.makedirs(os.path.join(root, "bin"))
+    for name, body in stubs.items():
+        with open(os.path.join(root, "bin", name), "w") as f:
+            f.write("#!/bin/sh\n" + body)
+    for folder in ("bin", os.path.join("venv", "bin")):
+        for name in os.listdir(os.path.join(root, folder)):
+            os.chmod(os.path.join(root, folder, name), 0o755)
+    return root, work, first, git
+
+
+def push_change(work, git, health, requirements=None):
+    with open(os.path.join(work, "app.py"), "w") as f:
+        f.write("CURRENT_CLIENT_BUILD = 7\n# HEALTH=%s\n# change %d\n" % (health, time.monotonic_ns()))
+    if requirements is not None:
+        with open(os.path.join(work, "requirements.txt"), "w") as f:
+            f.write(requirements)
+    git(work, "commit", "-q", "-am", health)
+    git(work, "push", "-q", "origin", "HEAD:main")
+    return git(work, "rev-parse", "--short", "HEAD").stdout.strip()
+
+
+def run_update(root, *args):
+    env = dict(os.environ, ELUSION_DEPLOY_SANDBOX=root, ELUSION_CRON_D=os.path.join(root, "cron"),
+               PATH=os.path.join(root, "bin") + os.pathsep + os.environ.get("PATH", ""))
+    os.makedirs(os.path.join(root, "cron"), exist_ok=True)
+    return subprocess.run([BASH, DEPLOY_SCRIPT, *args], env=env, capture_output=True, text=True, timeout=120)
+
+
+def head_of(root, git):
+    return git(os.path.join(root, "api"), "rev-parse", "--short", "HEAD").stdout.strip()
+
+
+def restarts(root):
+    path = os.path.join(root, "systemctl.log")
+    lines = open(path).read().splitlines() if os.path.exists(path) else []
+    return [line for line in lines if line.startswith("restart")]
+
+
+if BASH is None or GIT is None:
+    print("  (no bash or no git here: section H needs both, and is skipped)")
+else:
+    root, work, first, git = deploy_sandbox()
+    bad = push_change(work, git, "bad")
+    run = run_update(root)
+    out = run.stdout + run.stderr
+    check("an update whose /api/status never answers is taken back to the last healthy commit",
+          run.returncode == 1 and head_of(root, git) == first and "TAKEN BACK: %s did not come up" % bad in out,
+          out[-1500:])
+    check("  both services restarted twice: once onto it, once back",
+          restarts(root) == ["restart elusion-api", "restart elusion-presence"] * 2, restarts(root))
+    check("  the database is not touched, and the last healthy commit is still the one remembered",
+          open(os.path.join(root, "db", "elusion.db")).read() == "every save since the backup"
+          and open(os.path.join(root, "deployed_commit")).read().strip() == first)
+    check("  and it says the database was not undone, and where to read why",
+          "Nothing in the database was undone" in out and "journalctl -u elusion-api" in out, out[-800:])
+
+    good = push_change(work, git, "good")
+    run = run_update(root)
+    out = run.stdout + run.stderr
+    check("the next healthy update goes through, past the bad commit, and is remembered",
+          run.returncode == 0 and head_of(root, git) == good
+          and open(os.path.join(root, "deployed_commit")).read().strip() == good and "Updated" in out,
+          out[-1200:])
+
+    with open(os.path.join(root, "presence_down"), "w") as f:
+        f.write("1")
+    later = push_change(work, git, "good")
+    run = run_update(root)
+    out = run.stdout + run.stderr
+    check("an update the API takes but presence does not is taken back too",
+          run.returncode == 1 and head_of(root, git) == good and "presence: did not say it was listening" in out,
+          out[-1200:])
+    check("  and when the old commit does not come up either, it says the trouble is outside the code",
+          "AND IT DID NOT COME UP EITHER" in out and "newest file in" in out, out[-800:])
+    os.remove(os.path.join(root, "presence_down"))
+
+    broken = push_change(work, git, "bad", requirements="flask\nnewthing\n")
+    open(os.path.join(root, "pip.log"), "w").close()
+    run = run_update(root)
+    out = run.stdout + run.stderr
+    pips = open(os.path.join(root, "pip.log")).read().splitlines()
+    check("an update that changed requirements.txt has the old requirements put back with the code",
+          run.returncode == 1 and head_of(root, git) == good and len(pips) == 2
+          and "requirements.txt put back" in out, [pips, out[-900:]])
+
+    run = run_update(root, "--no-rollback")
+    out = run.stdout + run.stderr
+    check("--no-rollback leaves a failed update in place, and says so",
+          run.returncode == 1 and head_of(root, git) == broken and "Left as it is (--no-rollback)" in out,
+          out[-800:])
+    shutil.rmtree(root, ignore_errors=True)
 
 
 shutil.rmtree(SCRATCH, ignore_errors=True)

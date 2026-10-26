@@ -312,7 +312,24 @@ and `[DEPLOY]` lines and asks `/api/status`. It stops before restarting if a
 setting is missing, so the old process keeps serving. It remembers the last
 commit that came up healthy (`/var/lib/elusion/deployed_commit`), so a run that
 stopped half-way is finished by the next one rather than skipped.
-`--restart` restarts even when nothing new came down. The very first time,
+`--restart` restarts even when nothing new came down.
+
+**A new version that does not come up is taken back by itself (0.88.0).**
+After the restart it waits for `/api/status` to answer and for the presence
+server to log `[PRESENCE] listening`. If either does not, it puts the code
+back to the last commit that came up healthy (and the old requirements, when
+they changed), restarts both, checks again, and ends with one of:
+
+- `TAKEN BACK: <new> did not come up, so <old> is running again.` Players are
+  on the old version. Read the two `journalctl` lines it prints, fix, push,
+  run it again.
+- `TAKEN BACK TO <old>, AND IT DID NOT COME UP EITHER.` The trouble is outside
+  the code (the settings, the disk, the database). The backup it took before
+  the restart is the newest file in `/var/backups/elusion`.
+
+**The database is never put back automatically** - every save since the
+backup would go with it. `--no-rollback` leaves a failed update in place, to
+read it as it is. The very first time,
 the script is not on the server yet: pull once by hand (below), then use it.
 
 By hand, from an SSH session on the droplet:

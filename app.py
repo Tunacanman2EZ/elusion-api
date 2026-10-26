@@ -1158,6 +1158,7 @@ import parties.schema as parties_schema  # noqa: E402
 import consuming.schema as consuming_schema  # noqa: E402
 import smith.schema as smith_schema  # noqa: E402
 import economyrules.schema as economyrules_schema  # noqa: E402
+import clienterrors.schema as clienterrors_schema  # noqa: E402
 
 
 def init_db():
@@ -1958,6 +1959,7 @@ def init_db():
     consuming_schema.create(db)
     smith_schema.create(db)
     economyrules_schema.create(db)
+    clienterrors_schema.create(db)
 
     _migrate_bank_to_account(db)
 
@@ -8909,6 +8911,24 @@ _SERVER_HEALTH = serverhealth_package.register(
 )
 # For the suites, which write books rows and then read the receipts.
 _server_health_cache_clear = _SERVER_HEALTH.cache_clear
+
+
+# =============================================================================
+# WHAT BROKE IN THE PLAYERS' GAMES (game 0.88.0) - the clienterrors/ package
+# =============================================================================
+# Each game sends the script errors it hits (POST /api/client/errors: where,
+# what, how many times, its version and area), counted per account and day;
+# the GM panel's Health tab lists them for the owner and a co-owner, worst
+# first, with how many players - never who (GET /api/server/client-errors).
+import clienterrors as clienterrors_package  # noqa: E402
+
+clienterrors_package.register(
+    app,
+    require_auth=require_auth,
+    require_owner=require_owner,
+    get_db=get_db,
+    bad_request=bad_request,
+)
 
 
 # =============================================================================

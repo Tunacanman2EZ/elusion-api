@@ -25,9 +25,16 @@
 #
 #     ... update_server.sh --canary-cron           # print that file, change nothing
 #     ... update_server.sh --install-canary-cron   # write only that file, then stop
+#   7. A NEW VERSION THAT DOES NOT COME UP IS TAKEN BACK (0.88.0). Healthy is
+#      /api/status answering AND the presence server saying it is listening.
+#      If either fails after a pull, the code goes back to the last commit
+#      that came up healthy, the requirements with it when they changed, both
+#      services restart, and the same checks run again. The database is NEVER
+#      put back: every save since step 4 would go with it, and the backup is
+#      there for a person to decide. The run still exits 1, and says what
+#      happened. --no-rollback leaves the new code in place, as before.
 #
-# Nothing is rolled back automatically. If the new code is wrong, the last
-# line says which commit was live before and where the backup went.
+#     ... update_server.sh --no-rollback   # a failed update stays, for reading
 
 set -euo pipefail
 
@@ -53,6 +60,24 @@ CRON_D=${ELUSION_CRON_D:-/etc/cron.d}
 CANARY_CRON=elusion-canary
 CANARY_STATUS=$(dirname "$DB")/canary_status.json
 CANARY_LOG=/var/log/elusion-canary.log
+
+# HOW LONG A RESTART IS GIVEN to answer, in seconds, each of the two checks.
+WAIT_SECONDS=20
+
+# A SANDBOX FOR test_deploy.py ONLY. The run is the real main(), in a folder
+# of the test's making, with stand-ins for systemctl, curl, sudo and journalctl
+# on its PATH - which is how a broken update is shown to be taken back without
+# a server. Nothing on the live box sets it.
+if [ -n "${ELUSION_DEPLOY_SANDBOX:-}" ]; then
+    API=$ELUSION_DEPLOY_SANDBOX/api
+    VENV=$ELUSION_DEPLOY_SANDBOX/venv
+    ENV_FILE=$ELUSION_DEPLOY_SANDBOX/elusion.env
+    DB=$ELUSION_DEPLOY_SANDBOX/db/elusion.db
+    BACKUPS=$ELUSION_DEPLOY_SANDBOX/backups
+    DEPLOYED=$ELUSION_DEPLOY_SANDBOX/deployed_commit
+    CANARY_STATUS=$(dirname "$DB")/canary_status.json
+    WAIT_SECONDS=2
+fi
 
 # Every name here must be in the settings file, or the update stops before
 # anything restarts. The second list is only warned about.
@@ -118,13 +143,63 @@ install_canary_cron() {
     say "  $target written: hourly at :41, as elusion, status in $CANARY_STATUS."
 }
 
+# RESTART BOTH, THEN ASK BOTH (0.88.0). Prints what it found and returns 0
+# only when the API answers /api/status and the presence server has said, since
+# this restart, that it is listening. The presence half used to be nobody's
+# check: a presence.py that would not start left the API up, the update
+# "healthy", and every player alone in an empty world.
+restart_and_check() {
+    local started build _ status="" presence_ok=0
+    started=$(date '+%Y-%m-%d %H:%M:%S')
+    systemctl restart elusion-api
+    systemctl restart elusion-presence
+
+    build=$(grep -oP '^CURRENT_CLIENT_BUILD\s*=\s*\K[0-9]+' "$API/app.py" || echo 4)
+    for _ in $(seq 1 "$WAIT_SECONDS"); do
+        status=$(curl -s -m 3 -H "X-Elusion-Build: $build" http://127.0.0.1:5000/api/status || true)
+        [ -n "$status" ] && break
+        sleep 1
+    done
+    for _ in $(seq 1 "$WAIT_SECONDS"); do
+        if [ "$(systemctl is-active elusion-presence || true)" = "active" ] \
+                && journalctl -u elusion-presence --since "$started" --no-pager -o cat 2>/dev/null \
+                    | grep -q '^\[PRESENCE\] listening'; then
+            presence_ok=1
+            break
+        fi
+        sleep 1
+    done
+
+    say ""
+    say "elusion-api:      $(systemctl is-active elusion-api || true)"
+    say "elusion-presence: $(systemctl is-active elusion-presence || true)"
+    journalctl -u elusion-api --since "$started" --no-pager -o cat | grep -E '^\[(BOOT|DEPLOY)\]' || true
+    say ""
+    if [ -n "$status" ]; then
+        say "/api/status: $status"
+    else
+        say "/api/status did not answer in $WAIT_SECONDS seconds."
+    fi
+    if [ "$presence_ok" -eq 1 ]; then
+        say "presence: listening."
+    else
+        say "presence: did not say it was listening in $WAIT_SECONDS seconds."
+    fi
+    [ -n "$status" ] && [ "$presence_ok" -eq 1 ]
+}
+
 # THE WHOLE SCRIPT IS ONE FUNCTION, CALLED ON THE LAST LINE. bash reads a
 # script as it runs it, and step 1 can replace this very file; a function is
 # read in full before any of it runs, so a pull that changes this script
 # cannot change the steps of the run already going.
 main() {
-    local force_restart=0
-    [ "${1:-}" = "--restart" ] && force_restart=1
+    local force_restart=0 rollback=1 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --restart) force_restart=1 ;;
+            --no-rollback) rollback=0 ;;
+        esac
+    done
 
     # THE CANARY'S TWO OWN MODES: print the file (anybody, nothing changes),
     # or write only it. Before the root check, so the first needs no sudo;
@@ -202,37 +277,45 @@ main() {
     sudo -u elusion /usr/bin/python3 "$API/backup_db.py" --db "$DB" --out "$BACKUPS" --keep 14
 
     step "5. Restarting"
-    local started
-    started=$(date '+%Y-%m-%d %H:%M:%S')
-    systemctl restart elusion-api
-    systemctl restart elusion-presence
-
-    local build status="" _
-    build=$(grep -oP '^CURRENT_CLIENT_BUILD\s*=\s*\K[0-9]+' app.py || echo 4)
-    for _ in $(seq 1 20); do
-        status=$(curl -s -m 3 -H "X-Elusion-Build: $build" http://127.0.0.1:5000/api/status || true)
-        [ -n "$status" ] && break
-        sleep 1
-    done
-
-    say ""
-    say "elusion-api:      $(systemctl is-active elusion-api || true)"
-    say "elusion-presence: $(systemctl is-active elusion-presence || true)"
-    journalctl -u elusion-api --since "$started" --no-pager -o cat | grep -E '^\[(BOOT|DEPLOY)\]' || true
-    say ""
-    if [ -n "$status" ]; then
-        say "/api/status: $status"
+    if restart_and_check; then
         say ""
         echo "$after" > "$DEPLOYED"
         step "6. The canary on its timer"
         install_canary_cron || true
         say ""
         say "Updated $before -> $after."
-    else
-        say "/api/status did not answer in 20 seconds. Read: journalctl -u elusion-api -n 50 --no-pager"
+        exit 0
+    fi
+
+    say ""
+    say "Read: journalctl -u elusion-api -n 50 --no-pager"
+    say "  and journalctl -u elusion-presence -n 50 --no-pager"
+    if [ "$before" = "$after" ] || [ "$rollback" -eq 0 ]; then
+        [ "$rollback" -eq 0 ] && say "Left as it is (--no-rollback)."
         say "Live before this: $before. The backup from step 4 is the newest file in $BACKUPS."
         exit 1
     fi
+
+    step "7. Taking it back to $before"
+    # The code only. The database stays as it is: the backup is the newest
+    # file in $BACKUPS, and putting it back is a person's decision.
+    sudo -u elusion git reset --hard "$before"
+    if sudo -u elusion git diff --name-only "$before" "$after" | grep -qx "requirements.txt"; then
+        sudo -u elusion "$VENV/bin/pip" install -q -r requirements.txt
+        say "requirements.txt put back - installed."
+    fi
+    if restart_and_check; then
+        say ""
+        say "TAKEN BACK: $after did not come up, so $before is running again."
+        say "Players are back on the old version. Nothing in the database was undone."
+        say "Fix what the log above says, push, and run this again."
+    else
+        say ""
+        say "TAKEN BACK TO $before, AND IT DID NOT COME UP EITHER."
+        say "Something outside the code is wrong (the settings, the disk, the database)."
+        say "The backup from step 4 is the newest file in $BACKUPS."
+    fi
+    exit 1
 }
 
 main "$@"; exit $?
