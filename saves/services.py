@@ -10,10 +10,29 @@ VALID_CLASSES = {"warrior", "mage", "tank", "healer"}
 # a few hundred bytes an area - so 64 KB is roughly twenty times the largest
 # honest payload, and still small enough that a client cannot use the column as
 # free storage.
+# A NEW CHARACTER'S STARTER POTIONS (game 0.92.0): the owner's first five
+# minutes walked, a level 1 character leaving town with nothing to drink.
+# On the hotbar's first keys, in this order: health for everyone, and mana
+# for the two classes whose attacks spend it. Only for a slot's FIRST
+# character (routes.py): a slot that has had one deleted gets none, so
+# deleting and making again is not a way to mint potions.
+STARTER_POTIONS = (("tinyhealthpotion", 5),)
+STARTER_MANA = (("tinymanapotion", 5),)
+STARTER_MANA_CLASSES = {"mage", "healer"}
+
 MAX_EXPLORED_BYTES = 65536
 
 # Sanity bounds on one area's dimensions, mirroring WorldMap.MAX_AREA_TILES.
 MAX_EXPLORED_TILES = 262144
+
+
+def starter_kit(class_id):
+    """[(item_id, quantity)] a new character of class_id starts with, in hotbar
+    key order."""
+    kit = list(STARTER_POTIONS)
+    if class_id in STARTER_MANA_CLASSES:
+        kit += list(STARTER_MANA)
+    return kit
 
 
 def pet_id(raw):

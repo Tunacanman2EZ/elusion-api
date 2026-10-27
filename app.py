@@ -8563,6 +8563,15 @@ CHARACTER_DELETE_REASON = "character-deleted"
 
 import saves as saves_package  # noqa: E402
 
+
+def starter_kit_on():
+    """A new character's starter potions (saves/services.STARTER_POTIONS):
+    on unless ELUSION_STARTER_KIT is "off". Read each time, so a suite can
+    turn it on and off; testdir.py turns it off for every suite, whose checks
+    were written for a new character with an empty bag, and test_chardelete's
+    CD-8 turns it on."""
+    return os.environ.get("ELUSION_STARTER_KIT", "on").strip().lower() != "off"
+
 saves_package.register(
     app,
     require_auth=require_auth,
@@ -8583,6 +8592,7 @@ saves_package.register(
     gold_delta=gold_delta,
     deletions_kept=CHARACTER_DELETIONS_KEPT,
     delete_reason=CHARACTER_DELETE_REASON,
+    give_starter=lambda user_id, slot, items: _CARRY.starter_keys(user_id, slot, items) if starter_kit_on() else None,
 )
 
 # Named here as well, for anything that reads them off this module;

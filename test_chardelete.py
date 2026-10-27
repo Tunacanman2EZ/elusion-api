@@ -304,5 +304,43 @@ for bad in ("zero", 9):
           400 <= r.status_code < 500, r.status_code)
 
 
+# =============================================================================
+section("CD-8  a slot's first character starts with potions on its first keys (game 0.92.0)")
+# =============================================================================
+os.environ["ELUSION_STARTER_KIT"] = "on"
+kit_token = register("kitowner")
+kit_id = uid("kitowner")
+answer = client.put("/api/save", headers=bearer(kit_token),
+                    json={"slot": 0, "class_id": "warrior", "name": "warrior"}).get_json()
+check("the save that made it answers with its bag, so the game shows the potions at once",
+      isinstance(answer.get("inventory"), list) and len(answer["inventory"]) == 30
+      and answer["inventory"][20] == {"item_id": "tinyhealthpotion", "quantity": 5}, answer.get("inventory"))
+make(kit_token, 1, "mage")
+w_cells = raw("SELECT position, item_id, quantity FROM carry_items WHERE user_id = ? AND slot = 0 ORDER BY position", (kit_id,))
+m_cells = raw("SELECT position, item_id, quantity FROM carry_items WHERE user_id = ? AND slot = 1 ORDER BY position", (kit_id,))
+check("a new warrior: five Tiny Health Potions on hotbar key 1, nothing else",
+      [tuple(c) for c in w_cells] == [(20, "tinyhealthpotion", 5)], [tuple(c) for c in w_cells])
+check("a new mage: health on key 1 and five Tiny Mana Potions on key 2",
+      [tuple(c) for c in m_cells] == [(20, "tinyhealthpotion", 5), (21, "tinymanapotion", 5)], [tuple(c) for c in m_cells])
+make(kit_token, 0, "warrior")
+again = raw("SELECT position, item_id, quantity FROM carry_items WHERE user_id = ? AND slot = 0 ORDER BY position", (kit_id,))
+check("saving the character again gives nothing more", [tuple(c) for c in again] == [(20, "tinyhealthpotion", 5)],
+      [tuple(c) for c in again])
+second = client.put("/api/save", headers=bearer(kit_token),
+                    json={"slot": 0, "class_id": "warrior", "name": "warrior"}).get_json()
+check("  and its answer carries no bag", "inventory" not in second, second)
+r = delete(kit_token, 0, "warrior")
+check("deleted", r.status_code == 200, r.get_json())
+make(kit_token, 0, "warrior")
+remade = raw("SELECT position, item_id, quantity FROM carry_items WHERE user_id = ? AND slot = 0", (kit_id,))
+check("a character made again in a slot that had one deleted starts empty - deleting is no way to mint potions",
+      len(remade) == 0, [tuple(c) for c in remade])
+os.environ["ELUSION_STARTER_KIT"] = "off"
+other = register("kitless")
+make(other, 0, "warrior")
+check("with ELUSION_STARTER_KIT=off a new character starts empty, as before",
+      len(raw("SELECT 1 FROM carry_items WHERE user_id = ?", (uid("kitless"),))) == 0)
+
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

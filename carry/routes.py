@@ -170,6 +170,28 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, sl
         data.put(db, user_id, slot, writes)
         return [position for position, _, _ in writes]
 
+    def starter_keys(user_id, slot, items):
+        """A NEW CHARACTER'S STARTER KIT on its first hotbar keys (game 0.92.0):
+        [(item_id, quantity)], one key each from the first, onto empty keys
+        only, each held to the item's stack. The one place anything is put on
+        a key, and only for a character the save route has just made - whose
+        keys nobody has chosen yet. Returns the keys written."""
+        db = get_db()
+        taken = {int(r["position"]) for r in data.cells(db, user_id, slot)}
+        writes = []
+        position = bag_cells
+        for item_id, quantity in items:
+            if position >= carry_cells or catalogue.item_row(item_id) is None:
+                continue
+            while position in taken and position < carry_cells:
+                position += 1
+            if position >= carry_cells:
+                break
+            writes.append((position, item_id, min(int(quantity), stack_limit(item_id))))
+            position += 1
+        data.put(db, user_id, slot, writes)
+        return [p for p, _, _ in writes]
+
     # ---- the routes ----------------------------------------------------------
 
     def write_inventory():
@@ -549,7 +571,7 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, sl
     return SimpleNamespace(
         stack_limit=stack_limit, parse_positional_items=parse_positional_items,
         fingerprint=services.fingerprint, inventory_of=inventory_of, owns_item=owns_item,
-        take_from_backpack=take_from_backpack, add_to_backpack=add_to_backpack,
+        take_from_backpack=take_from_backpack, add_to_backpack=add_to_backpack, starter_keys=starter_keys,
         take_from_cells=services.take_from_cells, apply_cell_changes=apply_cell_changes,
         grid_cells=grid_cells, grid_rewrite=grid_rewrite, grid_move=grid_move, grid_discard=grid_discard,
         resync=resync, carry_request=carry_request)

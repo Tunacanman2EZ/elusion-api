@@ -189,3 +189,10 @@ def drop(db, user_id, slot):
         db.execute("DELETE FROM %s WHERE user_id = ? AND slot = ?" % table, (user_id, slot))
     db.execute("DELETE FROM loot_bags WHERE user_id = ? AND slot = ?", (user_id, slot))
     db.execute("DELETE FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot))
+
+
+def ever_deleted(db, user_id, slot):
+    """True when a character in this slot has been deleted (and its copy is
+    still kept - the newest CHARACTER_DELETIONS_KEPT of the account's)."""
+    return db.execute("SELECT 1 FROM character_deletions WHERE user_id = ? AND slot = ? LIMIT 1",
+                      (user_id, slot)).fetchone() is not None

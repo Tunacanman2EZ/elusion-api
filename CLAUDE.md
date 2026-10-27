@@ -1031,6 +1031,36 @@ T-7) holds it, and `_test_token_lifecycle()` holds the game's half.
   sessions, so the next check reads 401s - `game()` in `test_tokens.py` is the
   helper.
 
+## A new character's starter potions (game 0.92.0)
+
+The owner's first five minutes, walked: a level 1 character left town with
+nothing to drink. A slot's FIRST character now starts with potions on its
+first hotbar keys - `saves/services.STARTER_POTIONS` (5 Tiny Health) on key
+1, and `STARTER_MANA` (5 Tiny Mana) on key 2 for `STARTER_MANA_CLASSES` (mage,
+healer).
+
+- **Written by carry/'s `starter_keys()`**, handed to saves/ as
+  `give_starter`: the one place anything is put on a hotbar key, and only for
+  a character the save route has just made, whose keys nobody has chosen. Onto
+  empty keys only, each held to the item's stack; an id the catalogue does not
+  know is passed over. No ledger: items carry no money.
+- **Only a slot's first character.** `saves/data.ever_deleted()`: a slot with a
+  `character_deletions` row gets none, so deleting and making again does not
+  mint potions (to sell at the shop). The newest CHARACTER_DELETIONS_KEPT per
+  account are kept, and the slot's own deletion is always among the newest.
+- **The save that made it answers `inventory`**, the whole carry, so the
+  game shows the potions at once (it made the character with an empty bag of
+  its own). No other save answers it.
+- **`ELUSION_STARTER_KIT=off`** gives a new character an empty bag, as before
+  (`starter_kit_on()` in app.py, read each time). **testdir.py sets it off for
+  every suite**: dozens of checks count a new character's cells, written when
+  it had none. test_chardelete's CD-8 turns it on and holds the kit, the
+  answer, the second save, the remade slot (sabotage-caught: the guard taken
+  out) and the switch.
+- **Deploy order: either.** An older game ignores the answer's bag and sees
+  the potions at its next sign-in; this game against an older server gets no
+  bag and nothing changes.
+
 ## Deleting a character
 
 `POST /api/character/delete` (DELETING A CHARACTER in app.py,

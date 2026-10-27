@@ -45,7 +45,7 @@ from .services import MAX_EXPLORED_BYTES, VALID_CLASSES
 
 def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, clean_text, owns_item, stored_json,
              derived_stats, catalogue, take_snapshot, status_of, inventory_of, skills_of, find_open_trade,
-             gold_delta, deletions_kept, delete_reason):
+             gold_delta, deletions_kept, delete_reason, give_starter=None):
 
     def slot_view(row, buffs=None):
         """One slot as the game lists it - see services.slot_view(). `buffs` is
@@ -273,6 +273,7 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, cl
         # equipment is server-owned and this route never writes it.
         stored = data.wearer(db, g.user["id"], slot)
         derived = derived_stats(stored, class_id=class_id)
+        starter_given = False
 
         if derived is not None:
             if is_new:
@@ -282,6 +283,10 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, cl
                 # new character is told what the current curve says.
                 data.fill(db, g.user["id"], slot, derived,
                           catalogue.xp_needed_for_level(int(stored["level"])), int(time.time()))
+                # STARTER POTIONS (game 0.92.0), on the first keys - only for
+                # the slot's first character (services.STARTER_POTIONS).
+                if give_starter is not None and not data.ever_deleted(db, g.user["id"], slot):
+                    starter_given = bool(give_starter(g.user["id"], slot, services.starter_kit(class_id)))
             else:
                 # THE POOLS COME DOWN WITH THE CEILING, never up. A maximum can fall
                 # now - an amulet came off - and a stored hp above it would be a
@@ -298,6 +303,10 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, cl
         # active_pet_id is echoed back only when the caller actually set it, so a
         # client can tell "you stored this" apart from "we left yours alone".
         result = {"slot": slot, "updated_at": now}
+        # THE STARTER KIT, SAID: the game made the character with an empty
+        # bag of its own, and adopts this one (game 0.92.0, heard_save()).
+        if starter_given:
+            result["inventory"] = inventory_of(g.user["id"], slot)
         if pet_key_sent:
             result["active_pet_id"] = active_pet_id
 
