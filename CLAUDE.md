@@ -812,6 +812,16 @@ with "Party chat" and "Party on the map".
   party's id at post time (`target_id`), read and reported only by members of
   that party (`read_chat`, `_can_read_chat_row`), refused with 409 and
   `PARTY_CHAT_NO_PARTY` for somebody in none - guild chat's rules exactly.
+- **Logged off is leaving** (game 0.93.0; the owner: "when party members
+  leave party like log off party should end takes 2 people to make a
+  party"). `parties/data.drop_gone()` takes out every member none of whose
+  logins has been seen for `PARTY_GONE_SECONDS` (90) - logging out ends the
+  session, so that is at once - then `fix()` ends a party left with one.
+  It runs on every party read and on the broadcast poll (`_own_party()`), so
+  each online member's poll keeps their party honest within ten seconds; the
+  asker is never dropped (`present`), whatever their stamp. 0 switches it off
+  (test_packages' bare app, whose logins are stand-ins with no sessions).
+  test_parties.py "logged off is leaving".
 - test_parties.py.
 
 ## Party voice and reporting a player (game 0.43.0)

@@ -46,10 +46,12 @@ def register(app, *, require_auth, get_db, bad_request, find_user, ignores, play
         party = None
         if seat is not None:
             # A LEADER WHO DELETED THEIR ACCOUNT took their row with them: the
-            # read puts things right before it answers.
-            if data.fix(db, int(seat["party_id"])):
+            # read puts things right before it answers. And a member who
+            # logged off is out (data.drop_gone(), game 0.93.0).
+            gone = data.drop_gone(db, int(seat["party_id"]), now, user_id)
+            if gone or data.fix(db, int(seat["party_id"])):
                 db.commit()
-            elif data.membership(db, user_id) is not None:
+            if data.membership(db, user_id) is not None:
                 party = party_dict(db, int(seat["party_id"]), now)
         invites = [{"from": r["username"], "at": int(r["created_at"] or 0)}
                    for r in data.invites_to(db, user_id, now)]

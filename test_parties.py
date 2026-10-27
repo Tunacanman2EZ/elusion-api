@@ -273,6 +273,49 @@ check("a party whose leader went still has one, the longest there",
       party is not None and party["id"] == pid and party["leader"] in ("pdan", "pbob")
       and sum(1 for m in party["members"] if m["leader"]) == 1, party)
 
+print("\n--- logged off is leaving (game 0.93.0) ---")
+import time  # noqa: E402
+import parties.services as party_rules  # noqa: E402
+for t in (amy, bob, cat, dan, eve, fay, gus):
+    leave(t)
+r1 = invite(gus, "pfay")
+respond(fay, "pgus", True)
+check("gus and fay make a party of two", names(party_of(gus)) == ["pgus", "pfay"] or sorted(names(party_of(gus))) == ["pfay", "pgus"],
+      party_of(gus))
+conn = db_conn()
+fay_id = conn.execute("SELECT id FROM users WHERE username = 'pfay'").fetchone()["id"]
+gus_id = conn.execute("SELECT id FROM users WHERE username = 'pgus'").fetchone()["id"]
+quiet = int(time.time()) - party_rules.PARTY_GONE_SECONDS - 5
+conn.execute("UPDATE sessions SET last_seen_at = ? WHERE user_id = ?", (quiet, fay_id))
+conn.commit()
+check("a member quiet for PARTY_GONE_SECONDS is out at the next read, and a party of one ends",
+      party_of(gus) is None, party_of(gus))
+check("  no party rows are left behind",
+      conn.execute("SELECT COUNT(*) FROM party_members WHERE user_id IN (?, ?)", (fay_id, gus_id)).fetchone()[0] == 0)
+conn.close()
+# Three, and one logs out: the other two stay a party.
+conn = db_conn()
+conn.execute("UPDATE sessions SET last_seen_at = ? WHERE user_id = ?", (int(time.time()), fay_id))
+conn.commit()
+conn.close()
+invite(gus, "pfay"); respond(fay, "pgus", True)
+invite(gus, "peve"); respond(eve, "pgus", True)
+check("gus, fay and eve make three", len(names(party_of(gus))) == 3, party_of(gus))
+r = client.post("/api/auth/logout", headers=auth(eve))
+check("eve logs out", r.status_code in (200, 204), r.status_code)
+p = poll(gus).get("party", {})
+check("the poll takes a logged-out member out at once; the other two stay a party",
+      sorted(p.get("members", [])) == ["pfay", "pgus"], p)
+conn = db_conn()
+conn.execute("UPDATE sessions SET last_seen_at = ? WHERE user_id = ?", (quiet, fay_id))
+conn.commit()
+conn.close()
+p = poll(gus).get("party", {})
+check("  and when one of the two goes quiet, the party ends - it takes two",
+      p.get("id", -1) == 0 and party_of(gus) is None, p)
+check("a member asking is never taken out, whatever their stamp says",
+      "present" in open(os.path.join(HERE, "parties", "data.py")).read())
+
 print("\n--- nothing without a token ---")
 check("/api/party needs one", client.get("/api/party").status_code == 401)
 for path in ["/api/party/invite", "/api/party/respond", "/api/party/leave", "/api/party/kick", "/api/party/lead"]:

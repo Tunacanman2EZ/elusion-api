@@ -33,7 +33,7 @@ handed what it needs. Party chat is chat's, and the poll's view of a party
 party_membership(), party_member_rows() and _party_invites_to(), which are
 this package's membership(), member_rows() and invites_to().
 """
-from .data import invites_to, member_rows, membership  # noqa: F401
+from .data import drop_gone, invites_to, member_rows, membership  # noqa: F401
 from .routes import register  # noqa: F401
 from .services import (VOICE_FETCHES_PER_HOUR, VOICE_TURN_REUSE_SECONDS,  # noqa: F401
                        VOICE_TURN_TTL, clean_ice_servers)

@@ -8,6 +8,13 @@ import re
 # doing now.
 MAX_PARTY_MEMBERS = 4
 PARTY_INVITE_SECONDS = 120
+# LOGGED OFF IS LEAVING (game 0.93.0). The owner: "when party members leave
+# party like log off party should end takes 2 people to make a party". A member
+# none of whose logins has been seen for this long is taken out of the party
+# (data.drop_gone()), and a party left with one member ends (data.fix()). Twice
+# the online window and some: a page reloading or an area loading is seen
+# again well inside it; logging out ends the session, so it counts at once.
+PARTY_GONE_SECONDS = 90
 # How many invitations one player may have waiting at once.
 MAX_PARTY_INVITES = 8
 

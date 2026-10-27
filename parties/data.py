@@ -42,6 +42,28 @@ def fix(db, party_id):
     return False
 
 
+def drop_gone(db, party_id, now, present=0):
+    """Members of this party not seen for services.PARTY_GONE_SECONDS - every
+    login of theirs quiet that long, or none left at all (logged out) - taken
+    out, then fix(): a party left with one ends. Returns the names taken out.
+    `present` is the account asking, plainly here whatever its stamp says.
+    Read the constant on the module each time, so a suite can turn it; 0 is
+    off (test_packages' bare app stands in for logins and has no sessions)."""
+    if int(services.PARTY_GONE_SECONDS) <= 0:
+        return []
+    rows = member_rows(db, party_id)
+    ids = [int(r["user_id"]) for r in rows]
+    seen = last_seen(db, ids)
+    cutoff = now - int(services.PARTY_GONE_SECONDS)
+    gone = [r for r in rows if int(r["user_id"]) != int(present)
+            and seen.get(int(r["user_id"]), 0) <= cutoff]
+    for row in gone:
+        remove_member(db, int(row["user_id"]))
+    if gone:
+        fix(db, party_id)
+    return [str(r["username"]) for r in gone]
+
+
 def invites_to(db, user_id, now):
     """Invitations waiting on this player's answer, newest first. A READ, on
     the poll every ten seconds: the ones run out are skipped here and pruned by

@@ -4531,6 +4531,14 @@ def _own_party(db, user_id):
     seat = party_membership(db, user_id)
     if seat is None:
         return {"id": 0, "leader": "", "members": []}
+    # LOGGED OFF IS LEAVING (game 0.93.0): every member's poll, every ten
+    # seconds, takes out the ones gone quiet, and a party of one ends -
+    # parties/'s drop_gone(), the package's own write.
+    if parties.drop_gone(db, int(seat["party_id"]), int(time.time()), user_id):
+        db.commit()
+        seat = party_membership(db, user_id)
+        if seat is None:
+            return {"id": 0, "leader": "", "members": []}
     rows = party_member_rows(db, int(seat["party_id"]))
     return {"id": int(seat["party_id"]),
             "leader": next((r["username"] for r in rows if int(r["is_leader"] or 0)), ""),

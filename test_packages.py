@@ -47,6 +47,9 @@ import friends  # noqa: E402
 import gathering  # noqa: E402
 import guilds  # noqa: E402
 import parties  # noqa: E402
+# THE BARE APP HAS NO SESSIONS (its logins are stand-ins), so every party
+# member would read as logged off (parties/data.drop_gone(), game 0.93.0).
+parties.services.PARTY_GONE_SECONDS = 0
 import bank as bank_package  # noqa: E402
 import carry as carry_package  # noqa: E402
 import chat  # noqa: E402
