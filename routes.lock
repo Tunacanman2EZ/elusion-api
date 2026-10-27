@@ -57,6 +57,7 @@ GET /apispec_1.json  flasgger.apispec_1  open  rank=-  fresh=-  lock=yes  doc=ye
 GET /flasgger_static/<path:filename>  flasgger.static  open  rank=-  fresh=-  lock=yes  doc=yes
 GET /oauth2-redirect.html  flasgger.oauth_redirect  open  rank=-  fresh=-  lock=yes  doc=yes
 GET /static/<path:filename>  static  open  rank=-  fresh=-  lock=yes  doc=no
+POST /api/account/delete  delete_account  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/account/email  set_account_email  auth  rank=-  fresh=-  lock=no  doc=yes
 POST /api/account/email/verify  verify_account_email  auth  rank=-  fresh=-  lock=no  doc=yes
 POST /api/auth/confirm  confirm_password  auth  rank=-  fresh=-  lock=yes  doc=yes

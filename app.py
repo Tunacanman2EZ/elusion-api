@@ -2172,6 +2172,9 @@ def init_db():
     _migrate_add_column(db, "users", "chat_muted_until", "INTEGER NOT NULL DEFAULT 0")
     _migrate_add_column(db, "users", "chat_mute_reason", "TEXT NOT NULL DEFAULT ''")
     _migrate_add_column(db, "users", "chat_muted_by", "TEXT NOT NULL DEFAULT ''")
+    # DELETED, AND WHEN (game 0.90.0, accountdelete/): 0 for every account that
+    # was never deleted. A deleted one keeps its row as a numbered stand-in.
+    _migrate_add_column(db, "users", "deleted_at", "INTEGER NOT NULL DEFAULT 0")
 
     # THE DATA GUARD (game 0.79.0) on presence_health, which 0.78.0 made
     # without it: its level, the month counted so far and from when, and what
@@ -8929,6 +8932,38 @@ clienterrors_package.register(
     require_owner=require_owner,
     get_db=get_db,
     bad_request=bad_request,
+)
+
+
+# =============================================================================
+# DELETING YOUR OWN ACCOUNT (game 0.90.0) - the accountdelete/ package
+# =============================================================================
+# POST /api/account/delete: the account's name typed and its password, then
+# every row that is the player's goes, their gold and lusions burned through
+# the ledgers first, and the users row stays as a numbered stand-in ("deleted
+# player #12") so other people's trades and the ledgers keep their history.
+# accountdelete/__init__.py has the whole of it.
+import accountdelete as accountdelete_package  # noqa: E402
+
+accountdelete_package.register(
+    app,
+    require_auth=require_auth,
+    get_db=get_db,
+    bad_request=bad_request,
+    protected=lambda username: is_owner(username) or any(
+        str(username).casefold() == name.casefold() for name in CO_OWNER_USERNAMES),
+    find_open_trade=lambda db, user_id: _trade_find_open(db, user_id),
+    gold_delta=lambda db, user_id, slot, delta, reason, detail="": gold_delta(db, user_id, slot, delta, reason, detail),
+    bank_gold_delta=lambda db, user_id, delta, reason, detail="": bank_gold_delta(db, user_id, delta, reason, detail),
+    lusion_delta=lambda db, user_id, slot, delta, reason, detail="": lusion_delta(db, user_id, slot, delta, reason, detail),
+    fix_party=lambda db, party_id: parties.data.fix(db, party_id),
+    drop_guild=lambda db, guild_id: guilds.data.drop_guild(db, guild_id),
+    log_guild_event=lambda db, guild_id, kind, actor: guilds.data.log_guild_event(db, guild_id, kind, actor),
+    take_down_line=lambda db, row, now: chat.data.take_down(db, row, now),
+    record_login_attempt=lambda db, username, ip, ok, reason="": _record_login_attempt(db, username, ip, ok, reason),
+    client_ip=lambda: client_ip(),
+    log_staff_action=lambda actor, action, target_name, target_id=None, detail="": log_staff_action(
+        actor, action, target_name, target_id, detail),
 )
 
 

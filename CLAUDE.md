@@ -2923,6 +2923,54 @@ went to everybody in the area, wherever they stood: n players, n x n steps.
   caught: everyone near, no far edge, the leader held to near, no party,
   attacks or steps to the whole room. test_serverhealth.py, the "on" verdict.
 
+## Deleting your own account (game 0.90.0)
+
+The owner, of a database diagram (every table, Chen notation) that showed no
+way to remove an account: "lets fix all of those". Nothing in the server had
+ever removed a user row; before launch players will ask, and some privacy laws
+give them the right. `accountdelete/` (routes, services, data), POST
+/api/account/delete, Options > Account > Delete account... in the game.
+
+- **The row stays, emptied.** A bare `DELETE FROM users` would cascade through
+  two things that are other people's: a finished trade (the other player's
+  record - a moderator reads it when somebody says they were scammed) and the
+  gold and lusion ledgers (the supply's history). So every row that is the
+  player's is deleted (`data.OWN_TABLES`, then saves, accounts, friends and
+  ignores and party invitations both ways, their sign-in record), and the users
+  row keeps its id, its creation time and `services.stand_in_name()`: "deleted
+  player #12" - unique, and outside USERNAME_PATTERN, so nobody can sign up as
+  it - with `password_hash` '!' (no password matches it), no address, and
+  `users.deleted_at` set. The old name is free again.
+- **The money first**, through `gold_delta()`, `bank_gold_delta()` and
+  `lusion_delta()` under `account-deleted`, so `gold_supply()` still balances.
+- **Kept, with the name taken out**: the staff log (and one `account_deleted`
+  line, in the moderation group, saying what was burned), chat reports, the
+  owner's gifts ledger and the guild's history. Their chat lines are taken off
+  every screen (a `chat_deletions` row each, as a mod's delete) and out of the
+  table; a picture only they put up goes, one somebody else also put up stays.
+- **The guild and the party are left as leaving leaves them**: the last one
+  out takes the guild; a party goes on with exactly one leader (parties/'s
+  `fix()`).
+- **Asked three times**: the name typed (400), the password (401, counted as a
+  failed login, as the email route counts one), and the game's second press.
+  Refused while an open trade names them (409), while they lead a guild with
+  others in it (409: hand it on, as leaving asks), and for the owner and the
+  co-owners (403). The write lock is taken: the burns read then move balances.
+- **Signed out everywhere**: sessions, ended sessions, trusted devices and
+  presence tickets go, so presence.py drops the socket on its next sweep.
+- **The two tables with no foreign keys have them now** (`chat/schema.py`):
+  `ignores` (both sides) and `chat_image_holders` (the picture and the
+  account), ON DELETE CASCADE. SQLite cannot add a foreign key to a table that
+  exists, so `_with_foreign_keys()` rebuilds one made before, once, keeping
+  every row whose ends exist. The diagram had them as the only "who links to
+  whom" tables the database did not hold to their accounts.
+- **Backups still hold a deleted account** for as long as backups are kept
+  (`backup_db.py`); a restore would bring it back. That is the honest limit.
+- test_accountdelete.py (AD-1 to AD-4; six sabotages caught: no gold burn, no
+  password check, the staff log keeping the name, sessions kept, a bare DELETE
+  of the row, the party not fixed); test_packages.py (the refusals on a bare
+  app).
+
 ## Layout
 
 ```

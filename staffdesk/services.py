@@ -33,6 +33,8 @@ STAFF_ACTION_KINDS = (
     "receipts",
     # 0.74.0: an economy rule set or put back to the game's own (economyrules/).
     "economy_rule",
+    # 0.90.0: a player deleted their own account (accountdelete/).
+    "account_deleted",
 )
 
 # NAMED SETS OF KINDS the log can be asked for by one name (?action=moderation).
@@ -50,7 +52,7 @@ STAFF_ACTION_GROUPS = {
     # rolled back before" is exactly what a mod reading their record asks.
     "moderation": ("ban", "unban", "kick", "warn", "note", "role", "chat_delete",
                    "mute", "unmute", "report", "guild_rename", "guild_disband",
-                   "give", "rollback", "player_level"),
+                   "give", "rollback", "player_level", "account_deleted"),
 }
 
 # WRITTEN FOR THE PEOPLE WHO CAN ACT ON THE ACCOUNT, NOT FOR THE ACCOUNT.

@@ -81,6 +81,7 @@ import economywatch  # noqa: E402
 import serverhealth  # noqa: E402
 import clienterrors  # noqa: E402
 import clienterrors.schema as clienterrors_schema  # noqa: E402
+import accountdelete  # noqa: E402
 
 # Found, not listed: what app.py imports that has a routes.py (codemap.py).
 PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
@@ -89,7 +90,7 @@ RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathe
             "chat", "trade", "kingdom", "world", "moderation", "staffdesk", "equipment", "consuming",
             "death", "bank", "carry", "skills", "saves", "status", "shop", "players", "switches", "kill",
             "ownertools", "accountsettings", "auth", "larder", "smith", "economyrules", "economywatch",
-            "serverhealth", "clienterrors")
+            "serverhealth", "clienterrors", "accountdelete")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -1313,6 +1314,19 @@ def bare_app(name):
         clienterrors_schema.create(made)
     clienterrors.register(app, require_auth=require_auth, require_owner=owner_or_co, get_db=get_db,
                           bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400))
+
+    # accountdelete/ (0.90.0): registered with stand-ins; the bare database has
+    # few of the tables a deletion empties, so the refusals are asked here and
+    # the deletion itself in test_accountdelete.py.
+    accountdelete.register(
+        app, require_auth=require_auth, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+        protected=lambda username: username == "boss", find_open_trade=lambda db, user_id: None,
+        gold_delta=lambda *a, **k: None, bank_gold_delta=lambda *a, **k: None, lusion_delta=lambda *a, **k: None,
+        fix_party=lambda db, party_id: None, drop_guild=lambda db, guild_id: None,
+        log_guild_event=lambda *a, **k: None, take_down_line=lambda *a, **k: None,
+        record_login_attempt=lambda db, username, ip, ok, reason="": app.config.setdefault("attempts", []).append(reason),
+        client_ip=lambda: "127.0.0.1", log_staff_action=lambda *a, **k: None)
     return app, said, logged, path
 
 
@@ -1736,7 +1750,9 @@ check("a bare app has the packages' routes and nothing else",
                        # serverhealth/ (0.78.0)
                        "/api/server/health",
                        # clienterrors/ (0.88.0)
-                       "/api/client/errors", "/api/server/client-errors"]), rules)
+                       "/api/client/errors", "/api/server/client-errors",
+                       # accountdelete/ (0.90.0)
+                       "/api/account/delete"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -4483,6 +4499,16 @@ check("  a player gets the bare 404 for the list; no login, neither",
       client_a.get("/api/server/client-errors", headers=who("ann")).status_code == 404
       and client_a.get("/api/server/client-errors").status_code == 401
       and client_a.post("/api/client/errors", json={}).status_code == 401)
+
+# DELETING YOUR OWN ACCOUNT (0.90.0): accountdelete/'s refusals, on the bare app.
+res_name = client_a.post("/api/account/delete", headers=who("ann"), json={"confirm": "bob", "password": "x"})
+res_owner = client_a.post("/api/account/delete", headers=who("boss"), json={"confirm": "boss", "password": "x"})
+res_pass = client_a.post("/api/account/delete", headers=who("ann"), json={"confirm": "ANN", "password": "wrong"})
+check("account delete: the wrong name typed is a 400, the owner a 403, the wrong password a 401 and counted",
+      res_name.status_code == 400 and res_owner.status_code == 403 and res_pass.status_code == 401
+      and app_a.config.get("attempts") == ["bad-password-on-delete"], (res_name.status_code, res_owner.status_code,
+                                                         res_pass.status_code))
+check("  and nobody without a login gets in", client_a.post("/api/account/delete", json={}).status_code == 401)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")

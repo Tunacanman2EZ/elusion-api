@@ -121,11 +121,15 @@ SCHEMA = """
         -- only remembers the first. The second uploader still has to be able
         -- to see and send what they uploaded - see WHO MAY SEE A PICTURE.
         -- Removed with the picture (eviction, or a mod deleting its last line).
+        -- Both ends are foreign keys (game 0.90.0): a picture or an account
+        -- that goes takes its holder rows with it.
         CREATE TABLE IF NOT EXISTS chat_image_holders (
             image_id   TEXT    NOT NULL,
             user_id    INTEGER NOT NULL,
             created_at INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (image_id, user_id)
+            PRIMARY KEY (image_id, user_id),
+            FOREIGN KEY (image_id) REFERENCES chat_images(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id)  REFERENCES users(id)       ON DELETE CASCADE
         );
 
         -- A DELETION IS AN EVENT, AND THE FEED HAD NO WAY TO CARRY ONE.
@@ -179,11 +183,15 @@ SCHEMA = """
         -- per pair, directional: user_id is the one who ignores. Their lines
         -- are left out of every read of mine; their whispers, friend requests
         -- and trades to me are refused.
+        -- Both sides are foreign keys (game 0.90.0): either account going
+        -- takes the row with it.
         CREATE TABLE IF NOT EXISTS ignores (
             user_id    INTEGER NOT NULL,
             ignored_id INTEGER NOT NULL,
             created_at INTEGER NOT NULL,
-            PRIMARY KEY (user_id, ignored_id)
+            PRIMARY KEY (user_id, ignored_id),
+            FOREIGN KEY (user_id)    REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (ignored_id) REFERENCES users(id) ON DELETE CASCADE
         );
 """
 
@@ -230,3 +238,52 @@ def upgrade(db, add_column):
     # and must not grow a join, and a line is what somebody looked like when
     # they said it. NULL on an old line: never chose, drawn as the default.
     add_column(db, "chat_messages", "name_hue", "INTEGER")
+
+    # THE TWO TABLES THAT HAD NO FOREIGN KEYS (game 0.90.0). The database
+    # diagram showed them as the only "who links to whom" tables the database
+    # did not hold to their accounts, so a row could outlive both ends. SQLite
+    # cannot add a foreign key to a table that exists, so a table made before
+    # this is rebuilt once: the same columns and key, with the foreign keys,
+    # keeping every row whose ends still exist (one whose ends are gone was
+    # already pointing at nothing).
+    _with_foreign_keys(db, "ignores", REBUILT["ignores"],
+                       "SELECT user_id, ignored_id, created_at FROM ignores"
+                       " WHERE user_id IN (SELECT id FROM users) AND ignored_id IN (SELECT id FROM users)")
+    _with_foreign_keys(db, "chat_image_holders", REBUILT["chat_image_holders"],
+                       "SELECT image_id, user_id, created_at FROM chat_image_holders"
+                       " WHERE user_id IN (SELECT id FROM users) AND image_id IN (SELECT id FROM chat_images)")
+
+
+# The two tables as SCHEMA makes them, for the rebuild (the same words).
+REBUILT = {
+    "ignores": """CREATE TABLE ignores_rebuilt (
+            user_id    INTEGER NOT NULL,
+            ignored_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (user_id, ignored_id),
+            FOREIGN KEY (user_id)    REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (ignored_id) REFERENCES users(id) ON DELETE CASCADE
+        )""",
+    "chat_image_holders": """CREATE TABLE chat_image_holders_rebuilt (
+            image_id   TEXT    NOT NULL,
+            user_id    INTEGER NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (image_id, user_id),
+            FOREIGN KEY (image_id) REFERENCES chat_images(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id)  REFERENCES users(id)       ON DELETE CASCADE
+        )""",
+}
+
+
+def _with_foreign_keys(db, table, create_rebuilt, keep_rows):
+    """Rebuild `table` with its foreign keys if it has none - once; a table
+    that has them is left alone. db.execute only (inside init_db()'s one
+    migration transaction). Returns True when it rebuilt."""
+    if db.execute("PRAGMA foreign_key_list(%s)" % table).fetchall():
+        return False
+    db.execute("DROP TABLE IF EXISTS %s_rebuilt" % table)
+    db.execute(create_rebuilt)
+    db.execute("INSERT INTO %s_rebuilt %s" % (table, keep_rows))
+    db.execute("DROP TABLE %s" % table)
+    db.execute("ALTER TABLE %s_rebuilt RENAME TO %s" % (table, table))
+    return True

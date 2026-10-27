@@ -4,7 +4,7 @@
    "table",
    "users",
    "users",
-   "CREATE TABLE users (\n            id            INTEGER PRIMARY KEY AUTOINCREMENT,\n            username      TEXT    NOT NULL UNIQUE COLLATE NOCASE,\n            password_hash TEXT    NOT NULL,\n            role          TEXT    NOT NULL DEFAULT 'player'\n                          CHECK (role IN ('player', 'mod', 'dev')),\n            is_banned      INTEGER NOT NULL DEFAULT 0,\n            -- NULL with is_banned = 1 means permanent. See the migration.\n            ban_expires_at INTEGER,\n            ban_reason     TEXT    NOT NULL DEFAULT '',\n            banned_by      TEXT    NOT NULL DEFAULT '',\n            banned_at      INTEGER NOT NULL DEFAULT 0,\n            created_at    INTEGER NOT NULL\n        , email TEXT NOT NULL DEFAULT '', email_verified INTEGER NOT NULL DEFAULT 0, last_chat_at INTEGER NOT NULL DEFAULT 0, chat_tokens REAL NOT NULL DEFAULT 8.0, last_world_image_at INTEGER NOT NULL DEFAULT 0, deaths INTEGER NOT NULL DEFAULT 0, name_hue INTEGER, last_image_at INTEGER NOT NULL DEFAULT 0, failed_logins INTEGER NOT NULL DEFAULT 0, lockout_until INTEGER NOT NULL DEFAULT 0, chat_muted_until INTEGER NOT NULL DEFAULT 0, chat_mute_reason TEXT NOT NULL DEFAULT '', chat_muted_by TEXT NOT NULL DEFAULT '')"
+   "CREATE TABLE users (\n            id            INTEGER PRIMARY KEY AUTOINCREMENT,\n            username      TEXT    NOT NULL UNIQUE COLLATE NOCASE,\n            password_hash TEXT    NOT NULL,\n            role          TEXT    NOT NULL DEFAULT 'player'\n                          CHECK (role IN ('player', 'mod', 'dev')),\n            is_banned      INTEGER NOT NULL DEFAULT 0,\n            -- NULL with is_banned = 1 means permanent. See the migration.\n            ban_expires_at INTEGER,\n            ban_reason     TEXT    NOT NULL DEFAULT '',\n            banned_by      TEXT    NOT NULL DEFAULT '',\n            banned_at      INTEGER NOT NULL DEFAULT 0,\n            created_at    INTEGER NOT NULL\n        , email TEXT NOT NULL DEFAULT '', email_verified INTEGER NOT NULL DEFAULT 0, last_chat_at INTEGER NOT NULL DEFAULT 0, chat_tokens REAL NOT NULL DEFAULT 8.0, last_world_image_at INTEGER NOT NULL DEFAULT 0, deaths INTEGER NOT NULL DEFAULT 0, name_hue INTEGER, last_image_at INTEGER NOT NULL DEFAULT 0, failed_logins INTEGER NOT NULL DEFAULT 0, lockout_until INTEGER NOT NULL DEFAULT 0, chat_muted_until INTEGER NOT NULL DEFAULT 0, chat_mute_reason TEXT NOT NULL DEFAULT '', chat_muted_by TEXT NOT NULL DEFAULT '', deleted_at INTEGER NOT NULL DEFAULT 0)"
   ],
   [
    "index",
@@ -658,7 +658,7 @@
    "table",
    "chat_image_holders",
    "chat_image_holders",
-   "CREATE TABLE chat_image_holders (\n            image_id   TEXT    NOT NULL,\n            user_id    INTEGER NOT NULL,\n            created_at INTEGER NOT NULL DEFAULT 0,\n            PRIMARY KEY (image_id, user_id)\n        )"
+   "CREATE TABLE chat_image_holders (\n            image_id   TEXT    NOT NULL,\n            user_id    INTEGER NOT NULL,\n            created_at INTEGER NOT NULL DEFAULT 0,\n            PRIMARY KEY (image_id, user_id),\n            FOREIGN KEY (image_id) REFERENCES chat_images(id) ON DELETE CASCADE,\n            FOREIGN KEY (user_id)  REFERENCES users(id)       ON DELETE CASCADE\n        )"
   ],
   [
    "index",
@@ -682,7 +682,7 @@
    "table",
    "ignores",
    "ignores",
-   "CREATE TABLE ignores (\n            user_id    INTEGER NOT NULL,\n            ignored_id INTEGER NOT NULL,\n            created_at INTEGER NOT NULL,\n            PRIMARY KEY (user_id, ignored_id)\n        )"
+   "CREATE TABLE ignores (\n            user_id    INTEGER NOT NULL,\n            ignored_id INTEGER NOT NULL,\n            created_at INTEGER NOT NULL,\n            PRIMARY KEY (user_id, ignored_id),\n            FOREIGN KEY (user_id)    REFERENCES users(id) ON DELETE CASCADE,\n            FOREIGN KEY (ignored_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
   ],
   [
    "index",
@@ -1663,7 +1663,28 @@
      0
     ]
    ],
-   "foreign_keys": [],
+   "foreign_keys": [
+    [
+     0,
+     0,
+     "users",
+     "user_id",
+     "id",
+     "NO ACTION",
+     "CASCADE",
+     "NONE"
+    ],
+    [
+     1,
+     0,
+     "chat_images",
+     "image_id",
+     "id",
+     "NO ACTION",
+     "CASCADE",
+     "NONE"
+    ]
+   ],
    "index_info": {
     "sqlite_autoindex_chat_image_holders_1": [
      [
@@ -3697,7 +3718,28 @@
      0
     ]
    ],
-   "foreign_keys": [],
+   "foreign_keys": [
+    [
+     0,
+     0,
+     "users",
+     "ignored_id",
+     "id",
+     "NO ACTION",
+     "CASCADE",
+     "NONE"
+    ],
+    [
+     1,
+     0,
+     "users",
+     "user_id",
+     "id",
+     "NO ACTION",
+     "CASCADE",
+     "NONE"
+    ]
+   ],
    "index_info": {
     "sqlite_autoindex_ignores_1": [
      [
@@ -6813,6 +6855,14 @@
      "TEXT",
      1,
      "''",
+     0
+    ],
+    [
+     23,
+     "deleted_at",
+     "INTEGER",
+     1,
+     "0",
      0
     ]
    ],
