@@ -518,6 +518,18 @@
   ],
   [
    "table",
+   "loot_chest_items",
+   "loot_chest_items",
+   "CREATE TABLE loot_chest_items (\n            user_id  INTEGER NOT NULL,\n            slot     INTEGER NOT NULL,\n            game     TEXT    NOT NULL,\n            position INTEGER NOT NULL,\n            item_id  TEXT    NOT NULL,\n            quantity INTEGER NOT NULL CHECK (quantity > 0),\n            PRIMARY KEY (user_id, slot, game, position),\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
+  ],
+  [
+   "index",
+   "sqlite_autoindex_loot_chest_items_1",
+   "loot_chest_items",
+   null
+  ],
+  [
+   "table",
    "presence_tickets",
    "presence_tickets",
    "CREATE TABLE presence_tickets (\n            token_hash   TEXT    PRIMARY KEY,\n            session_hash TEXT    NOT NULL,\n            user_id      INTEGER NOT NULL,\n            slot         INTEGER NOT NULL,\n            identity     TEXT    NOT NULL,\n            issued_at    INTEGER NOT NULL,\n            expires_at   INTEGER NOT NULL,\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
@@ -911,6 +923,18 @@
    "sqlite_autoindex_minigame_entries_1",
    "minigame_entries",
    null
+  ],
+  [
+   "table",
+   "minigame_kills",
+   "minigame_kills",
+   "CREATE TABLE minigame_kills (\n            id        INTEGER PRIMARY KEY AUTOINCREMENT,\n            user_id   INTEGER NOT NULL,\n            slot      INTEGER NOT NULL,\n            game      TEXT    NOT NULL,\n            enemy_id  TEXT    NOT NULL,\n            boss      INTEGER NOT NULL DEFAULT 0,\n            at        INTEGER NOT NULL,\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
+  ],
+  [
+   "index",
+   "idx_minigame_kills_user",
+   "minigame_kills",
+   "CREATE INDEX idx_minigame_kills_user ON minigame_kills(user_id, game, at)"
   ],
   [
    "index",
@@ -4320,6 +4344,102 @@
     ]
    ]
   },
+  "loot_chest_items": {
+   "columns": [
+    [
+     0,
+     "user_id",
+     "INTEGER",
+     1,
+     null,
+     1
+    ],
+    [
+     1,
+     "slot",
+     "INTEGER",
+     1,
+     null,
+     2
+    ],
+    [
+     2,
+     "game",
+     "TEXT",
+     1,
+     null,
+     3
+    ],
+    [
+     3,
+     "position",
+     "INTEGER",
+     1,
+     null,
+     4
+    ],
+    [
+     4,
+     "item_id",
+     "TEXT",
+     1,
+     null,
+     0
+    ],
+    [
+     5,
+     "quantity",
+     "INTEGER",
+     1,
+     null,
+     0
+    ]
+   ],
+   "foreign_keys": [
+    [
+     0,
+     0,
+     "users",
+     "user_id",
+     "id",
+     "NO ACTION",
+     "CASCADE",
+     "NONE"
+    ]
+   ],
+   "index_info": {
+    "sqlite_autoindex_loot_chest_items_1": [
+     [
+      0,
+      0,
+      "user_id"
+     ],
+     [
+      1,
+      1,
+      "slot"
+     ],
+     [
+      2,
+      2,
+      "game"
+     ],
+     [
+      3,
+      3,
+      "position"
+     ]
+    ]
+   },
+   "indexes": [
+    [
+     "sqlite_autoindex_loot_chest_items_1",
+     1,
+     "pk",
+     0
+    ]
+   ]
+  },
   "lusion_ledger": {
    "columns": [
     [
@@ -4503,6 +4623,105 @@
      "sqlite_autoindex_minigame_entries_1",
      1,
      "pk",
+     0
+    ]
+   ]
+  },
+  "minigame_kills": {
+   "columns": [
+    [
+     0,
+     "id",
+     "INTEGER",
+     0,
+     null,
+     1
+    ],
+    [
+     1,
+     "user_id",
+     "INTEGER",
+     1,
+     null,
+     0
+    ],
+    [
+     2,
+     "slot",
+     "INTEGER",
+     1,
+     null,
+     0
+    ],
+    [
+     3,
+     "game",
+     "TEXT",
+     1,
+     null,
+     0
+    ],
+    [
+     4,
+     "enemy_id",
+     "TEXT",
+     1,
+     null,
+     0
+    ],
+    [
+     5,
+     "boss",
+     "INTEGER",
+     1,
+     "0",
+     0
+    ],
+    [
+     6,
+     "at",
+     "INTEGER",
+     1,
+     null,
+     0
+    ]
+   ],
+   "foreign_keys": [
+    [
+     0,
+     0,
+     "users",
+     "user_id",
+     "id",
+     "NO ACTION",
+     "CASCADE",
+     "NONE"
+    ]
+   ],
+   "index_info": {
+    "idx_minigame_kills_user": [
+     [
+      0,
+      1,
+      "user_id"
+     ],
+     [
+      1,
+      3,
+      "game"
+     ],
+     [
+      2,
+      6,
+      "at"
+     ]
+    ]
+   },
+   "indexes": [
+    [
+     "idx_minigame_kills_user",
+     0,
+     "c",
      0
     ]
    ]

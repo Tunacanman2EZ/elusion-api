@@ -171,8 +171,8 @@ def keep_copy(db, user_id, slot, row, gold, now, snapshot, kept):
 def drop(db, user_id, slot):
     """
     Every row of the character's own: its carry, skills, heal grants, save
-    history and kill record, its loot bags (loot_bag_items cascades), and last
-    the save itself.
+    history and kill record, its loot bags (loot_bag_items cascades), its
+    minigame chests (0.93.4), and last the save itself.
 
     AND ITS SAVE HISTORY: a snapshot names a slot, not a character, and the
     next character made in this slot is somebody else. The copy keep_copy()
@@ -188,6 +188,9 @@ def drop(db, user_id, slot):
                   "food_buffs", "smith_ranks"):
         db.execute("DELETE FROM %s WHERE user_id = ? AND slot = ?" % table, (user_id, slot))
     db.execute("DELETE FROM loot_bags WHERE user_id = ? AND slot = ?", (user_id, slot))
+    # Its minigame chests (game 0.93.4, loot/'s): a character made in the slot
+    # later must not find them.
+    db.execute("DELETE FROM loot_chest_items WHERE user_id = ? AND slot = ?", (user_id, slot))
     db.execute("DELETE FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot))
 
 

@@ -1,5 +1,5 @@
-"""loot/data.py - the SQL. loot_bags and loot_bag_items are this package's
-tables (schema.py). Everything that reads or writes them is here, but for one
+"""loot/data.py - the SQL. loot_bags, loot_bag_items and loot_chest_items are
+this package's tables (schema.py). Everything that reads or writes them is here, but for one
 delete: app.py's character_delete() clears a character's bags with the rest of
 it. No commits: the take's commit is its route's, a new bag's is the kill's."""
 
@@ -65,3 +65,59 @@ def contents(db, bag_id):
         "SELECT position, item_id, quantity FROM loot_bag_items WHERE bag_id = ? ORDER BY position",
         (bag_id,),
     ).fetchall()
+
+
+# =============================================================================
+# A MINIGAME'S CHEST (game 0.93.4) - loot_chest_items, scoped to the account
+# =============================================================================
+
+def chest_contents(db, user_id, slot, game):
+    """What is in one chest, cell by cell."""
+    return db.execute(
+        "SELECT position, item_id, quantity FROM loot_chest_items"
+        " WHERE user_id = ? AND slot = ? AND game = ? ORDER BY position",
+        (int(user_id), int(slot), str(game)),
+    ).fetchall()
+
+
+def chest_write(db, user_id, slot, game, cells):
+    """The chest as `cells` ({position: [item_id, quantity]}), every row
+    rewritten: it holds at most CHEST_CELLS."""
+    db.execute("DELETE FROM loot_chest_items WHERE user_id = ? AND slot = ? AND game = ?",
+               (int(user_id), int(slot), str(game)))
+    db.executemany(
+        "INSERT INTO loot_chest_items (user_id, slot, game, position, item_id, quantity)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        [(int(user_id), int(slot), str(game), int(cell), held[0], int(held[1]))
+         for cell, held in sorted(cells.items())],
+    )
+
+
+def chest_cell(db, user_id, slot, game, position):
+    """(item_id, quantity) in that cell of the chest, or None."""
+    return db.execute(
+        "SELECT item_id, quantity FROM loot_chest_items"
+        " WHERE user_id = ? AND slot = ? AND game = ? AND position = ?",
+        (int(user_id), int(slot), str(game), int(position)),
+    ).fetchone()
+
+
+def chest_empty_cell(db, user_id, slot, game, position):
+    db.execute(
+        "DELETE FROM loot_chest_items WHERE user_id = ? AND slot = ? AND game = ? AND position = ?",
+        (int(user_id), int(slot), str(game), int(position)),
+    )
+
+
+def chest_left(db, user_id, slot, game):
+    """How many cells of the chest still hold something."""
+    return db.execute(
+        "SELECT COUNT(*) FROM loot_chest_items WHERE user_id = ? AND slot = ? AND game = ?",
+        (int(user_id), int(slot), str(game)),
+    ).fetchone()[0]
+
+
+def chests_clear(db, user_id, game):
+    """Every one of the account's chests for that minigame, emptied (its next
+    Go)."""
+    db.execute("DELETE FROM loot_chest_items WHERE user_id = ? AND game = ?", (int(user_id), str(game)))

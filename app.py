@@ -1861,9 +1861,10 @@ def init_db():
         --
         -- WHY IT IS A QUEUE AND NOT A PUSH. The server has no socket to the
         -- game; the client asks. So a teleport is recorded here and collected
-        -- on the next poll, which also means it survives the player being
-        -- offline at the moment it was issued - they arrive where they were
-        -- sent, whenever they next turn up.
+        -- on the next poll. But only for TELEPORT_KEEP_SECONDS, and only for
+        -- somebody online when it was issued (game 0.93.4): it used to wait
+        -- for ever, and "everyone" queued every account, so a player who
+        -- signed in days later was moved on arrival.
         --
         -- slot_index and group_size are how the spacing is agreed. Every
         -- client computes the same offset from the same pair, so a group
@@ -4866,6 +4867,15 @@ def friend_entry(row, presence, now):
 # circle is radius 7 - with room to spare so nobody is nudged on arrival.
 TELEPORT_SPACING = 48.0
 
+# HOW LONG A TELEPORT WAITS TO BE COLLECTED (game 0.93.4). The owner: "i
+# teleported player then another player logged in and they were ported". A
+# teleport waited for ever, and "everyone" queued one for every account, online
+# or not - so whoever signed in next, days later, was moved on arrival. Now
+# only somebody online is moved (ownertools/ asks), and a move not collected
+# within this is forgotten: an online game polls every ten seconds, so two
+# minutes is twelve polls, and a stale row is never read.
+TELEPORT_KEEP_SECONDS = 120
+
 
 def teleport_ring_for_slot(index):
     """Which hex ring a slot falls on. Slot 0 is the centre, ring 0."""
@@ -4901,7 +4911,9 @@ def teleport_offset(index):
 
 
 def queue_teleport(db, user_id, area, x, y, slot_index, group_size, by, now):
-    """Record one pending move, replacing anything already waiting for them."""
+    """Record one pending move, replacing anything already waiting for them -
+    and forgetting every move nobody collected in TELEPORT_KEEP_SECONDS."""
+    db.execute("DELETE FROM pending_teleports WHERE issued_at < ?", (int(now) - TELEPORT_KEEP_SECONDS,))
     db.execute(
         """
         INSERT INTO pending_teleports
@@ -4924,8 +4936,11 @@ def queue_teleport(db, user_id, area, x, y, slot_index, group_size, by, now):
 def pending_teleport_for(user_id):
     """What this player should be told to do, or None. Shaped for the client."""
     try:
+        # Only a move issued in the last TELEPORT_KEEP_SECONDS: an older one is
+        # read as none (a GET writes nothing; the next queue prunes it).
         row = get_db().execute(
-            "SELECT * FROM pending_teleports WHERE user_id = ?", (user_id,)
+            "SELECT * FROM pending_teleports WHERE user_id = ? AND issued_at >= ?",
+            (user_id, int(time.time()) - TELEPORT_KEEP_SECONDS),
         ).fetchone()
     except sqlite3.OperationalError:
         return None
@@ -8701,6 +8716,8 @@ _LOOT = loot.register(
     status_of=status_payload,
     inventory_of=inventory_payload,
     bag_cells=INVENTORY_CAPACITY,
+    # What a full minigame chest keeps (game 0.93.4): the bag's own order.
+    loot_rank=gamedata.loot_rank,
 )
 _create_loot_bag = _LOOT.create_bag
 
@@ -8964,12 +8981,31 @@ clienterrors_package.register(
 # is left. The owner and a co-owner skip it. minigames/__init__.py has the rest.
 import minigames as minigames_package  # noqa: E402
 
+# AND THE ENDLESS'S CHEST (game 0.93.4): POST /api/minigames/kill rolls an
+# Endless elite's or boss's own loot - no XP - into the character's chest,
+# loot/'s, and the next Go empties it. Handed the roll (the catalogue), the
+# chest (loot/, above), the materials' scale and the mythic notice (kill/'s).
+def _class_of(db, user_id, slot):
+    row = kill_package.data.character(db, user_id, slot)
+    return row["class_id"] if row is not None else None
+
+
 minigames_package.register(
     app,
     require_auth=require_auth,
     get_db=get_db,
     bad_request=bad_request,
     skips_wait=has_owner_powers,
+    parse_slot=parse_slot,
+    max_slot=MAX_SLOT,
+    catalogue=gamedata,
+    class_of=_class_of,
+    material_scale=lambda db: economyrules.value(db, "material_drop_scale"),
+    store_in_chest=_LOOT.store_in_chest,
+    clear_chests=_LOOT.clear_chests,
+    post_broadcast=post_broadcast,
+    mythic_text=lambda username, item_id, enemy_id: kill_package.mythic_find_text(gamedata, username, item_id, enemy_id),
+    mythic_kind=kill_package.MYTHIC_BROADCAST_KIND,
 )
 
 

@@ -223,6 +223,8 @@ def bare_app(name):
         " PRIMARY KEY (user_id, slot, skill_id));"
         "CREATE TABLE loot_bags (bag_id TEXT PRIMARY KEY, user_id INTEGER, slot INTEGER, enemy_id TEXT, created_at INTEGER);"
         "CREATE TABLE loot_bag_items (bag_id TEXT, position INTEGER, item_id TEXT, quantity INTEGER);"
+        "CREATE TABLE loot_chest_items (user_id INTEGER, slot INTEGER, game TEXT, position INTEGER, item_id TEXT,"
+        " quantity INTEGER, PRIMARY KEY (user_id, slot, game, position));"
         "CREATE TABLE kill_tally (user_id INTEGER, slot INTEGER, enemy_id TEXT, kills INTEGER, first_at INTEGER,"
         " last_at INTEGER, PRIMARY KEY (user_id, slot, enemy_id));"
         "CREATE TABLE friends (requester_id INTEGER, addressee_id INTEGER, state TEXT DEFAULT 'pending',"
@@ -401,7 +403,8 @@ def bare_app(name):
     app.config["loot"] = loot.register(app, require_auth=require_auth, get_db=get_db,
                   bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
                   parse_stat=parse_stat,
-                  item_row={"smallhealthpotion": {"type_name": "CONSUMABLE"}, "silvercoin": {"type_name": "CURRENCY"},
+                  item_row={"smallhealthpotion": {"type_name": "CONSUMABLE", "stackable": True, "max_stack": 20},
+                            "silvercoin": {"type_name": "CURRENCY", "stackable": True, "max_stack": 9999},
                             "petmage": {"type_name": "PET"}}.get,
                   owns_item=lambda user_id, slot, item_id: any(i == item_id for i, _q in carried(user_id, slot).values()),
                   lusions_item_id="lusions", dupe_pet_lusions=lambda: 20,
@@ -413,7 +416,8 @@ def bare_app(name):
                   status_of=lambda user_id, slot: {"slot": slot},
                   inventory_of=lambda user_id, slot: [{"position": p, "item_id": i, "quantity": q}
                                                       for p, (i, q) in sorted(carried(user_id, slot).items())],
-                  bag_cells=GATHER_CELLS)
+                  bag_cells=GATHER_CELLS,
+                  loot_rank=lambda item_id: {"petmage": 0, "silvercoin": 2}.get(item_id, 1))
 
     # guilds/: the purse and the bank are a column and a dict here, through
     # ledgers that list what was burned and why; the moderation log is a list
@@ -1323,9 +1327,33 @@ def bare_app(name):
     # minigames/ (0.93.3): its table made here, as init_db() makes it.
     with sqlite3.connect(path) as made:
         minigames_schema.create(made)
+    # And the Endless's chest (0.93.4): a stand-in catalogue - two elites,
+    # one boss, a roll of a potion and a silver coin (a pet off the boss) -
+    # and a schedule of one elite wave a minute and one alive, so the
+    # ceiling is two elites in the first minute; the chest is loot/'s above.
+    endless_roll = {"lightsprite": [{"item_id": "smallhealthpotion", "quantity": 1},
+                                    {"item_id": "silvercoin", "quantity": 3}],
+                    "lightboss": [{"item_id": "petmage", "quantity": 1}]}
     minigames.register(app, require_auth=require_auth, get_db=get_db,
                        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
-                       skips_wait=lambda name: name in owners)
+                       skips_wait=lambda name: name in owners,
+                       parse_slot=lambda raw: raw if isinstance(raw, int) and 0 <= raw <= 3 else None,
+                       max_slot=3,
+                       catalogue=types.SimpleNamespace(
+                           ENDLESS={"stage_seconds": 60, "boss_every": 5, "alive_most": 1,
+                                    "elites": ["lightsprite"], "bosses": ["lightboss"],
+                                    "stages": [{"gap": 60, "wave": 1}] * 30},
+                           ENEMIES={"lightsprite": {}, "lightboss": {}, "slime": {}},
+                           roll_kill_rewards=lambda enemy_id, *_a, **_k: {
+                               "contents": [dict(e) for e in endless_roll.get(enemy_id, [])],
+                               "mythic": "", "pet_won": enemy_id == "lightboss", "xp": 9, "attack_xp": 9}),
+                       class_of=lambda _db, _user_id, slot: "warrior" if slot == 0 else None,
+                       material_scale=lambda _db: 1.0,
+                       store_in_chest=app.config["loot"].store_in_chest,
+                       clear_chests=app.config["loot"].clear_chests,
+                       post_broadcast=lambda body, kind="system", by="": None,
+                       mythic_text=lambda username, item_id, enemy_id: "%s found %s" % (username, item_id),
+                       mythic_kind="mythic")
 
     # accountdelete/ (0.90.0): registered with stand-ins; the bare database has
     # few of the tables a deletion empties, so the refusals are asked here and
@@ -1764,7 +1792,9 @@ check("a bare app has the packages' routes and nothing else",
                        # clienterrors/ (0.88.0)
                        "/api/client/errors", "/api/server/client-errors",
                        # minigames/ (0.93.3)
-                       "/api/minigames", "/api/minigames/enter",
+                       "/api/minigames", "/api/minigames/enter", "/api/minigames/kill",
+                       # loot/'s chest (0.93.4)
+                       "/api/loot/chest",
                        # accountdelete/ (0.90.0)
                        "/api/account/delete"]), rules)
 
@@ -3792,6 +3822,14 @@ check("  not in the middle of a trade; nor somebody else's snapshot; nor a numbe
       == "snapshot_id must be a whole number"
       and tool("/api/staff/rollback", {"username": "ann", "snapshot_id": first}, again=False)[0] == 403)
 around("DELETE FROM trades WHERE trade_id = 't-roll'")
+# ONLY SOMEBODY ONLINE IS MOVED (game 0.93.4): ann is away first, then playing.
+around("DELETE FROM sessions WHERE user_id = 2 AND token_hash IS NULL")
+away_code, away_body = tool("/api/staff/teleport", {"username": "ann", "area": "crypt"}, again=False)
+check("a teleport for somebody away is refused, and nothing waits for them",
+      away_code == 409 and "not online" in away_body.get("message", "")
+      and not ann_says("SELECT id FROM pending_teleports WHERE user_id = 2"), (away_code, away_body))
+around("INSERT INTO sessions (user_id, last_seen_at, expires_at) VALUES (?, ?, ?)",
+       [(2, int(time.time()), int(time.time()) + 3600)])
 code, body = tool("/api/staff/teleport", {"username": "ann", "area": "crypt", "x": 5, "y": 6}, again=False)
 moved = ann_says("SELECT id, area, x, y, issued_by FROM pending_teleports WHERE user_id = 2")
 check("a teleport: one player moved, queued for their poll, logged - and no password asked",
@@ -3800,7 +3838,9 @@ check("a teleport: one player moved, queued for their poll, logged - and no pass
       and logged_last("teleport")[2:] == ("ann", "-> crypt (5, 6)"), body)
 code, body = tool("/api/staff/teleport", {"everyone": True, "x": 1, "y": 2}, again=False)
 check("  everyone, by the owner: to his own area, said in the world; a dev may not",
-      code == 200 and body.get("moved") == len(ann_says("SELECT id FROM users")) and body.get("area") == "crypt"
+      code == 200 and body.get("moved") == len(ann_says("SELECT DISTINCT user_id FROM sessions WHERE last_seen_at > ?"
+                                                        " AND expires_at > ?", (int(time.time()) - 45, int(time.time()))))
+      and body.get("moved") < len(ann_says("SELECT id FROM users")) and body.get("area") == "crypt"
       and body.get("spacing") == 48 and told[-1][1] == "Everyone has been moved to crypt."
       and tool("/api/staff/teleport", {"everyone": True}, "bo", again=False)
       == (403, {"error": "Forbidden", "message": "Only the owner or a co-owner may teleport everyone."})
@@ -4525,6 +4565,56 @@ check("  the owner skips the wait; no login, no way in",
       client_a.post("/api/minigames/enter", headers=who("boss"), json={"game": "endless"}).status_code == 200
       and client_a.post("/api/minigames/enter", headers=who("boss"), json={"game": "endless"}).status_code == 200
       and client_a.get("/api/minigames").status_code == 401)
+
+# THE ENDLESS'S CHEST (0.93.4): a kill rolls into the chest, the chest is read
+# and taken from like a bag, the run's schedule is the ceiling, and the next Go
+# empties it. ann went in above; bob never has.
+paid = client_a.post("/api/minigames/kill", headers=who("ann"),
+                     json={"game": "endless", "slot": 0, "enemy_id": "lightsprite"})
+chest = client_a.get("/api/loot/chest?game=endless&slot=0", headers=who("ann")).get_json() or {}
+check("endless: a kill is paid into the chest - the roll, no XP - and the chest reads like a bag",
+      paid.status_code == 200 and paid.get_json().get("used") == 2 and "xp" not in paid.get_json()
+      and chest.get("bag_id") == "chest:endless:0" and chest.get("cells") == 36
+      and [(c["position"], c["item_id"], c["quantity"]) for c in chest.get("contents", [])]
+      == [(0, "smallhealthpotion", 1), (1, "silvercoin", 3)], (paid.status_code, paid.get_json(), chest))
+again = client_a.post("/api/minigames/kill", headers=who("ann"),
+                      json={"game": "endless", "slot": 0, "enemy_id": "lightsprite"})
+over = client_a.post("/api/minigames/kill", headers=who("ann"),
+                     json={"game": "endless", "slot": 0, "enemy_id": "lightsprite"})
+folded = client_a.get("/api/loot/chest?game=endless&slot=0", headers=who("ann")).get_json() or {}
+check("  a second folds onto the same cells; a third is past what the run could have sent (429)",
+      again.status_code == 200 and over.status_code == 429
+      and [(c["item_id"], c["quantity"]) for c in folded.get("contents", [])]
+      == [("smallhealthpotion", 2), ("silvercoin", 6)], (again.status_code, over.status_code, folded))
+boss_kill = client_a.post("/api/minigames/kill", headers=who("ann"),
+                          json={"game": "endless", "slot": 0, "enemy_id": "lightboss"})
+took = client_a.post("/api/loot/take", headers=who("ann"), json={"bag_id": "chest:endless:0", "position": 1})
+check("  a boss counts on its own; a chest's cell is taken by /api/loot/take, the coins into the purse",
+      boss_kill.status_code == 200 and boss_kill.get_json().get("pet_won") is True
+      and took.status_code == 200 and took.get_json().get("credited") == "gold"
+      and took.get_json().get("gold_amount") == 300
+      and 1 not in [c["position"] for c in (client_a.get("/api/loot/chest?game=endless&slot=0",
+                                                          headers=who("ann")).get_json() or {}).get("contents", [])],
+      (boss_kill.status_code, took.status_code, took.get_json()))
+check("  refused: a monster the run never sends (400), an empty slot (404), no Go today (409), a chest "
+      "cell past 35 (400), another account's chest (404)",
+      client_a.post("/api/minigames/kill", headers=who("ann"),
+                    json={"game": "endless", "slot": 0, "enemy_id": "slime"}).status_code == 400
+      and client_a.post("/api/minigames/kill", headers=who("ann"),
+                        json={"game": "endless", "slot": 2, "enemy_id": "lightsprite"}).status_code == 404
+      and client_a.post("/api/minigames/kill", headers=who("bo"),
+                        json={"game": "endless", "slot": 0, "enemy_id": "lightsprite"}).status_code == 409
+      and client_a.post("/api/loot/take", headers=who("ann"),
+                        json={"bag_id": "chest:endless:0", "position": 36}).status_code == 400
+      and client_a.post("/api/loot/take", headers=who("bo"),
+                        json={"bag_id": "chest:endless:0", "position": 0}).status_code == 404
+      and client_a.post("/api/minigames/kill", json={}).status_code == 401)
+client_a.post("/api/minigames/kill", headers=who("boss"), json={"game": "endless", "slot": 0, "enemy_id": "lightsprite"})
+before_go = len(ann_says("SELECT * FROM loot_chest_items WHERE user_id = (SELECT id FROM users WHERE username = 'boss')"))
+client_a.post("/api/minigames/enter", headers=who("boss"), json={"game": "endless"})
+check("  the next Go empties the chest",
+      before_go == 2 and not ann_says("SELECT * FROM loot_chest_items WHERE user_id = "
+                                      "(SELECT id FROM users WHERE username = 'boss')"), before_go)
 
 # DELETING YOUR OWN ACCOUNT (0.90.0): accountdelete/'s refusals, on the bare app.
 res_name = client_a.post("/api/account/delete", headers=who("ann"), json={"confirm": "bob", "password": "x"})

@@ -4,6 +4,9 @@ since 18 Oct; the routes are as they were in app.py).
     POST /api/loot/take   take one cell of a bag: into the backpack, the purse
                           or the lusions
     GET  /api/loot/bag    what is still in a bag
+    GET  /api/loot/chest  what is in your chest for a minigame (game 0.93.4):
+                          the Endless's elites and bosses pay into it, and it
+                          is taken from by /api/loot/take like a bag
 
 THE LAST THING THE CLIENT GOT TO ASSERT. /api/combat/kill already decided what
 dropped, but the bag then existed only in the client's world: it spawned a

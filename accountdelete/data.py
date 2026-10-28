@@ -18,7 +18,7 @@ OWN_TABLES = (
     "trade_holds", "pending_teleports", "presence_tickets", "auth_codes", "account_ips",
     "account_installs", "trusted_devices", "ended_sessions", "sessions",
     "guild_invites", "guild_members", "party_members", "chat_image_holders",
-    "minigame_entries",
+    "minigame_entries", "minigame_kills", "loot_chest_items",
 )
 
 

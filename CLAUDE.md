@@ -3071,6 +3071,68 @@ server first. `minigames/` (routes, services, data, schema):
 - test_minigames.py (MG-1 to MG-5); test_packages.py (the bare app);
   test_accountdelete.py (the row goes with the account).
 
+## A teleport waits two minutes, for somebody online (game 0.93.4)
+
+The owner: "i teleported player then another player logged in and they were
+ported". A pending teleport waited for ever, and Bring everyone queued one for
+every account in `users`, online or not - so whoever signed in next, days
+later, was moved on arrival.
+
+- **Bring everyone moves everyone online** (ownertools/data.py
+  `online_accounts()`: a session heard inside `ONLINE_WINDOW_SECONDS` and still
+  valid).
+- **Bring here on somebody away is a 409** saying they are not online, and
+  queues nothing.
+- **A move not collected in `TELEPORT_KEEP_SECONDS` (120) is forgotten**:
+  `pending_teleport_for()` reads only rows issued since (a GET writes
+  nothing), and `queue_teleport()` deletes the stale ones before it writes. An
+  online game polls every ten seconds; anything left from before this release
+  stops working the moment it is deployed.
+- test_teleport.py ("nobody away is moved"), test_packages.py.
+
+## The Endless's chest: an elite's loot, no XP, held to the run (game 0.93.4)
+
+The owner, 28 Oct: "the goal is to acquire gold so every elite and boss has
+chance for drops from the table"; asked about XP: "Loot only". minigames/ and
+loot/; test_minigames.py MG-6 to MG-10, test_packages.py.
+
+- **`POST /api/minigames/kill {game, slot, enemy_id}`** (minigames/routes.py):
+  an Endless elite or boss the game's player killed. Refused: a game that
+  pays nothing or a monster the run never sends (400), an empty slot (404),
+  no Go inside the day (409), past the ceiling (429). Paid: the monster's own
+  `roll_kill_rewards()` - gold, gear, materials, pet and mythic odds, the
+  owner's material scale - **and nothing else**: no XP, no attack XP, no
+  kill_reports or kill_tally row, no bag, no receipt. A `minigame_kills` row
+  (kept a week), a mythic's notice like the Field's (kill/'s text and kind).
+- **The ceiling is the run's own schedule** (minigames/services.py): the
+  kills since the account's Go against what a run begun at the Go could have
+  sent by now at the biggest party - every stage reached, `ceil(60 / gap) x
+  wave` elites, plus `alive_most` (a run joined part-way may meet that many at
+  once) - and bosses one each `boss_every` stages reached plus one. No run is
+  believed past `STAGES_BELIEVED` (30): a day's most is about 1,400 elites and
+  7 bosses, one long party run's worth. **The schedule is gamedata.json's
+  `"endless"`**, written by the game's exporter from endlessrun.gd
+  `schedule()` (`gamedata.ENDLESS`); a catalogue without it pays no Endless
+  kill. Copy the file across when the game's waves change.
+- **The honest limit**: a modified game could report every kill the
+  schedule allows, inside its Go's day. Once a day caps it.
+- **The chest is loot/'s** (`loot_chest_items`: user_id, slot, game,
+  position): `store_in_chest()` in the kill's own transaction folds what
+  stacks onto its cells, then the lowest free cell; full (`CHEST_CELLS` 36),
+  a find takes the place of the least kept cell only if worth more
+  (`gamedata.loot_rank()` - the bag's rarest_first order - then value), and
+  what loses is `cut`. `GET /api/loot/chest?game=&slot=` reads it; **taking is
+  `/api/loot/take` with `bag_id` "chest:<game>:<slot>"** (`parse_chest_id()`),
+  every query scoped to the caller, no expiry, never dropped. Coins credit
+  the purse through the same `gold_delta()` "loot" as a bag's.
+- **Kept until the account's next Go**: `/api/minigames/enter` empties every
+  chest of the account's for that game in the Go's transaction. Deleting a
+  character empties its chest (saves/data.py `drop()`); deleting the account
+  takes both tables (accountdelete/ OWN_TABLES).
+- **Deploy order: server first.** A 0.93.4 game against an older server gets
+  404s for its Endless kills and an empty chest; an older game never sends
+  them.
+
 ## Layout
 
 ```

@@ -739,6 +739,12 @@ SWEEPS_ALLOWED = [
     # the games' error reports (0.88.0, clienterrors/): every account's past
     # DAYS_KEPT days go on the next report, the server acting on its own clock.
     ("client_errors", "day <", "retention: games' error reports past DAYS_KEPT"),
+    # a teleport not collected in TELEPORT_KEEP_SECONDS (game 0.93.4) is
+    # forgotten for everybody on the next queue: the server's own clock.
+    ("pending_teleports", "issued_at <", "retention: teleports past TELEPORT_KEEP_SECONDS"),
+    # a minigame's paid kills (0.93.4, minigames/): every account's past
+    # KILLS_KEPT_SECONDS go on the next kill, the server's own clock.
+    ("minigame_kills", "at <", "retention: minigame kills past KILLS_KEPT_SECONDS"),
 ]
 
 # THE PACKAGES' WRITES TOO. Since 16 Oct the areas moving out of app.py take

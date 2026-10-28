@@ -957,7 +957,7 @@ def register(app, *, require_auth, require_owner, require_role, require_fresh_pa
               type: object
               properties:
                 username: {type: string, description: "who to move; omit when everyone is true"}
-                everyone: {type: boolean, description: "move every account - owner only"}
+                everyone: {type: boolean, description: "move everyone online - owner only"}
                 area:     {type: string, description: "destination area; defaults to yours"}
                 x:        {type: number}
                 y:        {type: number}
@@ -968,6 +968,8 @@ def register(app, *, require_auth, require_owner, require_role, require_fresh_pa
             description: Neither a username nor everyone
           403:
             description: Only the owner may move everyone
+          409:
+            description: That player is not online
           404:
             description: No such account, one you may not act on, or not staff
           401:
@@ -1008,7 +1010,10 @@ def register(app, *, require_auth, require_owner, require_role, require_fresh_pa
                     "message": "Only the owner or a co-owner may teleport everyone.",
                 }, 403
 
-            rows = data.every_account(db)
+            # ONLY WHO IS ONLINE (game 0.93.4): a move waits two minutes at most
+            # (TELEPORT_KEEP_SECONDS in app.py), so queuing one for somebody
+            # away only ever moved them on a later sign-in, by surprise.
+            rows = data.online_accounts(db, now - online_window, now)
             total = len(rows)
             for slot, row in enumerate(rows):
                 queue_teleport(db, row["id"], area, x, y, slot, total, g.user["username"], now)
@@ -1033,6 +1038,13 @@ def register(app, *, require_auth, require_owner, require_role, require_fresh_pa
         target, refusal = moderation_target({"username": username})
         if refusal is not None:
             return refusal
+        # NOBODY AWAY IS MOVED (game 0.93.4): it would wait for their next
+        # sign-in, and move them then, wherever they meant to be.
+        if not data.heard_lately(db, target["id"], now - online_window, now):
+            return {
+                "error": "Conflict",
+                "message": "%s is not online - a teleport is only for somebody playing." % target["username"],
+            }, 409
 
         queue_teleport(db, target["id"], area, x, y, 0, 1, g.user["username"], now)
         log_staff_action(g.user, "teleport", target["username"], target["id"],

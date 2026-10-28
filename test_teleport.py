@@ -230,6 +230,53 @@ check("a newer teleport replaces the waiting one", spot.get("area") == "crypt", 
 
 
 # =============================================================================
+print("\n--- nobody away is moved, and a move does not wait for ever (game 0.93.4) ---")
+# The owner: "i teleported player then another player logged in and they were
+# ported". A teleport waited for ever, and "everyone" queued every account.
+
+import sqlite3  # noqa: E402
+import time  # noqa: E402
+
+
+def sql(statement, args=()):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(statement, args)
+    conn.commit()
+    conn.close()
+
+
+def one(statement, args=()):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(statement, args).fetchone()
+    conn.close()
+    return row
+
+
+away = register("awayplayer")
+away_id = one("SELECT id FROM users WHERE username = 'awayplayer'")[0]
+player_id = one("SELECT id FROM users WHERE username = 'someplayer'")[0]
+sql("UPDATE sessions SET last_seen_at = ? WHERE user_id = ?", (int(time.time()) - 3600, away_id))
+res = client.post("/api/staff/teleport", json={"username": "awayplayer", "area": "field"}, headers=auth(owner))
+check("a player who is not online is not moved: 409, saying so",
+      res.status_code == 409 and "not online" in (res.get_json() or {}).get("message", ""), str(res.get_json()))
+check("  and nothing waits for them",
+      one("SELECT COUNT(*) FROM pending_teleports WHERE user_id = ?", (away_id,))[0] == 0)
+res = client.post("/api/staff/teleport", json={"everyone": True, "area": "town"}, headers=auth(owner))
+check("everyone is everyone online: the four playing, not the one away",
+      res.get_json().get("moved") == 4
+      and one("SELECT COUNT(*) FROM pending_teleports WHERE user_id = ?", (away_id,))[0] == 0, str(res.get_json()))
+sql("UPDATE pending_teleports SET issued_at = issued_at - ? WHERE user_id = ?",
+    (app_module.TELEPORT_KEEP_SECONDS + 1, player_id))
+spot = client.get("/api/server/broadcasts?since=0", headers=auth(player)).get_json().get("teleport")
+check("a move nobody collected in %d s is forgotten" % app_module.TELEPORT_KEEP_SECONDS, spot is None, str(spot))
+client.post("/api/staff/teleport", json={"username": "devguy", "area": "field"}, headers=auth(owner))
+check("  and the next teleport sweeps it out",
+      one("SELECT COUNT(*) FROM pending_teleports WHERE user_id = ?", (player_id,))[0] == 0)
+check("  while a fresh one stays", one("SELECT COUNT(*) FROM pending_teleports WHERE user_id ="
+                                        " (SELECT id FROM users WHERE username = 'devguy')")[0] == 1)
+
+
+# =============================================================================
 print("\n--- it shows up in the powers list, because that list is derived ---")
 
 d = client.get("/api/staff/powers", headers=auth(owner)).get_json()

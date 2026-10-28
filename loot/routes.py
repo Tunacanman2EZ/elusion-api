@@ -1,4 +1,5 @@
-"""loot/routes.py - the edge: the two routes, as they were in app.py.
+"""loot/routes.py - the edge: the two routes, as they were in app.py, and a
+minigame's chest (game 0.93.4).
 
 register() is handed app.py's own pieces - it never imports app.py:
 
@@ -25,9 +26,15 @@ register() is handed app.py's own pieces - it never imports app.py:
     status_of           (user_id, slot) -> the status block
     inventory_of        (user_id, slot) -> the carry, cell by cell
     bag_cells           the backpack's size, for "Your backpack is full"
+    loot_rank           an item_id -> 0 the rarest (a pet, a mythic), 1, 2
+                        coins: what a full chest keeps (gamedata.loot_rank)
 
 It hands back create_bag(), which a paid kill calls (kill/, through app.py):
-the one place a bag is made.
+the one place a bag is made - and since game 0.93.4 a minigame's chest:
+store_in_chest(), which a paid Endless kill calls (minigames/), and
+clear_chests(), at the account's next Go. A chest is taken from by
+/api/loot/take like a bag, by its "chest:<game>:<slot>" id, and read by
+GET /api/loot/chest.
 
 THE ENDPOINT NAMES ARE app.py's - take_loot, read_loot_bag - and routes.lock
 holds them.
@@ -43,7 +50,8 @@ from . import data, services
 
 def register(app, *, require_auth, get_db, bad_request, parse_stat, item_row, owns_item,
              lusions_item_id, dupe_pet_lusions, gold_item_value, gold_delta, lusion_delta,
-             ensure_account, add_to_backpack, place_trade_hold, status_of, inventory_of, bag_cells):
+             ensure_account, add_to_backpack, place_trade_hold, status_of, inventory_of, bag_cells,
+             loot_rank):
 
     def take_loot():
         """
@@ -74,7 +82,7 @@ def register(app, *, require_auth, get_db, bad_request, parse_stat, item_row, ow
           400:
             description: Bad bag_id or position
           404:
-            description: No such bag, not yours, or that cell is already empty
+            description: No such bag or chest, not yours, or that cell is already empty
           409:
             description: Backpack full - the item stays in the bag
           410:
@@ -89,33 +97,46 @@ def register(app, *, require_auth, get_db, bad_request, parse_stat, item_row, ow
         if not bag_id or len(bag_id) > 64:
             return bad_request("bag_id must be 1-64 characters")
 
+        # A MINIGAME'S CHEST (game 0.93.4) is taken from here too, by the id
+        # that names it - "chest:endless:0" - and scoped to this account in
+        # every query below, as a bag is. It never expires and is never
+        # dropped: an emptied chest is simply empty.
+        chest = services.parse_chest_id(bag_id)
+        capacity = services.CHEST_CELLS if chest is not None else services.LOOT_BAG_CAPACITY
+
         # Bounded by the BAG's capacity, not the backpack's. They were the same
         # number by accident, and a cell index from a 6-cell grid validated
         # against a 20-cell one is a check that reads as if it is doing
         # something.
         position = parse_stat(payload.get("position"))
-        if position is None or position >= services.LOOT_BAG_CAPACITY:
-            return bad_request("position must be an integer 0-%d" % (services.LOOT_BAG_CAPACITY - 1))
+        if position is None or position >= capacity:
+            return bad_request("position must be an integer 0-%d" % (capacity - 1))
 
         db = get_db()
 
-        bag = data.bag_of(db, bag_id, user_id)
-        if bag is None:
-            return {"error": "Not Found", "message": "No such loot bag."}, 404
+        if chest is not None:
+            game, slot = chest
+            item = data.chest_cell(db, user_id, slot, game, position)
+            if item is None:
+                return {"error": "Not Found", "message": "Nothing in that slot of the chest."}, 404
+        else:
+            bag = data.bag_of(db, bag_id, user_id)
+            if bag is None:
+                return {"error": "Not Found", "message": "No such loot bag."}, 404
 
-        if services.expired(bag["created_at"], time.time()):
-            data.drop_bag(db, bag_id)
-            db.commit()
-            return {"error": "Gone", "message": "That loot bag has expired."}, 410
+            if services.expired(bag["created_at"], time.time()):
+                data.drop_bag(db, bag_id)
+                db.commit()
+                return {"error": "Gone", "message": "That loot bag has expired."}, 410
 
-        item = data.cell(db, bag_id, position)
-        if item is None:
-            # Already taken, or never there. Same answer either way, and it is
-            # the answer that makes a duplicate request harmless: the second
-            # one finds nothing and changes nothing.
-            return {"error": "Not Found", "message": "Nothing in that slot of the bag."}, 404
+            item = data.cell(db, bag_id, position)
+            if item is None:
+                # Already taken, or never there. Same answer either way, and it is
+                # the answer that makes a duplicate request harmless: the second
+                # one finds nothing and changes nothing.
+                return {"error": "Not Found", "message": "Nothing in that slot of the bag."}, 404
 
-        slot = int(bag["slot"])
+            slot = int(bag["slot"])
         item_id = item["item_id"]
         quantity = int(item["quantity"])
         definition = item_row(item_id) or {}
@@ -203,11 +224,15 @@ def register(app, *, require_auth, get_db, bad_request, parse_stat, item_row, ow
         # Removed only after it has landed somewhere. If the insert above had
         # failed the transaction carries the delete with it, so an item cannot
         # evaporate between the two.
-        data.empty_cell(db, bag_id, position)
+        if chest is not None:
+            data.chest_empty_cell(db, user_id, slot, chest[0], position)
+            remaining = data.chest_left(db, user_id, slot, chest[0])
+        else:
+            data.empty_cell(db, bag_id, position)
 
-        remaining = data.left_in(db, bag_id)
-        if remaining == 0:
-            data.drop_bag(db, bag_id)
+            remaining = data.left_in(db, bag_id)
+            if remaining == 0:
+                data.drop_bag(db, bag_id)
 
         db.commit()
 
@@ -266,6 +291,65 @@ def register(app, *, require_auth, get_db, bad_request, parse_stat, item_row, ow
 
         return services.contents_answer(bag_id, bag, data.contents(db, bag_id)), 200
 
+    def read_chest():
+        """
+        What is in your chest for a minigame (game 0.93.4)
+        ---
+        tags:
+          - Loot
+        parameters:
+          - in: header
+            name: Authorization
+            type: string
+            required: true
+            description: "Bearer <token>"
+          - in: query
+            name: game
+            type: string
+            required: true
+            description: "the minigame: endless"
+          - in: query
+            name: slot
+            type: integer
+            required: true
+        responses:
+          200:
+            description: "bag_id (take from it by /api/loot/take), cells, columns, contents - empty when nothing is in it"
+          400:
+            description: Bad game or slot
+          401:
+            description: Missing, invalid or expired token
+        """
+        game = str(request.args.get("game", "")).strip()
+        if not game or len(game) > 32 or not game.isalnum():
+            return bad_request("game must be a minigame's id")
+        raw_slot = str(request.args.get("slot", "")).strip()
+        slot = parse_stat(int(raw_slot)) if raw_slot.isdigit() and len(raw_slot) < 4 else None
+        if slot is None:
+            return bad_request("slot must be an integer")
+        rows = data.chest_contents(get_db(), g.user["id"], slot, game)
+        return services.chest_answer(game, slot, rows), 200
+
+    def store_in_chest(db, user_id, slot, game, contents):
+        """
+        A win into the character's chest: (cells used, cut). NO COMMIT - the
+        paid kill's own transaction carries it (minigames/). Folded and placed
+        by services.chest_after(); what a full chest could not keep is `cut`,
+        and logged.
+        """
+        cells = {int(r["position"]): [r["item_id"], int(r["quantity"])]
+                 for r in data.chest_contents(db, user_id, slot, game)}
+        cells, cut = services.chest_after(cells, contents, services.CHEST_CELLS, item_row, loot_rank)
+        data.chest_write(db, user_id, slot, game, cells)
+        if cut:
+            app.logger.info("loot: %s's %s chest (slot %d) is full - cut %s",
+                            user_id, game, int(slot), cut)
+        return len(cells), cut
+
+    def clear_chests(db, user_id, game):
+        """Every chest of the account's for that minigame emptied. NO COMMIT."""
+        data.chests_clear(db, user_id, game)
+
     def create_bag(user_id, slot, enemy_id, contents):
         """
         Store a rolled bag and return (bag_id, stored_contents). COMMITS: it is
@@ -308,5 +392,7 @@ def register(app, *, require_auth, get_db, bad_request, parse_stat, item_row, ow
                      view_func=require_auth(take_loot), methods=["POST"])
     app.add_url_rule("/api/loot/bag", endpoint="read_loot_bag",
                      view_func=require_auth(read_loot_bag), methods=["GET"])
+    app.add_url_rule("/api/loot/chest", endpoint="read_loot_chest",
+                     view_func=require_auth(read_chest), methods=["GET"])
 
-    return SimpleNamespace(create_bag=create_bag)
+    return SimpleNamespace(create_bag=create_bag, store_in_chest=store_in_chest, clear_chests=clear_chests)

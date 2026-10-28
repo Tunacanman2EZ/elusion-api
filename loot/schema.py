@@ -1,6 +1,6 @@
 """loot/schema.py - loot/'s tables:
 loot_bags and loot_bag_items, a bag the server rolled and what
-is in it.
+is in it, and loot_chest_items, a minigame's chest (game 0.93.4).
 
 Until 19 Oct these were in app.py's init_db(), and they moved word for word.
 
@@ -40,6 +40,21 @@ SCHEMA = """
             quantity INTEGER NOT NULL CHECK (quantity > 0),
             PRIMARY KEY (bag_id, position),
             FOREIGN KEY (bag_id) REFERENCES loot_bags(bag_id) ON DELETE CASCADE
+        );
+
+        -- A MINIGAME'S CHEST (game 0.93.4): what the Endless's elites and
+        -- bosses paid a character, kept until it is taken or the account's
+        -- next Go (minigames/ empties it). Position-keyed like a bag, taken
+        -- through /api/loot/take, and never expires on its own.
+        CREATE TABLE IF NOT EXISTS loot_chest_items (
+            user_id  INTEGER NOT NULL,
+            slot     INTEGER NOT NULL,
+            game     TEXT    NOT NULL,
+            position INTEGER NOT NULL,
+            item_id  TEXT    NOT NULL,
+            quantity INTEGER NOT NULL CHECK (quantity > 0),
+            PRIMARY KEY (user_id, slot, game, position),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
 """
 

@@ -108,13 +108,18 @@ def _load():
     # say they cannot judge, and every route here works as it did.
     areas = raw.get("areas") if isinstance(raw.get("areas"), dict) else {}
     combat = raw.get("combat") if isinstance(raw.get("combat"), dict) else {}
-    return raw.get("constants", {}), items, enemies, classes, shops, areas, combat
+    # THE ENDLESS'S SCHEDULE (game 0.93.4): which monsters a run sends, and how
+    # many elites each stage's waves bring at the biggest party - what
+    # minigames/ holds a reported Endless kill to. A catalogue from before it
+    # is not an error: minigames/ then pays no Endless kill at all.
+    endless = raw.get("endless") if isinstance(raw.get("endless"), dict) else {}
+    return raw.get("constants", {}), items, enemies, classes, shops, areas, combat, endless
 
 
 # Loaded once at import. Failing here takes the whole server down on start,
 # which is correct: a server that cannot roll loot should not accept kills and
 # quietly grant nothing.
-CONSTANTS, ITEMS, ENEMIES, CLASSES, SHOPS, AREAS, COMBAT = _load()
+CONSTANTS, ITEMS, ENEMIES, CLASSES, SHOPS, AREAS, COMBAT, ENDLESS = _load()
 
 
 # =============================================================================
@@ -2203,16 +2208,21 @@ def rarest_first(contents):
     rules, 76% of boss bags ran past six cells and 573 of 616 boss pet wins
     were cut away without a word. Coins last means a cut costs copper.
     """
-    def rank(entry):
-        item = item_row(entry.get("item_id", "")) or {}
-        kind = item.get("type_name", "")
-        # A mythic is cut by nothing, like the pet.
-        if kind == "PET" or (kind in LOOT_GEAR_TYPES and int(item.get("tier", 0)) >= mythic_tier()):
-            return 0
-        if kind == "CURRENCY":
-            return 2
-        return 1
-    return sorted(contents, key=rank)
+    return sorted(contents, key=lambda entry: loot_rank(entry.get("item_id", "")))
+
+
+def loot_rank(item_id):
+    """0 for a pet or a mythic, 2 for coins, 1 for everything else: the order a
+    full bag keeps them in (rarest_first()), and a full chest (loot/, game
+    0.93.4)."""
+    item = item_row(item_id) or {}
+    kind = item.get("type_name", "")
+    # A mythic is cut by nothing, like the pet.
+    if kind == "PET" or (kind in LOOT_GEAR_TYPES and int(item.get("tier", 0)) >= mythic_tier()):
+        return 0
+    if kind == "CURRENCY":
+        return 2
+    return 1
 
 
 def roll_material_drops(enemy, scale=1.0):

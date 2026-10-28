@@ -213,8 +213,19 @@ def bring_pools_down(db, user_id, slot, derived, now):
 
 
 def every_account(db):
-    """Every account, by id - who "everyone" moves."""
+    """Every account, by id."""
     return db.execute("SELECT id, username FROM users ORDER BY id").fetchall()
+
+
+def online_accounts(db, cutoff, now):
+    """Every account with a session heard since `cutoff` and valid at `now`,
+    by id - who "everyone" moves (game 0.93.4; it was every account, online
+    or not, and the offline ones were moved whenever they next signed in)."""
+    return db.execute(
+        "SELECT u.id, u.username FROM users u WHERE EXISTS (SELECT 1 FROM sessions s"
+        " WHERE s.user_id = u.id AND s.last_seen_at > ? AND s.expires_at > ?) ORDER BY u.id",
+        (cutoff, now),
+    ).fetchall()
 
 
 def clear_teleport(db, user_id, teleport_id):
