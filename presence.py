@@ -301,6 +301,7 @@ import os
 import re
 import sqlite3
 import time
+import traceback
 
 from websockets.asyncio.server import broadcast, serve
 from websockets.extensions.permessage_deflate import ServerPerMessageDeflateFactory
@@ -327,6 +328,11 @@ TICK_SECONDS = 0.1
 # How often every connection's ticket and login are checked. Seconds, not
 # minutes: this is how long a banned player stays on other people's screens.
 SWEEP_SECONDS = 5.0
+# A CLOCK THAT GOES WRONG CARRIES ON (28 Oct): one turn's error is said in the
+# log with where it happened, then at most once in this many seconds a clock,
+# with how many came since - a tick failing ten times a second must not fill
+# the disk (_turn()).
+CLOCK_ERROR_REPORT_SECONDS = 60.0
 # A socket that has not said hello by then is not a game.
 HELLO_SECONDS = 5.0
 # One state message is under 200 bytes; nothing a game sends is near this -
@@ -1460,6 +1466,10 @@ class PresenceServer:
         # behind on (tick_loop).
         self.ticks = 0
         self.late_ticks = 0
+        # How many turns of each clock went wrong and were passed over (_turn()),
+        # and when each was last said in the log, with its count then.
+        self.clock_errors = {}
+        self._clock_said = {}
         # HOW ITS MINUTES WENT (game 0.78.0): every frame sent and its bytes,
         # counted by _out() and _send(); and where the last health row left
         # each counter, so a row holds its own minute (take_health()).
@@ -2411,7 +2421,40 @@ class PresenceServer:
                 due = loop.time()
                 wait = 0.0
             await asyncio.sleep(max(0.0, wait))
-            self.tick()
+            await self._turn("tick", self.tick)
+
+    async def _turn(self, clock, work):
+        """ONE TURN OF A CLOCK, AND AN ERROR IN IT DOES NOT END THE CLOCK (28 Oct).
+        The four clocks (start_clocks()) are tasks nothing awaits, and a task
+        that raises simply ends - asyncio says so only when the task is thrown
+        away, at shutdown. The process goes on and the sockets go on being
+        accepted, so nothing looks down and systemd restarts nothing: a tick
+        that hit a bug once froze every player on every screen until somebody
+        restarted presence, and a sweep the database refused once (busy past
+        its five seconds) stopped dropping banned and signed-out games for
+        good. So every turn goes through here: an error is counted
+        (`clock_errors`), said with its traceback, and that turn alone is
+        passed over. CancelledError is not an Exception, so stop_clocks()
+        still stops them. The owner asked for it after the asyncio unit:
+        "anything we can improve on now"."""
+        try:
+            result = work()
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:  # noqa: BLE001 - every error, so the clock goes on
+            self._clock_failed(clock)
+
+    def _clock_failed(self, clock):
+        count = self.clock_errors.get(clock, 0) + 1
+        self.clock_errors[clock] = count
+        now = time.monotonic()
+        said = self._clock_said.get(clock)
+        if said is not None and now - said[0] < CLOCK_ERROR_REPORT_SECONDS:
+            return
+        self._clock_said[clock] = (now, count)
+        since = count - (said[1] if said is not None else 0)
+        print("[PRESENCE] the %s went wrong (%d time%s since it was last said) and carries on:\n%s"
+              % (clock, since, "" if since == 1 else "s", traceback.format_exc()), flush=True)
 
     def tick(self):
         self.ticks += 1
@@ -2663,9 +2706,9 @@ class PresenceServer:
             since_all += self.kills_flush_seconds
             if since_all >= self.flush_seconds:
                 since_all = 0.0
-                await self.flush_books()
+                await self._turn("books", self.flush_books)
             else:
-                await self.flush_kills()
+                await self._turn("kills", self.flush_kills)
 
     async def flush_kills(self):
         """Write the deaths judged since the last write, and nothing else."""
@@ -2746,7 +2789,7 @@ class PresenceServer:
     async def sweep_loop(self):
         while True:
             await asyncio.sleep(self.sweep_seconds)
-            await self.sweep()
+            await self._turn("sweep", self.sweep)
 
     async def sweep(self):
         """Drop every connection whose ticket ran out or whose login is gone."""
@@ -2895,13 +2938,13 @@ class PresenceServer:
         self._guard_moved = time.monotonic()
 
     async def health_loop(self):
-        await self.take_up_month()
+        await self._turn("health", self.take_up_month)
         # The first call only marks where the counters stand: the first row is
         # a whole minute's.
-        self.take_health()
+        await self._turn("health", self.take_health)
         while True:
             await asyncio.sleep(self.health_seconds)
-            await self.flush_health()
+            await self._turn("health", self.flush_health)
 
     def start_clocks(self):
         self._tasks = [asyncio.create_task(self.tick_loop()), asyncio.create_task(self.sweep_loop()),

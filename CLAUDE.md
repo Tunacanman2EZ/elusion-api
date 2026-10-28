@@ -1564,6 +1564,22 @@ every rule.
   million rows over two weeks at 50 players moving all day. test_presence.py
   P-12.
 
+- **A CLOCK THAT GOES WRONG CARRIES ON (28 Oct).** The four clocks
+  `start_clocks()` starts - the tick, the sweep, the books, the health - are
+  tasks nothing awaits, and a task that raises just ends: the process stays
+  up, sockets are still accepted and systemd restarts nothing. One bug in a
+  tick froze every player on every screen until somebody restarted presence;
+  one sweep the database refused (busy past its five seconds) stopped
+  dropping banned and signed-out games for good. Every turn of every clock
+  now goes through `_turn()`: the error is counted in `clock_errors`, said in
+  the log with its traceback - once, then at most every
+  `CLOCK_ERROR_REPORT_SECONDS` (60) a clock with how many came since - and
+  only that turn is passed over. A cancel is not an Exception, so
+  `stop_clocks()` still stops them. **A new clock goes through `_turn()`
+  too**: test_presence.py P-23 reads `start_clocks()` and fails on one that
+  does not. The owner asked after his asyncio unit: "anything we can improve
+  on now".
+
 ## Shared monsters: one game runs them, presence.py passes the notes
 
 The owner, 6 Oct: "shared monsters separate loot bags". Everyone in an area

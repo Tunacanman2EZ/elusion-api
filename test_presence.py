@@ -17,7 +17,7 @@ out - takes the player off everybody's screen within seconds.
 It runs the real presence server in this process, on a free port, against a
 throwaway database in the temp folder - never elusion.db.
 """
-import asyncio, importlib.util, json, math, os, sqlite3, sys, time
+import asyncio, contextlib, importlib.util, inspect, io, json, math, os, re, sqlite3, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import testdir  # noqa: E402  (a private folder per run - testdir.py)
@@ -2614,6 +2614,91 @@ async def the_run_between_a_party():
             sql("DELETE FROM party_members WHERE party_id = ?", (party,))
 
 
+async def clocks_carry_on():
+    """P-23: A CLOCK THAT GOES WRONG CARRIES ON (28 Oct) - an error in one
+    turn of the tick, the sweep, the books or the health is counted and said
+    once, and the next turn runs. Before, the task simply ended: every player
+    frozen on every screen, or banned games never dropped, with nothing in the
+    log and the process still up."""
+    section("P-23 A CLOCK THAT GOES WRONG CARRIES ON: ONE BAD TURN IS SAID, AND THE NEXT ONE RUNS")
+
+    async def run_for(coro, seconds):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            task = asyncio.create_task(coro)
+            await asyncio.sleep(seconds)
+            alive = not task.done()
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        return alive, out.getvalue()
+
+    hub = presence.PresenceServer(tick_seconds=0.02, sweep_seconds=0.02)
+    ticks = []
+
+    def bad_tick():
+        ticks.append(1)
+        if len(ticks) <= 3:
+            raise RuntimeError("a planted fault in the tick")
+    hub.tick = bad_tick
+    alive, said = await run_for(hub.tick_loop(), 0.35)
+    check("a tick that raises does not end the tick: the beat went on past it", alive and len(ticks) >= 8,
+          (alive, len(ticks)))
+    check("  it is counted, and said once with where it went wrong - not once a tick",
+          hub.clock_errors.get("tick") == 3 and said.count("the tick went wrong") == 1
+          and "a planted fault in the tick" in said and "Traceback" in said, (hub.clock_errors, said[:300]))
+
+    sweeps = []
+
+    async def refused_sweep():
+        sweeps.append(1)
+        if len(sweeps) == 1:
+            raise sqlite3.OperationalError("database is locked")
+    hub.sweep = refused_sweep
+    alive, said = await run_for(hub.sweep_loop(), 0.25)
+    check("a sweep the database refused does not end the sweeping: the next one ran, so a ban still drops a game",
+          alive and len(sweeps) >= 3 and hub.clock_errors.get("sweep") == 1, (alive, len(sweeps), hub.clock_errors))
+
+    flushes = []
+
+    async def bad_flush():
+        flushes.append(1)
+        raise RuntimeError("a planted fault in the books")
+    hub.flush_books = bad_flush
+    hub.flush_kills = bad_flush
+    hub.kills_flush_seconds = 0.02
+    hub.flush_seconds = 0.04
+    alive, said = await run_for(hub.flush_loop(), 0.25)
+    check("  nor do the books' writes, failing every time - and they are said once a minute, not every turn",
+          alive and len(flushes) >= 5 and said.count("went wrong") <= 2, (alive, len(flushes), said.count("went wrong")))
+
+    healths = []
+
+    async def bad_health():
+        healths.append(1)
+        raise RuntimeError("a planted fault in the health")
+    hub.flush_health = bad_health
+    hub.health_seconds = 0.02
+    alive, said = await run_for(hub.health_loop(), 0.25)
+    check("  nor the health rows", alive and len(healths) >= 3, (alive, len(healths)))
+
+    started = re.findall(r"create_task\(self\.(\w+)\(\)\)", inspect.getsource(presence.PresenceServer.start_clocks))
+    unguarded = [name for name in started
+                 if "self._turn(" not in inspect.getsource(getattr(presence.PresenceServer, name))]
+    check("every clock start_clocks() starts takes its turns through _turn() - a new one added bare fails here",
+          len(started) >= 4 and not unguarded, (started, unguarded))
+
+    stopping = presence.PresenceServer(tick_seconds=0.02)
+    task = asyncio.create_task(stopping.tick_loop())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    check("  and stopping a clock still stops it: a cancel is not an error to carry on from", task.cancelled(),
+          task.done())
+
+
 async def main():
     await kills_written_soon()
     await positions_written()
@@ -2627,6 +2712,7 @@ async def main():
     await only_what_is_near()
     await one_arena_a_party()
     await the_run_between_a_party()
+    await clocks_carry_on()
     presence.HELLO_SECONDS = 0.5
     combatbook.HOLD_SECONDS = 0.2
     combatbook.PENDING_SECONDS = 0.3
