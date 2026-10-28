@@ -19,6 +19,7 @@ GET /api/kills  kills_mine  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/kills/everyone  kills_everyone  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/loot/bag  read_loot_bag  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/metrics  metrics  auth  rank=coowner  fresh=-  lock=yes  doc=yes
+GET /api/minigames  minigames_list  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/owner/economy/canary  owner_canary_status  auth  rank=coowner  fresh=-  lock=yes  doc=yes
 GET /api/owner/economy/flow  owner_economy_flow  auth  rank=coowner  fresh=-  lock=yes  doc=yes
 GET /api/owner/economy/rules  owner_economy_rules  auth  rank=coowner  fresh=-  lock=yes  doc=yes
@@ -107,6 +108,7 @@ POST /api/ignores  add_ignore  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/ignores/remove  remove_ignore  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/kingdom/donate  kingdom_donate  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/loot/take  take_loot  auth  rank=-  fresh=-  lock=yes  doc=yes
+POST /api/minigames/enter  minigames_enter  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/owner/economy/canary  owner_canary_check  auth  rank=coowner  fresh=-  lock=no  doc=yes
 POST /api/party/invite  party_invite  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/party/kick  party_kick  auth  rank=-  fresh=-  lock=yes  doc=yes

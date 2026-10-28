@@ -1159,6 +1159,7 @@ import consuming.schema as consuming_schema  # noqa: E402
 import smith.schema as smith_schema  # noqa: E402
 import economyrules.schema as economyrules_schema  # noqa: E402
 import clienterrors.schema as clienterrors_schema  # noqa: E402
+import minigames.schema as minigames_schema  # noqa: E402
 
 
 def init_db():
@@ -1960,6 +1961,7 @@ def init_db():
     smith_schema.create(db)
     economyrules_schema.create(db)
     clienterrors_schema.create(db)
+    minigames_schema.create(db)
 
     _migrate_bank_to_account(db)
 
@@ -8950,6 +8952,24 @@ clienterrors_package.register(
     require_owner=require_owner,
     get_db=get_db,
     bad_request=bad_request,
+)
+
+
+# =============================================================================
+# MINIGAMES AND THEIR WAIT (game 0.93.3) - the minigames/ package
+# =============================================================================
+# The HUD's Minigames button lists them (GET /api/minigames) and Go asks first
+# (POST /api/minigames/enter): going in starts the minigame's wait - a day for
+# the Endless - per account, and a second Go inside it is refused with how long
+# is left. The owner and a co-owner skip it. minigames/__init__.py has the rest.
+import minigames as minigames_package  # noqa: E402
+
+minigames_package.register(
+    app,
+    require_auth=require_auth,
+    get_db=get_db,
+    bad_request=bad_request,
+    skips_wait=has_owner_powers,
 )
 
 

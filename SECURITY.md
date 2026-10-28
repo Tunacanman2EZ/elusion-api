@@ -495,6 +495,17 @@ No comforting lies. These are known, named and open.
   caps the few numbers the leader sends, and is paid only against the
   server's count (E-3). A game older than 0.87.0 still shows the leader's
   health.
+- **In a party's arena the run is the party's word** (game 0.93.3). The
+  Endless gives each party a room of its own, chosen by the server from its
+  own `party_members` rows - a game names only the area, so nobody can walk
+  into another party's run (`test_presence.py` P-21). Inside it, the games
+  pass the run between them (`"en"`): the leader's clock and its slimes, and
+  everybody's hits on the swarm, checked for shape and size but not for
+  truth, and nothing in the arena is booked. So a modified game in your party
+  can kill slimes it never hit, start or end the run, or - as the room's
+  leader - set the elites' health. None of it pays: the swarm, the elites and
+  the bosses there report no kill, and the run's chest is not built
+  (`test_presence.py` P-22).
 
 - **A rollback can make a second copy of an item.** It puts back what the
   character held when the snapshot was taken; an item traded, banked or sold

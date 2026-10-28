@@ -195,6 +195,7 @@ sql("INSERT INTO carry_items (user_id, slot, position, item_id, quantity) VALUES
 sql("INSERT INTO bank_items (user_id, position, item_id, quantity) VALUES (?, 0, 'ironhelm', 1)", (vid,))
 sql("INSERT OR REPLACE INTO skills (user_id, slot, skill_id, level, xp) VALUES (?, 0, 'attack', 5, 10)", (vid,))
 sql("INSERT INTO kill_tally (user_id, slot, enemy_id, kills, first_at, last_at) VALUES (?, 0, 'bat', 3, ?, ?)", (vid, now, now))
+sql("INSERT INTO minigame_entries (user_id, game, entered_at) VALUES (?, 'endless', ?)", (vid, now))
 sql("INSERT INTO position_samples (at, user_id, slot, area, x, y) VALUES (?, ?, 0, 'field', 1, 2)", (now, vid))
 sql("INSERT INTO combat_kills (at, area, enemy_id, user_id, slot, verdict) VALUES (?, 'field', 'bat', ?, 0, 'AGREED')", (now, vid))
 sql("INSERT INTO friends (requester_id, addressee_id, state, created_at) VALUES (?, ?, 'accepted', ?)", (vid, oid, now))

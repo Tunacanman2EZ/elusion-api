@@ -1657,6 +1657,41 @@ running past them, "i noticed some lag wobble". `presence.py`'s header,
 - **Deploy order: this first.** A game ahead of its server sends neither `x`
   nor `l` (its welcome has no `"x"`) and plays as 0.18.
 
+## The Endless for a party: an arena each, and the run between them (game 0.93.3)
+
+The owner: "we need a 4 player party plan but can play solo duo or 3 or 4",
+then "lets do it". presence.py's header has the wire (ONE ARENA A PARTY, THE
+RUN BETWEEN A PARTY); test_presence.py P-21 and P-22 hold it.
+
+- **An arena per party, chosen here.** An area in `INSTANCED_PLACES`
+  (`{"endless"}`) is never one room for everybody: a game that says
+  "endless" is seated in `endless#p<party id>`, or `endless#u<account id>`
+  with no party (`instance_room()`). The game is never asked and never told
+  which - the room's name goes out as its area, as a data-guard room's does
+  - so nobody can walk into another party's run by naming it. The party is
+  read at hello and every sweep **whatever `ELUSION_NEAR` says** (it was read
+  only with NEAR on), and `rehouse()` moves anybody whose party changed
+  while they stand there, with the guard's leave/join/lead messages. At the
+  guard's "alone", everyone has a room of their own here too.
+- **"en" passes the run** between the games in the arena that said `"en": 1`
+  in their hello (the welcome says it too): the leader's line (`r`), its
+  slimes born (`sp`) and everything for a game that walked in (`full`,
+  with `to`) - those three the leader's alone - and anybody's hits on the
+  swarm (`h`, `[slot, batch, damage]`), their own line (`me`), `go` and
+  `need` (to the leader alone). `clean_run()` takes whole numbers only, each
+  list bounded (`MAX_RUN_HITS`, `RUN_SLOTS`, `RUN_BATCH_MOST`,
+  `RUN_FULL_MOST`), and `MAX_RUN_BYTES` (32 KB) a message. Re-encoded, with
+  `id`. What the numbers mean is the game's (endlessparty.gd).
+- **No books in a party's arena** (`keeps_books()`): nothing there pays,
+  and its elites are born mid-run where no map has them. The lead message
+  carries `"b"`, and a game hearing `"b": 0` counts its monsters' health
+  itself, as before 0.87.0. Nothing about any other area changes.
+- **Deploy order: this first.** A 0.93.3 game against an older server sends
+  no "en" (its welcome has none), so each game plays a run of its own in
+  one room for everybody, as before; an older game against this server is
+  seated in its party's arena and plays a run of its own there, seeing its
+  party walk about.
+
 ## A crowd of 128: swarm.py, and what it changed (game 0.76.0)
 
 The owner, 22 Oct, of a 16x stress test: "i need absolute masterclass help to
@@ -3010,6 +3045,31 @@ give them the right. `accountdelete/` (routes, services, data), POST
   password check, the staff log keeping the name, sessions kept, a bare DELETE
   of the row, the party not fixed); test_packages.py (the refusals on a bare
   app).
+
+## Minigames and their wait (game 0.93.3)
+
+The owner: "we need to get rid of ladder and make this a button in hud that
+says minigames this dungeon will have a 1 day wait timer for players", and,
+asked when the day starts: "Pressing Go". The town's ladder down to the
+Endless is gone; the game's bar has a Minigames button whose card asks the
+server first. `minigames/` (routes, services, data, schema):
+
+- **GET /api/minigames** - every minigame (`services.GAMES`: today only
+  `endless`, a wait of `DAY` = 86,400 s), when you last went in and
+  `ready_in` seconds, plus `skips_wait`.
+- **POST /api/minigames/enter** `{game}` - going in IS the day: allowed, it
+  writes `entered_at` now and answers 200; inside the wait, 409 with
+  `ready_in` and a message in words ("The Endless opens for you again in
+  13h 20m."); an unknown game or a body that is not JSON, 400.
+- **Per account** (`minigame_entries`, one row a user and game, INSERT OR
+  REPLACE), so another character does not start a fresh day. The owner and
+  a co-owner skip the wait (`has_owner_powers`), and their going in is
+  written all the same. Account deletion removes the row (`OWN_TABLES`).
+- **The honest limit**: the game asks before it goes, and a modified game
+  could walk into the area without asking. Nothing in a minigame pays yet;
+  when the Endless's chest does, it pays only inside a day this table holds.
+- test_minigames.py (MG-1 to MG-5); test_packages.py (the bare app);
+  test_accountdelete.py (the row goes with the account).
 
 ## Layout
 

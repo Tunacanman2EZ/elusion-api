@@ -901,6 +901,18 @@
    "CREATE INDEX idx_client_errors_user_day\n            ON client_errors(user_id, day)"
   ],
   [
+   "table",
+   "minigame_entries",
+   "minigame_entries",
+   "CREATE TABLE minigame_entries (\n            user_id     INTEGER NOT NULL,\n            game        TEXT    NOT NULL,\n            entered_at  INTEGER NOT NULL,\n            PRIMARY KEY (user_id, game),\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
+  ],
+  [
+   "index",
+   "sqlite_autoindex_minigame_entries_1",
+   "minigame_entries",
+   null
+  ],
+  [
    "index",
    "idx_sessions_seen",
    "sessions",
@@ -4429,6 +4441,68 @@
      "idx_lusion_ledger_user",
      0,
      "c",
+     0
+    ]
+   ]
+  },
+  "minigame_entries": {
+   "columns": [
+    [
+     0,
+     "user_id",
+     "INTEGER",
+     1,
+     null,
+     1
+    ],
+    [
+     1,
+     "game",
+     "TEXT",
+     1,
+     null,
+     2
+    ],
+    [
+     2,
+     "entered_at",
+     "INTEGER",
+     1,
+     null,
+     0
+    ]
+   ],
+   "foreign_keys": [
+    [
+     0,
+     0,
+     "users",
+     "user_id",
+     "id",
+     "NO ACTION",
+     "CASCADE",
+     "NONE"
+    ]
+   ],
+   "index_info": {
+    "sqlite_autoindex_minigame_entries_1": [
+     [
+      0,
+      0,
+      "user_id"
+     ],
+     [
+      1,
+      1,
+      "game"
+     ]
+    ]
+   },
+   "indexes": [
+    [
+     "sqlite_autoindex_minigame_entries_1",
+     1,
+     "pk",
      0
     ]
    ]

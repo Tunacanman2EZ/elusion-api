@@ -85,6 +85,8 @@ import serverhealth  # noqa: E402
 import clienterrors  # noqa: E402
 import clienterrors.schema as clienterrors_schema  # noqa: E402
 import accountdelete  # noqa: E402
+import minigames  # noqa: E402
+import minigames.schema as minigames_schema  # noqa: E402
 
 # Found, not listed: what app.py imports that has a routes.py (codemap.py).
 PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
@@ -93,7 +95,7 @@ RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathe
             "chat", "trade", "kingdom", "world", "moderation", "staffdesk", "equipment", "consuming",
             "death", "bank", "carry", "skills", "saves", "status", "shop", "players", "switches", "kill",
             "ownertools", "accountsettings", "auth", "larder", "smith", "economyrules", "economywatch",
-            "serverhealth", "clienterrors", "accountdelete")
+            "serverhealth", "clienterrors", "accountdelete", "minigames")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -1318,6 +1320,13 @@ def bare_app(name):
     clienterrors.register(app, require_auth=require_auth, require_owner=owner_or_co, get_db=get_db,
                           bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400))
 
+    # minigames/ (0.93.3): its table made here, as init_db() makes it.
+    with sqlite3.connect(path) as made:
+        minigames_schema.create(made)
+    minigames.register(app, require_auth=require_auth, get_db=get_db,
+                       bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+                       skips_wait=lambda name: name in owners)
+
     # accountdelete/ (0.90.0): registered with stand-ins; the bare database has
     # few of the tables a deletion empties, so the refusals are asked here and
     # the deletion itself in test_accountdelete.py.
@@ -1754,6 +1763,8 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/server/health",
                        # clienterrors/ (0.88.0)
                        "/api/client/errors", "/api/server/client-errors",
+                       # minigames/ (0.93.3)
+                       "/api/minigames", "/api/minigames/enter",
                        # accountdelete/ (0.90.0)
                        "/api/account/delete"]), rules)
 
@@ -4502,6 +4513,18 @@ check("  a player gets the bare 404 for the list; no login, neither",
       client_a.get("/api/server/client-errors", headers=who("ann")).status_code == 404
       and client_a.get("/api/server/client-errors").status_code == 401
       and client_a.post("/api/client/errors", json={}).status_code == 401)
+
+# MINIGAMES AND THEIR WAIT (0.93.3): minigames/, on the bare app.
+first = client_a.post("/api/minigames/enter", headers=who("ann"), json={"game": "endless"})
+again = client_a.post("/api/minigames/enter", headers=who("ann"), json={"game": "endless"})
+listed = (client_a.get("/api/minigames", headers=who("ann")).get_json() or {}).get("games", [])
+check("minigames: Go lets you in once, a second Go inside the day is a 409, and the list says how long",
+      first.status_code == 200 and again.status_code == 409
+      and [(g["id"], g["ready_in"] > 0) for g in listed] == [("endless", True)], (first.status_code, again.status_code))
+check("  the owner skips the wait; no login, no way in",
+      client_a.post("/api/minigames/enter", headers=who("boss"), json={"game": "endless"}).status_code == 200
+      and client_a.post("/api/minigames/enter", headers=who("boss"), json={"game": "endless"}).status_code == 200
+      and client_a.get("/api/minigames").status_code == 401)
 
 # DELETING YOUR OWN ACCOUNT (0.90.0): accountdelete/'s refusals, on the bare app.
 res_name = client_a.post("/api/account/delete", headers=who("ann"), json={"confirm": "bob", "password": "x"})

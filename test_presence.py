@@ -148,12 +148,17 @@ def of(messages, kind):
     return [m for m in messages if m.get("t") == kind]
 
 
+def booked(place):
+    """What a lead message says of `place`'s books ("b", game 0.93.3)."""
+    return 1 if presence.PresenceServer.keeps_books(place) else 0
+
+
 def last_lead(messages):
     leads = of(messages, "lead")
     return leads[-1] if leads else None
 
 
-async def enter(port, headers, area=None, v=None, xt=None, sh=None, **kw):
+async def enter(port, headers, area=None, v=None, xt=None, sh=None, en=None, **kw):
     """A connected game: hello with a fresh ticket, welcome read, optionally
     standing somewhere. v=2 is a game that shares monsters; xt=1 one that
     takes attacks inside the tick (game 0.76.0)."""
@@ -166,6 +171,8 @@ async def enter(port, headers, area=None, v=None, xt=None, sh=None, **kw):
         hello["xt"] = xt
     if sh is not None:
         hello["sh"] = sh
+    if en is not None:
+        hello["en"] = en
     await ws.send(json.dumps(hello))
     welcome = json.loads(await asyncio.wait_for(ws.recv(), 2))
     if area:
@@ -219,7 +226,8 @@ async def run(port, server):
     check("a real ticket is welcomed, by account id",
           welcome == {"t": "welcome", "id": uid("presa"), "v": presence.SHARED_VERSION,
                       "books": presence.BOOKS, "x": presence.RELAY_VERSION,
-                      "sh": presence.SERVER_HEALTH if presence.BOOKS else 0}, welcome)
+                      "sh": presence.SERVER_HEALTH if presence.BOOKS else 0,
+                      "en": presence.RUN_VERSION}, welcome)
     await a.close()
 
     # =========================================================================
@@ -447,13 +455,13 @@ async def run(port, server):
     got_d = await collect(d)
     lead = last_lead(got_d)
     check("the first game into an area leads it, alone",
-          lead == {"t": "lead", "a": "crypt", "id": uid("presd"), "n": 0}, got_d)
+          lead == {"t": "lead", "a": "crypt", "id": uid("presd"), "n": 0, "b": booked("crypt")}, got_d)
 
     e, _ = await enter(port, ERIN, "crypt", v=2)
     got_d = await collect(d)
     got_e = await collect(e)
     check("the second one in is told who leads", last_lead(got_e) == {
-        "t": "lead", "a": "crypt", "id": uid("presd"), "n": 1}, got_e)
+        "t": "lead", "a": "crypt", "id": uid("presd"), "n": 1, "b": booked("crypt")}, got_e)
     check("  and so is the leader, with one game sharing",
           (last_lead(got_d) or {}).get("n") == 1, got_d)
     check("  and the leader is asked to send it everything",
@@ -525,7 +533,7 @@ async def run(port, server):
     got_e = await collect(e)
     got_f = await collect(f)
     check("when the leader goes, the game that came in next takes over",
-          last_lead(got_e) == {"t": "lead", "a": "crypt", "id": uid("prese"), "n": 1}, got_e)
+          last_lead(got_e) == {"t": "lead", "a": "crypt", "id": uid("prese"), "n": 1, "b": booked("crypt")}, got_e)
     check("  and everyone left is told", (last_lead(got_f) or {}).get("id") == uid("prese"), got_f)
     check("  and the server agrees", server.leaders.get("crypt") is server.players.get(uid("prese")))
     await e.send(json.dumps(world))
@@ -537,7 +545,8 @@ async def run(port, server):
     check("a leader walking into another area hands this one on",
           (last_lead(got_f) or {}).get("id") == uid("presf"), got_f)
     check("  and leads the empty one it walked into",
-          (last_lead(got_e) or {}) == {"t": "lead", "a": "dungeon", "id": uid("prese"), "n": 0}, got_e)
+          (last_lead(got_e) or {}) == {"t": "lead", "a": "dungeon", "id": uid("prese"), "n": 0,
+                                       "b": booked("dungeon")}, got_e)
     await e.send(json.dumps(world))
     check("  whose monsters nobody in the old area hears", not of(await collect(f), "w"))
 
@@ -2394,6 +2403,217 @@ async def only_what_is_near():
     check("ELUSION_NEAR reads on unless it says off", presence.NEAR is True)
 
 
+async def one_arena_a_party():
+    """P-21: ONE ARENA A PARTY (game 0.93.3) - the Endless is a room per party,
+    or per player with none: the party sees each other, nobody else walks in."""
+    section("P-21 ONE ARENA A PARTY: A PARTY HAS THE ENDLESS TO ITSELF, AND NOBODY ELSE WALKS IN")
+    check("the Endless is an area every party has its own copy of",
+          "endless" in presence.INSTANCED_PLACES and "field" not in presence.INSTANCED_PLACES)
+    A, B, C = account("arenaa"), account("arenab", "mage"), account("arenac", "tank")
+    now = int(time.time())
+    sql("INSERT INTO parties (created_at) VALUES (?)", (now,))
+    party = int(sql("SELECT MAX(id) AS id FROM parties")[0]["id"])
+    for who, lead, at in (("arenaa", 1, now), ("arenab", 0, now + 1)):
+        sql("INSERT INTO party_members (user_id, party_id, is_leader, joined_at) VALUES (?, ?, ?, ?)",
+            (uid(who), party, lead, at))
+    server = presence.PresenceServer(sweep_seconds=60, tick_seconds=0.05)
+    server.view_ticks = 1
+    # ELUSION_NEAR off: the party is read at hello and every sweep whatever it
+    # says (it was read only with it on, for who is always drawn).
+    server.near = False
+    server.start_clocks()
+    async with serve(server.handler, "127.0.0.1", 0, max_size=presence.MAX_SOCKET_BYTES) as ws_server:
+        port = list(ws_server.sockets)[0].getsockname()[1]
+        try:
+            a, _ = await enter(port, A, "endless", x=768.0, y=1100.0, v=2)
+            await collect(a)
+            b, _ = await enter(port, B, "endless", x=790.0, y=1100.0, v=2)
+            got_a, got_b = await collect(a), await collect(b)
+            pa, pb = server.players[uid("arenaa")], server.players[uid("arenab")]
+            room = "endless#p%d" % party
+            check("two of a party walking into the Endless share its room, the party's own",
+                  pa.area == room and pb.area == room, (pa.area, pb.area))
+            check("  and see each other", uid("arenab") in joined(got_a) and uid("arenaa") in joined(got_b),
+                  (got_a, got_b))
+            check("  both still know the area as \"endless\" (the room's name never goes out)",
+                  pa.where == "endless" and pb.where == "endless"
+                  and (last_lead(got_b) or {}).get("a") == "endless", got_b)
+            check("  and the first in runs its monsters, for both",
+                  (last_lead(got_b) or {}).get("id") == uid("arenaa"), got_b)
+
+            c, _ = await enter(port, C, "endless", x=780.0, y=1100.0, v=2)
+            got_a, got_c = await collect(a), await collect(c)
+            pc = server.players[uid("arenac")]
+            check("one not in the party, standing among them, is in a room of its own",
+                  pc.area == "endless#u%d" % uid("arenac"), pc.area)
+            check("  not drawn on theirs, nor they on its",
+                  uid("arenac") not in joined(got_a) and not ({uid("arenaa"), uid("arenab")} & set(joined(got_c))),
+                  (got_a, got_c))
+            check("  and it runs its own arena's monsters (told in the area's name)",
+                  (last_lead(got_c) or {}).get("id") == uid("arenac")
+                  and (last_lead(got_c) or {}).get("a") == "endless", got_c)
+            await c.send(state("endless", x=781.0, y=1101.0, m="walkleft"))
+            got_a = await collect(a)
+            check("  nor are its steps sent to them", uid("arenac") not in moved(got_a), got_a)
+
+            f1, _ = await enter(port, C, "field", x=100.0, y=200.0, v=2)
+            await collect(f1)
+            check("any other area is one room for everybody, as before",
+                  server.players[uid("arenac")].area == "field", server.players[uid("arenac")].area)
+            await f1.send(state("endless", x=780.0, y=1100.0))
+            await collect(f1)
+            c = f1
+            check("  and walking back down, it is in its own arena again",
+                  server.players[uid("arenac")].area == "endless#u%d" % uid("arenac"),
+                  server.players[uid("arenac")].area)
+            await collect(a)
+
+            sql("INSERT INTO party_members (user_id, party_id, is_leader, joined_at) VALUES (?, ?, 0, ?)",
+                (uid("arenac"), party, now + 2))
+            await server.sweep()
+            got_a, got_c = await collect(a), await collect(c)
+            check("joining the party, the next sweep moves it into the party's arena",
+                  server.players[uid("arenac")].area == room, server.players[uid("arenac")].area)
+            check("  drawn on theirs, and they on its",
+                  uid("arenac") in joined(got_a) and {uid("arenaa"), uid("arenab")} <= set(joined(got_c)),
+                  (got_a, got_c))
+            check("  and its game is told who runs the monsters now: the party's",
+                  (last_lead(got_c) or {}).get("id") == uid("arenaa"), got_c)
+            check("  a sweep after that moves nobody", await server.rehouse() == 0)
+
+            sql("DELETE FROM party_members WHERE user_id = ?", (uid("arenac"),))
+            await server.sweep()
+            got_a, got_c = await collect(a), await collect(c)
+            check("leaving it, the next sweep puts it back in an arena of its own, off their screens",
+                  server.players[uid("arenac")].area == "endless#u%d" % uid("arenac")
+                  and uid("arenac") in left(got_a) and {uid("arenaa"), uid("arenab")} <= set(left(got_c)),
+                  (got_a, got_c))
+
+            server.guard = 3
+            moved_n = await server.reseat()
+            check("at the data guard's \"alone\", even a party has a room each",
+                  moved_n == 2 and len({p.area for p in server.players.values()}) == 3
+                  and server.players[uid("arenab")].area == "endless#u%d" % uid("arenab"),
+                  sorted(p.area for p in server.players.values()))
+            server.guard = 0
+            moved_n = await server.reseat()
+            check("  and back together when it eases",
+                  moved_n == 2 and pa.area == room and pb.area == room, (pa.area, pb.area))
+            for w in (a, b, c):
+                await w.close()
+        finally:
+            server.stop_clocks()
+            sql("DELETE FROM party_members WHERE party_id = ?", (party,))
+
+
+async def the_run_between_a_party():
+    """P-22: THE RUN BETWEEN A PARTY (game 0.93.3) - "en" passes the run
+    between the games in a party's arena, checked; the leader's keys are the
+    leader's; nothing there is booked."""
+    section("P-22 THE RUN BETWEEN A PARTY: THE ARENA'S GAMES PASS THE RUN, CHECKED, AND NOTHING THERE IS BOOKED")
+    A, B, C, D, E = (account("runa"), account("runb", "mage"), account("runc", "tank"), account("rund", "healer"),
+                     account("rune"))
+    now = int(time.time())
+    sql("INSERT INTO parties (created_at) VALUES (?)", (now,))
+    party = int(sql("SELECT MAX(id) AS id FROM parties")[0]["id"])
+    for who, lead, at in (("runa", 1, now), ("runb", 0, now + 1), ("rund", 0, now + 2), ("rune", 0, now + 3)):
+        sql("INSERT INTO party_members (user_id, party_id, is_leader, joined_at) VALUES (?, ?, ?, ?)",
+            (uid(who), party, lead, at))
+    server = presence.PresenceServer(sweep_seconds=60, tick_seconds=0.05)
+    server.view_ticks = 1
+    server.start_clocks()
+
+    def runs(messages):
+        return [m for m in messages if m.get("t") == "en"]
+
+    async with serve(server.handler, "127.0.0.1", 0, max_size=presence.MAX_SOCKET_BYTES) as ws_server:
+        port = list(ws_server.sockets)[0].getsockname()[1]
+        try:
+            a, welcome = await enter(port, A, "endless", v=2, en=1, x=768.0, y=1100.0)
+            got_a = await collect(a)
+            check("the welcome says this server passes the run", welcome.get("en") == presence.RUN_VERSION == 1,
+                  welcome)
+            check("  and the arena's lead says nothing in it is booked (\"b\": 0)",
+                  (last_lead(got_a) or {}).get("b") == 0, got_a)
+            b, _ = await enter(port, B, "endless", v=2, en=1, x=780.0, y=1100.0)
+            d, _ = await enter(port, D, "endless", v=2, x=790.0, y=1100.0)
+            c, _ = await enter(port, C, "endless", v=2, en=1, x=790.0, y=1100.0)
+            got_a, got_b, got_c, got_d = await collect(a), await collect(b), await collect(c), await collect(d)
+
+            line = {"t": "en", "r": [1, 61500, 2, 0, 1, 2], "sp": [[7, 12345, 2, 2, 3, 0, 1, 2]]}
+            await a.send(json.dumps(line))
+            got_a, got_b, got_c, got_d = await collect(a), await collect(b), await collect(c), await collect(d)
+            heard = runs(got_b)
+            check("the leader's line and its slimes reach the party's other game, with who sent them",
+                  len(heard) == 1 and heard[0].get("id") == uid("runa") and heard[0].get("r") == line["r"]
+                  and heard[0].get("sp") == line["sp"], got_b)
+            check("  never back to the leader, never to a game that does not speak it, never to another arena",
+                  not runs(got_a) and not runs(got_d) and not runs(got_c), (got_a, got_d, got_c))
+
+            await b.send(json.dumps({"t": "en", "r": [1, 0, 9, 0, 0, 1]}))
+            await b.send(json.dumps({"t": "en", "sp": [[1, 2, 3]]}))
+            got_a = await collect(a)
+            check("the run's line and its slimes are the leader's alone: another's is dropped", not runs(got_a), got_a)
+
+            hits = {"t": "en", "h": [[0, 7, 31], [2999, 7, 12]]}
+            await b.send(json.dumps(hits))
+            got_a = await collect(a)
+            check("hits on the swarm from any game reach the others", [m.get("h") for m in runs(got_a)] == [hits["h"]]
+                  and runs(got_a)[0].get("id") == uid("runb"), got_a)
+            bad = [[[0, 7, 0]], [[0, 7, 1.5]], [[4096, 7, 3]], [[0, -1, 3]], [[0, 7, True]], [[0, 7]],
+                   [[0, 7, presence.MAX_HIT + 1]], [[0, 1, 1]] * (presence.MAX_RUN_HITS + 1)]
+            for h in bad:
+                await b.send(json.dumps({"t": "en", "h": h}))
+            await b.send(json.dumps({"t": "en", "h": [[0, 1, 1]], "boo": 1}))
+            await b.send(json.dumps({"t": "en", "me": [1, "x"]}))
+            got_a = await collect(a)
+            check("  a hit that is not three whole numbers in range, too many, or an unknown key: dropped (%d tries)"
+                  % (len(bad) + 2), not runs(got_a), runs(got_a))
+
+            e, _ = await enter(port, E, "endless", v=2, en=1, x=770.0, y=1100.0)
+            await collect(e), await collect(a), await collect(b)
+            await b.send(json.dumps({"t": "en", "go": 1}))
+            await b.send(json.dumps({"t": "en", "need": 1}))
+            got_a, got_e = await collect(a), await collect(e)
+            check("\"go\" and \"need\" go to the leader alone, not the party's other games",
+                  [sorted(k for k in m if k not in ("t", "id")) for m in runs(got_a)] == [["go"], ["need"]]
+                  and not runs(got_e), (got_a, got_e))
+            whole = list(range(2000, 6000))
+            await a.send(json.dumps({"t": "en", "full": whole, "part": 0, "parts": 2, "to": uid("runb")}))
+            got_b = await collect(b)
+            check("everything, to the game that asked, as big as a part of the swarm (%d bytes)"
+                  % len(json.dumps(whole)), [m.get("full") == whole and m.get("parts") == 2 for m in runs(got_b)]
+                  == [True], [len(json.dumps(m)) for m in got_b])
+            await a.send(json.dumps({"t": "en", "full": [1], "part": 2, "parts": 2, "to": uid("runb")}))
+            got_b = await collect(b)
+            check("  a part past the last is dropped", not runs(got_b), got_b)
+
+            f, _ = await enter(port, C, "field", v=2, en=1, x=100.0, y=200.0)
+            g, _ = await enter(port, D, "field", v=2, en=1, x=110.0, y=200.0)
+            got_f, got_g = await collect(f), await collect(g)
+            await f.send(json.dumps({"t": "en", "h": [[0, 7, 3]]}))
+            got_g = await collect(g)
+            check("anywhere but a party's arena the run is nobody's business: dropped", not runs(got_g), got_g)
+            check("  and there the lead says what the books keep, as before",
+                  not presence.PresenceServer.keeps_books("endless")
+                  and (last_lead(got_f) or {}).get("b", -1) == booked("field"), [last_lead(got_f), presence.BOOKS])
+            await a.send(json.dumps({"t": "w", "d": {"ev": [{"k": "spawn", "r": {"id": 1, "o": "", "s":
+                         "res://scene/enemy/lightsprite.tscn", "pp": "", "x": 700, "y": 600, "a": "idledown",
+                         "hp": 50, "mh": 50, "p": {}}}]}}))
+            await collect(b)
+            check("  and the arena keeps no books, whatever its leader sends",
+                  not any(k.startswith("endless") for k in server.books), sorted(server.books))
+            await a.send(json.dumps({"t": "en", "full": list(range(5000)) * 2, "part": 0, "parts": 1}))
+            got_a = await collect(a, 0.5)
+            check("  a message past MAX_RUN_BYTES closes the socket, as any too big", "too big" in byes(got_a)
+                  or any(m.get("t") == "_closed" for m in got_a), got_a)
+            for w in (b, e, f, g):
+                await w.close()
+        finally:
+            server.stop_clocks()
+            sql("DELETE FROM party_members WHERE party_id = ?", (party,))
+
+
 async def main():
     await kills_written_soon()
     await positions_written()
@@ -2405,6 +2625,8 @@ async def main():
     await kills_survive_a_failed_write()
     await server_owns_health()
     await only_what_is_near()
+    await one_arena_a_party()
+    await the_run_between_a_party()
     presence.HELLO_SECONDS = 0.5
     combatbook.HOLD_SECONDS = 0.2
     combatbook.PENDING_SECONDS = 0.3

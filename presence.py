@@ -93,6 +93,9 @@ THE WIRE (JSON text frames):
                                                          I pulled a lever (0.19.0)
     {"t": "vs", "on": true}                              my party's voice: in, or out (0.43.0)
     {"t": "vc", "to": 40, "d": {...}}                    a voice call's setup, for 40 (0.43.0)
+    {"t": "en", "h": [[slot, batch, damage]], ...}       (a game that said "en": 1, in a party's
+                                                         arena) the run - see THE RUN BETWEEN A
+                                                         PARTY
 
   here -> game
     {"t": "welcome", "id": 12, "v": 2, "books": true, "x": 2, "sh": 1}
@@ -130,8 +133,13 @@ THE WIRE (JSON text frames):
                                                          whatever the leader says
     {"t": "leave", "ids": [12, 40]}                      gone from your area, or gone far
                                                          from you (0.89.0)
-    {"t": "lead", "a": "field", "id": 12, "n": 2}        who runs this area's monsters, and how
-                                                         many others share them (-1: nobody)
+    {"t": "lead", "a": "field", "id": 12, "n": 2, "b": 1}
+                                                         who runs this area's monsters, and how
+                                                         many others share them (-1: nobody);
+                                                         "b" 0 (0.93.3): nothing here is booked
+                                                         - count their health yourself
+    {"t": "en", "id": 40, ...}                           (a game that said "en") 40's part of the
+                                                         party's run, checked
     {"t": "need", "id": 40}                              (to the leader) send 40 everything;
                                                          id 0 is the server's books
     {"t": "w", "d": {...}}                               the leader's monsters, passed on as sent
@@ -225,6 +233,43 @@ where they stand when it is alone, as it does when a leader leaves. The level
 is written with every health row and taken up again after a restart.
 ELUSION_TRANSFER_GIB sets the allowance (a bigger droplet comes with more);
 "off" switches the guard off. test_presence.py P-14.
+
+ONE ARENA A PARTY (game 0.93.3). The owner: "we need a 4 player party plan but
+can play solo duo or 3 or 4" - for the Endless, a run of thousands of slimes
+behind a locked door. A party runs it together and nobody else walks in: an
+area in INSTANCED_PLACES is never one room for everybody in it. A game says
+"endless" as it says any area; this server seats it in its party's room,
+"endless#p<party id>", or one of its own, "endless#u<account id>", with no
+party (instance_room()). The game is never asked which, and never told - a
+room's name goes out as its area, as a second room of the data guard's does -
+so nobody can name somebody else's party's room. The party is read at hello
+and every sweep; a game whose party changed while it stands there is moved to
+the room it belongs in now (rehouse()), told who left its screen, who is on
+it and who runs its monsters, as the guard's moves are. At the guard's
+"alone", everyone has a room of their own here too.
+
+THE RUN BETWEEN A PARTY (game 0.93.3). One clock, one swarm and one set of
+elites for the party in its arena. The game that leads the room (the earliest
+in, as for any area's monsters) runs the run; every game moves its own copy of
+the swarm. What crosses is "en", from a game that said "en": 1 in its hello,
+passed on at once to the others in its room that said it too, with "id" -
+who sent it - added:
+  {"t": "en", "r": [...]}          the run's line: state, clock, stage, door
+  {"t": "en", "sp": [[...], ...]}  slimes born: the slots, the batch, the seed
+  {"t": "en", "full": [...], "part": i, "parts": n, "to": id}
+                                   everything, to a game that walked in
+  {"t": "en", "h": [[slot, batch, damage], ...]}
+                                   hits on the swarm, from any game
+  {"t": "en", "me": [...]}         a player's own line: in the run or down
+  {"t": "en", "go": 1}             through the door: start the countdown
+  {"t": "en", "need": 1}           send me everything
+"r", "sp" and "full" are the leader's alone; "go" and "need" go to the leader
+alone; "to" sends to one game. Only in an area in INSTANCED_PLACES, every
+value a whole number (clean_run()). What the numbers mean is the games'
+business (the game's endlessparty.gd). Nothing in a party's arena keeps BOOKS
+(keeps_books()): nothing in it pays, and its elites are born mid-run where no
+map has them. The lead message says so ("b": 0), and a game then counts its
+monsters' health itself, as before 0.87.0.
 
 PARTY VOICE (game 0.43.0). The owner: "I really really want the option for voice
 chat in game for parties". The voice itself never comes here: each game's
@@ -447,6 +492,9 @@ MEMINFO_PATH = "/proc/meminfo"
 # What a body may claim to be doing: the player scenes' own animation names.
 ANIM_PATTERN = re.compile(r"^(idle|walk|attack|death|hitflash)(up|down|left|right)$")
 AREA_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
+# ONE ARENA A PARTY: the areas each party (or each player with none) has a
+# room of its own in - instance_room().
+INSTANCED_PLACES = frozenset({"endless"})
 # The tank's aura rings, the only effect drawn on the body itself.
 EFFECTS = ("ring", "firering")
 POSITION_LIMIT = 100000.0
@@ -500,6 +548,23 @@ RELAY_VERSION = 2
 # the tick (remoteplayer.gd). A game says it can in its hello ("xt": 1); any
 # other is sent every attack on its own, as it came, as before.
 TICK_ATTACKS = 1
+
+# THE RUN BETWEEN A PARTY (game 0.93.3): said in the welcome ("en"), and by a
+# game that speaks it in its hello. A message is at most MAX_RUN_BYTES (a part
+# of the whole swarm, to a game that walked in); hits at most MAX_RUN_HITS a
+# message, on a slot below RUN_SLOTS; the leader's keys at most these sizes.
+RUN_VERSION = 1
+MAX_RUN_BYTES = 32768
+MAX_RUN_HITS = 256
+RUN_SLOTS = 4096
+RUN_LINE_MOST = 16
+RUN_BATCHES_MOST = 16
+RUN_BATCH_MOST = 700
+RUN_FULL_MOST = 12000
+RUN_PARTS_MOST = 64
+RUN_WHOLE = 2 ** 31
+RUN_LEADER_KEYS = ("r", "sp", "full", "part", "parts")
+RUN_KEYS = frozenset(("t", "to", "h", "me", "go", "need") + RUN_LEADER_KEYS)
 
 # THE SERVER OWNS THEIR HEALTH (game 0.87.0). Every monster's health is the
 # books' count, not the leader's word: each tick, a room of two or more is sent
@@ -1009,6 +1074,8 @@ class Player:
         self.tick_attacks = False
         # THE SERVER OWNS THEIR HEALTH: this game draws the books' count.
         self.server_health = False
+        # THE RUN BETWEEN A PARTY (0.93.3): this game speaks "en".
+        self.runs = False
         # THE DAMAGE METER (0.81.0): this game has it open. Only an owner's or
         # a co-owner's can (METER_ROLES).
         self.meter = False
@@ -1291,6 +1358,71 @@ def clean_hits(msg):
     return out
 
 
+def _whole_list(value, most, low=-RUN_WHOLE, high=RUN_WHOLE - 1):
+    """`value` if it is a list of at most `most` whole numbers in [low, high]."""
+    if not isinstance(value, list) or len(value) > most:
+        return None
+    for v in value:
+        if isinstance(v, bool) or not isinstance(v, int) or not low <= v <= high:
+            return None
+    return value
+
+
+def clean_run(msg, leads):
+    """THE RUN BETWEEN A PARTY: an "en" message checked, without "t" and "to",
+    or None when it is not one. `leads`: whether its game leads the room - the
+    run's line, the slimes born and everything are the leader's alone. Whole
+    numbers only, each list bounded: it goes to other players' games."""
+    if any(key not in RUN_KEYS for key in msg):
+        return None
+    out = {}
+    for key in RUN_LEADER_KEYS:
+        if key in msg and not leads:
+            return None
+    if "r" in msg:
+        if _whole_list(msg["r"], RUN_LINE_MOST) is None:
+            return None
+        out["r"] = msg["r"]
+    if "sp" in msg:
+        batches = msg["sp"]
+        if not isinstance(batches, list) or len(batches) > RUN_BATCHES_MOST:
+            return None
+        if any(_whole_list(b, RUN_BATCH_MOST) is None for b in batches):
+            return None
+        out["sp"] = batches
+    if "full" in msg:
+        if _whole_list(msg["full"], RUN_FULL_MOST) is None:
+            return None
+        part, parts = msg.get("part", 0), msg.get("parts", 1)
+        if _whole_list([part, parts], 2, 0, RUN_PARTS_MOST) is None or part >= parts:
+            return None
+        out.update({"full": msg["full"], "part": part, "parts": parts})
+    elif "part" in msg or "parts" in msg:
+        return None
+    if "h" in msg:
+        hits = msg["h"]
+        if not isinstance(hits, list) or len(hits) > MAX_RUN_HITS:
+            return None
+        for hit in hits:
+            if _whole_list(hit, 3) is None or len(hit) != 3:
+                return None
+            if not (0 <= hit[0] < RUN_SLOTS and 0 <= hit[1] < RUN_WHOLE and 1 <= hit[2] <= MAX_HIT):
+                return None
+        out["h"] = hits
+    if "me" in msg:
+        if _whole_list(msg["me"], 4) is None:
+            return None
+        out["me"] = msg["me"]
+    for key in ("go", "need"):
+        if key in msg:
+            if msg[key] != 1 or isinstance(msg[key], bool):
+                return None
+            out[key] = 1
+    if not out:
+        return None
+    return out
+
+
 class PresenceServer:
     def __init__(self, sweep_seconds=None, tick_seconds=None):
         self.players = {}     # user_id -> Player
@@ -1435,7 +1567,7 @@ class PresenceServer:
         # THE DATA GUARD: the room it is seated in - the area itself, unless
         # the area is at the guard's crowd cap (_seat()).
         place = area
-        area = room_name or self._seat(place)
+        area = room_name or self.instance_room(player, place) or self._seat(place)
         room = self.rooms.setdefault(area, set())
         room.add(player)
         player.area = area
@@ -1471,6 +1603,30 @@ class PresenceServer:
         """How many players one room holds at THE DATA GUARD's level: no cap,
         GUARD_CROWD, or one."""
         return {2: GUARD_CROWD, 3: 1}.get(self.guard)
+
+    def instance_room(self, player, place):
+        """ONE ARENA A PARTY: the room `player` belongs in, in an area every
+        party has its own copy of - its party's, or its own with no party or
+        at the guard's "alone" - or None for any other area."""
+        if place not in INSTANCED_PLACES:
+            return None
+        if player.party and self.crowd_cap != 1:
+            return "%s#p%d" % (place, int(player.party))
+        return "%s#u%d" % (place, int(player.user_id))
+
+    async def rehouse(self):
+        """Everyone in an instanced area into the room they belong in now - a
+        party made, left or ended since they walked in. Returns how many
+        moved."""
+        moved = 0
+        for p in list(self.players.values()):
+            if not p.area or p.place not in INSTANCED_PLACES:
+                continue
+            want = self.instance_room(p, p.place)
+            if want and p.area != want:
+                await self._move_room(p, want)
+                moved += 1
+        return moved
 
     @staticmethod
     def room_name(place, n):
@@ -1518,7 +1674,7 @@ class PresenceServer:
             taken = {}
             plan = []
             for p in sorted(by_place[place], key=lambda q: (q.joined_at, q.user_id)):
-                name = self._seat(place, taken)
+                name = self.instance_room(p, place) or self._seat(place, taken)
                 taken[name] = taken.get(name, 0) + 1
                 plan.append((p, name))
             for p, name in plan:
@@ -1539,8 +1695,9 @@ class PresenceServer:
             return
         leader = self.leaders.get(area)
         # THE AREA AS THE GAMES KNOW IT: a second room of it is still its area.
-        message = {"t": "lead", "a": area.split("#", 1)[0], "id": leader.user_id if leader is not None else -1,
-                   "n": len(sharers) - 1 if leader is not None else 0}
+        place = area.split("#", 1)[0]
+        message = {"t": "lead", "a": place, "id": leader.user_id if leader is not None else -1,
+                   "n": len(sharers) - 1 if leader is not None else 0, "b": 1 if self.keeps_books(place) else 0}
         self._out([p.ws for p in sharers], json.dumps(message, separators=(",", ":")))
 
     def _ask_for_world(self, area, player):
@@ -1553,13 +1710,21 @@ class PresenceServer:
 
     # ---- the books (combatbook.py) --------------------------------------------
 
+    @staticmethod
+    def keeps_books(place):
+        """Whether the monsters of this area are booked: books on, an area the
+        catalogue has a map of, and not a party's arena (THE RUN BETWEEN A
+        PARTY - nothing in it pays, and its elites are born where no map has
+        them)."""
+        return bool(BOOKS and place and place in gamedata.AREAS and place not in INSTANCED_PLACES)
+
     def _book(self, area):
         """The books on this room's monsters, or None: books off, or an area
         the catalogue has no map of. One a room - a second room of an area
         (THE DATA GUARD) has monsters of its own - each with the area's map
         and the area's name, which is what a death is written down under."""
         place = area.split("#", 1)[0] if area else ""
-        if not BOOKS or not place or place not in gamedata.AREAS:
+        if not self.keeps_books(place):
             return None
         book = self.books.get(area)
         if book is None:
@@ -1769,6 +1934,34 @@ class PresenceServer:
         self._book_safely(self._book_hits, player, hits)
         self._out([leader.ws], json.dumps({"t": "h", "from": player.user_id, "p": hits},
                                           separators=(",", ":")))
+        return True
+
+    def relay_run(self, player, msg):
+        """THE RUN BETWEEN A PARTY: an "en" message, checked, to the others in
+        the room that speak it - "go" and "need" to the leader alone, one with
+        "to" to that game alone - never back. Only in an instanced area."""
+        area = player.area
+        if not area or player.place not in INSTANCED_PLACES or not player.runs:
+            return False
+        leader = self.leaders.get(area)
+        run = clean_run(msg, leader is player)
+        if run is None:
+            return False
+        to = msg.get("to")
+        if to is not None and (isinstance(to, bool) or not isinstance(to, int)):
+            return False
+        room = [p for p in self.rooms.get(area, ()) if p.runs and p is not player]
+        if to is not None:
+            targets = [p for p in room if p.user_id == to]
+        elif "go" in run or "need" in run:
+            targets = [p for p in room if p is leader]
+        else:
+            targets = room
+        if not targets:
+            return False
+        run["t"] = "en"
+        run["id"] = player.user_id
+        self._out([p.ws for p in targets], json.dumps(run, separators=(",", ":")))
         return True
 
     # ---- attacks and levers (game 0.19.0) ---------------------------------------
@@ -2123,14 +2316,15 @@ class PresenceServer:
             player.fighter.reports_hits = player.version >= BOOKS_VERSION
         player.tick_attacks = msg.get("xt") == TICK_ATTACKS and not isinstance(msg.get("xt"), bool)
         player.server_health = msg.get("sh") == SERVER_HEALTH and not isinstance(msg.get("sh"), bool)
+        player.runs = msg.get("en") == RUN_VERSION and not isinstance(msg.get("en"), bool)
         self.players[user_id] = player
-        if self.near:
-            try:
-                player.party = (await asyncio.to_thread(parties_of, [user_id])).get(user_id, 0)
-            except Exception as exc:  # noqa: BLE001
-                print("[PRESENCE] could not read a party: %r" % exc, flush=True)
+        # Its party, whatever ELUSION_NEAR says: ONE ARENA A PARTY reads it too.
+        try:
+            player.party = (await asyncio.to_thread(parties_of, [user_id])).get(user_id, 0)
+        except Exception as exc:  # noqa: BLE001
+            print("[PRESENCE] could not read a party: %r" % exc, flush=True)
         await self._send(player, {"t": "welcome", "id": user_id, "v": SHARED_VERSION, "books": BOOKS,
-                                  "x": RELAY_VERSION, "sh": SERVER_HEALTH if BOOKS else 0})
+                                  "x": RELAY_VERSION, "sh": SERVER_HEALTH if BOOKS else 0, "en": RUN_VERSION})
 
         try:
             async for raw in ws:
@@ -2149,7 +2343,8 @@ class PresenceServer:
                 # ONLY A WORLD MESSAGE MAY BE BIG. The socket takes up to
                 # MAX_SOCKET_BYTES so a leader can describe Big Field to a game
                 # that walked in; anything else that size is not a game.
-                if kind != "w" and len(raw) > (VOICE_MAX_BYTES if kind == "vc" else MAX_MESSAGE_BYTES):
+                most = {"vc": VOICE_MAX_BYTES, "en": MAX_RUN_BYTES}.get(kind, MAX_MESSAGE_BYTES)
+                if kind != "w" and len(raw) > most:
                     await self.drop(player, "too big", 1009)
                     continue
                 if kind == "s":
@@ -2187,6 +2382,8 @@ class PresenceServer:
                     await self.voice_signal(player, message)
                 elif kind == "dm":
                     self.meter_switch(player, message)
+                elif kind == "en":
+                    self.relay_run(player, message)
         except ConnectionClosed:
             pass
         finally:
@@ -2561,11 +2758,13 @@ class PresenceServer:
             if p.ticket_hash not in valid and self.players.get(p.user_id) is p:
                 await self.drop(p, "signed out", 1008)
         await self.sweep_voice()
-        if self.near:
-            try:
-                await self.read_parties()
-            except Exception as exc:  # noqa: BLE001
-                print("[PRESENCE] could not read the parties: %r" % exc, flush=True)
+        # The parties, whatever ELUSION_NEAR says (ONE ARENA A PARTY reads them
+        # too), and anybody whose party changed in an instanced area moved.
+        try:
+            await self.read_parties()
+            await self.rehouse()
+        except Exception as exc:  # noqa: BLE001
+            print("[PRESENCE] could not read the parties: %r" % exc, flush=True)
 
     # ---- how its minutes went (game 0.78.0) ----------------------------------
 
