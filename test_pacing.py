@@ -169,9 +169,15 @@ for el in SLIMES:
           (large.get("split_into"), large["element"], small["element"]))
     check("  the large grants nothing and the small does",
           not large["grants_rewards"] and small["grants_rewards"])
-    check("  the small's kill ceiling is eight per placed large",
-          int(small["placed_count"]) == 8 * int(large["placed_count"]) and int(large["placed_count"]) > 0,
-          (small["placed_count"], large["placed_count"]))
+    # Eight from each placed large, and since game 0.94.0 the smalls a map
+    # places itself (a Splitters pack is a large and two smalls), read from
+    # the maps' own spawn lists.
+    placed_smalls = sum(1 for area in gamedata.AREAS.values() for spawn in area.get("spawns", [])
+                        if spawn.get("e") == el + "slime")
+    check("  the small's kill ceiling is eight per placed large, and the smalls placed",
+          int(small["placed_count"]) == 8 * int(large["placed_count"]) + placed_smalls
+          and int(large["placed_count"]) > 0,
+          (small["placed_count"], large["placed_count"], placed_smalls))
 
 r = client.post("/api/combat/kill", headers=H, json={"slot": 0, "enemy_id": "windslimelarge"})
 check("a kill claim for the large itself is refused", r.status_code == 400, r.status_code)

@@ -2010,7 +2010,10 @@ gamedata.json's `xp_base` / `xp_growth`.
   and a normal dark bush mage now has 1,555; `killwatch.is_boss()` falls back
   to health only for a catalogue without the field.
 - **A small slime's kill ceiling is eight per placed large** (the exporter's
-  `placed_count`). The large grants nothing and a kill claim for it is 400.
+  `placed_count`), plus the smalls a map places itself (game 0.94.2: the
+  Field's Splitters pack is a large and two smalls). The large grants
+  nothing and a kill claim for it is 400. test_pacing.py counts the placed
+  smalls from the areas' spawns.
 - **`placed_count` is every scene added together.** Day 2 the game gained a
   second field, the Big Field, and most ceilings rose about fivefold (one
   light sprite in the world became five). A player is only ever in one area,

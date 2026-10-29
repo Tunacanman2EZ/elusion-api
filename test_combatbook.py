@@ -570,14 +570,16 @@ check("a spot the map does not hold", spawn(book, record(11, "darksprite", origi
 check("the wrong monster at a spot",
       spawn(book, record(12, "firesprite", origin=spot["o"]), 1.0) == ["wrong_monster"])
 check("two at one spot", spawn(book, record(13, "darksprite"), 1.0) == ["unaccounted_spawn"])
-check("a different maximum health", spawn(book, record(14, "lightsprite",
-      mh=gamedata.ENEMIES["lightsprite"]["max_hp"] * 10), 1.0) == ["max_hp_differs"])
+# (Kinds the Field places, each at a spot nothing above took: since game
+# 0.94.2 it holds fire, dark and skeletons only.)
+check("a different maximum health", spawn(book, record(14, "darkfiresprite",
+      mh=gamedata.ENEMIES["darkfiresprite"]["max_hp"] * 10), 1.0) == ["max_hp_differs"])
 check("  which the books ignore: they count from the catalogue's",
-      book.monsters[14].hp == gamedata.ENEMIES["lightsprite"]["max_hp"])
+      book.monsters[14].hp == gamedata.ENEMIES["darkfiresprite"]["max_hp"])
 check("a monster from nowhere", spawn(book, record(15, "firesprite", origin=""), 1.0) == ["unaccounted_spawn"])
-spawn(book, record(16, "windsprite", hp=1), 1.0)
+spawn(book, record(16, "darkbushsniper", hp=1), 1.0)
 check("a monster that spawns is counted from the catalogue's health, whatever the leader says it has",
-      book.monsters[16].hp == gamedata.ENEMIES["windsprite"]["max_hp"], book.monsters[16].hp)
+      book.monsters[16].hp == gamedata.ENEMIES["darkbushsniper"]["max_hp"], book.monsters[16].hp)
 check("  and every one of those deaths would be NOT DUE",
       all(book.monsters[i].not_due for i in (10, 11, 12, 13, 15)) and not book.monsters[14].not_due)
 book.world(lead, {"ev": [{"k": "gone", "id": 12}, {"k": "gone", "id": 13}]}, 1.0)
