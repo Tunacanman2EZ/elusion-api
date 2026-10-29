@@ -318,13 +318,14 @@ check("the save that made it answers with its bag, so the game shows the potions
 make(kit_token, 1, "mage")
 w_cells = raw("SELECT position, item_id, quantity FROM carry_items WHERE user_id = ? AND slot = 0 ORDER BY position", (kit_id,))
 m_cells = raw("SELECT position, item_id, quantity FROM carry_items WHERE user_id = ? AND slot = 1 ORDER BY position", (kit_id,))
-check("a new warrior: five Tiny Health Potions on hotbar key 1, nothing else",
-      [tuple(c) for c in w_cells] == [(20, "tinyhealthpotion", 5)], [tuple(c) for c in w_cells])
+check("a new warrior: five Tiny Health Potions on hotbar key 1 and five Tiny Mana on key 2 - every class spends mana",
+      [tuple(c) for c in w_cells] == [(20, "tinyhealthpotion", 5), (21, "tinymanapotion", 5)], [tuple(c) for c in w_cells])
 check("a new mage: health on key 1 and five Tiny Mana Potions on key 2",
       [tuple(c) for c in m_cells] == [(20, "tinyhealthpotion", 5), (21, "tinymanapotion", 5)], [tuple(c) for c in m_cells])
 make(kit_token, 0, "warrior")
 again = raw("SELECT position, item_id, quantity FROM carry_items WHERE user_id = ? AND slot = 0 ORDER BY position", (kit_id,))
-check("saving the character again gives nothing more", [tuple(c) for c in again] == [(20, "tinyhealthpotion", 5)],
+check("saving the character again gives nothing more",
+      [tuple(c) for c in again] == [(20, "tinyhealthpotion", 5), (21, "tinymanapotion", 5)],
       [tuple(c) for c in again])
 second = client.put("/api/save", headers=bearer(kit_token),
                     json={"slot": 0, "class_id": "warrior", "name": "warrior"}).get_json()

@@ -12,13 +12,15 @@ VALID_CLASSES = {"warrior", "mage", "tank", "healer"}
 # free storage.
 # A NEW CHARACTER'S STARTER POTIONS (game 0.92.0): the owner's first five
 # minutes walked, a level 1 character leaving town with nothing to drink.
-# On the hotbar's first keys, in this order: health for everyone, and mana
-# for the two classes whose attacks spend it. Only for a slot's FIRST
+# On the hotbar's first keys, in this order: health, then mana - for every
+# class, since every class spends mana (the warrior's slash wave, the tank's
+# dynamite; it was the mage and the healer alone until 28 Oct, the owner's
+# testers: "no mana potions"). Only for a slot's FIRST
 # character (routes.py): a slot that has had one deleted gets none, so
 # deleting and making again is not a way to mint potions.
 STARTER_POTIONS = (("tinyhealthpotion", 5),)
 STARTER_MANA = (("tinymanapotion", 5),)
-STARTER_MANA_CLASSES = {"mage", "healer"}
+STARTER_MANA_CLASSES = {"warrior", "tank", "mage", "healer"}
 
 MAX_EXPLORED_BYTES = 65536
 

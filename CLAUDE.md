@@ -1046,8 +1046,9 @@ T-7) holds it, and `_test_token_lifecycle()` holds the game's half.
 The owner's first five minutes, walked: a level 1 character left town with
 nothing to drink. A slot's FIRST character now starts with potions on its
 first hotbar keys - `saves/services.STARTER_POTIONS` (5 Tiny Health) on key
-1, and `STARTER_MANA` (5 Tiny Mana) on key 2 for `STARTER_MANA_CLASSES` (mage,
-healer).
+1, and `STARTER_MANA` (5 Tiny Mana) on key 2 for `STARTER_MANA_CLASSES` - every
+class since 28 Oct (it was mage and healer; the owner's testers said "no mana
+potions", and the warrior's slash wave and the tank's dynamite spend mana too).
 
 - **Written by carry/'s `starter_keys()`**, handed to saves/ as
   `give_starter`: the one place anything is put on a hotbar key, and only for
