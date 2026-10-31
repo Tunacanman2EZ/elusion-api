@@ -721,6 +721,51 @@ def stirred_lands(now=None):
     return frozenset(int(r["element"]) for r in rows if 1 <= int(r["element"] or 0) <= 7)
 
 
+# THE SWELL (game 0.97.1): while a land stirs, each of its monsters in the
+# Big Field may have (size - 1) more of its kind beside it, which the books
+# take as on the map (combatbook.AreaBook._judge_swell()). The size is the
+# owner's (world/services.py swell_of()), read here from the settings row
+# itself so this process imports none of the API's packages; test_world.py
+# holds the two readings together. Shipped on, at twice.
+SWELL_DEFAULT = 2
+SWELL_MOST = 4
+
+
+def swell_from(raw):
+    """The swell size from the stirring lands' saved settings (`raw`, the
+    row's JSON, or None for no row): 1 - nothing added - when it is off,
+    the lands are off or the row cannot be read."""
+    if raw is None:
+        return SWELL_DEFAULT
+    try:
+        stored = json.loads(raw)
+    except (ValueError, TypeError):
+        return 1
+    if not isinstance(stored, dict) or stored.get("on") is False:
+        return 1
+    on = stored.get("swell_on", True)
+    if isinstance(on, bool) and not on:
+        return 1
+    size = stored.get("swell_size", SWELL_DEFAULT)
+    if isinstance(size, bool) or not isinstance(size, (int, float)):
+        return SWELL_DEFAULT
+    return min(max(int(round(size)), 2), SWELL_MOST)
+
+
+def swell_size():
+    """swell_from() of the settings row as it is now; 1 when it cannot be
+    read. Runs in a thread."""
+    try:
+        conn = _connect()
+        try:
+            row = conn.execute("SELECT value FROM server_settings WHERE key = 'world'").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 1
+    return swell_from(row["value"] if row is not None else None)
+
+
 def write_books(kills, flags, prune_before=None):
     """Write what the books found: kills as combat_kills rows, flags as
     combat_flags rows ((user_id, area, kind, count, detail, first_at, last_at)),
@@ -1456,6 +1501,7 @@ class PresenceServer:
         self._book_errors = 0
         # The lands the books count stirred monsters for, and when last read.
         self.stirred = frozenset()
+        self.swell = 1
         self._stirred_at = -1e9
         # THE AURA'S HEALS not yet written: (user_id, slot, share).
         self._heals = []
@@ -1740,6 +1786,7 @@ class PresenceServer:
         if book is None:
             book = self.books[area] = combatbook.AreaBook(place, gamedata.AREAS[place])
             book.stirred_lands = self.stirred
+            book.swell = self.swell
             book.owns_health = True
             book.on_hit = lambda user_id, booked, claimed, boss, monster=None, element=None, room=area: \
                 self.dealt(room, user_id, booked, claimed, boss, monster, element)
@@ -1748,12 +1795,15 @@ class PresenceServer:
                 room, "grew" if after > before else "shrank", monster.id, [before, after])
         return book
 
-    def set_stirred(self, lands):
+    def set_stirred(self, lands, swell=1):
         """Every book, and every one made from now on, counts these lands'
-        monsters as stirred."""
+        monsters as stirred - and (THE SWELL) each of their monsters in the
+        Big Field as `swell` of its kind."""
         self.stirred = frozenset(lands)
+        self.swell = int(swell)
         for book in self.books.values():
             book.stirred_lands = self.stirred
+            book.swell = self.swell
 
     def _book_safely(self, what, *args):
         """THE BOOKS NEVER BREAK THE RELAY. Whatever a book cannot read, the
@@ -2770,7 +2820,8 @@ class PresenceServer:
         if now - self._stirred_at >= STIR_READ_SECONDS:
             self._stirred_at = now
             try:
-                self.set_stirred(await asyncio.to_thread(stirred_lands, now))
+                self.set_stirred(await asyncio.to_thread(stirred_lands, now),
+                                 await asyncio.to_thread(swell_size))
             except Exception as exc:  # noqa: BLE001
                 print("[PRESENCE] could not read the stirring lands: %r" % exc, flush=True)
         prune = None

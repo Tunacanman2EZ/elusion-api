@@ -197,6 +197,44 @@ def _ceiling_for(placed, window, respawn):
     return int(placed * (window / respawn + 1))
 
 
+# THE SWELL (game 0.97.1): while a land stirs, and for SWELL_GRACE_SECONDS
+# after, each of its Big Field spots may hold SWELL_MOST of it, and the live
+# ceiling allows for the size the owner set (kill/routes.py). This script does
+# not know which size was set then, so it allows the most. Mirrors
+# world/services.py; test_killwatch.py holds the two together.
+SWELL_MOST = 4
+SWELL_GRACE_SECONDS = 3600
+
+
+def _stir_spans(con):
+    """{element: [(from, to)]} - each stir's time, its grace hour included,
+    from world_ticks; {} when the table is not there."""
+    spans = {}
+    try:
+        for element, started, ends in con.execute("SELECT element, started_at, ends_at FROM world_ticks"):
+            spans.setdefault(int(element), []).append((int(started), int(ends) + SWELL_GRACE_SECONDS))
+    except sqlite3.Error:
+        return {}
+    return spans
+
+
+def _worst_breach(times, window, plain, swollen, spans):
+    """(kills, ceiling) of the window over its ceiling by the most, or None.
+    A window ending inside a stir of the enemy's land (`spans`) is held to
+    `swollen`, any other to `plain`. Same [t-W, t] as _worst_window_count()."""
+    times.sort()
+    worst = None
+    j = 0
+    for i, t in enumerate(times):
+        while times[j] < t - window:
+            j += 1
+        count = i - j + 1
+        ceiling = swollen if any(a <= t <= b for a, b in spans) else plain
+        if count > ceiling and (worst is None or count - ceiling > worst[0] - worst[1]):
+            worst = (count, ceiling)
+    return worst
+
+
 def _worst_window_count(times, window):
     """The most kills that ever fall inside one `window`-second span, by the same
     [t-W, t] the live server uses. Two pointers over sorted times: O(n)."""
@@ -251,6 +289,7 @@ def analyze(con, window=KILL_WINDOW_SECONDS, respawn=KILL_RESPAWN_FLOOR_SECONDS)
     # caller is warned and only the SUSPICIOUS behavioural checks proceed.
     # --------------------------------------------------------------------- #
     if _GAMEDATA_OK:
+        stir_spans = None
         for (user_id, enemy_id), times in by_user_enemy.items():
             enemy = gamedata.ENEMIES.get(enemy_id)
 
@@ -271,13 +310,24 @@ def analyze(con, window=KILL_WINDOW_SECONDS, respawn=KILL_RESPAWN_FLOOR_SECONDS)
             placed = gamedata.spawn_count_for(enemy_id) if gamedata.SPAWNS_EXPORTED else 0
             if placed > 0:
                 ceiling = _ceiling_for(placed, window, respawn)
-                worst = _worst_window_count(list(times), window)
-                if worst > ceiling:
+                spots = gamedata.swell_spots_for(enemy_id) if hasattr(gamedata, "swell_spots_for") else 0
+                swollen = _ceiling_for(placed + spots * (SWELL_MOST - 1), window, respawn)
+                try:
+                    element = int((enemy or {}).get("element", 0) or 0)
+                except (TypeError, ValueError):
+                    element = 0
+                if stir_spans is None:
+                    stir_spans = _stir_spans(con)
+                breach = _worst_breach(list(times), window, ceiling, swollen,
+                                       stir_spans.get(element, []) if spots > 0 else [])
+                if breach is not None:
+                    worst, allowed = breach
                     note(user_id, "IMPOSSIBLE", "spawn ceiling breached",
                          "%d kills of '%s' inside one %ds window; only %d exist, so "
                          "at most %d could have died. The live ceiling would have "
                          "refused this - it was not running."
-                         % (worst, enemy_id, window, placed, ceiling))
+                         % (worst, enemy_id, window, placed if allowed == ceiling
+                            else placed + spots * (SWELL_MOST - 1), allowed))
 
     # --------------------------------------------------------------------- #
     # SUSPICIOUS checks. Legal today, far outside honest play. Ranked, never

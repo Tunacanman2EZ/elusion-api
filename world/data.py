@@ -40,6 +40,15 @@ def begin(db, tick, element, started_at, ends_at, chosen_by):
     return cursor.rowcount == 1
 
 
+def stirred_lately(db, element, now, grace):
+    """Whether `element` stirs now or stopped within `grace` seconds (THE
+    SWELL's kill ceiling)."""
+    return db.execute(
+        "SELECT 1 FROM world_ticks WHERE element = ? AND started_at <= ? AND ends_at >= ? LIMIT 1",
+        (int(element), int(now) + 60, int(now) - int(grace)),
+    ).fetchone() is not None
+
+
 def kills_since(db, since):
     """[(enemy_id, paid kills)] since `since`."""
     return db.execute(

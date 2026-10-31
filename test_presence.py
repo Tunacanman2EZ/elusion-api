@@ -1469,6 +1469,14 @@ async def server_owns_health():
         check("a stir raising a monster while it stands is counted, not flagged",
               b2.monsters[7].max_hp == raised and b2.monsters[7].hp == raised and not b2.take()[1],
               (b2.monsters[7].max_hp, b2.monsters[7].hp))
+
+        # THE SWELL: a book made after the last read knows the size as well as the lands.
+        hub3 = presence.PresenceServer(sweep_seconds=5, tick_seconds=5)
+        hub3.set_stirred({4}, 3)
+        made = hub3._book("bigfield")
+        check("a book made after the stir was read is told the swell too, not only the lands",
+              made is not None and made.swell == 3 and made.stirred_lands == frozenset({4}),
+              made and (made.swell, made.stirred_lands))
     finally:
         presence.broadcast = real_broadcast
 

@@ -78,6 +78,12 @@ AGREED_LEFT = 0.02
 # more). The leader's word for it is taken, and counted: more health than the
 # catalogue's only ever makes a death harder to agree, never easier.
 STIRRED_MAX_TIMES = 3
+# THE SWELL (game 0.97.1): while a land stirs, the leader's game puts (swell -
+# 1) more of each of its Big Field monsters beside it, each at a place of its
+# own, its origin the authored spot's plus SWELL_MARK and a number from 1
+# ("...#swell1"). They are judged by _judge_swell(), not against the map.
+SWELL_MARK = "#swell"
+SWELL_AREA = "bigfield"
 # BOSSES THAT SCALE (game 0.80.0): a boss's health is raised by who fights it
 # (bossenemy.gd, scale_for() - the fighters' levels above its band, how many
 # they are, the Crowned's own 2.5), on the game that runs it, and told in a
@@ -335,6 +341,9 @@ class AreaBook:
         # The lands (Element.Type 1-7) stirring now or lately, as presence.py
         # last read them (stirred_lands()); nothing stirs in a book alone.
         self.stirred_lands = frozenset()
+        # THE SWELL: how many of each stirring monster the Big Field may hold
+        # (1: none added), as presence.py last read it (swell_size()).
+        self.swell = 1
         # THE DAMAGE METER (game 0.81.0): presence.py's ear on every hit these
         # books count - on_hit(user_id, booked, claimed, boss, monster,
         # element) - and (0.82.0, THE FIGHT LOG) on every death - on_kill(
@@ -587,6 +596,9 @@ class AreaBook:
 
     def _judge_spawn(self, m, enemy, props, now, kind):
         leader = self.leader_id if self.leader_id is not None else 0
+        if SWELL_MARK in m.origin:
+            self._judge_swell(m, enemy, props, now, leader)
+            return
         if m.origin:
             spot = self.spawns.get(m.origin)
             if spot is None:
@@ -631,6 +643,32 @@ class AreaBook:
                 return
         m.not_due = True
         self._flag(leader, "unaccounted_spawn", "a %s from nowhere" % m.enemy_id, now)
+
+    def _judge_swell(self, m, enemy, props, now, leader):
+        """A SWELL MONSTER (game 0.97.1) is on the map when its spot is the
+        Big Field's, holds this kind, its land is stirring (or did lately), and
+        its number is under the swell size - one at each such place at a
+        time. Its death never moves the spot's respawn clock: that is the
+        authored monster's (`deaths` is keyed by the spot's own origin)."""
+        base, _mark, nth = m.origin.partition(SWELL_MARK)
+        spot = self.spawns.get(base)
+        try:
+            number = int(nth)
+            element = int(enemy.get("element", 0) or 0)
+        except (TypeError, ValueError):
+            number, element = 0, 0
+        if self.area != SWELL_AREA or spot is None or str(spot.get("e", "")) != m.enemy_id \
+                or element not in self.stirred_lands or not 1 <= number < self.swell:
+            m.not_due = True
+            self._flag(leader, "unaccounted_spawn", "a swell %s the map does not allow (%r)"
+                       % (m.enemy_id, m.origin[:80]), now)
+            return
+        if any(other.origin == m.origin for other in self.monsters.values()):
+            m.not_due = True
+            self._flag(leader, "unaccounted_spawn", "a second swell %s at one place" % m.enemy_id, now)
+            return
+        if m.splitter and not props.get("du"):
+            m.twins_left = 1
 
     def _twin_parent(self, twin, now):
         best = None

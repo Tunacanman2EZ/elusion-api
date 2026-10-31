@@ -938,6 +938,77 @@ book.world(lead, {"ev": [{"k": "mh", "id": 952, "mh": CAT, "hp": CAT}]}, 17.0)
 check("  and every boss its fight raised or lowered, from what to what - not a no-change",
       grown == [(952, CAT, CAT * 2), (952, CAT * 2, CAT)], grown)
 
+# =============================================================================
+section("CB-15 THE SWELL: A STIRRING LAND'S MONSTERS, MORE OF THEM (game 0.97.1)")
+# =============================================================================
+# While a land stirs, the leader's game puts (swell - 1) more of each of its
+# Big Field monsters beside it, each at "<the spot's origin>#swell<n>".
+BIG = gamedata.AREAS.get("bigfield")
+if not BIG:
+    print("  skip  the swell: this catalogue has no Big Field")
+else:
+    spot = next(s for s in BIG["spawns"] if int(gamedata.ENEMIES.get(s["e"], {}).get("element", 0) or 0) in range(1, 8)
+                and gamedata.ENEMIES[s["e"]].get("grants_rewards") and not gamedata.ENEMIES[s["e"]].get("split_count"))
+    kind = spot["e"]
+    land = int(gamedata.ENEMIES[kind]["element"])
+    other = next(e for e in sorted(gamedata.ENEMIES) if gamedata.ENEMIES[e].get("resource")
+                 and e != kind and int(gamedata.ENEMIES[e].get("element", 0) or 0) == land)
+
+    def swollen(book, monster_id, enemy_id, origin, now):
+        r = record(monster_id, enemy_id, origin=origin, x=spot["x"] + 30, y=spot["y"])
+        book.world(lead, {"ev": [{"k": "spawn", "r": r}]}, now)
+        return kinds(book.take()[1])
+
+    book = AreaBook("bigfield", BIG)
+    lead = warrior(1)
+    lead.scene_at = 0.0
+    book.stirred_lands = frozenset({land})
+    book.swell = 3
+    book.world(lead, {"full": True, "reset": True, "part": 0, "parts": 1,
+                      "spawn": [record(1, kind, origin=spot["o"], x=spot["x"], y=spot["y"])]}, 0.5)
+    book.take()
+    check("two more of a stirring monster beside its spot, at a swell of 3: on the map",
+          swollen(book, 2, kind, spot["o"] + combatbook.SWELL_MARK + "1", 1.0) == []
+          and swollen(book, 3, kind, spot["o"] + combatbook.SWELL_MARK + "2", 1.0) == []
+          and not book.monsters[2].not_due and not book.monsters[3].not_due)
+    check("  a third (its number is the size): flagged",
+          swollen(book, 4, kind, spot["o"] + combatbook.SWELL_MARK + "3", 1.0) == ["unaccounted_spawn"])
+    check("  a second at one swell place: flagged",
+          swollen(book, 5, kind, spot["o"] + combatbook.SWELL_MARK + "1", 1.0) == ["unaccounted_spawn"])
+    check("  another kind at the spot's swell place: flagged",
+          swollen(book, 6, other, spot["o"] + combatbook.SWELL_MARK + "1", 1.0) == ["unaccounted_spawn"])
+    check("  a swell place of a spot the map does not hold: flagged",
+          swollen(book, 7, kind, "ysortworld/enemies/elsewhere" + combatbook.SWELL_MARK + "1", 1.0)
+          == ["unaccounted_spawn"])
+    book.world(lead, {"ev": [{"k": "gone", "id": i} for i in (4, 5, 6, 7)]}, 1.0)
+    end = fight(book, lead, 2, gamedata.ENEMIES[kind]["max_hp"], 2.0)
+    book.world(lead, {"ev": [{"k": "die", "id": 2, "x": spot["x"] + 30, "y": spot["y"]}]}, end)
+    book.tick(end + 5.0)
+    kills, _ = book.take()
+    check("its death is AGREED, so it pays even with kill receipts on",
+          [k["verdict"] for k in kills if k["enemy_id"] == kind] == ["agreed"], kills)
+    check("  and it does not move the spot's respawn clock - the authored monster's",
+          spot["o"] not in book.deaths, book.deaths)
+    quiet = AreaBook("bigfield", BIG)
+    quiet.swell = 3
+    quiet.world(lead, {"full": True, "reset": True, "part": 0, "parts": 1,
+                       "spawn": [record(1, kind, origin=spot["o"], x=spot["x"], y=spot["y"])]}, 0.5)
+    quiet.take()
+    check("its land not stirring: flagged",
+          swollen(quiet, 2, kind, spot["o"] + combatbook.SWELL_MARK + "1", 1.0) == ["unaccounted_spawn"])
+    off = AreaBook("bigfield", BIG)
+    off.stirred_lands = frozenset({land})
+    off.world(lead, {"full": True, "reset": True, "part": 0, "parts": 1,
+                     "spawn": [record(1, kind, origin=spot["o"], x=spot["x"], y=spot["y"])]}, 0.5)
+    off.take()
+    check("  the swell off (1): flagged",
+          swollen(off, 2, kind, spot["o"] + combatbook.SWELL_MARK + "1", 1.0) == ["unaccounted_spawn"])
+    elsewhere = AreaBook("field", FIELD)
+    elsewhere.stirred_lands = frozenset({land})
+    elsewhere.swell = 3
+    check("  and in any area but the Big Field: flagged",
+          swollen(elsewhere, 2, kind, spot["o"] + combatbook.SWELL_MARK + "1", 1.0) == ["unaccounted_spawn"])
+
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))
 print("=" * 60)

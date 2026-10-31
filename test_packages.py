@@ -2454,7 +2454,7 @@ def stir_for(enemy_id):
 
 
 WIND_TEXT = ("The wind lands stir for 3 hours: wind monsters hit 25% harder, have 50% more health, move 15% faster"
-             " and drop loot 1.5x as often, and wind resistance counts 1.5x.")
+             " and drop loot 1.5x as often, and wind resistance counts 1.5x. In the Big Field its monsters swell 2x.")
 # A day's hunting: one paid kill in every land but wind.
 conn = sqlite3.connect(path_a)
 conn.executemany("INSERT INTO kill_reports (user_id, slot, enemy_id, at) VALUES (2, 0, ?, ?)",

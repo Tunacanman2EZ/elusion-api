@@ -6450,6 +6450,7 @@ kill_package.register(
     max_slot=MAX_SLOT,
     catalogue=gamedata,
     stir_for=lambda db, enemy_id: world_stir_for(db, enemy_id),
+    swell_for=lambda db, enemy_id: world_swell_for(db, enemy_id),
     derived_stats=_derived_stats,
     levelup_grant_id=LEVELUP_GRANT_ID,
     proficient_amount=proficient_amount,
@@ -7190,6 +7191,7 @@ current_world_tick = _WORLD.current_tick
 world_next_stir = _WORLD.next_stir
 world_public = _WORLD.public
 world_stir_for = _WORLD.stir_for
+world_swell_for = _WORLD.swell_for
 # The two owner's changes, as the routes are registered: test_world.py reads
 # their mark for asking the password again.
 set_world = app.view_functions["set_world"]

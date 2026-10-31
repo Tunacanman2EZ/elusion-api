@@ -202,6 +202,24 @@ def register(app, *, require_auth, require_owner, require_fresh_password, get_db
             bags, xp = happening.ceiling(bags, xp)
         return bags, xp
 
+    def world_swell_for(db, enemy_id):
+        """THE SWELL (game 0.97.1): how many of `enemy_id` may stand at each
+        of its Big Field spots - the owner's size while its land stirs or
+        within SWELL_GRACE_SECONDS of its stir ending, and 1 otherwise, or
+        for anything that goes wrong (the kill ceiling then is as ever)."""
+        try:
+            element = element_of(enemy_id)
+            settings = world_settings()
+            size = services.swell_of(settings)
+            if size <= 1 or not settings["on"] or element not in LANDS:
+                return 1
+            if not data.stirred_lately(db, element, time.time(), services.SWELL_GRACE_SECONDS):
+                return 1
+            return size
+        except Exception:   # noqa: BLE001 - a kill must outlive the world
+            app.logger.exception("[WORLD] could not read the swell for a kill; the plain ceiling")
+            return 1
+
     def owner_payload(db):
         settings = world_settings()
         state = world_public(db)
@@ -366,4 +384,4 @@ def register(app, *, require_auth, require_owner, require_fresh_password, get_db
 
     return SimpleNamespace(settings=world_settings, land_hunts=land_hunts, pick_land=pick_land,
                            begin_stir=begin_stir, current_tick=current_world_tick, next_stir=world_next_stir,
-                           public=world_public, stir_for=world_stir_for)
+                           public=world_public, stir_for=world_stir_for, swell_for=world_swell_for)

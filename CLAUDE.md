@@ -2331,6 +2331,45 @@ dark, light, ice, wind, earth, fire, water; 8 and 9 are not lands) stirs.
   (`test_broadcast.py`, `test_maintenance.py`): the first poll writes stir 1
   and announces it, one message more than the suite expects.
 
+## The Swell (game 0.97.1)
+
+The owner, 30 Oct: "lets make the tests into a real feature that changes
+with the land we can customize it more in hud". While a land stirs, each of
+its monsters in the Big Field stands `swell` times over - real monsters the
+game that runs the area builds (the game's CLAUDE.md, "The Swell"), shared
+and paying like any other. What the server does:
+
+- **Settings** (world/services.py): `swell_on` (shipped on) and
+  `swell_size` (2 to `SWELL_MOST` 4, whole), in `WORLD_SWITCHES` and
+  `WORLD_LIMITS`. `swell_of(settings)` is the size, or 1 when off.
+  `public()` sends `"swell"` in the poll's world; `stir_text()` adds "In the
+  Big Field its monsters swell 2x." to the announcement.
+- **The kill ceiling counts them** (kill/routes.py): `standing = placed +
+  swell_spots_for(enemy) * (size - 1)` (gamedata.py counts the monster's
+  spots in the Big Field) while its land stirs - or stirred within
+  `SWELL_GRACE_SECONDS` (3600, world/data.py `stirred_lately()`), for the
+  ones still standing after it ended. `world_swell_for(db, enemy_id)`
+  (world/routes.py, through app.py's `swell_for`) answers 1 on any error.
+- **The books accept them** (combatbook.py `_judge_swell`): an origin
+  `"<authored>#swell<n>"` in the Big Field is a spawn the books expected when
+  the spot exists, the monster is the spot's, its land is stirring, n is
+  under the size and no other stands there; anything else is
+  `unaccounted_spawn`. Its death never touches the authored spot's respawn
+  clock. presence.py reads the size from the `server_settings` row
+  (`swell_from()`, `swell_size()`, without importing the API's packages)
+  with the stirring lands, every flush, and gives it to each book - one
+  made after the last read too.
+- **killwatch.py** allows the swollen ceiling (`SWELL_MOST`) inside each
+  land's stir spans plus the grace (`_stir_spans()`), and the plain one
+  outside them.
+- **Deploy the server first**: an older server refuses the World tab's Save
+  (an unknown key is 400) and flags the swell's spawns.
+
+Tests: `test_world.py` W-1 (the settings), W-3 (the text and the poll), W-9
+(presence's reading, `world_swell_for`, the ceiling held at the swollen
+count, 1 after the grace); `test_combatbook.py` CB-15; `test_killwatch.py`
+section 9; `test_presence.py` (a new book is told the size).
+
 ## Player stats, and the first feature package (game 0.47.0)
 
 The owner, after "they log in noone is here it is pretty discouraging": "build

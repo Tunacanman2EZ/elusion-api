@@ -357,6 +357,42 @@ rc, out = run_cli(breach_rows, extra=("--quiet",))
 check("CLI --quiet still speaks and exits 1 on an alarm",
       rc == 1 and out.strip() != "", "rc=%d out=%r" % (rc, out[:120]))
 
+# 9. THE SWELL (game 0.97.1). While a land stirs, and for an hour after, each
+#    of its Big Field spots may hold up to four of a monster: a burst that the
+#    plain ceiling calls impossible is honest then, and only then.
+import world.services as world_rules  # noqa: E402
+
+check("killwatch allows the live swell's most and grace",
+      (killwatch.SWELL_MOST, killwatch.SWELL_GRACE_SECONDS)
+      == (world_rules.SWELL_MOST, world_rules.SWELL_GRACE_SECONDS))
+swell_enemy = next((e for e in sorted(gamedata.ENEMIES) if gamedata.swell_spots_for(e) > 0
+                    and gamedata.ENEMIES[e].get("grants_rewards")
+                    and int(gamedata.ENEMIES[e].get("element", 0) or 0) in range(1, 8)), None)
+if swell_enemy is None:
+    print("  skip  the swell: this catalogue places nothing in the Big Field")
+else:
+    land = int(gamedata.ENEMIES[swell_enemy]["element"])
+    placed = gamedata.spawn_count_for(swell_enemy)
+    plain = killwatch._ceiling_for(placed, killwatch.KILL_WINDOW_SECONDS, killwatch.KILL_RESPAWN_FLOOR_SECONDS)
+
+    def swell_burst(stirs):
+        con = fresh(); add_user(con, 9, "swell")
+        con.execute("CREATE TABLE world_ticks (tick INTEGER PRIMARY KEY, element INTEGER,"
+                    " started_at INTEGER, ends_at INTEGER, chosen_by TEXT)")
+        for n, (element, a, b) in enumerate(stirs, 1):
+            con.execute("INSERT INTO world_ticks VALUES (?, ?, ?, ?, '')", (n, element, a, b))
+        for i in range(plain + 2):
+            kill(con, 9, swell_enemy, 900000 + i)
+        return killwatch.analyze(con)
+
+    other = 1 if land != 1 else 2
+    check("a burst past the plain ceiling while its land stirs: not flagged",
+          "spawn ceiling breached" not in signals(swell_burst([(land, 890000, 905000)]), 9))
+    check("  the same burst while another land stirs: IMPOSSIBLE",
+          "spawn ceiling breached" in signals(swell_burst([(other, 890000, 910000)]), 9))
+    check("  and long after its land's stir and grace hour: IMPOSSIBLE",
+          "spawn ceiling breached" in signals(swell_burst([(land, 800000, 810000)]), 9))
+
 # --------------------------------------------------------------------------- #
 print("-" * 68)
 print("PASSED %d  FAILED %d" % (_passed, _failed))

@@ -25,7 +25,19 @@ WORLD_DEFAULTS = {
     "bags_on": True, "bags_times": 1.5,
     "resist_on": True, "resist_times": 1.5,
     "xp_on": False, "xp_percent": 25,
+    # THE SWELL (game 0.97.1; the owner: "lets make the tests into a real
+    # feature that changes with the land"): while a land stirs, each of its
+    # monsters in the Big Field has (swell_size - 1) more of its kind beside
+    # it - real ones, shared and paid. Shipped on, at twice.
+    "swell_on": True, "swell_size": 2,
 }
+# The most a swell may be: each monster and three more. The books, the kill
+# ceiling and killwatch allow for it (swell_spots_for(), SWELL_GRACE_SECONDS).
+SWELL_MOST = 4
+# How long after its stir ends a land's swell may still be met: its monsters
+# leave once out of a fight, and kills report a moment later. presence.py's
+# STIR_GRACE_SECONDS is the same hour.
+SWELL_GRACE_SECONDS = 3600
 # What each number may be: (lowest, highest, whole numbers only).
 WORLD_LIMITS = {
     "hours": (1, 24, True),
@@ -35,8 +47,9 @@ WORLD_LIMITS = {
     "bags_times": (1.0, 3.0, False),
     "resist_times": (1.0, 2.0, False),
     "xp_percent": (0, 100, True),
+    "swell_size": (2, SWELL_MOST, True),
 }
-WORLD_SWITCHES = ("on", "hit_on", "health_on", "speed_on", "bags_on", "resist_on", "xp_on")
+WORLD_SWITCHES = ("on", "hit_on", "health_on", "speed_on", "bags_on", "resist_on", "xp_on", "swell_on")
 
 
 def settings_from(raw):
@@ -133,7 +146,15 @@ def stir_text(element, settings, hours):
         text += ": %s monsters %s" % (name, ", ".join(does[:-1]) + (" and " if len(does) > 1 else "") + does[-1])
     if settings["resist_on"] and settings["resist_times"] > 1.0:
         text += (", and " if does else ": ") + "%s resistance counts %sx" % (name, "%g" % settings["resist_times"])
+    if swell_of(settings) > 1:
+        text += ". In the Big Field its monsters swell %dx" % swell_of(settings)
     return text + "."
+
+
+def swell_of(settings):
+    """How many of each stirring monster stand in the Big Field: the size,
+    or 1 with the swell off."""
+    return int(settings["swell_size"]) if settings.get("swell_on") else 1
 
 
 def public(row, settings, now):
@@ -153,6 +174,9 @@ def public(row, settings, now):
         "resist": settings["resist_times"] if settings["resist_on"] else 1.0,
         "bags": settings["bags_times"] if settings["bags_on"] else 1.0,
         "xp": settings["xp_percent"] / 100.0 if settings["xp_on"] else 0.0,
+        # THE SWELL: how many of each of its monsters the Big Field holds (1:
+        # none added). A game from before 0.97.1 ignores it.
+        "swell": swell_of(settings),
         # The server's clock, so the game counts down to ends_at on it rather
         # than on a computer clock that may be minutes out.
         "now": int(now),

@@ -1030,6 +1030,22 @@ def spawn_count_for(enemy_id):
         return 0
 
 
+# THE SWELL (game 0.97.1): the area whose stirring monsters may swell, and how
+# many of an enemy are placed there - each may have (size - 1) more beside it
+# while its land stirs, which the kill ceiling allows for (kill/routes.py).
+SWELL_AREA = "bigfield"
+
+
+def swell_spots_for(enemy_id):
+    """How many of `enemy_id` the Big Field places: the spots the swell adds
+    beside. 0 for one it does not place, or a catalogue without the areas."""
+    area = AREAS.get(SWELL_AREA) if isinstance(AREAS, dict) else None
+    spawns = area.get("spawns") if isinstance(area, dict) else None
+    if not isinstance(spawns, list):
+        return 0
+    return sum(1 for spot in spawns if isinstance(spot, dict) and spot.get("e") == enemy_id)
+
+
 def equip_slot_for(item_id):
     """Which slot this item is worn in, lowercased.
 

@@ -46,7 +46,7 @@ from . import data, services
 
 def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, catalogue, stir_for, derived_stats,
              levelup_grant_id, proficient_amount, grant_skill_xp, post_broadcast, create_loot_bag,
-             note_refill, receipts_on, client_build, material_scale):
+             note_refill, receipts_on, client_build, material_scale, swell_for=None):
 
     def combat_kill():
         """
@@ -173,7 +173,12 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, ca
         if placed > 0:
             window_start = int(time.time()) - services.KILL_WINDOW_SECONDS
             recent = data.paid_recently(db, user_id, enemy_id, window_start)
-            ceiling = services.spawn_ceiling(placed)
+            # THE SWELL (game 0.97.1): while its land stirs, and an hour
+            # after, each of its Big Field spots holds `size` of it, not one.
+            size = swell_for(db, enemy_id) if swell_for is not None else 1
+            standing = placed + catalogue.swell_spots_for(enemy_id) * (max(1, size) - 1) \
+                if hasattr(catalogue, "swell_spots_for") else placed
+            ceiling = services.spawn_ceiling(standing)
             if recent >= ceiling:
                 # 429, matching the bucket above: this is "not yet", not "never".
                 # The message names the world rather than a policy, because that is
@@ -182,7 +187,7 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, ca
                     "error": "Too Many Requests",
                     "message": "Only %d '%s' exist in the world - that is more kills "
                                "than could have respawned in the last %d minutes."
-                               % (placed, enemy_id, services.KILL_WINDOW_SECONDS // 60),
+                               % (standing, enemy_id, services.KILL_WINDOW_SECONDS // 60),
                 }, 429
 
         # ---- everything above this line is validation; everything below commits --

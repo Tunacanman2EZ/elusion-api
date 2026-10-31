@@ -155,7 +155,8 @@ with app_module.app.app_context():
 check("with no row: on, 3-hour stirs, hits +25%, health +50%, speed +15%, loot 1.5x, resistance 1.5x, more XP there but off",
       defaults == {"on": True, "hours": 3, "hit_on": True, "hit_percent": 25, "health_on": True, "health_percent": 50,
                    "speed_on": True, "speed_percent": 15, "bags_on": True, "bags_times": 1.5,
-                   "resist_on": True, "resist_times": 1.5, "xp_on": False, "xp_percent": 25}, defaults)
+                   "resist_on": True, "resist_times": 1.5, "xp_on": False, "xp_percent": 25,
+                   "swell_on": True, "swell_size": 2}, defaults)
 sql("INSERT OR REPLACE INTO server_settings (key, value) VALUES (?, ?)", (app_module.WORLD_KEY, "{not json"))
 with app_module.app.app_context():
     broken = app_module.world_settings()
@@ -176,7 +177,9 @@ for body, why in [({}, "nothing"), ({"color": "red"}, "unknown"), ({"on": "yes"}
                   ({"bags_times": 3.5}, "bags over 3"), ({"resist_times": 0.5}, "resist under 1"),
                   ({"xp_percent": True}, "a bool for a number"), ({"health_percent": 201}, "health over 200"),
                   ({"speed_percent": 51}, "speed over 50"), ({"speed_percent": 10.5}, "speed not whole"),
-                  ({"health_on": "on"}, "health switch not a bool")]:
+                  ({"health_on": "on"}, "health switch not a bool"), ({"swell_size": 5}, "swell over 4"),
+                  ({"swell_size": 1}, "swell under 2"), ({"swell_size": 2.5}, "swell not whole"),
+                  ({"swell_on": 1}, "swell switch not a bool")]:
     res = client.post("/api/server/world", headers=auth(owner), json=body)
     check("  refused with 400: %s" % why, res.status_code == 400, (res.status_code, res.get_json()))
 check("nobody but the owner sees or changes it - the same bare 404 as no route",
@@ -270,14 +273,15 @@ check("the broadcast poll carries the world: land, name, when, and the numbers t
       res.status_code == 200 and world.get("on") is True and world.get("tick") == 1 and world.get("element") in app_module.LANDS
       and world.get("name") == app_module.LANDS[world["element"]] and world["ends_at"] - world["started_at"] == 3 * 3600
       and world["hit"] == 0.25 and world["resist"] == 1.5 and world["bags"] == 1.5 and world["xp"] == 0.0
-      and world["health"] == 0.5 and world["speed"] == 0.15, world)
+      and world["health"] == 0.5 and world["speed"] == 0.15 and world["swell"] == 2, world)
 check("  and the stir this poll began is announced in this poll's own messages",
       any(m["kind"] == "world" and m["body"].startswith("The %s lands stir" % world["name"]) for m in body["messages"]),
       body.get("messages"))
 said = [m["body"] for m in body["messages"] if m["kind"] == "world"]
 check("  saying what it does: harder hits, more health, faster, more loot, resistance counting more",
       said and said[0] == "The %s lands stir for 3 hours: %s monsters hit 25%% harder, have 50%% more health, "
-      "move 15%% faster and drop loot 1.5x as often, and %s resistance counts 1.5x." % (world["name"], world["name"], world["name"]),
+      "move 15%% faster and drop loot 1.5x as often, and %s resistance counts 1.5x. In the Big Field its monsters "
+      "swell 2x." % (world["name"], world["name"], world["name"]),
       said)
 client.post("/api/server/world", headers=auth(owner), json={"hit_on": False, "resist_on": False, "health_on": False,
                                                           "speed_on": False})
@@ -410,10 +414,13 @@ AREA = next(iter(gamedata.AREAS)) if gamedata.AREAS else None
 if AREA is None:
     print("  skip  the books: this catalogue has no areas' maps")
 else:
+    # NOT A BOSS (0.97.1): sorted first, the fire and water bosses were
+    # picked, and since game 0.80.0 a boss's health is raised by its fight
+    # (_scaled_boss()), so "more health" was allowed and two checks failed.
     fire_id = next(e for e in sorted(gamedata.ENEMIES) if int(gamedata.ENEMIES[e].get("element", 0)) == 6
-                   and gamedata.ENEMIES[e].get("resource"))
+                   and gamedata.ENEMIES[e].get("resource") and not gamedata.ENEMIES[e].get("slots_are_gear"))
     water_id = next(e for e in sorted(gamedata.ENEMIES) if int(gamedata.ENEMIES[e].get("element", 0)) == 7
-                    and gamedata.ENEMIES[e].get("resource"))
+                    and gamedata.ENEMIES[e].get("resource") and not gamedata.ENEMIES[e].get("slots_are_gear"))
 
     class Leader:
         user_id = 1
@@ -457,6 +464,65 @@ else:
           presence.stirred_lands(now) == frozenset({4, 6}), presence.stirred_lands(now))
     sql("DROP TABLE world_ticks")
     check("  and none from a database from before them", presence.stirred_lands(now) == frozenset())
+
+# =============================================================================
+section("W-9  the swell (game 0.97.1)")
+# The owner: "lets make the tests into a real feature that changes with the
+# land". While a land stirs, each of its Big Field monsters has (size - 1)
+# more of its kind beside it, and the server takes them as on the map, pays
+# them, and lets the kill ceiling count them.
+with app_module.app.app_context():
+    world.schema.create(app_module.get_db())
+reset_world()
+import world.services as world_services  # noqa: E402
+for raw in [None, "{not json", json.dumps({}), json.dumps({"swell_on": False}), json.dumps({"swell_size": 4}),
+            json.dumps({"swell_size": 9}), json.dumps({"swell_on": "yes", "swell_size": 3}),
+            json.dumps({"on": False, "swell_size": 3}), json.dumps({"swell_size": True})]:
+    settings = world_services.settings_from(raw)
+    expected = world_services.swell_of(settings) if settings["on"] else 1
+    check("presence.py reads the swell as the API does: %s" % raw, presence.swell_from(raw) == expected,
+          (presence.swell_from(raw), expected))
+check("  and the two agree on the most and the default",
+      presence.SWELL_MOST == world_services.SWELL_MOST
+      and presence.SWELL_DEFAULT == world_services.WORLD_DEFAULTS["swell_size"])
+client.post("/api/server/world", headers=auth(owner), json={"swell_size": 3})
+world = poll(player).get_json()["world"]
+check("the poll says how many of each the Big Field holds: 3", world["swell"] == 3, world)
+client.post("/api/server/world", headers=auth(owner), json={"swell_on": False})
+check("  switched off: 1 - none added", poll(player).get_json()["world"]["swell"] == 1)
+client.post("/api/server/world", headers=auth(owner), json={"swell_on": True, "swell_size": 4})
+
+land = poll(player).get_json()["world"]["element"]
+swelling = next((e for e in sorted(gamedata.ENEMIES) if ELEMENT_OF.get(e) == land
+                 and gamedata.ENEMIES[e].get("grants_rewards") and gamedata.swell_spots_for(e) > 0), None)
+quiet = next((e for e in sorted(gamedata.ENEMIES) if ELEMENT_OF.get(e) not in (None, land)
+              and gamedata.ENEMIES[e].get("grants_rewards") and gamedata.swell_spots_for(e) > 0), None)
+if swelling is None or quiet is None:
+    print("  skip  the swell's kills: this catalogue places no Big Field monster of the land")
+else:
+    check("its land's monster may stand 4 at a spot, another land's 1",
+          in_app(lambda db: app_module.world_swell_for(db, swelling)) == 4
+          and in_app(lambda db: app_module.world_swell_for(db, quiet)) == 1)
+    placed = gamedata.spawn_count_for(swelling)
+    spots = gamedata.swell_spots_for(swelling)
+    import kill.services as kill_rules  # noqa: E402
+    plain = kill_rules.spawn_ceiling(placed)
+    swollen = kill_rules.spawn_ceiling(placed + spots * 3)
+    sql("DELETE FROM kill_reports")
+    now = int(time.time())
+    for i in range(plain):
+        sql("INSERT INTO kill_reports (user_id, enemy_id, slot, at) VALUES (?, ?, 0, ?)", (player_id, swelling, now - 5))
+    res = kill(swelling)
+    check("  the kill ceiling counts the swell: %d kills in the window, more than one spot could make, and paid"
+          % plain, res.status_code == 200, (res.status_code, res.get_json()))
+    for i in range(swollen - plain - 1):
+        sql("INSERT INTO kill_reports (user_id, enemy_id, slot, at) VALUES (?, ?, 0, ?)", (player_id, swelling, now - 5))
+    res = kill(swelling)
+    check("  and still holds at what even four a spot could make (%d)" % swollen, res.status_code == 429,
+          (res.status_code, res.get_json()))
+    end_current(seconds_ago=world_services.SWELL_GRACE_SECONDS + 120)
+    check("  an hour after its stir ends, 1 again", in_app(lambda db: app_module.world_swell_for(db, swelling)) == 1)
+reset_world()
 
 print("\n=== %d passed, %d failed ===" % (passed, failed))
 if failures:
