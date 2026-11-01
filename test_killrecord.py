@@ -146,6 +146,9 @@ for _package, _rows, _layers in codemap.feature_packages():
                  for _name in sorted(os.listdir(os.path.join(HERE, _package))) if _name.endswith(".py")]
 _records = [src.split(mark)[1].split("\ndef ")[0] for src in _sources
             for mark in ("\ndef _record_kill(", "\ndef record_kill(") if mark in src]
+# minigames/ has a record_kill() of its own (a minigame's paid kills, 0.93.4),
+# so the one meant is the one that counts the tally.
+_records = [record for record in _records if "kill_tally" in record]
 _record = _records[0] if len(_records) == 1 else ""
 check("the count is written beside kill_reports, in the kill's transaction (no commit of its own)",
       len(_records) == 1 and "INSERT INTO kill_tally" in _record and "commit" not in _record.replace("NO COMMIT", ""),

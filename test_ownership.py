@@ -745,6 +745,13 @@ SWEEPS_ALLOWED = [
     # a minigame's paid kills (0.93.4, minigames/): every account's past
     # KILLS_KEPT_SECONDS go on the next kill, the server's own clock.
     ("minigame_kills", "at <", "retention: minigame kills past KILLS_KEPT_SECONDS"),
+    # a Google sign-in's codes (0.101.0, googlesignin/): ten minutes long,
+    # pruned an hour past their end whenever one is begun - dead to everybody.
+    ("google_codes", "expires_at <", "retention: Google sign-in codes past GOOGLE_CODES_KEPT_SECONDS"),
+    # and found by the code's own hash: the code is a secret only the game
+    # that began it was handed, and only that computer may collect it (the
+    # poll checks its install) - holding it is what makes it yours.
+    ("google_codes", "code_hash =", "a Google sign-in code, found by its secret's hash"),
 ]
 
 # THE PACKAGES' WRITES TOO. Since 16 Oct the areas moving out of app.py take

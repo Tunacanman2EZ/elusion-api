@@ -87,6 +87,8 @@ import clienterrors.schema as clienterrors_schema  # noqa: E402
 import accountdelete  # noqa: E402
 import minigames  # noqa: E402
 import minigames.schema as minigames_schema  # noqa: E402
+import googlesignin  # noqa: E402
+import googlesignin.schema as googlesignin_schema  # noqa: E402
 
 # Found, not listed: what app.py imports that has a routes.py (codemap.py).
 PACKAGES = tuple(name for name, _rows, _layers in codemap.feature_packages())
@@ -95,7 +97,7 @@ RUN_HERE = ("playerstats", "events", "insights", "killrecord", "friends", "gathe
             "chat", "trade", "kingdom", "world", "moderation", "staffdesk", "equipment", "consuming",
             "death", "bank", "carry", "skills", "saves", "status", "shop", "players", "switches", "kill",
             "ownertools", "accountsettings", "auth", "larder", "smith", "economyrules", "economywatch",
-            "serverhealth", "clienterrors", "accountdelete", "minigames")
+            "serverhealth", "clienterrors", "accountdelete", "minigames", "googlesignin")
 LANDS = {1: "dark", 2: "light", 3: "ice", 4: "wind", 5: "earth", 6: "fire", 7: "water"}
 
 passed = 0
@@ -1367,6 +1369,28 @@ def bare_app(name):
         log_guild_event=lambda *a, **k: None, take_down_line=lambda *a, **k: None,
         record_login_attempt=lambda db, username, ip, ok, reason="": app.config.setdefault("attempts", []).append(reason),
         client_ip=lambda: "127.0.0.1", log_staff_action=lambda *a, **k: None)
+
+    # googlesignin/ (0.101.0): its tables made here, as init_db() makes them;
+    # no Client ID, so every Google route says it is not set up, and the
+    # whole road is asked in test_googlesignin.py.
+    with sqlite3.connect(path) as made:
+        googlesignin_schema.create(made)
+    googlesignin.register(
+        app, require_auth=require_auth, require_fresh_password=lambda view: view, get_db=get_db,
+        bad_request=lambda message: ({"error": "Bad Request", "message": message}, 400),
+        client_ip=lambda: "127.0.0.1", client_id=lambda: "", request_install_hash=lambda: "",
+        username_ok=lambda name: name.isalnum(), maintenance_refusal=lambda name: None,
+        prune_login_attempts=lambda *a: None, ip_throttle_state=lambda *a: None,
+        register_throttle_state=lambda *a: None, record_login_attempt=lambda *a, **k: None,
+        wait_words=lambda seconds: "%d seconds" % seconds, ban_state=lambda row: None,
+        ban_evasion_state=lambda *a: None, install_evasion_state=lambda *a: None,
+        record_account_ip=lambda *a: None, record_account_install=lambda *a: None,
+        issue_token=lambda user_id, **k: ("stand-in-token", 0), login_hardening=lambda: (False, ""),
+        end_other_sessions=lambda *a, **k: None, role_for=lambda row: row["role"], default_role="player",
+        has_owner_powers=lambda name: name in owners, role_at_least=lambda row, rank: RANKS.index(
+            row["role"] if row["role"] in RANKS else "player") >= RANKS.index(rank),
+        name_hue_of=lambda row: None, needs_recovery_email=lambda row: False,
+        mask_email=lambda address: "masked", dummy_hash="!")
     return app, said, logged, path
 
 
@@ -1796,7 +1820,11 @@ check("a bare app has the packages' routes and nothing else",
                        # loot/'s chest (0.93.4)
                        "/api/loot/chest",
                        # accountdelete/ (0.90.0)
-                       "/api/account/delete"]), rules)
+                       "/api/account/delete",
+                       # googlesignin/ (0.101.0)
+                       "/api/auth/google/start", "/api/auth/google/page", "/api/auth/google/finish",
+                       "/api/auth/google/poll", "/api/auth/google/register", "/api/account/google",
+                       "/api/account/google/link", "/api/account/google/unlink"]), rules)
 
 # =============================================================================
 section("P-2  on a bare app, each answers as on the real server")
@@ -4626,6 +4654,17 @@ check("account delete: the wrong name typed is a 400, the owner a 403, the wrong
       and app_a.config.get("attempts") == ["bad-password-on-delete"], (res_name.status_code, res_owner.status_code,
                                                          res_pass.status_code))
 check("  and nobody without a login gets in", client_a.post("/api/account/delete", json={}).status_code == 401)
+
+# SIGNING IN WITH GOOGLE (0.101.0): on a bare app with no Client ID, every
+# route says so, and the account's status says it is not available.
+not_set = [client_a.post(path, json={}).status_code for path in
+           ("/api/auth/google/start", "/api/auth/google/finish")]
+status = client_a.get("/api/account/google", headers=who("ann")).get_json() or {}
+check("google sign-in: not set up on a bare app - start and finish 503, ann not linked and it not available",
+      not_set == [503, 503] and status.get("available") is False and status.get("linked") is False
+      and status.get("staff") is False, (not_set, status))
+check("  and the boss is staff, so never offered it",
+      (client_a.get("/api/account/google", headers=who("boss")).get_json() or {}).get("staff") is True)
 
 # =============================================================================
 section("P-3  two apps from the same code, each its own")

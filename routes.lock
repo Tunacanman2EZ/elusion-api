@@ -3,6 +3,8 @@
 # METHOD PATH  ENDPOINT  auth|open  rank=  fresh=  lock=  doc=
 GET /api/account  read_account  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/account/email  get_account_email  auth  rank=-  fresh=-  lock=yes  doc=yes
+GET /api/account/google  google_status  auth  rank=-  fresh=-  lock=yes  doc=yes
+GET /api/auth/google/page  google_page  open  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/auth/session  session_info  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/character  read_character  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/chat  read_chat  auth  rank=-  fresh=-  lock=yes  doc=yes
@@ -62,7 +64,13 @@ GET /static/<path:filename>  static  open  rank=-  fresh=-  lock=yes  doc=no
 POST /api/account/delete  delete_account  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/account/email  set_account_email  auth  rank=-  fresh=-  lock=no  doc=yes
 POST /api/account/email/verify  verify_account_email  auth  rank=-  fresh=-  lock=no  doc=yes
+POST /api/account/google/link  google_link  auth  rank=-  fresh=yes  lock=yes  doc=yes
+POST /api/account/google/unlink  google_unlink  auth  rank=-  fresh=yes  lock=yes  doc=yes
 POST /api/auth/confirm  confirm_password  auth  rank=-  fresh=-  lock=yes  doc=yes
+POST /api/auth/google/finish  google_finish  open  rank=-  fresh=-  lock=yes  doc=yes
+POST /api/auth/google/poll  google_poll  open  rank=-  fresh=-  lock=yes  doc=yes
+POST /api/auth/google/register  google_register  open  rank=-  fresh=-  lock=yes  doc=yes
+POST /api/auth/google/start  google_start  open  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/auth/login  login  open  rank=-  fresh=-  lock=no  doc=yes
 POST /api/auth/logout  logout  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/auth/logout-all  logout_all  auth  rank=-  fresh=-  lock=yes  doc=yes
@@ -110,6 +118,7 @@ POST /api/ignores/remove  remove_ignore  auth  rank=-  fresh=-  lock=yes  doc=ye
 POST /api/kingdom/donate  kingdom_donate  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/loot/take  take_loot  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/minigames/enter  minigames_enter  auth  rank=-  fresh=-  lock=yes  doc=yes
+POST /api/minigames/finish  minigames_finish  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/minigames/kill  minigames_kill  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/owner/economy/canary  owner_canary_check  auth  rank=coowner  fresh=-  lock=no  doc=yes
 POST /api/party/invite  party_invite  auth  rank=-  fresh=-  lock=yes  doc=yes

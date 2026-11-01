@@ -283,7 +283,9 @@ check("the routes that ask: ranks, bans, gold, levels, skills, items, rollback, 
                       # The kill receipts' switch (game 0.57.0, test_receipts.py).
                       "/api/server/receipts",
                       # The economy's numbers, the owner's alone (0.74.0, test_economyrules.py).
-                      "/api/owner/economy/rules"]), asks)
+                      "/api/owner/economy/rules",
+                      # Linking Google, or taking it off (game 0.101.0, test_googlesignin.py).
+                      "/api/account/google/link", "/api/account/google/unlink"]), asks)
 check("  and not a moderator's everyday ones: mute, kick, a deleted line, reports",
       not any(fresh.get(p) for p in ("/api/staff/mute", "/api/staff/kick", "/api/chat/delete",
                                      "/api/staff/reports/resolve")))

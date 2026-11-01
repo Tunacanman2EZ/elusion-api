@@ -237,7 +237,7 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
             bosses = 1 if boss else 0
         if seconds > services.HEALER_RUN_KEPT_SECONDS:
             gold = 0
-        if not data.finish_run(db, run_id, now, believed_waves, bosses, goal, gold):
+        if not data.finish_run(db, run_id, g.user["id"], now, believed_waves, bosses, goal, gold):
             return {"error": "Conflict", "message": "That run is already finished."}, 409
         purse = None
         if gold > 0 and gold_delta is not None:

@@ -1160,6 +1160,7 @@ import smith.schema as smith_schema  # noqa: E402
 import economyrules.schema as economyrules_schema  # noqa: E402
 import clienterrors.schema as clienterrors_schema  # noqa: E402
 import minigames.schema as minigames_schema  # noqa: E402
+import googlesignin.schema as googlesignin_schema  # noqa: E402
 
 
 def init_db():
@@ -1963,6 +1964,7 @@ def init_db():
     economyrules_schema.create(db)
     clienterrors_schema.create(db)
     minigames_schema.create(db)
+    googlesignin_schema.create(db)
 
     _migrate_bank_to_account(db)
 
@@ -9042,6 +9044,52 @@ accountdelete_package.register(
     client_ip=lambda: client_ip(),
     log_staff_action=lambda actor, action, target_name, target_id=None, detail="": log_staff_action(
         actor, action, target_name, target_id, detail),
+)
+
+
+# =============================================================================
+# SIGNING IN WITH GOOGLE (game 0.101.0) - the googlesignin/ package
+# =============================================================================
+# A player: "Google account to play or I am not registering". The game asks
+# for a code, the player signs in with Google on our page in the web browser,
+# and the game is signed in exactly as a password login would sign it in -
+# every gate above handed in, so none of them is a copy. Staff never sign in
+# this way. googlesignin/__init__.py has the whole of it.
+import googlesignin as googlesignin_package  # noqa: E402
+
+googlesignin_package.register(
+    app,
+    require_auth=require_auth,
+    require_fresh_password=require_fresh_password,
+    get_db=get_db,
+    bad_request=bad_request,
+    client_ip=lambda: client_ip(),
+    # ASKED ON EVERY CALL: the suite sets it, and unset is "not set up".
+    client_id=lambda: os.environ.get("ELUSION_GOOGLE_CLIENT_ID", ""),
+    request_install_hash=request_install_hash,
+    username_ok=lambda name: bool(USERNAME_PATTERN.match(name)),
+    maintenance_refusal=maintenance_refusal,
+    prune_login_attempts=_prune_login_attempts,
+    ip_throttle_state=_ip_throttle_state,
+    register_throttle_state=_register_throttle_state,
+    record_login_attempt=_record_login_attempt,
+    wait_words=_wait_words,
+    ban_state=ban_state,
+    ban_evasion_state=_ban_evasion_state,
+    install_evasion_state=_install_evasion_state,
+    record_account_ip=_record_account_ip,
+    record_account_install=_record_account_install,
+    issue_token=issue_token,
+    login_hardening=login_hardening,
+    end_other_sessions=_end_other_sessions,
+    role_for=role_for,
+    default_role=DEFAULT_ROLE,
+    has_owner_powers=has_owner_powers,
+    role_at_least=role_at_least,
+    name_hue_of=name_hue_of,
+    needs_recovery_email=needs_recovery_email,
+    mask_email=_mask_email,
+    dummy_hash=_TIMING_DUMMY_HASH,
 )
 
 

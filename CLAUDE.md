@@ -3253,6 +3253,64 @@ passing phase 2". The run is 3 tiers of 8 waves, each ending with a boss.
 
 `test_minigames.py` MG-13.
 
+## Signing in with Google (game 0.101.0)
+
+A player: "Google account to play or I am not registering". The owner: "lets
+do it because i agree i can still use my key for admin stuff". The
+googlesignin/ package; the plan is the commit folder's GOOGLE_SIGNIN_PLAN.txt.
+
+- **One road for every game.** Google cannot run inside Godot, so the game
+  asks `POST /api/auth/google/start` for a code (bound to its install id,
+  `X-Elusion-Install`, required), opens `GET /api/auth/google/page?c=CODE` in
+  the web browser - our page with Google's button and a short check code the
+  game shows too - and asks `POST /api/auth/google/poll` every two seconds.
+  The page hands Google's ID token to `POST /api/auth/google/finish`. Done:
+  the poll answers exactly as `/login` does (`via: "google"`, `needs_email`
+  false), or `needs_name`, and `POST /api/auth/google/register` makes the
+  account with the name picked.
+- **Google's token is checked here** (services.verify_id_token(), google-auth's
+  `jwt.decode`): Google's published keys (fetched from Google and kept as long
+  as Google says, `fetch_certs` the suite's door), our Client ID as the
+  audience, not run out, Google's issuer, `email_verified`. Checked BEFORE
+  `get_db()`, so the key fetch never holds the write lock.
+- **The setting**: `ELUSION_GOOGLE_CLIENT_ID`, read on every call. Not a
+  secret (every page shows it), and the flow uses no client secret. Unset or
+  not a Client ID: every route answers 503 "not set up", the page says so.
+- **Every gate the password login has** is handed in, not copied: bans (the
+  ban and its reason), the closed server, one login at a time, the session
+  bound to the computer and hardened as a login is, the address and computer
+  recorded, and for a new account both throttles and both ban-evasion checks.
+- **One Google account, one game account** (`google_accounts.sub` UNIQUE): a
+  banned player cannot make another with the same Google account.
+- **Staff never**: a mod, dev, co-owner or the owner is refused at the page and
+  the poll, Google cannot be linked to them, and no Google sign-up may take a
+  staff name (`services.staff_name()`).
+- **A new account made with Google** has the timing stand-in hash as its
+  password (its password was never kept, and a login against it costs the
+  same scrypt as any) and Google's verified email as its confirmed recovery
+  address, so "Forgot password" can give it one. It stays linked
+  (`made_with_google`); unlinking is for an account that also has a password.
+- **Linking** (`/api/account/google/link`, `require_fresh_password`) runs the
+  same road with purpose `link`; an account with no confirmed address takes
+  Google's. `GET /api/account/google` says linked, the masked email,
+  `made_with_google`, `available` and `staff` (the game hides the row for staff).
+- **Deleting an account** takes `google_accounts` and `google_codes` with it
+  (accountdelete/'s OWN_TABLES), so that Google account may make a new one.
+- **The page** sends `Referrer-Policy: strict-origin-when-cross-origin` (Google's
+  button needs the origin; the app's default is no-referrer) and `no-store`;
+  X-Frame-Options stays DENY. Authorized JavaScript origins in Google Cloud:
+  `https://api.elusionrpg.com`, `https://play.elusionrpg.com`, and for testing
+  `http://localhost`, `http://localhost:5000` (a local 127.0.0.1 is said as
+  localhost - Google allows http only there).
+- **Deploy**: `google-auth` is in requirements.txt (the update script installs
+  it), then the Client ID in `/etc/elusion/elusion.env` and a restart. Server
+  first: an older server 404s the game's Google button, which says so.
+
+`test_googlesignin.py` GS-1 to GS-9 (a stand-in Google key signs the tokens,
+so the real check runs); SECURITY.md invariant 40; test_packages (a bare app),
+test_tokens (the two routes that ask for the password), test_ownership (the
+codes' prune and their own updates), routes.lock.
+
 ## Layout
 
 ```

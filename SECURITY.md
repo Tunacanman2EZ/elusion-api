@@ -381,6 +381,18 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     nothing. A change that is meant is written with `--write`, and the lock's
     diff is in the commit for anyone to read.
     → Held by: `test_routes.py` — "every one of the %d routes that needs a token answers 401 without one", "  and no path answers one method twice - the second rule would never be reached"
+40. **Signing in with Google opens no door the password login keeps shut**
+    (game 0.101.0, googlesignin/). Google's token is checked here, never
+    trusted from the page: Google's signature, our Client ID, not run out,
+    made by Google, an email Google verified. The code is the computer's
+    that began it - another install cannot collect it - used once, and good
+    for ten minutes. Every gate of the password login applies (bans, the
+    closed server, one login at a time, the session bound to the computer,
+    both ban-evasion checks for a new account), one Google account is one
+    game account, and staff never sign in this way: Google is refused for
+    them, cannot be linked to them, and no Google sign-up may take a staff
+    name.
+    → Held by: `test_googlesignin.py` — "  and the code is still waiting for a good one", "another computer cannot collect it - the same 404 as a code that never was", "a staff account's Google is refused at the page", "no Google sign-up may take the owner's name", "one Google account, one game account: it is never asked for a name again, and no second is made"
 
 ---
 
