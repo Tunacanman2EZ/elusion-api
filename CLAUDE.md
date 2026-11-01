@@ -3227,15 +3227,19 @@ purse and the ledger, once, held to the time, somebody else's run, a run left
 too long). (MG-10's "another account reads its own chest" fails on the PC's
 own code too, before these: unlooked-at.)
 
-**Three tiers, up to 5000 (game 0.100.0).** The owner: "lets progress tiers
-after round 8 to the next difficulty diff boss", then "up to 5000 gold for
-passing phase 2". The run is 3 tiers of 8 waves, each ending with a boss.
+**Three tiers, up to 20,000 (game 0.100.0; 0.104.0).** The owner: "lets
+progress tiers after round 8 to the next difficulty diff boss", then "up to
+5000 gold for passing phase 2", then (0.104.0) "t3 needs to reward up to
+20,000 gold high stakes hi rewards". The run is 3 tiers of 8 waves, each
+ending with a boss.
 
 - **A game from 0.100.0 sends `bosses`** (how many fell, 0-3) at Leave, and
   is paid by `healer_tier_gold()`: each wave passed by tier
-  (`HEALER_TIER_WAVE_GOLD` 10, 25, 100: 1080), each boss
-  (`HEALER_TIER_BOSS_GOLD` 120, 300, 1500: 1920), the goal
-  (`HEALER_TIER_GOAL_GOLD` 2000) - 5000, 700 of it by the second boss.
+  (`HEALER_TIER_WAVE_GOLD` 10, 25, 500: 4280), each boss
+  (`HEALER_TIER_BOSS_GOLD` 120, 300, 6000: 6420), the goal
+  (`HEALER_TIER_GOAL_GOLD` 9300) - 20,000, 700 of it by the second boss
+  (5000 until 0.104.0; at most 60,000 a day). A game is told the table at
+  Go (`pays.tiers`), so an older game shows the new numbers too.
   `healer_tier_believed()` holds it to the time: 3 s a wave, and a boss only
   once its tier's waves are passed and with 15 s for it and each before it.
   `bosses` that is not a whole number is a 400. The answer carries `bosses`;

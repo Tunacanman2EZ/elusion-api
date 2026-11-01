@@ -100,24 +100,27 @@ def healer_gold(waves, boss, goal):
 # the third boss the goal marker. And "up to 5000 gold for passing phase 2":
 # 0 to 5000 a run, most of it past the second boss -
 #
-#   each wave passed   HEALER_TIER_WAVE_GOLD by tier (3 tiers of 8):  1080
-#   each boss beaten   HEALER_TIER_BOSS_GOLD, the first, second, third: 1920
-#   the goal marker    HEALER_TIER_GOAL_GOLD                          2000
+#   each wave passed   HEALER_TIER_WAVE_GOLD by tier (3 tiers of 8):  4280
+#   each boss beaten   HEALER_TIER_BOSS_GOLD, the first, second, third: 6420
+#   the goal marker    HEALER_TIER_GOAL_GOLD                          9300
 #
-# - 700 by the second boss, the other 4300 in the third tier.
+# - 700 by the second boss, the other 19,300 in the third tier. Since game
+# 0.104.0 (the owner: "t3 needs to reward up to 20,000 gold high stakes hi
+# rewards") - it was 100 a wave, 1500 the third boss and 2000 the goal, 5000
+# in all.
 #
 # A game says it played the tiers by sending `bosses` (how many beaten, 0-3)
 # at Leave; one that sends `boss` (true or false) is from before 0.100.0 and
 # is paid by the table above, so a game not yet updated is paid what it shows.
 # The same limits on time: HEALER_MIN_WAVE_SECONDS a wave and
-# HEALER_MIN_BOSS_SECONDS a boss since its Go - so at the very most 15,000
+# HEALER_MIN_BOSS_SECONDS a boss since its Go - so at the very most 60,000
 # gold a day from it (three runs).
 
 HEALER_TIERS = 3
 HEALER_WAVES_PER_TIER = 8
-HEALER_TIER_WAVE_GOLD = (10, 25, 100)
-HEALER_TIER_BOSS_GOLD = (120, 300, 1500)
-HEALER_TIER_GOAL_GOLD = 2000
+HEALER_TIER_WAVE_GOLD = (10, 25, 500)
+HEALER_TIER_BOSS_GOLD = (120, 300, 6000)
+HEALER_TIER_GOAL_GOLD = 9300
 
 
 def healer_tier_waves():
