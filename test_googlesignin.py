@@ -23,6 +23,8 @@
   GS-8  THE GATES OF A NEW ACCOUNT: names, a closed server, ban evasion by
         address and by computer.
   GS-9  DELETING THE ACCOUNT takes its Google link with it.
+  GS-10 THE BROWSER'S TWO PAGES PASS THE MINIMUM BUILD: the page and finish
+        carry no build (a web browser opens them); the game's routes are gated.
 
 Run: python test_googlesignin.py
 """
@@ -375,6 +377,27 @@ c = start(INSTALL_A, dodge_ip).get_json()["code"]
 finish(c, token(sub="g-dodge2"))
 check("  and from a banned player's computer (403)", google_register(c, "gsdodge2", ip=dodge_ip).status_code == 403)
 raw("UPDATE users SET is_banned = 0 WHERE username = 'gspat'")
+
+
+section("GS-10 THE BROWSER'S TWO PAGES PASS THE MINIMUM BUILD")
+# Found live: the server's minimum build is set, the browser sends no build,
+# and the sign-in page answered 426 "too old to connect".
+raw("INSERT OR REPLACE INTO server_settings (key, value, updated_by, updated_at) VALUES ('min_client_build', '{\"build\": 7}', 't', 0)")
+ip = next_ip()
+gated = client.post("/api/auth/google/start", json={}, **game(INSTALL_A, ip=ip))
+old_start = client.post("/api/auth/google/start", json={}, **game(INSTALL_A, build=6, ip=ip))
+fresh = client.post("/api/auth/google/start", json={}, **game(INSTALL_A, build=7, ip=ip))
+code = (fresh.get_json() or {}).get("code", "")
+page = client.get("/api/auth/google/page?c=" + code)
+done = finish(code, token(sub="g-browser"))
+check("with a minimum build set, the browser's page and its answer are let through (no build), the game's start is not",
+      gated.status_code == 426 and old_start.status_code == 426 and fresh.status_code == 200
+      and page.status_code == 200 and "gsi/client" in page.get_data(as_text=True) and done.status_code == 200,
+      (gated.status_code, old_start.status_code, fresh.status_code, page.status_code, done.status_code))
+check("  and the game's poll is held to it", client.post("/api/auth/google/poll", json={"code": code},
+      **game(INSTALL_A, ip=ip)).status_code == 426
+      and client.post("/api/auth/google/poll", json={"code": code}, **game(INSTALL_A, build=7, ip=ip)).status_code == 200)
+raw("DELETE FROM server_settings WHERE key = 'min_client_build'")
 
 
 section("GS-9 DELETING THE ACCOUNT")

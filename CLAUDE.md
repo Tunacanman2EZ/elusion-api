@@ -3302,6 +3302,11 @@ googlesignin/ package; the plan is the commit folder's GOOGLE_SIGNIN_PLAN.txt.
   `https://api.elusionrpg.com`, `https://play.elusionrpg.com`, and for testing
   `http://localhost`, `http://localhost:5000` (a local 127.0.0.1 is said as
   localhost - Google allows http only there).
+- **The browser's two pages pass the minimum build** (`_BUILD_EXEMPT` in
+  app.py): the page and finish are opened by the player's web browser, which
+  sends no build, so the minimum-build gate answered the live sign-in page 426
+  "too old to connect" the first time it was tried. start, poll and register -
+  the game's - stay gated. GS-10.
 - **Deploy**: `google-auth` is in requirements.txt (the update script installs
   it), then the Client ID in `/etc/elusion/elusion.env` and a restart. Server
   first: an older server 404s the game's Google button, which says so.

@@ -814,7 +814,14 @@ def _rate_limit():
 # and then getting 426 on everything is a worse experience than being told at
 # the login screen, which is the one place the client already knows how to
 # display a refusal.
-_BUILD_EXEMPT = ("/api/status", "/apidocs", "/flasgger_static", "/apispec")
+#
+# AND GOOGLE'S PAGE AND ITS ANSWER (game 0.101.0, googlesignin/). Those two are
+# opened by the player's WEB BROWSER, not the game, so they never carry a
+# build: gated, the sign-in page answered 426 on the live server the moment it
+# was tried. The game's own Google requests - start, poll, register - stay
+# gated like every other.
+_BUILD_EXEMPT = ("/api/status", "/apidocs", "/flasgger_static", "/apispec",
+                 "/api/auth/google/page", "/api/auth/google/finish")
 
 
 @app.before_request
