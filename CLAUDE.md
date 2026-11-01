@@ -3227,6 +3227,32 @@ purse and the ledger, once, held to the time, somebody else's run, a run left
 too long). (MG-10's "another account reads its own chest" fails on the PC's
 own code too, before these: unlooked-at.)
 
+**Three tiers, up to 5000 (game 0.100.0).** The owner: "lets progress tiers
+after round 8 to the next difficulty diff boss", then "up to 5000 gold for
+passing phase 2". The run is 3 tiers of 8 waves, each ending with a boss.
+
+- **A game from 0.100.0 sends `bosses`** (how many fell, 0-3) at Leave, and
+  is paid by `healer_tier_gold()`: each wave passed by tier
+  (`HEALER_TIER_WAVE_GOLD` 10, 25, 100: 1080), each boss
+  (`HEALER_TIER_BOSS_GOLD` 120, 300, 1500: 1920), the goal
+  (`HEALER_TIER_GOAL_GOLD` 2000) - 5000, 700 of it by the second boss.
+  `healer_tier_believed()` holds it to the time: 3 s a wave, and a boss only
+  once its tier's waves are passed and with 15 s for it and each before it.
+  `bosses` that is not a whole number is a 400. The answer carries `bosses`;
+  the run's `boss` column holds the count; the ledger line says "N of 3
+  bosses".
+- **A game that sends `boss`** (before 0.100.0) is paid by the old table as
+  before, so a game not yet updated is paid what it shows.
+- **Go's `pays` carries both**: the old keys for an old game, and `tiers`
+  (`healer_tier_pays()`) for a new one (the game's `RunScript.pays_from()`).
+- **The honest limit** is now 15,000 gold a day at most from this game
+  (three runs). The plan's daily gold cap across minigames is the lever if
+  that is too much.
+- **Deploy the server first**: a new game against an old server is paid by
+  the old table and its `bosses` ignored.
+
+`test_minigames.py` MG-13.
+
 ## Layout
 
 ```

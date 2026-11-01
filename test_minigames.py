@@ -29,6 +29,10 @@ own loot - no XP, the owner's "Loot only" - into the character's chest
         the least cell's place only if it is worth more.
   MG-10 DELETING THE CHARACTER takes its chest; another account's chest is
         nobody else's to read or take from.
+  MG-13 THE HEALER'S RUN'S TIERS (game 0.100.0): 3 tiers of 8 waves, a boss
+        each, then the goal - up to 5000, 700 of it by the second boss; each
+        boss believed only with its tier's waves and the time; a game that
+        sends `boss` is paid as before (1000 at most).
 """
 import importlib.util, os, sqlite3, sys, time
 
@@ -354,6 +358,51 @@ check("refused: somebody else's run (404), a bad body (400), not logged in (401)
 raw("UPDATE minigame_runs SET started_at = started_at - ? WHERE id = ?", (services.HEALER_RUN_KEPT_SECONDS + 10, runs[0]))
 check("a run left too long pays nothing (closed without Leave)", (finish(erin, runs[0], 25, True, True).get_json() or {})
       .get("gold") == 0)
+
+section("MG-13 THE HEALER'S RUN'S TIERS (game 0.100.0)")
+tg = services.healer_tier_gold
+check("the tiers' gold: 10, 25, 100 a wave by tier, bosses 120, 300, 1500, the goal 2000 - 5000 in all, 700 by the second boss",
+      tg(0, 0, False) == 0 and tg(8, 0, False) == 80 and tg(8, 1, False) == 200 and tg(16, 2, False) == 700
+      and tg(24, 3, False) == 3000 and tg(24, 3, True) == 5000 and tg(24, 2, True) == 1500
+      and services.healer_tier_pays()["most"] == 5000, [tg(8, 1, False), tg(16, 2, False), tg(24, 3, True)])
+check("  a boss is not paid before its tier's waves are passed, nor more than three",
+      tg(7, 1, False) == 70 and tg(9, 2, False) == 80 + 25 + 120 and tg(99, 9, True) == 5000)
+tb = services.healer_tier_believed
+check("believed only as far as the time allows: 3 s a wave, 15 s a boss",
+      tb(24, 3, True, 9999) == (24, 3, True) and tb(24, 3, True, 30) == (10, 0, False)
+      and tb(8, 1, False, 24) == (8, 0, False) and tb(8, 1, False, 39) == (8, 1, False)
+      and tb(24, 3, True, 24 * 3 + 2 * 15) == (24, 2, False), [tb(24, 3, True, 30), tb(8, 1, False, 39)])
+fay = register("mgfay")
+assert client.put("/api/save", headers=fay, json={"slot": 0, "class_id": "healer", "name": "healer"}).status_code in (200, 201)
+went = run_go(fay).get_json() or {}
+check("Go hands the game the tiers' table beside the old one (a game from before reads the old)",
+      went.get("pays", {}).get("tiers", {}).get("waves_per_tier") == 8
+      and went.get("pays", {}).get("tiers", {}).get("boss_gold") == [120, 300, 1500]
+      and went.get("pays", {}).get("waves_per_stretch") == 5, went.get("pays"))
+fay_purse = lambda: raw("SELECT gold FROM saves WHERE user_id = ? AND slot = 0", (uid("mgfay"),))[0][0]
+before = fay_purse()
+raw("UPDATE minigame_runs SET started_at = started_at - 600 WHERE id = ?", (went.get("run", 0),))
+res = client.post("/api/minigames/finish", headers=fay, json={"run": went.get("run", 0), "waves": 24, "bosses": 3,
+                                                             "goal": True})
+body = res.get_json() or {}
+check("Leave from a whole tiered run: 5000 gold, three bosses, the goal, in the ledger with the bosses",
+      res.status_code == 200 and body.get("gold") == 5000 and body.get("bosses") == 3 and body.get("goal") is True
+      and fay_purse() == before + 5000
+      and "3 of 3 bosses" in raw("SELECT detail FROM gold_ledger WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+                                 (uid("mgfay"),))[0][0]
+      and raw("SELECT boss FROM minigame_runs WHERE id = ?", (went.get("run", 0),))[0][0] == 3, (res.status_code, body))
+second = run_go(fay).get_json() or {}
+raw("UPDATE minigame_runs SET started_at = started_at - 600 WHERE id = ?", (second.get("run", 0),))
+body = (client.post("/api/minigames/finish", headers=fay, json={"run": second.get("run", 0), "waves": 12,
+                                                                "bosses": 1, "goal": False}).get_json() or {})
+check("  fallen in the second tier, the first boss beaten: 80 + 120 + four of 25", body.get("gold") == 80 + 120 + 100
+      and body.get("bosses") == 1, body)
+third = run_go(fay).get_json() or {}
+check("  bosses must be a whole number (400)",
+      client.post("/api/minigames/finish", headers=fay, json={"run": third.get("run", 0), "waves": 3,
+                                                              "bosses": True}).status_code == 400
+      and client.post("/api/minigames/finish", headers=fay, json={"run": third.get("run", 0), "waves": 3,
+                                                                  "bosses": -1}).status_code == 400)
 
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))

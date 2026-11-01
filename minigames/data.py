@@ -58,10 +58,12 @@ def run_of(db, run_id):
     return db.execute("SELECT * FROM minigame_runs WHERE id = ?", (int(run_id),)).fetchone()
 
 
-def finish_run(db, run_id, now, waves, boss, goal, gold):
-    """The run's end written - once: False when it was already finished."""
+def finish_run(db, run_id, now, waves, bosses, goal, gold):
+    """The run's end written - once: False when it was already finished.
+    `bosses` is how many were beaten (0-3 since game 0.100.0's tiers; 0 or 1
+    before), in the boss column."""
     cur = db.execute(
         "UPDATE minigame_runs SET finished_at = ?, waves = ?, boss = ?, goal = ?, gold = ? "
         "WHERE id = ? AND finished_at = 0",
-        (int(now), int(waves), 1 if boss else 0, 1 if goal else 0, int(gold), int(run_id)))
+        (int(now), int(waves), int(bosses), 1 if goal else 0, int(gold), int(run_id)))
     return cur.rowcount == 1

@@ -69,7 +69,7 @@ def healer_pays():
     """The table the game counts gold by on screen (handed it at Go)."""
     return {"wave_gold": list(HEALER_WAVE_GOLD), "waves_per_stretch": HEALER_WAVES_PER_STRETCH,
             "boss_gold": HEALER_BOSS_GOLD, "goal_gold": HEALER_GOAL_GOLD,
-            "most": healer_gold(healer_waves(), True, True)}
+            "most": healer_gold(healer_waves(), True, True), "tiers": healer_tier_pays()}
 
 
 def healer_believed(waves, boss, goal, seconds):
@@ -91,6 +91,69 @@ def healer_gold(waves, boss, goal):
         gold += HEALER_BOSS_GOLD
         if goal:
             gold += HEALER_GOAL_GOLD
+    return gold
+
+
+# THREE TIERS, A BOSS EACH (game 0.100.0). The owner: "lets progress tiers
+# after round 8 to the next difficulty diff boss": every 8 waves end with a
+# boss of a different land, beaten it the next tier starts harder, and after
+# the third boss the goal marker. And "up to 5000 gold for passing phase 2":
+# 0 to 5000 a run, most of it past the second boss -
+#
+#   each wave passed   HEALER_TIER_WAVE_GOLD by tier (3 tiers of 8):  1080
+#   each boss beaten   HEALER_TIER_BOSS_GOLD, the first, second, third: 1920
+#   the goal marker    HEALER_TIER_GOAL_GOLD                          2000
+#
+# - 700 by the second boss, the other 4300 in the third tier.
+#
+# A game says it played the tiers by sending `bosses` (how many beaten, 0-3)
+# at Leave; one that sends `boss` (true or false) is from before 0.100.0 and
+# is paid by the table above, so a game not yet updated is paid what it shows.
+# The same limits on time: HEALER_MIN_WAVE_SECONDS a wave and
+# HEALER_MIN_BOSS_SECONDS a boss since its Go - so at the very most 15,000
+# gold a day from it (three runs).
+
+HEALER_TIERS = 3
+HEALER_WAVES_PER_TIER = 8
+HEALER_TIER_WAVE_GOLD = (10, 25, 100)
+HEALER_TIER_BOSS_GOLD = (120, 300, 1500)
+HEALER_TIER_GOAL_GOLD = 2000
+
+
+def healer_tier_waves():
+    return HEALER_TIERS * HEALER_WAVES_PER_TIER
+
+
+def healer_tier_pays():
+    """The tiers' table, handed to the game at Go beside the old one."""
+    return {"wave_gold": list(HEALER_TIER_WAVE_GOLD), "waves_per_tier": HEALER_WAVES_PER_TIER,
+            "boss_gold": list(HEALER_TIER_BOSS_GOLD), "goal_gold": HEALER_TIER_GOAL_GOLD,
+            "most": healer_tier_gold(healer_tier_waves(), HEALER_TIERS, True)}
+
+
+def healer_tier_believed(waves, bosses, goal, seconds):
+    """How far a tiered run said it got, held to what `seconds` since its Go
+    allow: (waves, bosses, goal). A boss counts only once its tier's waves
+    are passed, and only with the time for those waves and every boss so far."""
+    seconds = int(seconds)
+    waves = max(0, min(int(waves), healer_tier_waves(), seconds // HEALER_MIN_WAVE_SECONDS))
+    bosses = max(0, min(int(bosses), HEALER_TIERS, waves // HEALER_WAVES_PER_TIER))
+    while bosses > 0 and seconds < bosses * (HEALER_WAVES_PER_TIER * HEALER_MIN_WAVE_SECONDS
+                                             + HEALER_MIN_BOSS_SECONDS):
+        bosses -= 1
+    goal = bool(goal) and bosses == HEALER_TIERS
+    return waves, bosses, goal
+
+
+def healer_tier_gold(waves, bosses, goal):
+    """The gold for a tiered run that passed `waves` waves, beat `bosses`
+    bosses, and reached the goal marker or not."""
+    waves = max(0, min(int(waves), healer_tier_waves()))
+    bosses = max(0, min(int(bosses), HEALER_TIERS, waves // HEALER_WAVES_PER_TIER))
+    gold = sum(HEALER_TIER_WAVE_GOLD[i // HEALER_WAVES_PER_TIER] for i in range(waves))
+    gold += sum(HEALER_TIER_BOSS_GOLD[:bosses])
+    if goal and bosses == HEALER_TIERS:
+        gold += HEALER_TIER_GOAL_GOLD
     return gold
 
 

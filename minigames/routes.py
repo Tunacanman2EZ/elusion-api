@@ -187,8 +187,9 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
               required: [run, waves]
               properties:
                 run:   {type: integer, description: "the run's id, from its Go"}
-                waves: {type: integer, description: "waves passed, 0-25"}
-                boss:  {type: boolean, description: "the gate's boss beaten"}
+                waves: {type: integer, description: "waves passed, 0-24 (0-25 before game 0.100.0)"}
+                bosses: {type: integer, description: "bosses beaten, 0-3 (game 0.100.0's tiers)"}
+                boss:  {type: boolean, description: "before game 0.100.0: the gate's boss beaten"}
                 goal:  {type: boolean, description: "the goal marker reached"}
         responses:
           200:
@@ -217,21 +218,42 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
         seconds = now - int(run["started_at"])
         if int(run["finished_at"]) != 0:
             return {"error": "Conflict", "message": "That run is already finished."}, 409
-        believed_waves, boss, goal = services.healer_believed(waves, payload.get("boss") is True,
-                                                              payload.get("goal") is True, seconds)
-        gold = services.healer_gold(believed_waves, boss, goal) if seconds <= services.HEALER_RUN_KEPT_SECONDS else 0
-        if not data.finish_run(db, run_id, now, believed_waves, boss, goal, gold):
+        # A game from 0.100.0 says how many bosses it beat (the tiers); one
+        # from before says whether it beat the one boss, and is paid by the
+        # old table.
+        tiered = "bosses" in payload
+        if tiered:
+            bosses_said = payload.get("bosses")
+            if isinstance(bosses_said, bool) or not isinstance(bosses_said, int) or bosses_said < 0:
+                return bad_request("bosses must be a whole number")
+            believed_waves, bosses, goal = services.healer_tier_believed(waves, bosses_said,
+                                                                         payload.get("goal") is True, seconds)
+            gold = services.healer_tier_gold(believed_waves, bosses, goal)
+            boss = bosses == services.HEALER_TIERS
+        else:
+            believed_waves, boss, goal = services.healer_believed(waves, payload.get("boss") is True,
+                                                                  payload.get("goal") is True, seconds)
+            gold = services.healer_gold(believed_waves, boss, goal)
+            bosses = 1 if boss else 0
+        if seconds > services.HEALER_RUN_KEPT_SECONDS:
+            gold = 0
+        if not data.finish_run(db, run_id, now, believed_waves, bosses, goal, gold):
             return {"error": "Conflict", "message": "That run is already finished."}, 409
         purse = None
         if gold > 0 and gold_delta is not None:
+            beaten = (", %d of %d bosses" % (bosses, services.HEALER_TIERS) if bosses else "") if tiered \
+                else (", the boss" if boss else "")
             purse = gold_delta(db, g.user["id"], int(run["slot"]), gold, "minigame",
                                "%s run %d: %d waves%s%s" % (run["game"], run_id, believed_waves,
-                                                            ", the boss" if boss else "", ", the goal" if goal else ""))
+                                                            beaten, ", the goal" if goal else ""))
             if purse is None:
                 gold = 0
         db.commit()
-        return {"ok": True, "gold": gold, "waves": believed_waves, "boss": boss, "goal": goal,
-                "status": {"gold": int(purse)} if purse is not None else {}}, 200
+        answer = {"ok": True, "gold": gold, "waves": believed_waves, "boss": boss, "goal": goal,
+                  "status": {"gold": int(purse)} if purse is not None else {}}
+        if tiered:
+            answer["bosses"] = bosses
+        return answer, 200
 
     def minigames_kill():
         """
