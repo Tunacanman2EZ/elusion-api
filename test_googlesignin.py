@@ -25,6 +25,10 @@
   GS-9  DELETING THE ACCOUNT takes its Google link with it.
   GS-10 THE BROWSER'S TWO PAGES PASS THE MINIMUM BUILD: the page and finish
         carry no build (a web browser opens them); the game's routes are gated.
+  GS-11 AN ACCOUNT ALREADY THERE: a new Google account whose verified email
+        is an account's CONFIRMED recovery address is offered that account
+        (never an unconfirmed address, staff, a deleted or linked account);
+        claiming it links and signs in; a banned one gets its ban.
 
 Run: python test_googlesignin.py
 """
@@ -174,6 +178,9 @@ check("the page: Google's button for our Client ID, the check code, no caching, 
       and page.headers.get("Referrer-Policy") == "strict-origin-when-cross-origin"
       and page.headers.get("Content-Type", "").startswith("text/html"), page.headers)
 check("  and not framed by anyone (the app's own X-Frame-Options)", page.headers.get("X-Frame-Options") == "DENY")
+check("  once Google is done it goes back to the game: a button, the game's tab focused and this one closed",
+      'id="back"' in html and "window.opener.focus()" in html and "window.close()" in html
+      and "Back to the game" in html and "Close this tab" in html)
 check("  a code that never was gets no button, only the words",
       "gsi/client" not in client.get("/api/auth/google/page?c=" + "z" * 32).get_data(as_text=True))
 check("  nor does anything that is not a code (nothing of it reaches the page)",
@@ -210,7 +217,7 @@ check("the page is told to go back to the game", done.status_code == 200
       and done.get_json().get("message") == gs.DONE_SIGNIN, done.get_json())
 asked = poll(began["code"], ip=ip)
 check("  a Google account with no game account yet: the game asks for a name",
-      asked.status_code == 200 and asked.get_json() == {"needs_name": True}, asked.get_json())
+      asked.status_code == 200 and asked.get_json() == {"needs_name": True, "found": []}, asked.get_json())
 made = google_register(began["code"], "gsann", ip=ip)
 body = made.get_json() or {}
 check("the name taken: an account made and signed in, the login's own answer, nothing more asked",
@@ -412,6 +419,65 @@ check("deleting the account takes its Google link and codes with it", deleted.st
       (deleted.status_code, deleted.get_json()))
 res, body = new_player("g-gone", "gsback", install="e" * 64)
 check("  so the same Google account may make a new one", res.status_code == 201, body)
+
+section("GS-11 AN ACCOUNT ALREADY THERE")
+def claim(code, name, install=INSTALL_A, ip="203.0.113.250"):
+    return client.post("/api/auth/google/claim", json={"code": code, "username": name}, **game(install, ip=ip))
+def confirmed(name, email, verified=1):
+    password_account(name)
+    raw("UPDATE users SET email = ?, email_verified = ? WHERE username = ?", (email, verified, name))
+confirmed("gsmia", "Mia.Row@Example.com")
+confirmed("gsmiaun", "mia.row@example.com", verified=0)
+confirmed("gsmiagone", "mia.row@example.com")
+raw("UPDATE users SET deleted_at = 1 WHERE username = 'gsmiagone'")
+raw("UPDATE users SET email = 'mia.row@example.com', email_verified = 1 WHERE username = 'gsowner'")
+confirmed("gsmialinked", "mia.row@example.com")
+raw("INSERT INTO google_accounts (user_id, sub, email, linked_at, made_with_google) VALUES (?, 'g-other', '', 0, 0)",
+    (uid("gsmialinked"),))
+ip = next_ip()
+code = start(INSTALL_A, ip).get_json()["code"]
+finish(code, token(sub="g-mia", email="mia.row@example.com"))
+asked = poll(code, ip=ip).get_json() or {}
+check("a new Google account is offered the account whose confirmed email it is (any case) - and only that one",
+      asked.get("needs_name") is True and asked.get("found") == ["gsmia"], asked)
+check("  a name not offered cannot be claimed: unconfirmed, staff, deleted, linked or made up (404)",
+      all(claim(code, n, ip=ip).status_code == 404 for n in ("gsmiaun", "gsowner", "gsmiagone", "gsmialinked",
+                                                            "nobody")))
+check("  another computer cannot claim with this code", claim(code, "gsmia", install=INSTALL_B, ip=ip).status_code == 404)
+took = claim(code, "GSMIA", ip=ip)
+body = took.get_json() or {}
+check("claiming it links Google to that account and signs in like a login",
+      took.status_code == 200 and body.get("username") == "gsmia" and body.get("token") and body.get("via") == "google"
+      and raw("SELECT made_with_google FROM google_accounts WHERE sub = 'g-mia'") == [(0,)]
+      and raw("SELECT user_id FROM google_accounts WHERE sub = 'g-mia'")[0][0] == uid("gsmia"), body)
+check("  the code is spent: no second claim, and no new account from it",
+      claim(code, "gsmia", ip=ip).status_code in (409, 410) and google_register(code, "gsmia2", ip=ip).status_code
+      in (409, 410) and not raw("SELECT id FROM users WHERE username = 'gsmia2'"))
+ip = next_ip()
+code = start(INSTALL_A, ip).get_json()["code"]
+finish(code, token(sub="g-mia", email="mia.row@example.com"))
+back = poll(code, ip=ip).get_json() or {}
+check("  next time the same Google account goes straight in", back.get("username") == "gsmia" and back.get("token"), back)
+check("  and the password still works beside it", client.post("/api/auth/login", json={"username": "gsmia",
+      "password": PW}, environ_base={"REMOTE_ADDR": next_ip()}).status_code == 200)
+confirmed("gsned", "ned@example.com")
+raw("UPDATE users SET is_banned = 1 WHERE username = 'gsned'")
+ip = next_ip()
+code = start(INSTALL_A, ip).get_json()["code"]
+finish(code, token(sub="g-ned", email="ned@example.com"))
+banned = claim(code, "gsned", ip=ip)
+check("a banned account is claimed only to be told its ban (403), never signed in",
+      banned.status_code == 403 and "ban" in (banned.get_json() or {}) and not (banned.get_json() or {}).get("token"),
+      banned.get_json())
+raw("UPDATE users SET is_banned = 0 WHERE username = 'gsned'")
+ip = next_ip()
+code = start(INSTALL_A, ip).get_json()["code"]
+finish(code, token(sub="g-zed", email="zed@example.com"))
+poll(code, ip=ip)
+taken = google_register(code, "gsmia", ip=ip)
+check("a name already taken says how to link Google to it instead (409)", taken.status_code == 409 and gs.NAME_TAKEN == (taken.get_json() or {}).get("message"),
+      taken.get_json())
+
 
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))

@@ -40,6 +40,8 @@ STAFF_REFUSED = "Staff accounts sign in with their password and code, not Google
 RUN_OUT = "This sign-in has run out. Press Sign in with Google in the game again."
 LINKED_ELSEWHERE = "That Google account is already linked to another Elusion account."
 DONE_SIGNIN = "Done - go back to the game."
+NAME_TAKEN = ("That name is taken. If it is yours, sign in with your password,"
+              " then link Google in Options.")
 DONE_LINK = "Linked - go back to the game."
 
 
@@ -156,6 +158,8 @@ PAGE_STYLE = (
     ".code{font:700 30px ui-monospace,Consolas,monospace;letter-spacing:4px;color:#ffd977;margin:8px 0 18px}"
     ".gbtn{display:flex;justify-content:center;min-height:44px}"
     ".say{min-height:1.4em;margin-top:16px}.bad{color:#ff9a85}.good{color:#8fe08a}"
+    ".back{margin-top:14px;padding:10px 22px;font:600 16px system-ui,sans-serif;color:#16130f;"
+    "background:#ffd977;border:0;border-radius:999px;cursor:pointer}.back:hover{background:#ffe7a3}"
 )
 
 PAGE_SCRIPT = """
@@ -164,13 +168,32 @@ function say(text, kind) {
   line.textContent = text;
   line.className = "say " + (kind || "");
 }
+// BACK TO THE GAME (the owner: "need a go back button or redirection"). In
+// the browser game this tab was opened by the game's own tab: focus that one
+// and close this. A tab the computer opened (the downloaded game) cannot be
+// closed by a page - then it says so, and the button is "Close this tab".
+function goBack() {
+  if (window.opener) { try { window.opener.focus(); } catch (e) {} }
+  window.close();
+  setTimeout(function () {
+    say("Signed in - close this tab and go back to the game.", "good");
+    document.getElementById("back").textContent = "Close this tab";
+  }, 400);
+}
+function done(words) {
+  say(words, "good");
+  var back = document.getElementById("back");
+  back.hidden = false;
+  back.onclick = goBack;
+  setTimeout(goBack, 1500);
+}
 function elusionSignedIn(answer) {
   say("Signing in...");
   fetch(FINISH, {method: "POST", headers: {"Content-Type": "application/json"},
                  body: JSON.stringify({code: CODE, credential: answer.credential})})
     .then(function (r) { return r.json().then(function (d) { return [r.ok, d]; }); })
     .then(function (x) {
-      if (x[0]) { say(x[1].message || "Done - go back to the game.", "good"); }
+      if (x[0]) { done(x[1].message || "Done - go back to the game."); }
       else { say(x[1].message || "That did not work. Press Sign in with Google in the game again.", "bad"); }
     })
     .catch(function () { say("Could not reach the server. Try once more.", "bad"); });
@@ -198,7 +221,8 @@ def page_html(code, client_id, words=""):
             + ' data-auto_prompt="false" data-ux_mode="popup"></div>'
             + '<div class="gbtn"><div class="g_id_signin" data-type="standard" data-size="large"'
             + ' data-text="signin_with" data-shape="pill" data-theme="filled_black"></div></div>'
-            + '<p class="say" id="say"></p></div></body></html>')
+            + '<p class="say" id="say"></p>'
+            + '<button type="button" class="back" id="back" hidden>Back to the game</button></div></body></html>')
 
 
 def staff_name(role_for, default_role, username):

@@ -1823,7 +1823,8 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/account/delete",
                        # googlesignin/ (0.101.0)
                        "/api/auth/google/start", "/api/auth/google/page", "/api/auth/google/finish",
-                       "/api/auth/google/poll", "/api/auth/google/register", "/api/account/google",
+                       "/api/auth/google/poll", "/api/auth/google/register", "/api/auth/google/claim",
+                       "/api/account/google",
                        "/api/account/google/link", "/api/account/google/unlink"]), rules)
 
 # =============================================================================

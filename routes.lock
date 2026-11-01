@@ -67,6 +67,7 @@ POST /api/account/email/verify  verify_account_email  auth  rank=-  fresh=-  loc
 POST /api/account/google/link  google_link  auth  rank=-  fresh=yes  lock=yes  doc=yes
 POST /api/account/google/unlink  google_unlink  auth  rank=-  fresh=yes  lock=yes  doc=yes
 POST /api/auth/confirm  confirm_password  auth  rank=-  fresh=-  lock=yes  doc=yes
+POST /api/auth/google/claim  google_claim  open  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/auth/google/finish  google_finish  open  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/auth/google/poll  google_poll  open  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/auth/google/register  google_register  open  rank=-  fresh=-  lock=yes  doc=yes

@@ -3294,6 +3294,17 @@ googlesignin/ package; the plan is the commit folder's GOOGLE_SIGNIN_PLAN.txt.
   same road with purpose `link`; an account with no confirmed address takes
   Google's. `GET /api/account/google` says linked, the masked email,
   `made_with_google`, `available` and `staff` (the game hides the row for staff).
+- **An account already there** (the owner: "also need to look for existing
+  accounts"): with no account for that Google account, the poll's
+  `needs_name` answer carries `found` - the names of accounts whose recovery
+  email is CONFIRMED and is Google's verified email (any case; not staff,
+  deleted or linked; four at most, `data.accounts_with_email()`).
+  `POST /api/auth/google/claim {code, username}` links one of those and signs
+  in through the same `sign_in()` as the poll (a banned one gets its ban). The
+  reach is "Forgot password"'s: whoever reads that inbox. A name taken at
+  register says to sign in with the password and link Google in Options
+  (`services.NAME_TAKEN`). The page shows "Back to the game" when done and
+  closes itself when the game's own tab opened it (`goBack()`).
 - **Deleting an account** takes `google_accounts` and `google_codes` with it
   (accountdelete/'s OWN_TABLES), so that Google account may make a new one.
 - **The page** sends `Referrer-Policy: strict-origin-when-cross-origin` (Google's

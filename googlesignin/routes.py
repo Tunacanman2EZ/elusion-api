@@ -39,7 +39,7 @@ def register(app, *, require_auth, require_fresh_password, get_db, bad_request, 
              install_evasion_state, record_account_ip, record_account_install, issue_token, login_hardening,
              end_other_sessions, role_for, default_role, has_owner_powers, role_at_least, name_hue_of,
              needs_recovery_email, mask_email, dummy_hash):
-    """Add the eight routes."""
+    """Add the nine routes."""
 
     def live_client_id():
         return services.clean_client_id(client_id())
@@ -280,10 +280,22 @@ def register(app, *, require_auth, require_fresh_password, get_db, bad_request, 
             db.commit()
             return {"linked": True, "message": "Google is linked to your account."}, 200
         if row["user_id"] is None:
-            return {"needs_name": True}, 200
+            # A GOOGLE ACCOUNT WE HAVE NOT SEEN - but its email may be an
+            # account's confirmed recovery address: offer those first.
+            return {"needs_name": True, "found": [a["username"] for a in claimable(db, row)]}, 200
         account = data.user(db, row["user_id"])
         if account is None or data.link_of_sub(db, row["sub"]) is None:
             return {"error": "Gone", "message": services.RUN_OUT}, 410
+        return sign_in(db, account, row, now)
+
+    def claimable(db, row):
+        """The accounts this sign-in may claim by its email: confirmed for
+        that address, not linked, never staff."""
+        return [a for a in data.accounts_with_email(db, row["email"]) if not is_staff(a)]
+
+    def sign_in(db, account, row, now):
+        """The code spent and `account` signed in, under every rule the
+        password login has; or the refusal."""
         closed = maintenance_refusal(account["username"])
         if closed is not None:
             return closed
@@ -312,6 +324,57 @@ def register(app, *, require_auth, require_fresh_password, get_db, bad_request, 
         record_account_ip(db, account["id"], ip, now)
         record_account_install(db, account["id"], install, now)
         return signed_in(account, token, expires_at)
+
+    def google_claim():
+        """
+        Sign in to an existing account whose confirmed recovery email is this Google account's
+        ---
+        tags:
+          - Auth
+        parameters:
+          - in: body
+            name: body
+            required: true
+            schema:
+              type: object
+              required: [code, username]
+              properties:
+                code: {type: string}
+                username: {type: string, description: "one of the poll's found"}
+        responses:
+          200:
+            description: linked and signed in (the login's answer)
+          403:
+            description: refused - a ban (with it)
+          404:
+            description: no such account among those this sign-in may claim
+          410:
+            description: run out
+        """
+        payload = request.get_json(silent=True)
+        username = payload.get("username") if isinstance(payload, dict) else None
+        if not isinstance(username, str) or username == "":
+            return bad_request("username must be one of the accounts found")
+        db = get_db()
+        now = int(time.time())
+        row, code = own_code(db, now)
+        if row is None:
+            return code
+        if row["state"] != "done" or row["purpose"] != "signin" or row["user_id"] is not None:
+            return {"error": "Conflict", "message": "That sign-in has no account to claim."}, 409
+        # ONLY AN ACCOUNT WHOSE CONFIRMED ADDRESS IS GOOGLE'S VERIFIED ONE:
+        # the same reach "Forgot password" already gives whoever reads that
+        # inbox - nothing more.
+        account = next((a for a in claimable(db, row) if a["username"].casefold() == username.casefold()), None)
+        if account is None or data.link_of_sub(db, row["sub"]) is not None:
+            return {"error": "Not Found", "message": "That account cannot be signed into with this Google account."}, 404
+        try:
+            data.add_link(db, account["id"], row["sub"], row["email"], now, False)
+        except sqlite3.IntegrityError:  # two claims at once: the first won
+            db.rollback()
+            return {"error": "Gone", "message": services.RUN_OUT}, 410
+        app.logger.info("[GOOGLE] claimed by its email  user=%r", account["username"])
+        return sign_in(db, account, row, now)
 
     def google_register():
         """
@@ -380,7 +443,7 @@ def register(app, *, require_auth, require_fresh_password, get_db, bad_request, 
         except sqlite3.IntegrityError:
             db.rollback()
             record_login_attempt(db, username, ip, False, "register-conflict")
-            return {"error": "Conflict", "message": "That name is taken. Pick another."}, 409
+            return {"error": "Conflict", "message": services.NAME_TAKEN}, 409
         data.add_link(db, user_id, row["sub"], row["email"], now, True)
         data.use_code(db, row["code_hash"])
         db.commit()
@@ -469,6 +532,7 @@ def register(app, *, require_auth, require_fresh_password, get_db, bad_request, 
     app.add_url_rule("/api/auth/google/poll", endpoint="google_poll", view_func=google_poll, methods=["POST"])
     app.add_url_rule("/api/auth/google/register", endpoint="google_register", view_func=google_register,
                      methods=["POST"])
+    app.add_url_rule("/api/auth/google/claim", endpoint="google_claim", view_func=google_claim, methods=["POST"])
     app.add_url_rule("/api/account/google", endpoint="google_status", view_func=require_auth(google_status),
                      methods=["GET"])
     app.add_url_rule("/api/account/google/link", endpoint="google_link",

@@ -72,6 +72,22 @@ def make_account(db, username, password_hash, email, now):
     return cursor.lastrowid
 
 
+# How many accounts with the same email are offered at most.
+FOUND_MOST = 4
+
+
+def accounts_with_email(db, email):
+    """Accounts whose CONFIRMED recovery address is `email` (any case), not
+    deleted and not linked to any Google account yet - those a Google sign-in
+    with that verified email may claim. Oldest first, FOUND_MOST at most."""
+    if not email:
+        return []
+    return db.execute(
+        "SELECT * FROM users WHERE email_verified = 1 AND email != '' AND lower(email) = lower(?)"
+        " AND deleted_at = 0 AND id NOT IN (SELECT user_id FROM google_accounts) ORDER BY id LIMIT ?",
+        (str(email), FOUND_MOST)).fetchall()
+
+
 def give_recovery_email(db, user_id, email):
     """A linked account with no confirmed recovery address takes Google's
     verified one (it has proved it owns it)."""

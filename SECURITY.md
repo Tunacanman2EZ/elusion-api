@@ -391,8 +391,11 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     both ban-evasion checks for a new account), one Google account is one
     game account, and staff never sign in this way: Google is refused for
     them, cannot be linked to them, and no Google sign-up may take a staff
-    name.
-    → Held by: `test_googlesignin.py` — "  and the code is still waiting for a good one", "another computer cannot collect it - the same 404 as a code that never was", "a staff account's Google is refused at the page", "no Google sign-up may take the owner's name", "one Google account, one game account: it is never asked for a name again, and no second is made"
+    name. An existing account is offered to a new Google account only when
+    its recovery email is CONFIRMED and is the email Google verified - the
+    reach "Forgot password" already gives whoever reads that inbox - and
+    never a staff, deleted or already-linked account.
+    → Held by: `test_googlesignin.py` — "  and the code is still waiting for a good one", "another computer cannot collect it - the same 404 as a code that never was", "a staff account's Google is refused at the page", "no Google sign-up may take the owner's name", "one Google account, one game account: it is never asked for a name again, and no second is made", "  a name not offered cannot be claimed: unconfirmed, staff, deleted, linked or made up (404)"
 
 ---
 
