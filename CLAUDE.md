@@ -1674,6 +1674,20 @@ running past them, "i noticed some lag wobble". `presence.py`'s header,
 - **Deploy order: this first.** A game ahead of its server sends neither `x`
   nor `l` (its welcome has no `"x"`) and plays as 0.18.
 
+## The Healer's Run with the party (game 0.105.0)
+
+The owner: "make it to where you can join with your party". presence.py seats
+"healerrun" a room per party (`INSTANCED_PLACES`, as the Endless) and says so
+in the welcome (`"hr"`: `HEALER_ROOMS`); a game in a party playing the run
+says it stands there, its steps are where its healer runs, and the run crosses
+as "en" exactly as the Endless's does (the same `clean_run()` - whole numbers,
+the leader's keys the leader's). Nothing there is booked; each player's gold
+is their own run, paid at Leave by the minigames route. A game's own line
+("me") may be up to `RUN_ME_MOST` (8) numbers - the run's is six, for its
+Ready, its countdown and the party's board (it was four, the Endless's).
+test_presence.py P-24. **Deploy the server first**: a 0.105.0 game against an older server
+hears no "hr" and plays the run alone, as before.
+
 ## The Endless for a party: an arena each, and the run between them (game 0.93.3)
 
 The owner: "we need a 4 player party plan but can play solo duo or 3 or 4",

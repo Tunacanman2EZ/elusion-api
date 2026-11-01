@@ -248,6 +248,18 @@ the room it belongs in now (rehouse()), told who left its screen, who is on
 it and who runs its monsters, as the guard's moves are. At the guard's
 "alone", everyone has a room of their own here too.
 
+THE HEALER'S RUN TOGETHER (game 0.105.0). The owner: "make it to where you
+can join with your party". The run is played over the town, the character
+standing still; a game playing it with the server's "hr" says it stands in
+"healerrun", where it is seated in its party's room like the Endless, its
+steps are where its healer runs, and the run crosses between the party's
+games as "en" - the same checked whole numbers, read by the game's
+healerparty.gd. Nothing there pays or is booked: the run's gold is paid at
+Leave by the minigames route, each player's own run. Each game's own line
+("me") is up to RUN_ME_MOST numbers: the run's is six - the key, ready, out or
+through, power-ups, lives, kills and gold - for the Ready, the countdown and
+the party's board.
+
 THE RUN BETWEEN A PARTY (game 0.93.3). One clock, one swarm and one set of
 elites for the party in its arena. The game that leads the room (the earliest
 in, as for any area's monsters) runs the run; every game moves its own copy of
@@ -499,8 +511,13 @@ MEMINFO_PATH = "/proc/meminfo"
 ANIM_PATTERN = re.compile(r"^(idle|walk|attack|death|hitflash)(up|down|left|right)$")
 AREA_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
 # ONE ARENA A PARTY: the areas each party (or each player with none) has a
-# room of its own in - instance_room().
-INSTANCED_PLACES = frozenset({"endless"})
+# room of its own in - instance_room(). "healerrun" since game 0.105.0: the
+# Healer's Run with a party (THE HEALER'S RUN TOGETHER, below).
+INSTANCED_PLACES = frozenset({"endless", "healerrun"})
+# Said in the welcome ("hr"): this server seats the Healer's Run a room per
+# party, so a game may say it is there (game 0.105.0). A game against a server
+# without it plays the run alone, as before.
+HEALER_ROOMS = 1
 # The tank's aura rings, the only effect drawn on the body itself.
 EFFECTS = ("ring", "firering")
 POSITION_LIMIT = 100000.0
@@ -564,6 +581,7 @@ MAX_RUN_BYTES = 32768
 MAX_RUN_HITS = 256
 RUN_SLOTS = 4096
 RUN_LINE_MOST = 16
+RUN_ME_MOST = 8
 RUN_BATCHES_MOST = 16
 RUN_BATCH_MOST = 700
 RUN_FULL_MOST = 12000
@@ -1461,7 +1479,7 @@ def clean_run(msg, leads):
                 return None
         out["h"] = hits
     if "me" in msg:
-        if _whole_list(msg["me"], 4) is None:
+        if _whole_list(msg["me"], RUN_ME_MOST) is None:
             return None
         out["me"] = msg["me"]
     for key in ("go", "need"):
@@ -2384,7 +2402,8 @@ class PresenceServer:
         except Exception as exc:  # noqa: BLE001
             print("[PRESENCE] could not read a party: %r" % exc, flush=True)
         await self._send(player, {"t": "welcome", "id": user_id, "v": SHARED_VERSION, "books": BOOKS,
-                                  "x": RELAY_VERSION, "sh": SERVER_HEALTH if BOOKS else 0, "en": RUN_VERSION})
+                                  "x": RELAY_VERSION, "sh": SERVER_HEALTH if BOOKS else 0, "en": RUN_VERSION,
+                                  "hr": HEALER_ROOMS})
 
         try:
             async for raw in ws:

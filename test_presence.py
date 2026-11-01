@@ -227,7 +227,7 @@ async def run(port, server):
           welcome == {"t": "welcome", "id": uid("presa"), "v": presence.SHARED_VERSION,
                       "books": presence.BOOKS, "x": presence.RELAY_VERSION,
                       "sh": presence.SERVER_HEALTH if presence.BOOKS else 0,
-                      "en": presence.RUN_VERSION}, welcome)
+                      "en": presence.RUN_VERSION, "hr": presence.HEALER_ROOMS}, welcome)
     await a.close()
 
     # =========================================================================
@@ -2514,6 +2514,63 @@ async def one_arena_a_party():
             sql("DELETE FROM party_members WHERE party_id = ?", (party,))
 
 
+async def the_healers_run_together():
+    """P-24: THE HEALER'S RUN TOGETHER (game 0.105.0) - "healerrun" is a room
+    per party, as the Endless is; the welcome says so; "en" crosses there."""
+    section("P-24 THE HEALER'S RUN TOGETHER: A ROOM PER PARTY, AND THE RUN CROSSES IT")
+    check("the Healer's Run is an area every party has its own copy of",
+          "healerrun" in presence.INSTANCED_PLACES and "town" not in presence.INSTANCED_PLACES)
+    A, B, C = account("hrpa"), account("hrpb", "mage"), account("hrpc", "tank")
+    now = int(time.time())
+    sql("INSERT INTO parties (created_at) VALUES (?)", (now,))
+    party = int(sql("SELECT MAX(id) AS id FROM parties")[0]["id"])
+    for who, lead, at in (("hrpa", 1, now), ("hrpb", 0, now + 1)):
+        sql("INSERT INTO party_members (user_id, party_id, is_leader, joined_at) VALUES (?, ?, ?, ?)",
+            (uid(who), party, lead, at))
+    server = presence.PresenceServer(sweep_seconds=60, tick_seconds=0.05)
+    server.view_ticks = 1
+    server.near = False
+    server.start_clocks()
+
+    def runs(messages):
+        return [m for m in messages if m.get("t") == "en"]
+
+    async with serve(server.handler, "127.0.0.1", 0, max_size=presence.MAX_SOCKET_BYTES) as ws_server:
+        port = list(ws_server.sockets)[0].getsockname()[1]
+        try:
+            a, welcome = await enter(port, A, "healerrun", v=3, en=1, x=320.0, y=290.0)
+            got_a = await collect(a)
+            check("the welcome says this server seats the run a room per party (\"hr\": 1)",
+                  welcome.get("hr") == presence.HEALER_ROOMS == 1, welcome)
+            b, _ = await enter(port, B, "healerrun", v=3, en=1, x=340.0, y=290.0)
+            c, _ = await enter(port, C, "healerrun", v=3, en=1, x=330.0, y=290.0)
+            got_a, got_b, got_c = await collect(a), await collect(b), await collect(c)
+            pa, pb, pc = server.players[uid("hrpa")], server.players[uid("hrpb")], server.players[uid("hrpc")]
+            check("two of a party playing the run share its room, the party's own; a stranger has one of their own",
+                  pa.area == pb.area == "healerrun#p%d" % party and pc.area == "healerrun#u%d" % uid("hrpc"),
+                  (pa.area, pb.area, pc.area))
+            check("  the party sees each other's healers, and the first in leads the run",
+                  uid("hrpb") in joined(got_a) and uid("hrpa") in joined(got_b)
+                  and (last_lead(got_b) or {}).get("id") == uid("hrpa") and (last_lead(got_b) or {}).get("a") == "healerrun"
+                  and (last_lead(got_b) or {}).get("b") == 0, got_b)
+            line = {"t": "en", "r": [123, 1, 0, 2, 2, 0, 400, 2, 300, 1, 5, 3], "sp": [[123, 4, 1, 99, 3, 0, 2, 5, 2, 4, 50]]}
+            await a.send(json.dumps(line))
+            await b.send(json.dumps({"t": "en", "h": [[3, 123 * 2000 + 4, 2]], "me": [123, 1, 0, 3, 7, 1240]}))
+            got_a, got_b, got_c = await collect(a), await collect(b), await collect(c)
+            check("  the leader's line and spawns reach the party; its hits and line reach the leader; never the stranger",
+                  [m.get("r") for m in runs(got_b)] == [line["r"]] and [m.get("h") for m in runs(got_a)] == [[[3, 246004, 2]]]
+                  and not runs(got_c), (got_a, got_b, got_c))
+            check("  a player's own line of six (ready, lives, kills, gold - the party's board) reaches the party",
+                  [m.get("me") for m in runs(got_a)] == [[123, 1, 0, 3, 7, 1240]], got_a)
+            await b.send(json.dumps({"t": "en", "me": [123, 1, 0, 3, 7, 1240, 0, 0, 0]}))
+            got_a = await collect(a)
+            check("  and one longer than RUN_ME_MOST goes nowhere",
+                  not runs(got_a) and presence.RUN_ME_MOST == 8, got_a)
+        finally:
+            server.stop_clocks()
+            sql("DELETE FROM party_members WHERE party_id = ?", (party,))
+
+
 async def the_run_between_a_party():
     """P-22: THE RUN BETWEEN A PARTY (game 0.93.3) - "en" passes the run
     between the games in a party's arena, checked; the leader's keys are the
@@ -2720,6 +2777,7 @@ async def main():
     await only_what_is_near()
     await one_arena_a_party()
     await the_run_between_a_party()
+    await the_healers_run_together()
     await clocks_carry_on()
     presence.HELLO_SECONDS = 0.5
     combatbook.HOLD_SECONDS = 0.2
