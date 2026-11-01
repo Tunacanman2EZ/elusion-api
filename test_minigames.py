@@ -285,6 +285,76 @@ check("deleting the character takes its chest", gone.status_code == 200
       and not raw("SELECT * FROM loot_chest_items WHERE user_id = ?", (uid("mgdora"),)),
       (gone.status_code, gone.get_json()))
 
+section("MG-11 THE HEALER'S RUN: THREE RUNS A DAY")
+erin = register("mgerin")
+assert client.put("/api/save", headers=erin, json={"slot": 0, "class_id": "warrior", "name": "warrior"}).status_code in (200, 201)
+def healer(headers):
+    games = (client.get("/api/minigames", headers=headers).get_json() or {}).get("games", [])
+    return next((g for g in games if g.get("id") == "healerrun"), {})
+def run_go(headers, slot=0):
+    return client.post("/api/minigames/enter", headers=headers, json={"game": "healerrun", "slot": slot})
+listed = healer(erin)
+check("the Healer's Run is listed: three runs a day, all three left",
+      listed.get("name") == "The Healer's Run" and listed.get("plays") == 3 and listed.get("plays_left") == 3
+      and listed.get("ready_in") == 0, listed)
+check("  and the Endless says it is one a day", endless(erin).get("plays") == 1 and endless(erin).get("plays_left") == 1)
+runs = []
+for n in range(3):
+    res = run_go(erin)
+    body = res.get_json() or {}
+    runs.append(body.get("run"))
+    check("  Go %d is let in with a run of its own, %d left" % (n + 1, 2 - n), res.status_code == 200
+          and isinstance(body.get("run"), int) and body.get("plays_left") == 2 - n
+          and body.get("pays", {}).get("most") == 1000, (res.status_code, body))
+res = run_go(erin)
+body = res.get_json() or {}
+check("the fourth inside the day is refused (409) with when the next one is, in words",
+      res.status_code == 409 and services.DAY - 5 <= body.get("ready_in", 0) <= services.DAY
+      and "3 times today" in body.get("message", ""), (res.status_code, body))
+raw("UPDATE minigame_runs SET started_at = started_at - ? WHERE id = ?", (services.DAY + 5, runs[0]))
+check("  once the first is a day old, one is free again", healer(erin).get("plays_left") == 1
+      and run_go(erin).status_code == 200)
+check("refused: no slot (400), an empty slot (404)", run_go(erin, slot=None).status_code == 400
+      and run_go(erin, slot=3).status_code == 404)
+check("the owner runs it as often as they like", all(run_go(owner).status_code in (200, 404) for _ in range(4)))
+
+section("MG-12 ITS GOLD, PAID AT LEAVE")
+check("the gold by how far a run got: nothing, the first stretch, every wave, the boss, the goal",
+      services.healer_gold(0, False, False) == 0 and services.healer_gold(5, False, False) == 50
+      and services.healer_gold(25, False, False) == 600 and services.healer_gold(25, True, False) == 750
+      and services.healer_gold(25, True, True) == 1000 and services.healer_gold(24, True, True) < 600)
+def finish(headers, run_id, waves, boss=False, goal=False):
+    return client.post("/api/minigames/finish", headers=headers,
+                       json={"run": run_id, "waves": waves, "boss": boss, "goal": goal})
+purse = lambda: raw("SELECT gold FROM saves WHERE user_id = ? AND slot = 0", (uid("mgerin"),))[0][0]
+before = purse()
+raw("UPDATE minigame_runs SET started_at = started_at - 600 WHERE id = ?", (runs[1],))
+res = finish(erin, runs[1], 7)
+body = res.get_json() or {}
+check("Leave after seven waves pays their gold into the character's purse, in the ledger as minigame",
+      res.status_code == 200 and body.get("gold") == 50 + 2 * 16 and purse() == before + 82
+      and body.get("status", {}).get("gold") == purse()
+      and raw("SELECT reason, delta FROM gold_ledger WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+              (uid("mgerin"),))[0] == ("minigame", 82), (res.status_code, body))
+check("  once: a second Leave for the same run is refused (409)", finish(erin, runs[1], 7).status_code == 409
+      and purse() == before + 82)
+raw("UPDATE minigame_runs SET started_at = started_at - 30 WHERE id = ?", (runs[2],))
+body = finish(erin, runs[2], 25, True, True).get_json() or {}
+check("a run that says it reached the goal 30 seconds after its Go is believed only as far as the time allows",
+      body.get("waves") == 10 and body.get("boss") is False and body.get("gold") == services.healer_gold(10, False, False),
+      body)
+raw("UPDATE minigame_runs SET started_at = started_at - ? WHERE id = ?", (services.DAY, runs[2]))
+full = run_go(erin).get_json() or {}
+raw("UPDATE minigame_runs SET started_at = started_at - 400 WHERE id = ?", (full.get("run", 0),))
+body = finish(erin, full.get("run", 0), 25, True, True).get_json() or {}
+check("  a whole run, the boss and the goal: 1000 gold", body.get("gold") == 1000 and body.get("goal") is True, body)
+check("refused: somebody else's run (404), a bad body (400), not logged in (401)",
+      finish(bob, runs[0], 3).status_code == 404 and finish(erin, "x", 3).status_code == 400
+      and client.post("/api/minigames/finish", json={"run": runs[0], "waves": 3}).status_code == 401)
+raw("UPDATE minigame_runs SET started_at = started_at - ? WHERE id = ?", (services.HEALER_RUN_KEPT_SECONDS + 10, runs[0]))
+check("a run left too long pays nothing (closed without Leave)", (finish(erin, runs[0], 25, True, True).get_json() or {})
+      .get("gold") == 0)
+
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))
 print("=" * 60)

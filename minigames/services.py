@@ -10,7 +10,88 @@ DAY = 24 * 60 * 60
 # after going in. The order is the order the game lists them in.
 GAMES = {
     "endless": {"name": "The Endless", "wait": DAY},
+    # THE HEALER'S RUN (game 0.99.0, healerrun.gd): the owner, 31 Oct, "this
+    # minigame can be played 3 times a day". Three Go's in any day (a rolling
+    # one - the oldest of the three frees a run 24 hours after it), and its
+    # gold paid at Leave by POST /api/minigames/finish.
+    "healerrun": {"name": "The Healer's Run", "wait": DAY, "plays": 3},
 }
+
+
+def plays_of(game):
+    """How many Go's a game allows in its wait: 1 unless it says."""
+    return int(game.get("plays", 1))
+
+
+def ready_in_plays(starts, plays, wait, now):
+    """Seconds until somebody whose Go's were at `starts` may go in again,
+    `plays` allowed in any `wait`; 0 while one is left."""
+    recent = sorted(int(at) for at in starts if int(at) > int(now) - int(wait))
+    if len(recent) < int(plays):
+        return 0
+    return max(0, recent[-int(plays)] + int(wait) - int(now))
+
+
+# =============================================================================
+# THE HEALER'S RUN'S GOLD (game 0.99.0)
+# =============================================================================
+# The owner: "gold should be rewarded on the screen then moved to char when
+# hitting leave", 0 to 1000 a run, by how far it got. The game shows the same
+# sum as it goes (it is handed healer_pays() at Go), and says at Leave how far
+# it got; the server pays from that - held to what the time since the Go
+# allows - once a run, in the ledger as "minigame".
+#
+#   each wave passed   HEALER_WAVE_GOLD by stretch (5 stretches of 5): 600
+#   the gate's boss    HEALER_BOSS_GOLD                                  150
+#   the goal marker    HEALER_GOAL_GOLD                                  250
+#
+# THE HONEST LIMIT: a modified game could say it reached the goal. It cannot
+# say so sooner than HEALER_MIN_WAVE_SECONDS a wave and HEALER_MIN_BOSS_SECONDS
+# for the boss after its Go, nor more than three times a day: 3,000 gold a day
+# at the very most.
+
+HEALER_STRETCHES = 5
+HEALER_WAVES_PER_STRETCH = 5
+HEALER_WAVE_GOLD = (10, 16, 24, 30, 40)
+HEALER_BOSS_GOLD = 150
+HEALER_GOAL_GOLD = 250
+HEALER_MIN_WAVE_SECONDS = 3
+HEALER_MIN_BOSS_SECONDS = 15
+# A run not finished in this long pays nothing: closed without Leave.
+HEALER_RUN_KEPT_SECONDS = 3 * 60 * 60
+
+
+def healer_waves():
+    return HEALER_STRETCHES * HEALER_WAVES_PER_STRETCH
+
+
+def healer_pays():
+    """The table the game counts gold by on screen (handed it at Go)."""
+    return {"wave_gold": list(HEALER_WAVE_GOLD), "waves_per_stretch": HEALER_WAVES_PER_STRETCH,
+            "boss_gold": HEALER_BOSS_GOLD, "goal_gold": HEALER_GOAL_GOLD,
+            "most": healer_gold(healer_waves(), True, True)}
+
+
+def healer_believed(waves, boss, goal, seconds):
+    """How far a run said it got, held to what `seconds` since its Go allow:
+    (waves, boss, goal)."""
+    waves = max(0, min(int(waves), healer_waves(), int(seconds) // HEALER_MIN_WAVE_SECONDS))
+    full = waves == healer_waves()
+    boss = bool(boss) and full and int(seconds) >= healer_waves() * HEALER_MIN_WAVE_SECONDS + HEALER_MIN_BOSS_SECONDS
+    goal = bool(goal) and boss
+    return waves, boss, goal
+
+
+def healer_gold(waves, boss, goal):
+    """The gold for a run that passed `waves` waves, and beat the boss and
+    reached the goal marker or not."""
+    waves = max(0, min(int(waves), healer_waves()))
+    gold = sum(HEALER_WAVE_GOLD[i // HEALER_WAVES_PER_STRETCH] for i in range(waves))
+    if waves == healer_waves() and boss:
+        gold += HEALER_BOSS_GOLD
+        if goal:
+            gold += HEALER_GOAL_GOLD
+    return gold
 
 
 def ready_in(entered_at, wait, now):

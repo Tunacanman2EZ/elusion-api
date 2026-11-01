@@ -1,6 +1,7 @@
 """minigames/schema.py - minigames/'s tables: minigame_entries, when each
-account last went into each minigame (game 0.93.3), and minigame_kills, every
-paid kill in one (0.93.4).
+account last went into each minigame (game 0.93.3), minigame_kills, every
+paid kill in one (0.93.4), and minigame_runs, each run of a minigame played
+several times a day (0.99.0).
 
 WHY HERE. A table lives with the one area that adds its rows (ARCHITECTURE.md).
 init_db() calls create() with the other packages', after the core's tables and
@@ -36,6 +37,25 @@ SCHEMA = """
         );
 
         CREATE INDEX IF NOT EXISTS idx_minigame_kills_user ON minigame_kills(user_id, game, at);
+
+        -- EVERY RUN OF A MINIGAME PLAYED SEVERAL TIMES A DAY (0.99.0,
+        -- minigames/): the Healer's Run's three a day are counted here, one
+        -- row a Go, and each is finished - its gold paid - once.
+        CREATE TABLE IF NOT EXISTS minigame_runs (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id      INTEGER NOT NULL,
+            slot         INTEGER NOT NULL,
+            game         TEXT    NOT NULL,
+            started_at   INTEGER NOT NULL,
+            finished_at  INTEGER NOT NULL DEFAULT 0,
+            waves        INTEGER NOT NULL DEFAULT 0,
+            boss         INTEGER NOT NULL DEFAULT 0,
+            goal         INTEGER NOT NULL DEFAULT 0,
+            gold         INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_minigame_runs_user ON minigame_runs(user_id, game, started_at);
 """
 
 

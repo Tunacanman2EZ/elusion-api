@@ -3192,6 +3192,41 @@ loot/; test_minigames.py MG-6 to MG-10, test_packages.py.
   404s for its Endless kills and an empty chest; an older game never sends
   them.
 
+## The Healer's Run: three runs a day, its gold at Leave (game 0.99.0)
+
+The owner, 31 Oct: "gold should be rewarded on the screen then moved to char
+when hitting leave this minigame can be played 3 times a day". minigames/:
+
+- **`GAMES["healerrun"]`**: `"plays": 3` in a day - a rolling one: the oldest
+  of the three frees a run 24 hours after its Go (`ready_in_plays()`). The
+  listing gives every game `plays` and `plays_left`. The owner and a co-owner
+  run it as often as they like (`skips_wait`), written all the same.
+- **Its Go starts a run** (`enter_a_run()`): the character's `slot` is
+  required (400 without, 404 for an empty one); a row in `minigame_runs` (one
+  a Go, its own table - schema.py), and the answer carries `run` (its id),
+  `plays_left` and `pays` (`healer_pays()`: the table the game counts gold by
+  on screen). The fourth inside the day is a 409 with `ready_in` and the
+  words.
+- **`POST /api/minigames/finish`** `{run, waves, boss, goal}`: the game's
+  Leave (and Again). Its own run only (404), once (409). The gold is
+  `healer_gold()` - each wave passed by stretch (10, 16, 24, 30, 40: 600),
+  the boss 150, the goal 250: 1000 - from how far the run said it got, held
+  by `healer_believed()` to what the time since its Go allows
+  (`HEALER_MIN_WAVE_SECONDS` 3 a wave, `HEALER_MIN_BOSS_SECONDS` 15 for the
+  boss). A run left more than `HEALER_RUN_KEPT_SECONDS` (3 h) pays nothing.
+  Paid through `gold_delta()` (handed in by app.py), reason `"minigame"`; the
+  answer's `status.gold` is the purse after, which the game takes as the
+  total.
+- **The honest limit**: a modified game could claim the goal; not sooner than
+  the time allows, nor more than three times a day - 3,000 gold a day at
+  most.
+
+`test_minigames.py` MG-11 (three a day, the fourth refused, one freed a day
+later, refusals, the owner) and MG-12 (the gold by progress, paid into the
+purse and the ledger, once, held to the time, somebody else's run, a run left
+too long). (MG-10's "another account reads its own chest" fails on the PC's
+own code too, before these: unlooked-at.)
+
 ## Layout
 
 ```

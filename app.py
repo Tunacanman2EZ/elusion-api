@@ -9008,6 +9008,8 @@ minigames_package.register(
     post_broadcast=post_broadcast,
     mythic_text=lambda username, item_id, enemy_id: kill_package.mythic_find_text(gamedata, username, item_id, enemy_id),
     mythic_kind=kill_package.MYTHIC_BROADCAST_KIND,
+    # THE HEALER'S RUN'S GOLD (game 0.99.0): paid at Leave, through the ledger.
+    gold_delta=lambda db, user_id, slot, delta, reason, detail="": gold_delta(db, user_id, slot, delta, reason, detail),
 )
 
 

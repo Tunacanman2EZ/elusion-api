@@ -36,3 +36,32 @@ def record_kill(db, user_id, slot, game, enemy_id, boss, now):
         (int(user_id), int(slot), str(game), str(enemy_id), 1 if boss else 0, int(now)),
     )
     db.execute("DELETE FROM minigame_kills WHERE at < ?", (int(now) - KILLS_KEPT_SECONDS,))
+
+
+# THE HEALER'S RUN'S RUNS (game 0.99.0): one row a Go, finished once.
+
+def starts_since(db, user_id, game, since):
+    """When each of the account's runs of `game` started, since `since`."""
+    rows = db.execute("SELECT started_at FROM minigame_runs WHERE user_id = ? AND game = ? AND started_at > ?",
+                      (int(user_id), str(game), int(since))).fetchall()
+    return [int(row[0]) for row in rows]
+
+
+def start_run(db, user_id, slot, game, now):
+    """A run begun; its id."""
+    cur = db.execute("INSERT INTO minigame_runs (user_id, slot, game, started_at) VALUES (?, ?, ?, ?)",
+                     (int(user_id), int(slot), str(game), int(now)))
+    return int(cur.lastrowid)
+
+
+def run_of(db, run_id):
+    return db.execute("SELECT * FROM minigame_runs WHERE id = ?", (int(run_id),)).fetchone()
+
+
+def finish_run(db, run_id, now, waves, boss, goal, gold):
+    """The run's end written - once: False when it was already finished."""
+    cur = db.execute(
+        "UPDATE minigame_runs SET finished_at = ?, waves = ?, boss = ?, goal = ?, gold = ? "
+        "WHERE id = ? AND finished_at = 0",
+        (int(now), int(waves), 1 if boss else 0, 1 if goal else 0, int(gold), int(run_id)))
+    return cur.rowcount == 1

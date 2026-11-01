@@ -7,6 +7,16 @@
                                 your chest from the last day emptied
     POST /api/minigames/kill    an Endless elite or boss killed (0.93.4): its
                                 loot into your chest in the corridor, no XP
+    POST /api/minigames/finish  a Healer's Run's end (0.99.0): its gold, by
+                                how far it got, into the character's purse
+
+THE HEALER'S RUN (0.99.0): the owner, "this minigame can be played 3 times a
+day", and "gold should be rewarded on the screen then moved to char when
+hitting leave". Its Go starts a run of its own (minigame_runs) while the
+account has had fewer than three in the last day, and hands the game the gold
+table to count on screen (services.healer_pays()); Leave (or Again) finishes
+it, and the server pays from how far it got, held to what the time since the
+Go allows (services.healer_believed()), once.
 
 The owner: "we need to get rid of ladder and make this a button in hud that
 says minigames this dungeon will have a 1 day wait timer for players", and
