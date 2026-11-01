@@ -430,7 +430,8 @@ confirmed("gsmia", "Mia.Row@Example.com")
 confirmed("gsmiaun", "mia.row@example.com", verified=0)
 confirmed("gsmiagone", "mia.row@example.com")
 raw("UPDATE users SET deleted_at = 1 WHERE username = 'gsmiagone'")
-raw("UPDATE users SET email = 'mia.row@example.com', email_verified = 1 WHERE username = 'gsowner'")
+confirmed("gsmiamod", "mia.row@example.com")
+raw("UPDATE users SET role = 'mod' WHERE username = 'gsmiamod'")
 confirmed("gsmialinked", "mia.row@example.com")
 raw("INSERT INTO google_accounts (user_id, sub, email, linked_at, made_with_google) VALUES (?, 'g-other', '', 0, 0)",
     (uid("gsmialinked"),))
@@ -441,7 +442,7 @@ asked = poll(code, ip=ip).get_json() or {}
 check("a new Google account is offered the account whose confirmed email it is (any case) - and only that one",
       asked.get("needs_name") is True and asked.get("found") == ["gsmia"], asked)
 check("  a name not offered cannot be claimed: unconfirmed, staff, deleted, linked or made up (404)",
-      all(claim(code, n, ip=ip).status_code == 404 for n in ("gsmiaun", "gsowner", "gsmiagone", "gsmialinked",
+      all(claim(code, n, ip=ip).status_code == 404 for n in ("gsmiaun", "gsmiamod", "gsmiagone", "gsmialinked",
                                                             "nobody")))
 check("  another computer cannot claim with this code", claim(code, "gsmia", install=INSTALL_B, ip=ip).status_code == 404)
 took = claim(code, "GSMIA", ip=ip)
@@ -466,6 +467,13 @@ ip = next_ip()
 code = start(INSTALL_A, ip).get_json()["code"]
 finish(code, token(sub="g-ned", email="ned@example.com"))
 banned = claim(code, "gsned", ip=ip)
+ip = next_ip()
+code = start(INSTALL_A, ip).get_json()["code"]
+finish(code, token(sub="g-boss", email="MIA.ROW@example.com"))
+boss = poll(code, ip=ip)
+check("a Google email only a staff account has is told staff use their password - never asked for a name",
+      boss.status_code == 403 and (boss.get_json() or {}).get("message") == gs.STAFF_REFUSED
+      and google_register(code, "gsbossalt", ip=ip).status_code in (409, 410), boss.get_json())
 check("a banned account is claimed only to be told its ban (403), never signed in",
       banned.status_code == 403 and "ban" in (banned.get_json() or {}) and not (banned.get_json() or {}).get("token"),
       banned.get_json())

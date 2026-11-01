@@ -282,7 +282,16 @@ def register(app, *, require_auth, require_fresh_password, get_db, bad_request, 
         if row["user_id"] is None:
             # A GOOGLE ACCOUNT WE HAVE NOT SEEN - but its email may be an
             # account's confirmed recovery address: offer those first.
-            return {"needs_name": True, "found": [a["username"] for a in claimable(db, row)]}, 200
+            same = data.accounts_with_email(db, row["email"])
+            found = [a["username"] for a in same if not is_staff(a)]
+            if not found and any(is_staff(a) for a in same):
+                # ONLY A STAFF ACCOUNT HAS THIS EMAIL (the owner, signing in
+                # with Google: "im the gm it should know"): say why, rather
+                # than ask a name for a new account he never wanted.
+                data.use_code(db, row["code_hash"])
+                db.commit()
+                return {"error": "Forbidden", "message": services.STAFF_REFUSED}, 403
+            return {"needs_name": True, "found": found}, 200
         account = data.user(db, row["user_id"])
         if account is None or data.link_of_sub(db, row["sub"]) is None:
             return {"error": "Gone", "message": services.RUN_OUT}, 410

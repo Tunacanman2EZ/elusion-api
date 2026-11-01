@@ -3300,7 +3300,10 @@ googlesignin/ package; the plan is the commit folder's GOOGLE_SIGNIN_PLAN.txt.
   email is CONFIRMED and is Google's verified email (any case; not staff,
   deleted or linked; four at most, `data.accounts_with_email()`).
   `POST /api/auth/google/claim {code, username}` links one of those and signs
-  in through the same `sign_in()` as the poll (a banned one gets its ban). The
+  in through the same `sign_in()` as the poll (a banned one gets its ban). An
+  email only a staff account has is refused with `STAFF_REFUSED` (403, the
+  code spent) instead of asking a name - the owner, signed in with Google as
+  the GM: "it should know". The
   reach is "Forgot password"'s: whoever reads that inbox. A name taken at
   register says to sign in with the password and link Google in Options
   (`services.NAME_TAKEN`). The page shows "Back to the game" when done and
