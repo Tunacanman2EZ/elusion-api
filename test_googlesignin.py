@@ -14,9 +14,10 @@
   GS-5  COMING BACK: the same Google account signs into the same account; a
         second game account can never be made with it; a banned account gets
         its ban; the password login still works beside it.
-  GS-6  STAFF NEVER: a staff account linked by hand is refused at the page
-        and at the poll; Google cannot be linked to staff; no Google sign-up
-        may take the owner's name.
+  GS-6  STAFF (0.103.0): only once linked in Options, only on a computer it
+        proved with the password and emailed code, and the session is not
+        confirmed, so an admin power asks the password; no Google sign-up may
+        take the owner's name.
   GS-7  LINKING AN EXISTING ACCOUNT: link (the password again on a hardened
         session), the page, the poll; a Google account linked elsewhere is
         refused; unlink, but never for an account made with Google.
@@ -288,23 +289,68 @@ check("the password login works as ever beside it", client.post(
       environ_base={"REMOTE_ADDR": next_ip()}).status_code == 200)
 
 
-section("GS-6 STAFF NEVER")
+section("GS-6 STAFF: LINKED, ON A PROVED COMPUTER, AND ADMIN STILL ASKS THE PASSWORD")
+# Game 0.103.0, the owner: "add sync to google on settings hub in game so when
+# i click sign in with google it just signs me in no password needed".
 password_account("gsmod")
 raw("UPDATE users SET role = 'mod' WHERE username = 'gsmod'")
 raw("INSERT INTO google_accounts (user_id, sub, email, linked_at, made_with_google) VALUES (?, 'g-mod', '', 0, 0)",
     (uid("gsmod"),))
+now = int(time.time())
+def trust(name, raw_token, role="mod", expires_in=86400):
+    raw("INSERT INTO trusted_devices (token_hash, user_id, role, created_at, last_used_at, expires_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)", (app_module._token_hash(raw_token), uid(name), role, now, now, now + expires_in))
+trust("gsmod", "proved-computer")
+trust("gsmod", "old-rank-computer", role="dev")
+trust("gsmod", "run-out-computer", expires_in=-5)
+def staff_poll(code, devices, ip):
+    return client.post("/api/auth/google/poll", json={"code": code, "devices": devices},
+                       **game(INSTALL_A, build=6, ip=ip))
+sessions_of = lambda name: raw("SELECT COUNT(*) FROM sessions WHERE user_id = ?", (uid(name),))[0][0]
+before = sessions_of("gsmod")
 ip = next_ip()
 staff_code = start(INSTALL_A, ip).get_json()["code"]
 at_page = finish(staff_code, token(sub="g-mod"))
-check("a staff account's Google is refused at the page", at_page.status_code == 403
-      and at_page.get_json().get("message") == gs.STAFF_REFUSED, at_page.get_json())
-check("  and at the poll, with no session made", poll(staff_code, ip=ip).status_code == 403
-      and raw("SELECT COUNT(*) FROM sessions WHERE user_id = ?", (uid("gsmod"),))[0][0] == 1)
-mod_token = client.post("/api/auth/login", json={"username": "gsmod", "password": PW},
-                        environ_base={"REMOTE_ADDR": next_ip()}).get_json().get("token", "")
-check("Google cannot be linked to a staff account", client.post(
-      "/api/account/google/link", json={}, headers={"Authorization": "Bearer " + mod_token,
-                                                     "X-Elusion-Install": INSTALL_A}).status_code == 403)
+check("a staff account linked to Google is let through at the page (the poll decides)",
+      at_page.status_code == 200, at_page.get_json())
+refused = staff_poll(staff_code, ["somebody-elses", "old-rank-computer", "run-out-computer", 7], ip)
+check("  a computer not proved with the password and code - or proved at another rank, or run out - is refused",
+      refused.status_code == 403 and refused.get_json().get("message") == gs.STAFF_NEW_COMPUTER
+      and sessions_of("gsmod") == before, refused.get_json())
+check("  and the code is spent", staff_poll(staff_code, ["proved-computer"], ip).status_code == 410)
+ip = next_ip()
+staff_code = start(INSTALL_A, ip).get_json()["code"]
+finish(staff_code, token(sub="g-mod"))
+went = staff_poll(staff_code, ["nope", "proved-computer"], ip)
+mod = went.get_json() or {}
+row = raw("SELECT confirmed_at, expires_at, hardened FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
+          (uid("gsmod"),))
+check("on a computer it proved, a linked staff account signs in with Google",
+      went.status_code == 200 and mod.get("username") == "gsmod" and mod.get("role") == "mod" and mod.get("token"),
+      mod)
+check("  its session is a staff one: short, and NOT confirmed - Google is not the password",
+      row and row[0][0] == 0 and row[0][2] == 1 and row[0][1] <= int(time.time()) + app_module.STAFF_TOKEN_TTL, row)
+mod_headers = {"Authorization": "Bearer " + mod.get("token", ""), "X-Elusion-Install": INSTALL_A,
+               "X-Elusion-Build": "6"}
+asked = client.post("/api/staff/ban", json={"username": "gsann", "reason": "test", "days": 1}, headers=mod_headers)
+check("  so an admin power asks for the password first (confirm_password), and bans nobody",
+      asked.status_code == 403 and (asked.get_json() or {}).get("confirm_password") is True
+      and raw("SELECT is_banned FROM users WHERE username = 'gsann'") == [(0,)], asked.get_json())
+password_account("gsmod2")
+raw("UPDATE users SET role = 'mod' WHERE username = 'gsmod2'")
+mod2 = client.post("/api/auth/login", json={"username": "gsmod2", "password": PW, "install": INSTALL_A},
+                   headers={"X-Elusion-Install": INSTALL_A, "X-Elusion-Build": "6"},
+                   environ_base={"REMOTE_ADDR": next_ip()}).get_json()
+mod2_headers = {"Authorization": "Bearer " + mod2.get("token", ""), "X-Elusion-Install": INSTALL_A,
+                "X-Elusion-Build": "6"}
+status = client.get("/api/account/google", headers=mod2_headers).get_json() or {}
+link = client.post("/api/account/google/link", json={}, headers=mod2_headers)
+lcode = (link.get_json() or {}).get("code", "")
+linked_page = finish(lcode, token(sub="g-mod2"))
+check("staff may link Google in Options now (the password just typed), and the link is made",
+      status.get("staff_may_link") is True and link.status_code == 200 and linked_page.status_code == 200
+      and raw("SELECT COUNT(*) FROM google_accounts WHERE sub = 'g-mod2' AND user_id = ?", (uid("gsmod2"),))[0][0] == 1,
+      (status, link.get_json(), linked_page.get_json()))
 res, body = new_player("g-own", "gsowner")
 check("no Google sign-up may take the owner's name", res.status_code == 409, body)
 
@@ -471,8 +517,8 @@ ip = next_ip()
 code = start(INSTALL_A, ip).get_json()["code"]
 finish(code, token(sub="g-boss", email="MIA.ROW@example.com"))
 boss = poll(code, ip=ip)
-check("a Google email only a staff account has is told staff use their password - never asked for a name",
-      boss.status_code == 403 and (boss.get_json() or {}).get("message") == gs.STAFF_REFUSED
+check("a Google email only a staff account has is told to link Google in Options - never asked for a name",
+      boss.status_code == 403 and (boss.get_json() or {}).get("message") == gs.STAFF_LINK_FIRST
       and google_register(code, "gsbossalt", ip=ip).status_code in (409, 410), boss.get_json())
 check("a banned account is claimed only to be told its ban (403), never signed in",
       banned.status_code == 403 and "ban" in (banned.get_json() or {}) and not (banned.get_json() or {}).get("token"),

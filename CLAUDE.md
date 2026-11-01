@@ -3282,9 +3282,18 @@ googlesignin/ package; the plan is the commit folder's GOOGLE_SIGNIN_PLAN.txt.
   recorded, and for a new account both throttles and both ban-evasion checks.
 - **One Google account, one game account** (`google_accounts.sub` UNIQUE): a
   banned player cannot make another with the same Google account.
-- **Staff never**: a mod, dev, co-owner or the owner is refused at the page and
-  the poll, Google cannot be linked to them, and no Google sign-up may take a
-  staff name (`services.staff_name()`).
+- **Staff (game 0.103.0)** - the owner: "add sync to google on settings hub in
+  game so when i click sign in with google it just signs me in no password
+  needed". A mod, dev, co-owner or the owner may link Google in Options (the
+  link route's `require_fresh_password` is the password). Signing in with it
+  then needs a TRUSTED COMPUTER: the game sends every device token it holds
+  (`devices`, at most `DEVICES_MOST`) with its poll, and `sign_in()` asks
+  app.py's `_google_trusted_computer()` (auth/'s trusted_devices, in date, at
+  the rank held now); none is 403 `STAFF_NEW_COMPUTER`. The session is
+  issued `staff=True` (short) and NOT confirmed, so every
+  `require_fresh_password` route asks the password first. Staff are still
+  never offered by email (`STAFF_LINK_FIRST` when only staff has it), and no
+  Google sign-up may take a staff name (`services.staff_name()`).
 - **A new account made with Google** has the timing stand-in hash as its
   password (its password was never kept, and a login against it costs the
   same scrypt as any) and Google's verified email as its confirmed recovery

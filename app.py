@@ -9060,9 +9060,24 @@ accountdelete_package.register(
 # A player: "Google account to play or I am not registering". The game asks
 # for a code, the player signs in with Google on our page in the web browser,
 # and the game is signed in exactly as a password login would sign it in -
-# every gate above handed in, so none of them is a copy. Staff never sign in
-# this way. googlesignin/__init__.py has the whole of it.
+# every gate above handed in, so none of them is a copy. Staff sign in this
+# way only once linked in Options, and only on a computer already proved with
+# the password and emailed code (game 0.103.0). googlesignin/__init__.py has
+# the whole of it.
 import googlesignin as googlesignin_package  # noqa: E402
+
+
+def _google_trusted_computer(db, row, raws, now):
+    """True when one of `raws` - the trusted-computer tokens a game sent - is
+    a computer this account proved with a staff login code (auth/'s TRUSTED
+    DEVICES), still in date, at the rank it holds now. Read only."""
+    for raw in raws:
+        found = db.execute("SELECT role, expires_at FROM trusted_devices WHERE token_hash = ? AND user_id = ?",
+                           (_token_hash(raw), int(row["id"]))).fetchone()
+        if found is not None and int(found["expires_at"]) > now and found["role"] == role_for(row):
+            return True
+    return False
+
 
 googlesignin_package.register(
     app,
@@ -9097,6 +9112,7 @@ googlesignin_package.register(
     needs_recovery_email=needs_recovery_email,
     mask_email=_mask_email,
     dummy_hash=_TIMING_DUMMY_HASH,
+    trusted_device=_google_trusted_computer,
 )
 
 

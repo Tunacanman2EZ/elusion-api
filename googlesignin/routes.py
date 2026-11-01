@@ -38,7 +38,7 @@ def register(app, *, require_auth, require_fresh_password, get_db, bad_request, 
              register_throttle_state, record_login_attempt, wait_words, ban_state, ban_evasion_state,
              install_evasion_state, record_account_ip, record_account_install, issue_token, login_hardening,
              end_other_sessions, role_for, default_role, has_owner_powers, role_at_least, name_hue_of,
-             needs_recovery_email, mask_email, dummy_hash):
+             needs_recovery_email, mask_email, dummy_hash, trusted_device=lambda db, row, raws, now: False):
     """Add the nine routes."""
 
     def live_client_id():
@@ -212,10 +212,10 @@ def register(app, *, require_auth, require_fresh_password, get_db, bad_request, 
         if row["purpose"] == "link":
             account = data.user(db, row["user_id"]) if row["user_id"] is not None else None
             mine = data.link_of_user(db, row["user_id"]) if account is not None else None
-            if account is None or is_staff(account):
-                data.finish_code(db, row["code_hash"], "refused", said=services.STAFF_REFUSED)
+            if account is None:
+                data.finish_code(db, row["code_hash"], "refused", said=services.RUN_OUT)
                 db.commit()
-                return {"error": "Forbidden", "message": services.STAFF_REFUSED}, 403
+                return {"error": "Gone", "message": services.RUN_OUT}, 410
             if linked is not None and int(linked["user_id"]) != int(account["id"]):
                 data.finish_code(db, row["code_hash"], "refused", said=services.LINKED_ELSEWHERE)
                 db.commit()
@@ -227,11 +227,9 @@ def register(app, *, require_auth, require_fresh_password, get_db, bad_request, 
             db.commit()
             app.logger.info("[GOOGLE] linked  user=%r", account["username"])
             return {"ok": True, "message": services.DONE_LINK}, 200
+        # A STAFF ACCOUNT LINKED IN OPTIONS IS LET THROUGH HERE: whether this
+        # computer may sign it in is the poll's question (sign_in()).
         account = data.user(db, linked["user_id"]) if linked is not None else None
-        if account is not None and is_staff(account):
-            data.finish_code(db, row["code_hash"], "refused", said=services.STAFF_REFUSED)
-            db.commit()
-            return {"error": "Forbidden", "message": services.STAFF_REFUSED}, 403
         data.finish_code(db, row["code_hash"], "done", who["sub"], who["email"], services.DONE_SIGNIN,
                          user_id=account["id"] if account is not None else None, keep_user=False)
         db.commit()
@@ -286,11 +284,13 @@ def register(app, *, require_auth, require_fresh_password, get_db, bad_request, 
             found = [a["username"] for a in same if not is_staff(a)]
             if not found and any(is_staff(a) for a in same):
                 # ONLY A STAFF ACCOUNT HAS THIS EMAIL (the owner, signing in
-                # with Google: "im the gm it should know"): say why, rather
-                # than ask a name for a new account he never wanted.
+                # with Google: "im the gm it should know"): say how, rather
+                # than ask a name for a new account he never wanted. Never
+                # offered by email: staff link Google in Options, with the
+                # password.
                 data.use_code(db, row["code_hash"])
                 db.commit()
-                return {"error": "Forbidden", "message": services.STAFF_REFUSED}, 403
+                return {"error": "Forbidden", "message": services.STAFF_LINK_FIRST}, 403
             return {"needs_name": True, "found": found}, 200
         account = data.user(db, row["user_id"])
         if account is None or data.link_of_sub(db, row["sub"]) is None:
@@ -318,15 +318,25 @@ def register(app, *, require_auth, require_fresh_password, get_db, bad_request, 
             db.commit()
             return {"error": "Forbidden", "message": "This account is banned." if ban["permanent"]
                     else "This account is banned until further notice.", "ban": ban}, 403
-        if is_staff(account):
+        staff = is_staff(account)
+        if staff and not trusted_device(db, account, services.sent_devices(request.get_json(silent=True)), now):
+            # STAFF ONLY ON A COMPUTER ALREADY PROVED with the password and the
+            # emailed code (auth/'s TRUSTED DEVICES): a stolen Google account
+            # on another computer opens nothing.
             data.use_code(db, row["code_hash"])
+            record_login_attempt(db, account["username"], ip, False, "google-new-computer")
             db.commit()
-            return {"error": "Forbidden", "message": services.STAFF_REFUSED}, 403
+            return {"error": "Forbidden", "message": services.STAFF_NEW_COMPUTER}, 403
         if not data.use_code(db, row["code_hash"]):
             return {"error": "Gone", "message": services.RUN_OUT}, 410
         db.commit()
         hardened, bound_to = login_hardening()
-        token, expires_at = issue_token(account["id"], install_hash=bound_to, hardened=hardened, confirmed=True)
+        # NOT CONFIRMED FOR STAFF: Google is not the password, so every route
+        # behind require_fresh_password (bans, gold, grants, the server's
+        # switches) asks for it first - the owner: "i can still use my key for
+        # admin stuff". A staff session is short, as after any staff login.
+        token, expires_at = issue_token(account["id"], install_hash=bound_to, hardened=hardened, staff=staff,
+                                        confirmed=not staff)
         end_other_sessions(db, account["id"], token)
         db.commit()
         record_login_attempt(db, account["username"], ip, True, "google")
@@ -479,7 +489,7 @@ def register(app, *, require_auth, require_fresh_password, get_db, bad_request, 
         return {"available": bool(live_client_id()), "linked": link is not None,
                 "email": mask_email(link["email"]) if link is not None and link["email"] else "",
                 "made_with_google": bool(link is not None and int(link["made_with_google"])),
-                "staff": bool(is_staff(g.user))}, 200
+                "staff": bool(is_staff(g.user)), "staff_may_link": True}, 200
 
     def google_link():
         """
@@ -501,8 +511,6 @@ def register(app, *, require_auth, require_fresh_password, get_db, bad_request, 
             return not_set_up()
         if request_install_hash() == "":
             return bad_request("Update your game to link Google.")
-        if is_staff(g.user):
-            return {"error": "Forbidden", "message": services.STAFF_REFUSED}, 403
         db = get_db()
         if data.link_of_user(db, g.user["id"]) is not None:
             return {"error": "Conflict", "message": "Google is linked to this account already."}, 409

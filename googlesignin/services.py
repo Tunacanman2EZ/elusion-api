@@ -37,6 +37,16 @@ TOKEN_MOST = 4096
 
 NOT_SET_UP = "Google sign-in is not set up on this server yet."
 STAFF_REFUSED = "Staff accounts sign in with their password and code, not Google."
+# STAFF WITH GOOGLE (game 0.103.0; the owner: "add sync to google on settings
+# hub in game so when i click sign in with google it just signs me in"): a
+# staff account signs in with Google only once it is linked in Options, and
+# only on a computer it has already proved with its password and emailed code.
+STAFF_LINK_FIRST = ("This Google email is a staff account's. Sign in with your password and code,"
+                    " then link Google in Options.")
+STAFF_NEW_COMPUTER = ("Staff sign in with Google only on a computer that has signed in with the"
+                      " password and email code before. Do that once here, then Google works.")
+# How many of this computer's trusted-computer tokens a poll may carry.
+DEVICES_MOST = 5
 RUN_OUT = "This sign-in has run out. Press Sign in with Google in the game again."
 LINKED_ELSEWHERE = "That Google account is already linked to another Elusion account."
 DONE_SIGNIN = "Done - go back to the game."
@@ -223,6 +233,15 @@ def page_html(code, client_id, words=""):
             + ' data-text="signin_with" data-shape="pill" data-theme="filled_black"></div></div>'
             + '<p class="say" id="say"></p>'
             + '<button type="button" class="back" id="back" hidden>Back to the game</button></div></body></html>')
+
+
+def sent_devices(payload):
+    """The trusted-computer tokens the game sent with its poll: strings, at
+    most DEVICES_MOST, each at most 128 long; anything else is none."""
+    raw = payload.get("devices") if isinstance(payload, dict) else None
+    if not isinstance(raw, list):
+        return []
+    return [d for d in raw[:DEVICES_MOST] if isinstance(d, str) and 0 < len(d) <= 128]
 
 
 def staff_name(role_for, default_role, username):

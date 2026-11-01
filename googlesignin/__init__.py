@@ -35,9 +35,12 @@ and computer recorded, and for a new account the throttles and both
 ban-evasion checks. And two more:
 - ONE GOOGLE ACCOUNT, ONE GAME ACCOUNT (google_accounts.sub is UNIQUE): a
   banned player cannot make another account with the same Google account.
-- STAFF NEVER SIGN IN WITH GOOGLE: a mod, dev, co-owner or the owner signs in
-  with the password and the email code, as before. Google is refused for
-  them, cannot be linked to them, and no Google sign-up may take a staff name.
+- STAFF ONLY LINKED, ON A PROVED COMPUTER (game 0.103.0): a mod, dev,
+  co-owner or the owner links Google in Options with the password, then signs
+  in with it only on a computer already proved with the password and emailed
+  code; that session is short and not confirmed, so every admin power asks
+  the password first. Staff are never offered by email, and no Google
+  sign-up may take a staff name.
 
 A NEW ACCOUNT MADE WITH GOOGLE has no password anybody knows (the process's
 timing stand-in hash, whose password was never kept), and Google's verified

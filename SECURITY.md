@@ -388,14 +388,18 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     that began it - another install cannot collect it - used once, and good
     for ten minutes. Every gate of the password login applies (bans, the
     closed server, one login at a time, the session bound to the computer,
-    both ban-evasion checks for a new account), one Google account is one
-    game account, and staff never sign in this way: Google is refused for
-    them, cannot be linked to them, and no Google sign-up may take a staff
-    name. An existing account is offered to a new Google account only when
+    both ban-evasion checks for a new account), and one Google account is
+    one game account. Staff (game 0.103.0) sign in with Google only once
+    they linked it in Options with their password, only on a computer they
+    already proved with the password and emailed code (a trusted computer,
+    at their rank, in date), and that session is short and NOT confirmed:
+    every admin power behind the step-up asks for the password first. No
+    Google sign-up may take a staff name, and staff are never offered by
+    email. An existing account is offered to a new Google account only when
     its recovery email is CONFIRMED and is the email Google verified - the
     reach "Forgot password" already gives whoever reads that inbox - and
     never a staff, deleted or already-linked account.
-    → Held by: `test_googlesignin.py` — "  and the code is still waiting for a good one", "another computer cannot collect it - the same 404 as a code that never was", "a staff account's Google is refused at the page", "no Google sign-up may take the owner's name", "one Google account, one game account: it is never asked for a name again, and no second is made", "  a name not offered cannot be claimed: unconfirmed, staff, deleted, linked or made up (404)"
+    → Held by: `test_googlesignin.py` — "  and the code is still waiting for a good one", "another computer cannot collect it - the same 404 as a code that never was", "  a computer not proved with the password and code - or proved at another rank, or run out - is refused", "  so an admin power asks for the password first (confirm_password), and bans nobody", "no Google sign-up may take the owner's name", "one Google account, one game account: it is never asked for a name again, and no second is made", "  a name not offered cannot be claimed: unconfirmed, staff, deleted, linked or made up (404)"
 
 ---
 
