@@ -17,7 +17,7 @@ out - takes the player off everybody's screen within seconds.
 It runs the real presence server in this process, on a free port, against a
 throwaway database in the temp folder - never elusion.db.
 """
-import asyncio, contextlib, importlib.util, inspect, io, json, math, os, re, sqlite3, sys, time
+import ast, asyncio, contextlib, importlib.util, inspect, io, json, math, os, re, sqlite3, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import testdir  # noqa: E402  (a private folder per run - testdir.py)
@@ -2764,7 +2764,131 @@ async def clocks_carry_on():
           task.done())
 
 
+HANDS_OFF = ("to_thread", "run_in_executor")
+
+
+def loop_blockers(source):
+    """What in this source would hold the event loop: time.sleep anywhere,
+    and an async function opening the database itself - sqlite3, or a
+    function that reaches it - instead of handing it to asyncio.to_thread.
+    Answers (what was found, the functions that reach the database)."""
+    tree = ast.parse(source)
+    funcs = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            funcs.setdefault(node.name, []).append(node)
+
+    def name_of(call):
+        f = call.func
+        return f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else "")
+
+    def on(call, module, attr=None):
+        f = call.func
+        return (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id == module
+                and (attr is None or f.attr == attr))
+
+    def calls_in(fn):
+        # The calls this function makes itself: not inside a function written
+        # within it (judged on its own), nor a lambda handed to to_thread.
+        out, todo = [], list(fn.body)
+        while todo:
+            node = todo.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(node, ast.Call):
+                out.append(node)
+                if name_of(node) in HANDS_OFF:
+                    todo.append(node.func)
+                    todo.extend(a for a in node.args if not isinstance(a, ast.Lambda))
+                    todo.extend(k.value for k in node.keywords if not isinstance(k.value, ast.Lambda))
+                    continue
+            todo.extend(ast.iter_child_nodes(node))
+        return out
+
+    found = ["time.sleep at line %d" % c.lineno for c in ast.walk(tree)
+             if isinstance(c, ast.Call) and on(c, "time", "sleep")]
+    reach = {name for name, defs in funcs.items()
+             if any(isinstance(d, ast.FunctionDef) and any(on(c, "sqlite3") for c in calls_in(d)) for d in defs)}
+    grew = True
+    while grew:
+        grew = False
+        for name, defs in funcs.items():
+            if name not in reach and any(isinstance(d, ast.FunctionDef)
+                                         and any(name_of(c) in reach for c in calls_in(d)) for d in defs):
+                reach.add(name)
+                grew = True
+    for defs in funcs.values():
+        for d in defs:
+            if isinstance(d, ast.AsyncFunctionDef):
+                for c in calls_in(d):
+                    if on(c, "sqlite3"):
+                        found.append("%s() opens sqlite3 on the loop at line %d" % (d.name, c.lineno))
+                    elif name_of(c) in reach:
+                        found.append("%s() calls %s() on the loop at line %d" % (d.name, name_of(c), c.lineno))
+    return found, reach
+
+
+LOOP_SAMPLE = """
+import asyncio, sqlite3, time
+
+def rows(ids):
+    return sqlite3.connect("x").execute("SELECT 1").fetchall()
+
+def helper(ids):
+    return rows(ids)
+
+async def direct():
+    rows([1])
+
+async def through():
+    helper([1])
+
+async def bare():
+    sqlite3.connect("x")
+
+async def in_a_lambda():
+    sorted([1], key=lambda i: rows([i]))
+
+async def handed():
+    await asyncio.to_thread(rows, [1])
+    await asyncio.to_thread(lambda: rows([1]))
+    await asyncio.get_running_loop().run_in_executor(None, helper, [1])
+
+def nap():
+    time.sleep(1)
+"""
+
+
+def the_loop_never_waits():
+    """P-25: THE LOOP NEVER WAITS (1 Nov). presence.py is one event loop for
+    every player: a database call or a sleep made on it holds every socket
+    while it runs. Every database call is handed to asyncio.to_thread and
+    nothing sleeps the thread - held by reading presence.py's own code, so a
+    quick report added one day fails here, not on the live server."""
+    section("P-25 THE LOOP NEVER WAITS: NO time.sleep, AND THE DATABASE ONLY THROUGH to_thread")
+    with open(presence.__file__, encoding="utf-8") as handle:
+        source = handle.read()
+    found, reach = loop_blockers(source)
+    check("nothing in presence.py holds the loop: no time.sleep, no database call outside to_thread",
+          not found, found[:6])
+    check("  and the scan sees the database there (the functions that open it, and those calling them)",
+          len(reach) >= 3, sorted(reach))
+    tree = ast.parse(source)
+    spelled = [n.lineno for n in ast.walk(tree)
+               if (isinstance(n, ast.ImportFrom) and n.module in ("sqlite3", "time"))
+               or (isinstance(n, ast.Import) and any(a.name in ("sqlite3", "time") and a.asname for a in n.names))]
+    check("  and presence.py names them only as sqlite3.x and time.x, the spelling the scan reads",
+          not spelled, spelled)
+    planted, _ = loop_blockers(LOOP_SAMPLE)
+    said = " ".join(planted)
+    check("  and the scan catches a planted one: directly, through a helper, sqlite3 itself, in a lambda, a sleep",
+          all(w in said for w in ("direct()", "through()", "bare()", "in_a_lambda()", "time.sleep")), planted)
+    check("  and passes the database handed off, by name, in a lambda or to an executor",
+          "handed()" not in said, planted)
+
+
 async def main():
+    the_loop_never_waits()
     await kills_written_soon()
     await positions_written()
     await health_written()

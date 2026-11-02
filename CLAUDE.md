@@ -1580,6 +1580,12 @@ every rule.
   too**: test_presence.py P-23 reads `start_clocks()` and fails on one that
   does not. The owner asked after his asyncio unit: "anything we can improve
   on now".
+- **THE LOOP NEVER WAITS (1 Nov).** presence.py is one event loop for every
+  player, so a database call or a sleep made on it holds every socket while
+  it runs. **Every database call is handed to `asyncio.to_thread`, and
+  nothing calls `time.sleep`** - test_presence.py P-25 reads presence.py's
+  own code and fails on either, a call through a helper too. A big loop of
+  plain Python (a report over many rows) it cannot see: hand that off too.
 
 ## Shared monsters: one game runs them, presence.py passes the notes
 
