@@ -27,6 +27,14 @@ cost about four times a potion for every point either healed. So a set is now
 5 to 9 hours of the band before it (it was 2 to 6, about 3 to 4 in practice),
 and a potion costs about what the cooked fish of its tier does per point
 healed.
+
+4 Nov (game 0.118.0), the owner: "we need to speed up the game even more" -
+a gentler curve, 1,250 x 1.22 (level 22 in about four and a half hours, not
+eight), and twice the gold from every kill. Both halve together on purpose:
+each band is about half as long, and the next set costs about half as many
+hours of it (2.5 to 4.5 where it was 5 to 9; 2 to 4.5 selling everything),
+so a character reaches the same gear at the same level as after the price
+pass. Prices did not change.
 """
 import importlib.util, os, sqlite3, sys
 
@@ -80,10 +88,10 @@ SLIMES = ["light", "wind", "water", "ice", "earth", "dark"]
 
 
 # =============================================================================
-section("THE CURVE IS 1,250 x 1.27 AND THE SERVER DERIVES IT")
+section("THE CURVE IS 1,250 x 1.22 AND THE SERVER DERIVES IT")
 # =============================================================================
 check("gamedata.json carries the new curve",
-      float(gamedata.CONSTANTS["xp_base"]) == 1250.0 and abs(float(gamedata.CONSTANTS["xp_growth"]) - 1.27) < 1e-9,
+      float(gamedata.CONSTANTS["xp_base"]) == 1250.0 and abs(float(gamedata.CONSTANTS["xp_growth"]) - 1.22) < 1e-9,
       (gamedata.CONSTANTS["xp_base"], gamedata.CONSTANTS["xp_growth"]))
 check("level 1 costs 1,250", gamedata.xp_needed_for_level(1) == 1250)
 
@@ -146,7 +154,8 @@ check("health climbs light, wind, water, ice, earth, fire, dark",
       all(element_hp[ladder[i]] > element_hp[ladder[i - 1]] for i in range(1, len(ladder))),
       {k: round(v) for k, v in element_hp.items()})
 
-# EIGHT HOURS. Five kills a minute in the band that matches your level.
+# FOUR AND A HALF HOURS (eight until game 0.118.0). Five kills a minute in the
+# band that matches your level.
 avg = {b: sum(v) / len(v) for b, v in band_xp.items()}
 minutes, at = 0.0, {}
 for level in range(1, 22):
@@ -154,9 +163,9 @@ for level in range(1, 22):
     minutes += gamedata.xp_needed_for_level(level) / avg[band] / 5.0
     at[level + 1] = minutes / 60.0
 check("level 5 in about a quarter of an hour", 0.18 < at[5] < 0.35, round(at[5], 2))
-check("level 10 in about an hour", 0.7 < at[10] < 1.3, round(at[10], 2))
-check("level 16 in about three hours", 2.3 < at[16] < 3.5, round(at[16], 2))
-check("level 22 in about eight hours", 7.0 < at[22] < 9.0, round(at[22], 2))
+check("level 10 in about three quarters of an hour", 0.55 < at[10] < 0.95, round(at[10], 2))
+check("level 16 in about two hours", 1.5 < at[16] < 2.4, round(at[16], 2))
+check("level 22 in about four and a half hours", 3.6 < at[22] < 5.4, round(at[22], 2))
 
 
 # =============================================================================
@@ -306,9 +315,9 @@ for tier in (2, 3, 4):
                   [MATERIAL[tier] + p for p in pieces if gamedata.shop_price("generalstore", MATERIAL[tier] + p) is None])
             continue
         hours = cost / gold_an_hour[tier - 1]
-        check("the %s %s set (%s gold) is %.1f hours of %s-band gold: between 5 and 9"
+        check("the %s %s set (%s gold) is %.1f hours of %s-band gold: between 2.5 and 4.5"
               % (MATERIAL[tier], name, "{:,}".format(cost), hours, MATERIAL[tier - 1]),
-              5.0 <= hours <= 9.0, (cost, round(gold_an_hour[tier - 1])))
+              2.5 <= hours <= 4.5, (cost, round(gold_an_hour[tier - 1])))
 plate_costs = [set_cost(t, PLATE_SET) for t in (1, 2, 3, 4)]
 check("each set costs more than the one before it",
       None not in plate_costs and all(plate_costs[i] > plate_costs[i - 1] for i in (1, 2, 3)), plate_costs)
@@ -320,6 +329,7 @@ check("each set costs more than the one before it",
 # of what the hour paid in coin, in every band; and even a player who sells
 # every piece is still four hours or more from the next set. At 0.1 that was
 # about four hours, which undid the price pass the same day; 0.05 is about five.
+# Since game 0.118.0 doubled the gold and halved the bands, two hours or more.
 sell_an_hour = {}
 _real_rng = gamedata._rng
 try:
@@ -343,8 +353,8 @@ for tier in (2, 3, 4):
     for name, pieces in (("plate", PLATE_SET), ("cloth", CLOTH_SET)):
         cost = set_cost(tier, pieces)
         hours = cost / (gold_an_hour[tier - 1] + sell_an_hour[tier - 1])
-        check("  selling everything too, the %s %s set is still %.1f hours away: between 4 and 9"
-              % (MATERIAL[tier], name, hours), 4.0 <= hours <= 9.0, round(hours, 2))
+        check("  selling everything too, the %s %s set is still %.1f hours away: between 2 and 4.5"
+              % (MATERIAL[tier], name, hours), 2.0 <= hours <= 4.5, round(hours, 2))
 
 # A POTION COSTS WHAT THE COOKED FISH OF ITS TIER DOES, PER POINT HEALED. Before
 # the 5 Oct pass a tiny potion was 2.5 gold a point and a cooked mudfish 9.6 -

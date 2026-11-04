@@ -1330,8 +1330,9 @@ so a stock change is a re-export, a copy and a restart, with no code change.
   `required_level`.
 - **The pace is measured, not assumed.** `test_pacing.py`, "THE STORE SELLS
   IRON TO AMETHYST", rolls kills through the real `roll_kill_rewards()` with a
-  seeded generator swapped in for `_rng`, and holds each next set at 5 to 9
-  hours of the previous band's gold (about 6 to 8 today). It also holds the
+  seeded generator swapped in for `_rng`, and holds each next set at 2.5 to
+  4.5 hours of the previous band's gold (about 3 to 4 today; 5 to 9 until
+  game 0.118.0 doubled the gold - "A quicker game" below). It also holds the
   shelf against the catalogue: every tier 1-4 piece on it, nothing of tier 5.
 - **The 5 Oct price pass** (the owner: a few lucky kills or a good fishing
   trip made the old prices trivial): every weapon, armour piece, amulet and
@@ -2015,8 +2016,9 @@ and the status route clamps hp to them.
 
 ## Levels: the curve is derived, never read back
 
-The curve is 1,250 x 1.27 (eight hours to level 22) and comes from
-gamedata.json's `xp_base` / `xp_growth`.
+The curve is 1,250 x 1.22 (about four and a half hours to level 22; it was
+1.27 and eight hours until game 0.118.0) and comes from gamedata.json's
+`xp_base` / `xp_growth`.
 
 - **`apply_xp()` derives the requirement from the level** (`need(level)`) and
   ignores the stored `xp_to_next`. A row still holding the table's DEFAULT 100
@@ -2043,7 +2045,7 @@ gamedata.json's `xp_base` / `xp_growth`.
   breach works it out from the file: `test_killwatch.py` said "15 kills, the
   ceiling is 11" and went quiet the day the ceiling became 55.
 
-`test_pacing.py` holds all of it, including the eight hours.
+`test_pacing.py` holds all of it, including the hours to each level.
 
 ## Kill receipts: the books decide what is paid (0.57.0)
 
@@ -3362,6 +3364,29 @@ googlesignin/ package; the plan is the commit folder's GOOGLE_SIGNIN_PLAN.txt.
 so the real check runs); SECURITY.md invariant 40; test_packages (a bare app),
 test_tokens (the two routes that ask for the password), test_ownership (the
 codes' prune and their own updates), routes.lock.
+
+## A quicker game: regen, the curve, gold (game 0.118.0)
+
+The owner, 4 Nov: "we need to speed up the game even more look into what we
+can advance", then "they all sound good to me lets do it". Three numbers in
+gamedata.json, no code here:
+
+- **Regeneration twice as fast**: `regen_percent_per_second` 0.0167 ->
+  0.0333 (an empty bar in about 30 s, not 60) and `regen_minimum_per_second`
+  1 -> 2. `_reconcile_heals()` allows what these say, so **this file must be
+  live before a 0.118.0 game plays**, or every honest heal past the old rate
+  is clamped and logged as unexplained. The game's suite now holds all three
+  regen numbers in gamedata.json to its own (they had no check).
+- **A gentler curve**: `xp_growth` 1.27 -> 1.22. `apply_xp()` derives each
+  level's need from the level, so no row changes: a character just needs
+  less for its next level, and one already past it levels on its next kill.
+- **Twice the gold**: `gold_base_unit` 1 -> 2, every tier with it. Prices
+  are unchanged, so each band is about half as long and its next set about
+  half as many hours of it (`test_pacing.py`, 2.5 to 4.5) - the same gear at
+  the same level as after the 5 Oct price pass.
+
+The game's gamedata.json also carries the Descent's area (no spawns), which
+this copy had missed since game 0.112.0.
 
 ## Layout
 
