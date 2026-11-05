@@ -227,7 +227,8 @@ async def run(port, server):
           welcome == {"t": "welcome", "id": uid("presa"), "v": presence.SHARED_VERSION,
                       "books": presence.BOOKS, "x": presence.RELAY_VERSION,
                       "sh": presence.SERVER_HEALTH if presence.BOOKS else 0,
-                      "en": presence.RUN_VERSION, "hr": presence.HEALER_ROOMS}, welcome)
+                      "en": presence.RUN_VERSION, "hr": presence.HEALER_ROOMS,
+                      "dr": presence.DESCENT_ROOMS}, welcome)
     await a.close()
 
     # =========================================================================
@@ -2571,6 +2572,56 @@ async def the_healers_run_together():
             sql("DELETE FROM party_members WHERE party_id = ?", (party,))
 
 
+async def the_descent_together():
+    """P-26: THE DESCENT TOGETHER (game 0.126.0) - "descent" is a room per
+    party, as the Endless is; the welcome says so; "en" crosses there."""
+    section("P-26 THE DESCENT TOGETHER: A ROOM PER PARTY, AND THE RUN CROSSES IT")
+    check("the Descent is an area every party has its own copy of",
+          "descent" in presence.INSTANCED_PLACES and "town" not in presence.INSTANCED_PLACES)
+    A, B, C = account("dspa"), account("dspb", "mage"), account("dspc", "tank")
+    now = int(time.time())
+    sql("INSERT INTO parties (created_at) VALUES (?)", (now,))
+    party = int(sql("SELECT MAX(id) AS id FROM parties")[0]["id"])
+    for who, lead, at in (("dspa", 1, now), ("dspb", 0, now + 1)):
+        sql("INSERT INTO party_members (user_id, party_id, is_leader, joined_at) VALUES (?, ?, ?, ?)",
+            (uid(who), party, lead, at))
+    server = presence.PresenceServer(sweep_seconds=60, tick_seconds=0.05)
+    server.view_ticks = 1
+    server.near = False
+    server.start_clocks()
+
+    def runs(messages):
+        return [m for m in messages if m.get("t") == "en"]
+
+    async with serve(server.handler, "127.0.0.1", 0, max_size=presence.MAX_SOCKET_BYTES) as ws_server:
+        port = list(ws_server.sockets)[0].getsockname()[1]
+        try:
+            a, welcome = await enter(port, A, "descent", v=3, en=1, x=320.0, y=300.0)
+            got_a = await collect(a)
+            check("the welcome says this server seats the Descent a room per party (\"dr\": 1)",
+                  welcome.get("dr") == presence.DESCENT_ROOMS == 1, welcome)
+            b, _ = await enter(port, B, "descent", v=3, en=1, x=340.0, y=300.0)
+            c, _ = await enter(port, C, "descent", v=3, en=1, x=330.0, y=300.0)
+            got_a, got_b, got_c = await collect(a), await collect(b), await collect(c)
+            pa, pb, pc = server.players[uid("dspa")], server.players[uid("dspb")], server.players[uid("dspc")]
+            check("two of a party in the Descent share its room, the party's own; a stranger has one of their own",
+                  pa.area == pb.area == "descent#p%d" % party and pc.area == "descent#u%d" % uid("dspc"),
+                  (pa.area, pb.area, pc.area))
+            check("  the first in leads its monsters, and nothing there is booked",
+                  (last_lead(got_b) or {}).get("id") == uid("dspa") and (last_lead(got_b) or {}).get("a") == "descent"
+                  and (last_lead(got_b) or {}).get("b") == 0, got_b)
+            line = {"t": "en", "r": [77, 1, 2, 3, 1, 0, 0, 5, 0, 2, 40]}
+            await a.send(json.dumps(line))
+            await b.send(json.dumps({"t": "en", "me": [77, 0, 1, 2], "go": 1}))
+            got_a, got_b, got_c = await collect(a), await collect(b), await collect(c)
+            check("  the leader's line reaches the party; a player's own line and door reach the leader; never the stranger",
+                  [m.get("r") for m in runs(got_b)] == [line["r"]] and [m.get("me") for m in runs(got_a)] == [[77, 0, 1, 2]]
+                  and any(m.get("go") == 1 for m in runs(got_a)) and not runs(got_c), (got_a, got_b, got_c))
+        finally:
+            server.stop_clocks()
+            sql("DELETE FROM party_members WHERE party_id = ?", (party,))
+
+
 async def the_run_between_a_party():
     """P-22: THE RUN BETWEEN A PARTY (game 0.93.3) - "en" passes the run
     between the games in a party's arena, checked; the leader's keys are the
@@ -2902,6 +2953,7 @@ async def main():
     await one_arena_a_party()
     await the_run_between_a_party()
     await the_healers_run_together()
+    await the_descent_together()
     await clocks_carry_on()
     presence.HELLO_SECONDS = 0.5
     combatbook.HOLD_SECONDS = 0.2

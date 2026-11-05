@@ -1681,6 +1681,21 @@ running past them, "i noticed some lag wobble". `presence.py`'s header,
 - **Deploy order: this first.** A game ahead of its server sends neither `x`
   nor `l` (its welcome has no `"x"`) and plays as 0.18.
 
+## The Descent together (game 0.126.0)
+
+The owner: "lets set up party", "any class can join". presence.py seats
+"descent" a room per party (`INSTANCED_PLACES`) and says so in the welcome
+(`"dr"`: `DESCENT_ROOMS`): a party's games share its Descent, a stranger has
+one of their own. The first in leads the room's monsters (shared as any
+area's are; the game marks them its run's - worth nothing, no kill report)
+and nothing there is booked. The run crosses as "en" through the same
+`clean_run()`: the leader's line ("r", twelve numbers: the run's key, state,
+floor, room and doors, the countdown, the party's size, gold) and each
+player's own ("me", four: key, down, picked, the door walked into), and "go"
+for the countdown. test_presence.py P-26. **Deploy the server first**: a
+0.126.0 game against an older server hears no "dr" and plays the Descent
+alone, as before.
+
 ## The Healer's Run with the party (game 0.105.0)
 
 The owner: "make it to where you can join with your party". presence.py seats

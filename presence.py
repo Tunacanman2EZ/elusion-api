@@ -260,6 +260,14 @@ Leave by the minigames route, each player's own run. Each game's own line
 through, power-ups, lives, kills and gold - for the Ready, the countdown and
 the party's board.
 
+THE DESCENT TOGETHER (game 0.126.0). The owner: "lets set up party". The
+Descent is a room per party as the Endless is ("dr" in the welcome): a party's
+games share it, the first in leads (its monsters are the room's, shared as
+any area's are, and nothing there is booked), and the run crosses as "en" -
+the leader's line ("r": the run, its floor, room, doors and countdown) and
+each player's own ("me": out or standing, picked, the door they walked
+into). A stranger has a Descent of their own.
+
 THE RUN BETWEEN A PARTY (game 0.93.3). One clock, one swarm and one set of
 elites for the party in its arena. The game that leads the room (the earliest
 in, as for any area's monsters) runs the run; every game moves its own copy of
@@ -513,11 +521,15 @@ AREA_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
 # ONE ARENA A PARTY: the areas each party (or each player with none) has a
 # room of its own in - instance_room(). "healerrun" since game 0.105.0: the
 # Healer's Run with a party (THE HEALER'S RUN TOGETHER, below).
-INSTANCED_PLACES = frozenset({"endless", "healerrun"})
+INSTANCED_PLACES = frozenset({"endless", "healerrun", "descent"})
 # Said in the welcome ("hr"): this server seats the Healer's Run a room per
 # party, so a game may say it is there (game 0.105.0). A game against a server
 # without it plays the run alone, as before.
 HEALER_ROOMS = 1
+# Said in the welcome ("dr"): this server seats the Descent a room per party
+# (game 0.126.0), so a party may run it together. A game against a server
+# without it plays the Descent alone, as before.
+DESCENT_ROOMS = 1
 # The tank's aura rings, the only effect drawn on the body itself.
 EFFECTS = ("ring", "firering")
 POSITION_LIMIT = 100000.0
@@ -2403,7 +2415,7 @@ class PresenceServer:
             print("[PRESENCE] could not read a party: %r" % exc, flush=True)
         await self._send(player, {"t": "welcome", "id": user_id, "v": SHARED_VERSION, "books": BOOKS,
                                   "x": RELAY_VERSION, "sh": SERVER_HEALTH if BOOKS else 0, "en": RUN_VERSION,
-                                  "hr": HEALER_ROOMS})
+                                  "hr": HEALER_ROOMS, "dr": DESCENT_ROOMS})
 
         try:
             async for raw in ws:
