@@ -34,6 +34,7 @@ SCHEMA = """
             enemy_id  TEXT    NOT NULL,
             boss      INTEGER NOT NULL DEFAULT 0,
             at        INTEGER NOT NULL,
+            pet       INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
 
@@ -77,3 +78,15 @@ def create(db):
     it. An executescript, which commits first: init_db() calls this before
     its migrations begin."""
     db.executescript(SCHEMA)
+
+
+def upgrade(db, add_column):
+    """The columns added since these tables first shipped, for a database made
+    before them. add_column(db, table, column, definition) is init_db()'s
+    helper, handed in (a package never imports app.py). db.execute only -
+    init_db() runs this inside its one migration transaction.
+
+    minigame_kills.pet (game 0.121.0): 1 when the kill won its pet - the
+    Forge lets one through a day (minigames/routes.py). Every kill before it
+    won none as far as the rule is concerned, which is what the default says."""
+    add_column(db, "minigame_kills", "pet", "INTEGER NOT NULL DEFAULT 0")

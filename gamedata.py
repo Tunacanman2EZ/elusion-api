@@ -2338,7 +2338,8 @@ def fold_coins(contents, cells=LOOT_BAG_CELLS):
     return out
 
 
-def roll_kill_rewards(enemy_id, class_id="", bag_scale=1.0, xp_scale=1.0, material_drop_scale=1.0):
+def roll_kill_rewards(enemy_id, class_id="", bag_scale=1.0, xp_scale=1.0, material_drop_scale=1.0,
+                      rare_odds_scale=1, pets=True):
     """
     The whole reward for one kill. Port of BaseEnemy._die() plus
     _roll_and_spawn_loot(), minus everything to do with spawning a node.
@@ -2372,12 +2373,24 @@ def roll_kill_rewards(enemy_id, class_id="", bag_scale=1.0, xp_scale=1.0, materi
     the materials and NOTHING ELSE: no gold, no items. The bag's gold is the
     bag roll's; a material must never be a reason for more gold to drop, or
     giving a monster an ore would quietly raise what it pays.
+
+    rare_odds_scale and pets are THE FORGE'S (minigames/, game 0.121.0): the
+    pet's and the mythic's "one in N" each N times rare_odds_scale, and with
+    pets False no pet at all - a minigame that feeds a player hundreds of one
+    monster must not hand out its pet (and, as duplicates, its lusions) at the
+    Field's rate. 1 and True are an ordinary kill.
     """
     enemy = ENEMIES.get(enemy_id)
     if enemy is None:
         raise KeyError(enemy_id)
+    scale = max(1, int(rare_odds_scale))
+    if scale != 1:
+        enemy = dict(enemy)
+        for key in ("pet_odds", "mythic_odds"):
+            if int(enemy.get(key, 0) or 0) > 0:
+                enemy[key] = int(enemy[key]) * scale
 
-    pet_won = roll_pet(enemy)
+    pet_won = roll_pet(enemy) if pets else False
     chance = float(enemy.get("bag_drop_chance", 0.0))
     if bag_scale != 1.0 and chance > 0.0:
         chance = min(1.0, chance * max(0.0, float(bag_scale)))

@@ -278,6 +278,18 @@ FORGE_RUNS_BELIEVED = 6
 # The longest a run's time is believed, whatever it says (an hour).
 FORGE_BEST_MOST = 60 * 60
 
+# THE FORGE'S PETS AND MYTHICS (game 0.121.0). The owner, of a pet out of the
+# Forge: "hmm i got a pet", then "one could farm lusions in these events not
+# sure i like that" - a duplicate pet turns into lusions - and "lets fix pets
+# and mythics". Every fire sprite rolls its whole Field table, and a run sends
+# hundreds: at the Field's 1 in 216 a 200-sprite run won a pet 60% of the
+# time, and a day at the ceiling about 20 (and a mythic 8% of days). So in the
+# Forge each "one in N" is FORGE_RARE_SCALE times longer, and the pets won
+# since the Go stop at FORGE_PETS_A_DAY: a pet stays a moment, and the Field
+# stays where fire sprite pets are hunted. Gold, gear and materials as ever.
+FORGE_RARE_SCALE = 10
+FORGE_PETS_A_DAY = 1
+
 
 def _spawns(span, phase):
     gap = max(0.1, float(phase.get("gap", 1) or 1))

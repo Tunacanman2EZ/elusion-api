@@ -351,10 +351,15 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
         # LOOT ONLY (the owner, 28 Oct: "Loot only"): the monster's own table
         # as in the Field - gold, gear, materials, its pet and mythic odds -
         # and none of its XP. Into the chest, in this kill's transaction.
-        rewards = catalogue.roll_kill_rewards(enemy_id, class_id, 1.0, 1.0,
-                                              material_drop_scale=material_scale(db))
+        # THE FORGE'S RARER PETS AND MYTHICS (game 0.121.0, services.py):
+        # each one in N ten times longer, and one pet since the Go.
+        forge = game_id == "forge"
+        rewards = catalogue.roll_kill_rewards(
+            enemy_id, class_id, 1.0, 1.0, material_drop_scale=material_scale(db),
+            rare_odds_scale=services.FORGE_RARE_SCALE if forge else 1,
+            pets=not forge or data.pets_since(db, user_id, game_id, entered) < services.FORGE_PETS_A_DAY)
         used, cut = store_in_chest(db, user_id, slot, game_id, rewards["contents"])
-        data.record_kill(db, user_id, slot, game_id, enemy_id, boss, now)
+        data.record_kill(db, user_id, slot, game_id, enemy_id, boss, now, pet=bool(rewards.get("pet_won")))
         mythic = rewards.get("mythic", "")
         if mythic:
             post_broadcast(mythic_text(g.user["username"], mythic, enemy_id), mythic_kind, g.user["username"])

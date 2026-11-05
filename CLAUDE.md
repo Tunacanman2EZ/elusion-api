@@ -3320,6 +3320,28 @@ the four in the commit folder's FORGE_PLAN.txt). minigames/:
 `test_minigames.py` MG-14; the schema fixture and routes.lock carry the new
 table and route.
 
+**Its pets and mythics, ten times rarer, one pet a Go (game 0.121.0).** The
+owner, of a pet out of the Forge: "hmm i got a pet", then "one could farm
+lusions in these events not sure i like that" - a duplicate pet turns into
+lusions (loot/'s `dupe_pet_lusions`, 20) - and "lets fix pets and mythics".
+Every fire sprite rolls its whole Field table and a run sends hundreds: at
+the Field's 1 in 216 a 200-sprite run won a pet 60% of the time, a day at the
+ceiling about 20, and a mythic 8% of days.
+
+- **`gamedata.roll_kill_rewards(..., rare_odds_scale, pets)`**: the pet's and
+  the mythic's "one in N" each times `rare_odds_scale` (on a copy of the
+  monster's row), and `pets=False` rolls no pet. The defaults (1, True) are
+  every other caller's roll, unchanged.
+- **The kill route asks it for the Forge alone**: `FORGE_RARE_SCALE` (10)
+  and pets only while `data.pets_since()` the Go is under
+  `FORGE_PETS_A_DAY` (1). A 200-sprite run now wins a pet about 9% of the
+  time. The Endless's elites and bosses roll at their own odds, as before.
+- **`minigame_kills.pet`** (1 when that kill won its pet) is how the rule
+  counts: in the CREATE for a fresh database and `minigames/schema.py
+  upgrade()` for one made before it (init_db() calls it after trade's).
+
+MG-15; the schema fixture carries the column.
+
 ## Signing in with Google (game 0.101.0)
 
 A player: "Google account to play or I am not registering". The owner: "lets

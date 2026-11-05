@@ -928,7 +928,7 @@
    "table",
    "minigame_kills",
    "minigame_kills",
-   "CREATE TABLE minigame_kills (\n            id        INTEGER PRIMARY KEY AUTOINCREMENT,\n            user_id   INTEGER NOT NULL,\n            slot      INTEGER NOT NULL,\n            game      TEXT    NOT NULL,\n            enemy_id  TEXT    NOT NULL,\n            boss      INTEGER NOT NULL DEFAULT 0,\n            at        INTEGER NOT NULL,\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
+   "CREATE TABLE minigame_kills (\n            id        INTEGER PRIMARY KEY AUTOINCREMENT,\n            user_id   INTEGER NOT NULL,\n            slot      INTEGER NOT NULL,\n            game      TEXT    NOT NULL,\n            enemy_id  TEXT    NOT NULL,\n            boss      INTEGER NOT NULL DEFAULT 0,\n            at        INTEGER NOT NULL,\n            pet       INTEGER NOT NULL DEFAULT 0,\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
   ],
   [
    "index",
@@ -5027,6 +5027,14 @@
      "INTEGER",
      1,
      null,
+     0
+    ],
+    [
+     7,
+     "pet",
+     "INTEGER",
+     1,
+     "0",
      0
     ]
    ],

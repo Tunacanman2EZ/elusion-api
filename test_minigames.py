@@ -33,6 +33,9 @@ own loot - no XP, the owner's "Loot only" - into the character's chest
         its loot into the Forge's chest, held to its schedule (gamedata.json's
         "forge", six runs a day at most); a run's time kept when it is your
         best, believed no longer than since the Go.
+  MG-15 THE FORGE'S PETS AND MYTHICS (game 0.121.0): each fire sprite's
+        pet and mythic odds ten times rarer than the Field's, and one pet a
+        Go - the Endless and the Field unchanged.
   MG-13 THE HEALER'S RUN'S TIERS (game 0.100.0): 3 tiers of 8 waves, a boss
         each, then the goal - up to 20,000 (5000 before 0.104.0), 700 of it by
         the second boss; each
@@ -503,6 +506,55 @@ check("the next Go empties the Forge's chest", go(gus, "forge").status_code == 2
 import accountdelete.data as gone  # noqa: E402
 check("deleting the account takes its best times and runs", "minigame_bests" in gone.OWN_TABLES
       and "minigame_runs" in gone.OWN_TABLES)
+
+section("MG-15 THE FORGE'S PETS AND MYTHICS: TEN TIMES RARER, ONE PET A GO (game 0.121.0)")
+# The owner: "one could farm lusions in these events" (a duplicate pet is
+# lusions) and "lets fix pets and mythics". What the roll is asked, then a pet
+# forced to win - the first is kept, the second never rolls.
+hal = register("mghal")
+made = client.put("/api/save", headers=hal, json={"slot": 0, "class_id": "tank", "name": "tank"})
+assert made.status_code == 200, made.get_json()
+check("  (Go into the Forge)", go(hal, "forge").status_code == 200)
+asked = []
+real_roll, real_pet, real_mythic = gamedata.roll_kill_rewards, gamedata.roll_pet, gamedata.roll_mythic
+def spy_roll(*args, **kwargs):
+    asked.append(dict(kwargs))
+    return real_roll(*args, **kwargs)
+gamedata.roll_kill_rewards = spy_roll
+odds_seen = []
+gamedata.roll_pet = lambda enemy: odds_seen.append(("pet", enemy.get("pet_odds"))) or True
+gamedata.roll_mythic = lambda enemy, class_id="": odds_seen.append(("mythic", enemy.get("mythic_odds"))) or ""
+try:
+    first = forge_kill(hal).get_json() or {}
+    second = forge_kill(hal).get_json() or {}
+finally:
+    gamedata.roll_kill_rewards, gamedata.roll_pet, gamedata.roll_mythic = real_roll, real_pet, real_mythic
+sprite = gamedata.ENEMIES["firesprite"]
+check("a fire sprite in the Forge rolls its pet and its mythic ten times rarer",
+      services.FORGE_RARE_SCALE == 10 and asked and asked[0].get("rare_odds_scale") == 10
+      and ("pet", int(sprite["pet_odds"]) * 10) in odds_seen
+      and ("mythic", int(sprite["mythic_odds"]) * 10) in odds_seen, (asked[:1], odds_seen[:2]))
+hal_chest = client.get("/api/loot/chest?game=forge&slot=0", headers=hal).get_json() or {}
+pets_held = sum(q for item_id, q in held(hal_chest).items() if item_id.startswith("pet"))
+check("  one pet a Go: the first kill's is kept, the second kill is not let roll one",
+      first.get("pet_won") is True and second.get("pet_won") is False and pets_held == 1
+      and asked[0].get("pets") is True and asked[1].get("pets") is False
+      and raw("SELECT COUNT(*) FROM minigame_kills WHERE user_id = ? AND pet = 1", (uid("mghal"),))[0][0] == 1,
+      (first.get("pet_won"), second.get("pet_won"), pets_held, asked[:2]))
+plain = gamedata.roll_kill_rewards("firesprite", "tank")
+check("  the Field's roll is unchanged: no scale, pets on (the defaults)",
+      isinstance(plain, dict) and "pet_won" in plain
+      and gamedata.roll_kill_rewards.__defaults__[-2:] == (1, True))
+asked.clear()
+gamedata.roll_kill_rewards = spy_roll
+try:
+    raw("UPDATE minigame_entries SET entered_at = ? WHERE user_id = ? AND game = 'endless'", (0, uid("mghal")))
+    go(hal, "endless")
+    client.post("/api/minigames/kill", headers=hal, json={"game": "endless", "slot": 0, "enemy_id": "lightsprite"})
+finally:
+    gamedata.roll_kill_rewards = real_roll
+check("  the Endless is as it was: its elites roll at their own odds, pets on",
+      asked and asked[0].get("rare_odds_scale") == 1 and asked[0].get("pets") is True, asked)
 
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))

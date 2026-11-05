@@ -2202,6 +2202,7 @@ def init_db():
     # handed the helper every column here goes through.
     chat_schema.upgrade(db, add_column=_migrate_add_column)
     trade_schema.upgrade(db, add_column=_migrate_add_column)
+    minigames_schema.upgrade(db, add_column=_migrate_add_column)
 
     _migrate_seed_gold_ledger(db)
     _migrate_seed_lusion_ledger(db)

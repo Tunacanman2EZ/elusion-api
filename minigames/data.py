@@ -29,12 +29,22 @@ def kills_since(db, user_id, game, since, boss):
     ).fetchone()[0]
 
 
-def record_kill(db, user_id, slot, game, enemy_id, boss, now):
-    """One paid kill - and every one older than KILLS_KEPT_SECONDS out."""
+def record_kill(db, user_id, slot, game, enemy_id, boss, now, pet=False):
+    """One paid kill (pet: it won its pet) - and every one older than
+    KILLS_KEPT_SECONDS out."""
     db.execute(
-        "INSERT INTO minigame_kills (user_id, slot, game, enemy_id, boss, at) VALUES (?, ?, ?, ?, ?, ?)",
-        (int(user_id), int(slot), str(game), str(enemy_id), 1 if boss else 0, int(now)),
+        "INSERT INTO minigame_kills (user_id, slot, game, enemy_id, boss, at, pet) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (int(user_id), int(slot), str(game), str(enemy_id), 1 if boss else 0, int(now), 1 if pet else 0),
     )
+
+
+def pets_since(db, user_id, game, since):
+    """How many pets the account's kills in that minigame have won since
+    `since` (game 0.121.0)."""
+    return db.execute(
+        "SELECT COUNT(*) FROM minigame_kills WHERE user_id = ? AND game = ? AND at >= ? AND pet = 1",
+        (int(user_id), str(game), int(since)),
+    ).fetchone()[0]
     db.execute("DELETE FROM minigame_kills WHERE at < ?", (int(now) - KILLS_KEPT_SECONDS,))
 
 
