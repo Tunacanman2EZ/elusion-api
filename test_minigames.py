@@ -29,13 +29,17 @@ own loot - no XP, the owner's "Loot only" - into the character's chest
         the least cell's place only if it is worth more.
   MG-10 DELETING THE CHARACTER takes its chest; another account's chest is
         nobody else's to read or take from.
+  MG-14 THE FORGE (game 0.120.0): once a day; every fire sprite slain pays
+        its loot into the Forge's chest, held to its schedule (gamedata.json's
+        "forge", six runs a day at most); a run's time kept when it is your
+        best, believed no longer than since the Go.
   MG-13 THE HEALER'S RUN'S TIERS (game 0.100.0): 3 tiers of 8 waves, a boss
         each, then the goal - up to 20,000 (5000 before 0.104.0), 700 of it by
         the second boss; each
         boss believed only with its tier's waves and the time; a game that
         sends `boss` is paid as before (1000 at most).
 """
-import importlib.util, os, sqlite3, sys, time
+import importlib.util, math, os, sqlite3, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import testdir  # noqa: E402  (a private folder per run - testdir.py)
@@ -278,7 +282,12 @@ check("  the chest's id is read back, and nothing else is a chest",
 
 section("MG-10 WHOSE CHEST")
 go(dora)
-assert kill(dora, ELITE).status_code == 200
+# An elite's roll can be nothing at all, so kill until one lands (it was one
+# kill, and failed about one run in four).
+for _ in range(20):
+    assert kill(dora, ELITE).status_code == 200
+    if chest_of(dora).get("contents"):
+        break
 dora_chest = chest_of(dora)
 check("another account reads its own chest, never somebody else's, and cannot take from it",
       chest_of(carl).get("contents") == [] and len(dora_chest.get("contents", [])) > 0
@@ -404,6 +413,96 @@ check("  bosses must be a whole number (400)",
                                                               "bosses": True}).status_code == 400
       and client.post("/api/minigames/finish", headers=fay, json={"run": third.get("run", 0), "waves": 3,
                                                                   "bosses": -1}).status_code == 400)
+
+section("MG-14 THE FORGE (game 0.120.0): ONCE A DAY, ITS FIRE SPRITES PAY THE CHEST, ITS BEST TIME KEPT")
+# The owner, 4 Nov: "Rewards + daily wait". forgerun.gd's schedule() says what
+# a run could send at its fastest; gamedata.json carries it as "forge".
+forge_plan = gamedata.FORGE
+gus = register("mggus")
+made = client.put("/api/save", headers=gus, json={"slot": 0, "class_id": "tank", "name": "tank"})
+assert made.status_code == 200, made.get_json()
+def forge_row(headers):
+    games = (client.get("/api/minigames", headers=headers).get_json() or {}).get("games", [])
+    return next((g for g in games if g.get("id") == "forge"), {})
+def forge_kill(headers, enemy_id="firesprite", slot=0):
+    return client.post("/api/minigames/kill", headers=headers, json={"game": "forge", "slot": slot, "enemy_id": enemy_id})
+def forge_best(headers, seconds):
+    return client.post("/api/minigames/best", headers=headers, json={"game": "forge", "seconds": seconds})
+row = forge_row(gus)
+check("the Forge is a minigame: a day's wait, ready now, no best yet",
+      row.get("name") == "The Forge" and row.get("wait_seconds") == services.DAY and row.get("ready_in") == 0
+      and row.get("best") == 0 and "best" not in endless(gus), row)
+check("  the catalogue carries its schedule: fire sprites, eight floods, the volcano believed a minute, 50 alive at most",
+      forge_plan.get("sprites") == ["firesprite"] and len(forge_plan.get("phases", [])) == 8
+      and forge_plan.get("volcano_believed") == 60 and forge_plan.get("alive_most") == 50
+      and forge_plan["phases"][0] == {"count": 1, "gap": 3.0, "seconds": 40.0}, forge_plan)
+check("before a Go: a kill and a time are both 409, nothing paid",
+      forge_kill(gus).status_code == 409 and forge_best(gus, 60).status_code == 409
+      and not (client.get("/api/loot/chest?game=forge&slot=0", headers=gus).get_json() or {}).get("contents"))
+check("  Go is let in once a day, as the Endless's", go(gus, "forge").status_code == 200
+      and go(gus, "forge").status_code == 409 and forge_row(gus).get("ready_in", 0) > services.DAY - 10)
+paid = forge_kill(gus)
+body = paid.get_json() or {}
+forge_chest = client.get("/api/loot/chest?game=forge&slot=0", headers=gus).get_json() or {}
+check("a fire sprite slain pays its own loot into the Forge's chest - loot only, its own chest, not the Endless's",
+      paid.status_code == 200 and body.get("chest_id") == "chest:forge:0" and "xp_gained" not in body
+      and held(forge_chest) == {e["item_id"]: e["quantity"] for e in body.get("added", [])}
+      and not (client.get("/api/loot/chest?game=endless&slot=0", headers=gus).get_json() or {}).get("contents")
+      and raw("SELECT game, boss FROM minigame_kills WHERE user_id = ?", (uid("mggus"),)) == [("forge", 0)],
+      (paid.status_code, body))
+check("  a monster the Forge never sends is refused (400): an Endless elite, a boss",
+      forge_kill(gus, "lightsprite").status_code == 400 and forge_kill(gus, "boss").status_code == 400)
+def forge_by_hand(seconds):
+    total, left = 0, float(seconds)
+    for phase in forge_plan["phases"]:
+        span = min(left, phase["seconds"])
+        if span > 0:
+            total += (math.ceil(span / phase["gap"]) + 1) * phase["count"]
+        left -= span
+    if left > 0:
+        v = forge_plan["volcano"]
+        total += (math.ceil(min(left, 60) / v["gap"]) + 1) * v["count"]
+    return int(total)
+whole = services.forge_run_sprites(forge_plan, services.forge_run_seconds(forge_plan))
+check("its ceiling: every flood at its fastest, the volcano for a minute, the most alive - then back-to-back runs, six a day",
+      services.forge_ceiling(forge_plan, 0) == 50 and services.forge_ceiling(forge_plan, 100) == forge_by_hand(100) + 50
+      and whole == forge_by_hand(10 ** 6)
+      and services.forge_ceiling(forge_plan, 86000) == whole * services.FORGE_RUNS_BELIEVED + 50
+      and services.forge_ceiling(forge_plan, 2 * 288) > whole,
+      (services.forge_ceiling(forge_plan, 100), forge_by_hand(100), whole, services.forge_ceiling(forge_plan, 86000)))
+now = int(time.time())
+conn = sqlite3.connect(DB_PATH)
+conn.executemany("INSERT INTO minigame_kills (user_id, slot, game, enemy_id, boss, at) VALUES (?, 0, 'forge', 'firesprite', 0, ?)",
+                 [(uid("mggus"), now)] * (50 - 1))
+conn.commit(); conn.close()
+over = forge_kill(gus)
+check("  50 fire sprites at the Go is all there could be: the 51st is a 429 that names them",
+      over.status_code == 429 and "fire sprites than The Forge" in (over.get_json() or {}).get("message", ""),
+      (over.status_code, over.get_json()))
+raw("UPDATE minigame_entries SET entered_at = entered_at - 400 WHERE user_id = ? AND game = 'forge'", (uid("mggus"),))
+check("  400 seconds after the Go there is room again", forge_kill(gus).status_code == 200)
+first = forge_best(gus, 270).get_json() or {}
+worse = forge_best(gus, 200).get_json() or {}
+check("a run's time is kept when it is your best: 4:30, then a 3:20 changes nothing",
+      first.get("best") == 270 and first.get("new_best") is True and worse.get("best") == 270
+      and worse.get("new_best") is False and worse.get("seconds") == 200 and forge_row(gus).get("best") == 270,
+      (first, worse))
+long = forge_best(gus, 5000).get_json() or {}
+check("  no run is believed longer than since your Go", 400 <= long.get("seconds", 0) <= 410
+      and long.get("best") == long.get("seconds"), long)
+check("  refused: the Endless keeps no time (400), seconds not a whole number (400), no login (401)",
+      client.post("/api/minigames/best", headers=gus, json={"game": "endless", "seconds": 60}).status_code == 400
+      and forge_best(gus, "60").status_code == 400 and forge_best(gus, -1).status_code == 400
+      and forge_best(gus, True).status_code == 400
+      and client.post("/api/minigames/best", json={"game": "forge", "seconds": 60}).status_code == 401)
+raw("UPDATE minigame_entries SET entered_at = ? WHERE user_id = ? AND game = 'forge'", (now - services.DAY - 1, uid("mggus")))
+check("  a day after the Go: a kill and a time are 409",
+      forge_kill(gus).status_code == 409 and forge_best(gus, 60).status_code == 409)
+check("the next Go empties the Forge's chest", go(gus, "forge").status_code == 200
+      and (client.get("/api/loot/chest?game=forge&slot=0", headers=gus).get_json() or {}).get("contents") == [])
+import accountdelete.data as gone  # noqa: E402
+check("deleting the account takes its best times and runs", "minigame_bests" in gone.OWN_TABLES
+      and "minigame_runs" in gone.OWN_TABLES)
 
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))

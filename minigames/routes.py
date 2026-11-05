@@ -18,7 +18,7 @@ AND FOR A MINIGAME'S KILLS (game 0.93.4):
 
     parse_slot     a raw slot -> its int, or None
     max_slot       the highest slot, for the 400's words
-    catalogue      gamedata: ENDLESS (the run's schedule), ENEMIES and
+    catalogue      gamedata: ENDLESS and FORGE (the runs' schedules), ENEMIES and
                    roll_kill_rewards() - asked on every call, so a suite's
                    seeded die is heard
     class_of       (db, user_id, slot) -> the character's class_id, or None
@@ -30,6 +30,11 @@ AND FOR A MINIGAME'S KILLS (game 0.93.4):
     post_broadcast (body, kind, by): a mythic's notice; no commit
     mythic_text    (username, item_id, enemy_id) -> the notice (kill/'s)
     mythic_kind    the notice's kind (kill/'s)
+
+AND THE FORGE (game 0.120.0): its fire sprites pay into the chest through
+/kill (gamedata's FORGE, the run's schedule), and a run's time is kept:
+
+    POST /api/minigames/best    how long a run held, kept when it is your best
 
 AND THE HEALER'S RUN (game 0.99.0): three Go's a day, and its gold at Leave:
 
@@ -49,10 +54,11 @@ from . import data, services
 def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, max_slot, catalogue,
              class_of, material_scale, store_in_chest, clear_chests, post_broadcast, mythic_text,
              mythic_kind, gold_delta=None):
-    """Add the four routes."""
+    """Add the five routes."""
 
     def listing(db, now):
         entries = data.entries_of(db, g.user["id"])
+        bests = data.bests_of(db, g.user["id"])
         skip = bool(skips_wait(g.user["username"]))
         games = []
         for game_id, game in services.GAMES.items():
@@ -65,8 +71,12 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
             else:
                 left = 0 if skip else services.ready_in(entered, game["wait"], now)
                 plays_left = 0 if left > 0 else 1
-            games.append({"id": game_id, "name": game["name"], "wait_seconds": game["wait"],
-                          "entered_at": entered, "ready_in": left, "plays": plays, "plays_left": plays_left})
+            row = {"id": game_id, "name": game["name"], "wait_seconds": game["wait"],
+                   "entered_at": entered, "ready_in": left, "plays": plays, "plays_left": plays_left}
+            # A timed minigame's best (game 0.120.0, the Forge's): seconds, 0 for none.
+            if game.get("times"):
+                row["best"] = bests.get(game_id, 0)
+            games.append(row)
         return {"games": games, "skips_wait": skip}
 
     def minigames_list():
@@ -83,7 +93,7 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
             description: "Bearer <token>"
         responses:
           200:
-            description: "games: id, name, wait_seconds, entered_at (0 never), ready_in (0 now); skips_wait"
+            description: "games: id, name, wait_seconds, entered_at (0 never), ready_in (0 now), and a timed one's best (seconds); skips_wait"
           401:
             description: Not logged in
         """
@@ -108,7 +118,7 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
               type: object
               required: [game]
               properties:
-                game: {type: string, description: "a minigame's id: endless"}
+                game: {type: string, description: "a minigame's id: endless, healerrun, forge"}
         responses:
           200:
             description: "in: game, entered_at, ready_in (the next wait)"
@@ -257,7 +267,7 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
 
     def minigames_kill():
         """
-        An Endless elite or boss killed - its loot rolled into your chest (no XP)
+        An Endless elite or boss, or a Forge fire sprite, killed - its loot rolled into your chest (no XP)
         ---
         tags:
           - Minigames
@@ -274,7 +284,7 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
               type: object
               required: [game, slot, enemy_id]
               properties:
-                game:     {type: string,  description: "endless"}
+                game:     {type: string,  description: "endless or forge"}
                 slot:     {type: integer, example: 0}
                 enemy_id: {type: string,  example: lightsprite}
         responses:
@@ -296,7 +306,10 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
             return bad_request("body must be a JSON object")
         game_id = payload.get("game")
         game = services.GAMES.get(game_id) if isinstance(game_id, str) else None
-        schedule = catalogue.ENDLESS if game_id == "endless" else {}
+        # Each paying game's schedule, gamedata.json's own (the Forge's since
+        # game 0.120.0). A catalogue without one pays nothing for that game.
+        schedules = {"endless": getattr(catalogue, "ENDLESS", {}), "forge": getattr(catalogue, "FORGE", {})}
+        schedule = schedules.get(game_id, {}) if game is not None else {}
         if game is None or not schedule:
             return bad_request("no such minigame pays for a kill")
         slot = parse_slot(payload.get("slot"))
@@ -326,11 +339,14 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
         # NO MORE THAN THE RUN COULD HAVE SENT since the Go (services.py says
         # how that is counted). 429: "not yet", as the kill route says it.
         boss = kind == "boss"
-        ceiling = (services.bosses_ceiling if boss else services.elites_ceiling)(schedule, now - entered)
+        if kind == "sprite":
+            ceiling = services.forge_ceiling(schedule, now - entered)
+        else:
+            ceiling = (services.bosses_ceiling if boss else services.elites_ceiling)(schedule, now - entered)
         if data.kills_since(db, user_id, game_id, entered, boss) >= ceiling:
             return {"error": "Too Many Requests",
                     "message": "More %s than %s could have sent since you went in."
-                               % ("bosses" if boss else "elites", game["name"])}, 429
+                               % (services.KIND_WORDS.get(kind, "monsters"), game["name"])}, 429
 
         # LOOT ONLY (the owner, 28 Oct: "Loot only"): the monster's own table
         # as in the Field - gold, gear, materials, its pet and mythic odds -
@@ -350,6 +366,63 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
                 "chest_id": "chest:%s:%d" % (game_id, slot),
                 "mythic": mythic, "pet_won": bool(rewards.get("pet_won"))}, 200
 
+    def minigames_best():
+        """
+        How long a run of a timed minigame held - the Forge's - kept when it is your best
+        ---
+        tags:
+          - Minigames
+        parameters:
+          - in: header
+            name: Authorization
+            type: string
+            required: true
+            description: "Bearer <token>"
+          - in: body
+            name: body
+            required: true
+            schema:
+              type: object
+              required: [game, seconds]
+              properties:
+                game:    {type: string,  description: "forge"}
+                seconds: {type: integer, description: "how long the run held"}
+        responses:
+          200:
+            description: "seconds (as believed), best (yours now) and new_best"
+          400:
+            description: "not a timed minigame, or seconds not a whole number"
+          409:
+            description: "you have not gone in today: no Go inside the minigame's day"
+          401:
+            description: Not logged in
+        """
+        # THE TIME IS THE GAME'S WORD, held to what can be true: no longer
+        # than since your Go, nor services.FORGE_BEST_MOST, and only inside
+        # your day. The honest limit: a modified game could claim that long.
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return bad_request("body must be a JSON object")
+        game_id = payload.get("game")
+        game = services.GAMES.get(game_id) if isinstance(game_id, str) else None
+        if game is None or not game.get("times"):
+            return bad_request("no such minigame keeps a time")
+        seconds = payload.get("seconds")
+        if isinstance(seconds, float) and seconds.is_integer():
+            seconds = int(seconds)
+        if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds < 0:
+            return bad_request("seconds must be a whole number")
+        db = get_db()
+        now = int(time.time())
+        entered = data.entries_of(db, g.user["id"]).get(game_id, 0)
+        if not entered or now - entered >= int(game["wait"]):
+            return {"error": "Conflict",
+                    "message": "You have not gone into %s today." % game["name"]}, 409
+        believed = services.best_believed(seconds, now - entered)
+        best, new = data.keep_best(db, g.user["id"], game_id, believed, now)
+        db.commit()
+        return {"ok": True, "game": game_id, "seconds": believed, "best": best, "new_best": new}, 200
+
     app.add_url_rule("/api/minigames", endpoint="minigames_list",
                      view_func=require_auth(minigames_list), methods=["GET"])
     app.add_url_rule("/api/minigames/enter", endpoint="minigames_enter",
@@ -358,3 +431,5 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
                      view_func=require_auth(minigames_kill), methods=["POST"])
     app.add_url_rule("/api/minigames/finish", endpoint="minigames_finish",
                      view_func=require_auth(minigames_finish), methods=["POST"])
+    app.add_url_rule("/api/minigames/best", endpoint="minigames_best",
+                     view_func=require_auth(minigames_best), methods=["POST"])

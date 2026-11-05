@@ -1,7 +1,8 @@
 """minigames/schema.py - minigames/'s tables: minigame_entries, when each
 account last went into each minigame (game 0.93.3), minigame_kills, every
-paid kill in one (0.93.4), and minigame_runs, each run of a minigame played
-several times a day (0.99.0).
+paid kill in one (0.93.4), minigame_runs, each run of a minigame played
+several times a day (0.99.0), and minigame_bests, each account's best time in
+a timed one (0.120.0).
 
 WHY HERE. A table lives with the one area that adds its rows (ARCHITECTURE.md).
 init_db() calls create() with the other packages', after the core's tables and
@@ -56,6 +57,18 @@ SCHEMA = """
         );
 
         CREATE INDEX IF NOT EXISTS idx_minigame_runs_user ON minigame_runs(user_id, game, started_at);
+
+        -- EACH ACCOUNT'S BEST TIME IN A TIMED MINIGAME (game 0.120.0,
+        -- minigames/): the Forge's - how long a run held. One row per account
+        -- and minigame, kept only when beaten; `at` is when.
+        CREATE TABLE IF NOT EXISTS minigame_bests (
+            user_id  INTEGER NOT NULL,
+            game     TEXT    NOT NULL,
+            seconds  INTEGER NOT NULL,
+            at       INTEGER NOT NULL,
+            PRIMARY KEY (user_id, game),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
 """
 
 

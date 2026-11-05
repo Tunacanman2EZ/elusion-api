@@ -1,6 +1,6 @@
 """minigames/services.py - the rules, pure: which minigames there are, how long
-somebody waits (game 0.93.3), and what an Endless run could have sent since
-its Go (0.93.4)."""
+somebody waits (game 0.93.3), what an Endless run could have sent since its Go
+(0.93.4), and a Forge run's (0.120.0)."""
 
 import math
 
@@ -15,6 +15,12 @@ GAMES = {
     # one - the oldest of the three frees a run 24 hours after it), and its
     # gold paid at Leave by POST /api/minigames/finish.
     "healerrun": {"name": "The Healer's Run", "wait": DAY, "plays": 3},
+    # THE FORGE (game 0.120.0, forgerun.gd): the owner, 4 Nov, "Rewards +
+    # daily wait" - once a day, as the Endless; every fire sprite slain pays
+    # its own loot into the character's chest (loot only), held to what the
+    # run's schedule could have sent (FORGE below); and the time a run held
+    # is kept, the best of it (`times`, POST /api/minigames/best).
+    "forge": {"name": "The Forge", "wait": DAY, "times": True},
 }
 
 
@@ -230,9 +236,93 @@ def bosses_ceiling(schedule, seconds):
 
 
 def sends(schedule, enemy_id):
-    """"elite", "boss", or "" for a monster the run never sends."""
+    """"elite", "boss", "sprite" (the Forge's), or "" for a monster the run
+    never sends."""
     if enemy_id in (schedule.get("bosses") or []):
         return "boss"
     if enemy_id in (schedule.get("elites") or []):
         return "elite"
+    if enemy_id in (schedule.get("sprites") or []):
+        return "sprite"
     return ""
+
+
+# What a refusal calls each kind, many of them.
+KIND_WORDS = {"boss": "bosses", "elite": "elites", "sprite": "fire sprites"}
+
+
+# =============================================================================
+# WHAT A FORGE RUN COULD HAVE SENT (game 0.120.0)
+# =============================================================================
+# The Forge's fire sprites step out of the lava's edges every spawn gap, a few
+# at a time, both quicker after every flood (forgerun.gd spawn_gap(),
+# spawn_count()). gamedata.json's "forge", written by the game's exporter from
+# forgerun.gd's schedule(), says it AT ITS FASTEST - every flood the moment the
+# heat allows, no ice essence cooling it:
+#
+#   phases            one a flood (0-7): how long it lasts (the heat's fill
+#                     and the flood), the spawn gap and how many each spawn
+#   volcano           every slice gone: its gap and count, believed for
+#                     volcano_believed seconds (everyone burns, harder each
+#                     tick, and falls)
+#   alive_most        the most standing at once, met all together
+#
+# One run's worth is the most a run begun at the Go could have sent by now
+# (forge_run_sprites()). A run that ended is begun again on the island, so
+# past one whole run the ceiling goes on at a whole run's average - back to
+# back, which only a run cut short could beat by starting slow - up to
+# FORGE_RUNS_BELIEVED runs a day. THE HONEST LIMIT: a modified game could
+# report all of them; one Go a day caps it there.
+
+FORGE_RUNS_BELIEVED = 6
+# The longest a run's time is believed, whatever it says (an hour).
+FORGE_BEST_MOST = 60 * 60
+
+
+def _spawns(span, phase):
+    gap = max(0.1, float(phase.get("gap", 1) or 1))
+    count = max(0, int(phase.get("count", 0) or 0))
+    return (math.ceil(float(span) / gap) + 1) * count if span > 0 else 0
+
+
+def forge_run_seconds(schedule):
+    """How long one run at its fastest lasts: every phase, and the volcano
+    for as long as it is believed."""
+    phases = sum(max(0.0, float(p.get("seconds", 0) or 0)) for p in (schedule.get("phases") or []))
+    return phases + max(0, int(schedule.get("volcano_believed", 0) or 0))
+
+
+def forge_run_sprites(schedule, seconds):
+    """The most fire sprites one run begun at the Go could have sent in its
+    first `seconds`."""
+    left = max(0.0, float(seconds))
+    total = 0
+    for phase in schedule.get("phases") or []:
+        if left <= 0:
+            return total
+        span = min(left, max(0.0, float(phase.get("seconds", 0) or 0)))
+        total += _spawns(span, phase)
+        left -= span
+    volcano = schedule.get("volcano") or {}
+    if left > 0 and volcano:
+        total += _spawns(min(left, max(0, int(schedule.get("volcano_believed", 0) or 0))), volcano)
+    return total
+
+
+def forge_ceiling(schedule, seconds):
+    """The most fire sprites the day's runs could have sent `seconds` after
+    the Go - see above."""
+    alive = max(0, int(schedule.get("alive_most", 0) or 0))
+    length = forge_run_seconds(schedule)
+    if length <= 0:
+        return alive
+    whole = forge_run_sprites(schedule, length)
+    seconds = max(0, int(seconds))
+    worth = forge_run_sprites(schedule, seconds) if seconds <= length else int(whole * seconds / length)
+    return min(worth, whole * FORGE_RUNS_BELIEVED) + alive
+
+
+def best_believed(seconds_said, since_go):
+    """How long a run is believed to have held: what it says, no longer than
+    the time since the Go, nor FORGE_BEST_MOST."""
+    return max(0, min(int(seconds_said), int(since_go), FORGE_BEST_MOST))

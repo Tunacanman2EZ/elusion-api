@@ -118,6 +118,7 @@ POST /api/ignores  add_ignore  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/ignores/remove  remove_ignore  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/kingdom/donate  kingdom_donate  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/loot/take  take_loot  auth  rank=-  fresh=-  lock=yes  doc=yes
+POST /api/minigames/best  minigames_best  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/minigames/enter  minigames_enter  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/minigames/finish  minigames_finish  auth  rank=-  fresh=-  lock=yes  doc=yes
 POST /api/minigames/kill  minigames_kill  auth  rank=-  fresh=-  lock=yes  doc=yes

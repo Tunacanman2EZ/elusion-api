@@ -1,5 +1,5 @@
-"""minigames/data.py - the SQL (game 0.93.3; the kills 0.93.4). Imports nothing.
-No commits: each route commits its own."""
+"""minigames/data.py - the SQL (game 0.93.3; the kills 0.93.4; the best times
+0.120.0). Imports nothing. No commits: each route commits its own."""
 
 
 def entries_of(db, user_id):
@@ -67,3 +67,21 @@ def finish_run(db, run_id, user_id, now, waves, bosses, goal, gold):
         "WHERE id = ? AND user_id = ? AND finished_at = 0",
         (int(now), int(waves), int(bosses), 1 if goal else 0, int(gold), int(run_id), int(user_id)))
     return cur.rowcount == 1
+
+
+# THE BEST TIMES (game 0.120.0): one row an account and minigame.
+
+def bests_of(db, user_id):
+    """{game: best seconds} for one account."""
+    rows = db.execute("SELECT game, seconds FROM minigame_bests WHERE user_id = ?", (int(user_id),)).fetchall()
+    return {row["game"]: int(row["seconds"]) for row in rows}
+
+
+def keep_best(db, user_id, game, seconds, now):
+    """A run's time: kept when it beats the best. (best, whether it was new)."""
+    best = bests_of(db, user_id).get(str(game), 0)
+    if int(seconds) <= best:
+        return best, False
+    db.execute("INSERT OR REPLACE INTO minigame_bests (user_id, game, seconds, at) VALUES (?, ?, ?, ?)",
+               (int(user_id), str(game), int(seconds), int(now)))
+    return int(seconds), True

@@ -113,13 +113,17 @@ def _load():
     # minigames/ holds a reported Endless kill to. A catalogue from before it
     # is not an error: minigames/ then pays no Endless kill at all.
     endless = raw.get("endless") if isinstance(raw.get("endless"), dict) else {}
-    return raw.get("constants", {}), items, enemies, classes, shops, areas, combat, endless
+    # THE FORGE'S SCHEDULE (game 0.120.0): the fire sprites it sends and how
+    # fast at its fastest - what minigames/ holds a Forge kill to. Absent, it
+    # pays no Forge kill.
+    forge = raw.get("forge") if isinstance(raw.get("forge"), dict) else {}
+    return raw.get("constants", {}), items, enemies, classes, shops, areas, combat, endless, forge
 
 
 # Loaded once at import. Failing here takes the whole server down on start,
 # which is correct: a server that cannot roll loot should not accept kills and
 # quietly grant nothing.
-CONSTANTS, ITEMS, ENEMIES, CLASSES, SHOPS, AREAS, COMBAT, ENDLESS = _load()
+CONSTANTS, ITEMS, ENEMIES, CLASSES, SHOPS, AREAS, COMBAT, ENDLESS, FORGE = _load()
 
 
 # =============================================================================

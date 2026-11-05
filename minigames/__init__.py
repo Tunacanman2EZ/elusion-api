@@ -9,6 +9,14 @@
                                 loot into your chest in the corridor, no XP
     POST /api/minigames/finish  a Healer's Run's end (0.99.0): its gold, by
                                 how far it got, into the character's purse
+    POST /api/minigames/best    a Forge run's time (0.120.0), kept when it is
+                                your best; the list carries it
+
+THE FORGE (0.120.0): the owner, "Rewards + daily wait" - once a day as the
+Endless, every fire sprite slain paying its own loot into the character's
+chest by the island's arrival (loot only), held to what the run's schedule
+could have sent since the Go (services.forge_ceiling()), and the best time a
+run held kept per account.
 
 THE HEALER'S RUN (0.99.0): the owner, "this minigame can be played 3 times a
 day", and "gold should be rewarded on the screen then moved to char when

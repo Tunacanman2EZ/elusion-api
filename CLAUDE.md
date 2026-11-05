@@ -3246,8 +3246,9 @@ when hitting leave this minigame can be played 3 times a day". minigames/:
 `test_minigames.py` MG-11 (three a day, the fourth refused, one freed a day
 later, refusals, the owner) and MG-12 (the gold by progress, paid into the
 purse and the ledger, once, held to the time, somebody else's run, a run left
-too long). (MG-10's "another account reads its own chest" fails on the PC's
-own code too, before these: unlooked-at.)
+too long). (MG-10's "another account reads its own chest" failed about one run
+in four until game 0.120.0: one elite's roll can be nothing at all. It kills
+until one lands now.)
 
 **Three tiers, up to 20,000 (game 0.100.0; 0.104.0).** The owner: "lets
 progress tiers after round 8 to the next difficulty diff boss", then "up to
@@ -3278,6 +3279,46 @@ ending with a boss.
   the old table and its `bosses` ignored.
 
 `test_minigames.py` MG-13.
+
+## The Forge: once a day, its fire sprites pay the chest, its best time kept (game 0.120.0)
+
+The owner, 4 Nov, of the tank's minigame: "Rewards + daily wait" (step 1 of
+the four in the commit folder's FORGE_PLAN.txt). minigames/:
+
+- **`GAMES["forge"]`**: a day's wait, as the Endless - one Go a day, the
+  owner and a co-owner skipping it - and `"times": True`, so the listing
+  gives it `best` (seconds, 0 for none).
+- **Every fire sprite slain pays its own loot into the chest** through
+  `POST /api/minigames/kill` `{game: "forge", slot, enemy_id}`: no XP, loot/'s
+  chest `chest:forge:<slot>` (by the island's arrival in the game), emptied
+  at the next Go - the Endless's road exactly. Only a monster the schedule
+  sends (`sends()` gives "sprite"; an Endless elite or a boss is a 400).
+- **The ceiling is the Forge's schedule** - gamedata.json's `"forge"`
+  (`gamedata.FORGE`, from the game's `forgerun.gd schedule()`): a phase a
+  flood (its heat filling at its fastest, the spawn gap, how many a spawn),
+  the volcano's gap and count believed for `volcano_believed` (60 s), and
+  `alive_most` (50). `forge_ceiling()`: one run's worth from the Go
+  (`forge_run_sprites()`, 733 for one whole run of 288 s), then back to
+  back at a whole run's average, up to `FORGE_RUNS_BELIEVED` (6) runs a day,
+  plus the most alive. Past it, 429 naming "fire sprites". **A catalogue
+  without "forge" pays no Forge kill** - copy gamedata.json across with the
+  game.
+- **`POST /api/minigames/best`** `{game, seconds}`: a run's time, kept in
+  `minigame_bests` (one row an account and game) when it beats the best;
+  answers `seconds` (as believed), `best`, `new_best`. Believed no longer
+  than since the Go nor `FORGE_BEST_MOST` (an hour) - `best_believed()` -
+  only inside the day (409), only for a game with `times` (400), whole
+  seconds (400; `true` is not a number).
+- **Account deletion takes `minigame_bests`** - and `minigame_runs`, the
+  Healer's Run's, which it had missed since 0.99.0.
+- **The honest limit**: a modified game could report every fire sprite the
+  schedule allows (six whole runs' worth a day) and claim a time as long as
+  it has been in; one Go a day caps both.
+- **Deploy the server first**: a 0.120.0 game's Go against an older server is
+  a 400 ("no such minigame") and the card says it could not reach the server.
+
+`test_minigames.py` MG-14; the schema fixture and routes.lock carry the new
+table and route.
 
 ## Signing in with Google (game 0.101.0)
 

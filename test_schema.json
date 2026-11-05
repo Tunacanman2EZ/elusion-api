@@ -950,6 +950,18 @@
   ],
   [
    "table",
+   "minigame_bests",
+   "minigame_bests",
+   "CREATE TABLE minigame_bests (\n            user_id  INTEGER NOT NULL,\n            game     TEXT    NOT NULL,\n            seconds  INTEGER NOT NULL,\n            at       INTEGER NOT NULL,\n            PRIMARY KEY (user_id, game),\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
+  ],
+  [
+   "index",
+   "sqlite_autoindex_minigame_bests_1",
+   "minigame_bests",
+   null
+  ],
+  [
+   "table",
    "google_accounts",
    "google_accounts",
    "CREATE TABLE google_accounts (\n            user_id           INTEGER PRIMARY KEY,\n            sub               TEXT    NOT NULL UNIQUE,\n            email             TEXT    NOT NULL DEFAULT '',\n            linked_at         INTEGER NOT NULL,\n            made_with_google  INTEGER NOT NULL DEFAULT 0,\n            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n        )"
@@ -4823,6 +4835,76 @@
      "idx_lusion_ledger_user",
      0,
      "c",
+     0
+    ]
+   ]
+  },
+  "minigame_bests": {
+   "columns": [
+    [
+     0,
+     "user_id",
+     "INTEGER",
+     1,
+     null,
+     1
+    ],
+    [
+     1,
+     "game",
+     "TEXT",
+     1,
+     null,
+     2
+    ],
+    [
+     2,
+     "seconds",
+     "INTEGER",
+     1,
+     null,
+     0
+    ],
+    [
+     3,
+     "at",
+     "INTEGER",
+     1,
+     null,
+     0
+    ]
+   ],
+   "foreign_keys": [
+    [
+     0,
+     0,
+     "users",
+     "user_id",
+     "id",
+     "NO ACTION",
+     "CASCADE",
+     "NONE"
+    ]
+   ],
+   "index_info": {
+    "sqlite_autoindex_minigame_bests_1": [
+     [
+      0,
+      0,
+      "user_id"
+     ],
+     [
+      1,
+      1,
+      "game"
+     ]
+    ]
+   },
+   "indexes": [
+    [
+     "sqlite_autoindex_minigame_bests_1",
+     1,
+     "pk",
      0
     ]
    ]

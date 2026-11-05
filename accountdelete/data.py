@@ -19,6 +19,9 @@ OWN_TABLES = (
     "account_installs", "trusted_devices", "ended_sessions", "sessions",
     "guild_invites", "guild_members", "party_members", "chat_image_holders",
     "minigame_entries", "minigame_kills", "loot_chest_items", "google_codes", "google_accounts",
+    # A Healer's Run's runs (0.99.0) were left behind until game 0.120.0
+    # added the best times beside them.
+    "minigame_runs", "minigame_bests",
 )
 
 
