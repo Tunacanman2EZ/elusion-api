@@ -21,6 +21,11 @@ GAMES = {
     # run's schedule could have sent (FORGE below); and the time a run held
     # is kept, the best of it (`times`, POST /api/minigames/best).
     "forge": {"name": "The Forge", "wait": DAY, "times": True},
+    # CUT THE CLOTH (game 0.131.0, cloth/): the owner, 5 Nov, "add the other
+    # stuff now" - rewards and a daily limit through the server. Three runs a
+    # day, as the Healer's Run, and gold for every round cleared (CLOTH
+    # below), paid at Leave by POST /api/minigames/finish.
+    "cloth": {"name": "Cut the Cloth", "wait": DAY, "plays": 3},
 }
 
 
@@ -164,6 +169,57 @@ def healer_tier_gold(waves, bosses, goal):
     if goal and bosses == HEALER_TIERS:
         gold += HEALER_TIER_GOAL_GOLD
     return gold
+
+
+# =============================================================================
+# CUT THE CLOTH'S GOLD (game 0.131.0)
+# =============================================================================
+# Every round cleared pays: CLOTH_ROUND_GOLD for rounds 1-10 (5,050 for all
+# ten, the Plague Mother's rounds 5 and 10 the most), then CLOTH_ENDLESS_GOLD
+# for each Endless round and CLOTH_ENDLESS_BOSS_GOLD for each of its bosses
+# (every CLOTH_BOSS_EVERY-th). The game counts the same sum on screen (it is
+# handed cloth_pays() at Go) and says at Leave how many rounds it cleared.
+#
+# THE HONEST LIMIT: a modified game could say it cleared more. It cannot say
+# so faster than CLOTH_MIN_ROUND_SECONDS a round since its Go, nor more than
+# CLOTH_ROUNDS_MOST rounds (24,250 gold), nor more than three runs a day.
+
+CLOTH_ROUND_GOLD = (100, 150, 200, 300, 600, 400, 500, 600, 700, 1500)
+CLOTH_ENDLESS_GOLD = 800
+CLOTH_ENDLESS_BOSS_GOLD = 1600
+CLOTH_BOSS_EVERY = 5
+CLOTH_MIN_ROUND_SECONDS = 15
+CLOTH_ROUNDS_MOST = 30
+
+
+def cloth_round_gold(which):
+    """What clearing round `which` (from 1) pays."""
+    if 1 <= which <= len(CLOTH_ROUND_GOLD):
+        return CLOTH_ROUND_GOLD[which - 1]
+    return CLOTH_ENDLESS_BOSS_GOLD if which % CLOTH_BOSS_EVERY == 0 else CLOTH_ENDLESS_GOLD
+
+
+def cloth_gold(rounds):
+    """The gold for a run that cleared `rounds` rounds."""
+    rounds = max(0, min(int(rounds), CLOTH_ROUNDS_MOST))
+    return sum(cloth_round_gold(which) for which in range(1, rounds + 1))
+
+
+def cloth_believed(rounds, seconds):
+    """How many rounds a run said it cleared, held to what `seconds` since its
+    Go allow."""
+    return max(0, min(int(rounds), CLOTH_ROUNDS_MOST, int(seconds) // CLOTH_MIN_ROUND_SECONDS))
+
+
+def cloth_pays():
+    """The table the game counts gold by on screen (handed it at Go)."""
+    return {"rounds": list(CLOTH_ROUND_GOLD), "endless": CLOTH_ENDLESS_GOLD,
+            "endless_boss": CLOTH_ENDLESS_BOSS_GOLD, "most": cloth_gold(CLOTH_ROUNDS_MOST)}
+
+
+def pays_for(game_id):
+    """What a run of `game_id` is handed at Go: its own table."""
+    return cloth_pays() if game_id == "cloth" else healer_pays()
 
 
 def ready_in(entered_at, wait, now):

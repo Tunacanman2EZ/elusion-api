@@ -3357,6 +3357,32 @@ ceiling about 20, and a mythic 8% of days.
 
 MG-15; the schema fixture carries the column.
 
+## Cut the Cloth: three runs a day, gold for every round cleared (game 0.131.0)
+
+The owner, 5 Nov: "add the other stuff now" - Cut the Cloth's rewards and
+daily limit through the server. `minigames/services.py` (CUT THE CLOTH'S
+GOLD) and `finish_cloth()` in `minigames/routes.py`; MG-15 in
+`test_minigames.py`.
+
+- **`GAMES["cloth"]`, three runs a day** - the Healer's Run's rolling day
+  (`plays` 3): POST /api/minigames/enter `{"game": "cloth", "slot": n}` makes a
+  run of its own (`minigame_runs`) and answers its id and `pays` - the game's
+  own table, `cloth_pays()` (`pays_for()`: each multi-run game its own; the
+  Healer's Run is still handed `healer_pays()`). The owner skips the wait.
+- **Gold for each round cleared** (`cloth_gold()`): CLOTH_ROUND_GOLD for
+  rounds 1-10 (100, 150, 200, 300, 600, 400, 500, 600, 700, 1500 - 5,050 for
+  all ten, the Plague Mother's rounds 5 and 10 the most), then 800 an Endless
+  round and 1,600 each fifth, never past CLOTH_ROUNDS_MOST (30) rounds.
+- **POST /api/minigames/finish `{"run": id, "rounds": n}`** for a cloth run:
+  believed only as far as CLOTH_MIN_ROUND_SECONDS (15) a round since its Go
+  allows (`cloth_believed()`), paid once into the character's purse as
+  "minigame" ("cloth run N: R rounds"), the run's `waves` column holding the
+  rounds and `boss` the Plague Mothers sealed. A run older than the Healer's
+  HEALER_RUN_KEPT_SECONDS pays nothing. The route now answers 404 for
+  somebody else's run before it reads the body.
+- **The honest limit**: a modified game can claim at most 30 rounds (24,250
+  gold) a run, no faster than 15 s a round, three runs a day.
+
 ## Signing in with Google (game 0.101.0)
 
 A player: "Google account to play or I am not registering". The owner: "lets

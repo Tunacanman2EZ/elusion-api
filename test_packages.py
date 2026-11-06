@@ -4589,7 +4589,8 @@ again = client_a.post("/api/minigames/enter", headers=who("ann"), json={"game": 
 listed = (client_a.get("/api/minigames", headers=who("ann")).get_json() or {}).get("games", [])
 check("minigames: Go lets you in once, a second Go inside the day is a 409, and the list says how long",
       first.status_code == 200 and again.status_code == 409
-      and [(g["id"], g["ready_in"] > 0) for g in listed] == [("endless", True), ("healerrun", False), ("forge", False)],
+      and [(g["id"], g["ready_in"] > 0) for g in listed] == [("endless", True), ("healerrun", False), ("forge", False),
+                                                             ("cloth", False)],
       (first.status_code, again.status_code))
 check("  the owner skips the wait; no login, no way in",
       client_a.post("/api/minigames/enter", headers=who("boss"), json={"game": "endless"}).status_code == 200

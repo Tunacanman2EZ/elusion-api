@@ -118,7 +118,7 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
               type: object
               required: [game]
               properties:
-                game: {type: string, description: "a minigame's id: endless, healerrun, forge"}
+                game: {type: string, description: "a minigame's id: endless, healerrun, forge, cloth"}
         responses:
           200:
             description: "in: game, entered_at, ready_in (the next wait)"
@@ -175,11 +175,11 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
         return {"ok": True, "game": game_id, "entered_at": now, "run": run_id, "plays_left": plays_left,
                 "ready_in": 0 if skip or plays_left > 0 else services.ready_in_plays(
                     starts + [now], plays, game["wait"], now),
-                "pays": services.healer_pays()}, 200
+                "pays": services.pays_for(game_id)}, 200
 
     def minigames_finish():
         """
-        The end of a Healer's Run - how far it got - and its gold, paid once into the character's purse
+        The end of a Healer's Run or a Cut the Cloth run - how far it got - and its gold, paid once into the character's purse
         ---
         tags:
           - Minigames
@@ -197,13 +197,14 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
               required: [run, waves]
               properties:
                 run:   {type: integer, description: "the run's id, from its Go"}
-                waves: {type: integer, description: "waves passed, 0-24 (0-25 before game 0.100.0)"}
+                waves: {type: integer, description: "the Healer's Run: waves passed, 0-24 (0-25 before game 0.100.0)"}
+                rounds: {type: integer, description: "Cut the Cloth (game 0.131.0): rounds cleared"}
                 bosses: {type: integer, description: "bosses beaten, 0-3 (game 0.100.0's tiers)"}
                 boss:  {type: boolean, description: "before game 0.100.0: the gate's boss beaten"}
                 goal:  {type: boolean, description: "the goal marker reached"}
         responses:
           200:
-            description: "gold paid, the waves, boss and goal believed, and the purse after (gold)"
+            description: "gold paid, the waves, boss and goal believed (Cut the Cloth: the rounds believed), and the purse after (gold)"
           400:
             description: "a bad body"
           404:
@@ -216,15 +217,19 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
         payload = request.get_json(silent=True)
         if not isinstance(payload, dict):
             return bad_request("body must be a JSON object")
-        run_id, waves = payload.get("run"), payload.get("waves")
-        if isinstance(run_id, bool) or not isinstance(run_id, int) or isinstance(waves, bool) \
-                or not isinstance(waves, int) or waves < 0:
-            return bad_request("run and waves must be whole numbers")
+        run_id = payload.get("run")
+        if isinstance(run_id, bool) or not isinstance(run_id, int):
+            return bad_request("run must be a whole number")
         db = get_db()
         now = int(time.time())
         run = data.run_of(db, run_id)
         if run is None or int(run["user_id"]) != int(g.user["id"]):
             return {"error": "Not Found", "message": "No such run."}, 404
+        if str(run["game"]) == "cloth":
+            return finish_cloth(db, run, payload, now)
+        waves = payload.get("waves")
+        if isinstance(waves, bool) or not isinstance(waves, int) or waves < 0:
+            return bad_request("run and waves must be whole numbers")
         seconds = now - int(run["started_at"])
         if int(run["finished_at"]) != 0:
             return {"error": "Conflict", "message": "That run is already finished."}, 409
@@ -264,6 +269,32 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
         if tiered:
             answer["bosses"] = bosses
         return answer, 200
+
+    def finish_cloth(db, run, payload, now):
+        """A Cut the Cloth run's end (game 0.131.0): the rounds it cleared,
+        held to the time since its Go, and their gold paid - once."""
+        rounds = payload.get("rounds")
+        if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 0:
+            return bad_request("rounds must be a whole number")
+        if int(run["finished_at"]) != 0:
+            return {"error": "Conflict", "message": "That run is already finished."}, 409
+        seconds = now - int(run["started_at"])
+        believed = services.cloth_believed(rounds, seconds)
+        gold = services.cloth_gold(believed)
+        if seconds > services.HEALER_RUN_KEPT_SECONDS:
+            gold = 0
+        bosses = believed // services.CLOTH_BOSS_EVERY
+        if not data.finish_run(db, int(run["id"]), g.user["id"], now, believed, bosses, False, gold):
+            return {"error": "Conflict", "message": "That run is already finished."}, 409
+        purse = None
+        if gold > 0 and gold_delta is not None:
+            purse = gold_delta(db, g.user["id"], int(run["slot"]), gold, "minigame",
+                               "cloth run %d: %d rounds" % (int(run["id"]), believed))
+            if purse is None:
+                gold = 0
+        db.commit()
+        return {"ok": True, "gold": gold, "rounds": believed, "bosses": bosses,
+                "status": {"gold": int(purse)} if purse is not None else {}}, 200
 
     def minigames_kill():
         """

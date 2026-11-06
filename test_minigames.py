@@ -556,6 +556,65 @@ finally:
 check("  the Endless is as it was: its elites roll at their own odds, pets on",
       asked and asked[0].get("rare_odds_scale") == 1 and asked[0].get("pets") is True, asked)
 
+section("MG-15 CUT THE CLOTH (game 0.131.0): THREE RUNS A DAY, GOLD FOR EVERY ROUND CLEARED")
+cg = services.cloth_gold
+check("the rounds' gold: 100, 150, 200, 300, 600 ... 1,500 for the tenth - 5,050 for all ten; then 800 a round, "
+      "1,600 each fifth; never past %d rounds" % services.CLOTH_ROUNDS_MOST,
+      cg(0) == 0 and cg(1) == 100 and cg(5) == 1350 and cg(10) == 5050 and cg(11) == 5850
+      and cg(15) == 5050 + 4 * 800 + 1600 and cg(99) == cg(services.CLOTH_ROUNDS_MOST)
+      and services.cloth_pays()["most"] == cg(services.CLOTH_ROUNDS_MOST), [cg(5), cg(10), cg(15)])
+cb = services.cloth_believed
+check("  believed only as far as the time allows: %d s a round" % services.CLOTH_MIN_ROUND_SECONDS,
+      cb(10, 9999) == 10 and cb(10, 60) == 4 and cb(3, 14) == 0 and cb(-2, 999) == 0 and cb(99, 99999) == services.CLOTH_ROUNDS_MOST)
+ivy = register("mgivy")
+assert client.put("/api/save", headers=ivy, json={"slot": 0, "class_id": "mage", "name": "mage"}).status_code in (200, 201)
+def cloth_row(headers):
+    games = (client.get("/api/minigames", headers=headers).get_json() or {}).get("games", [])
+    return next((g for g in games if g.get("id") == "cloth"), {})
+def cloth_go(headers, slot=0):
+    return client.post("/api/minigames/enter", headers=headers, json={"game": "cloth", "slot": slot})
+def cloth_finish(headers, run_id, rounds):
+    return client.post("/api/minigames/finish", headers=headers, json={"run": run_id, "rounds": rounds})
+row = cloth_row(ivy)
+check("Cut the Cloth is listed: three runs a day, all three left", row.get("name") == "Cut the Cloth"
+      and row.get("plays") == 3 and row.get("plays_left") == 3 and row.get("ready_in") == 0, row)
+cloth_runs = []
+for n in range(3):
+    res = cloth_go(ivy)
+    body = res.get_json() or {}
+    cloth_runs.append(body.get("run"))
+    check("  Go %d is let in with a run of its own and the rounds' table, %d left" % (n + 1, 2 - n),
+          res.status_code == 200 and isinstance(body.get("run"), int) and body.get("plays_left") == 2 - n
+          and body.get("pays", {}).get("rounds", [None])[0] == 100 and body.get("pays", {}).get("endless") == 800,
+          (res.status_code, body))
+res = cloth_go(ivy)
+check("  the fourth inside the day is refused (409), in words", res.status_code == 409
+      and "3 times today" in (res.get_json() or {}).get("message", ""), (res.status_code, res.get_json()))
+ivy_purse = lambda: raw("SELECT gold FROM saves WHERE user_id = ? AND slot = 0", (uid("mgivy"),))[0][0]
+before = ivy_purse()
+raw("UPDATE minigame_runs SET started_at = started_at - 600 WHERE id = ?", (cloth_runs[0],))
+res = cloth_finish(ivy, cloth_runs[0], 6)
+body = res.get_json() or {}
+check("Leave after six rounds pays their 1,750 gold into the purse, in the ledger as minigame, the boss counted",
+      res.status_code == 200 and body.get("gold") == 1750 and body.get("rounds") == 6 and body.get("bosses") == 1
+      and ivy_purse() == before + 1750 and body.get("status", {}).get("gold") == ivy_purse()
+      and raw("SELECT reason, delta, detail FROM gold_ledger WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+              (uid("mgivy"),))[0] == ("minigame", 1750, "cloth run %d: 6 rounds" % cloth_runs[0]), (res.status_code, body))
+check("  once: a second Leave for the same run is refused (409)", cloth_finish(ivy, cloth_runs[0], 6).status_code == 409
+      and ivy_purse() == before + 1750)
+raw("UPDATE minigame_runs SET started_at = started_at - 40 WHERE id = ?", (cloth_runs[1],))
+body = cloth_finish(ivy, cloth_runs[1], 12).get_json() or {}
+check("a run that says it cleared 12 rounds 40 seconds after its Go is believed for 2", body.get("rounds") == 2
+      and body.get("gold") == 250, body)
+check("refused: rounds missing or not a whole number (400), somebody else's run (404), a Healer's body (400)",
+      client.post("/api/minigames/finish", headers=ivy, json={"run": cloth_runs[2]}).status_code == 400
+      and cloth_finish(ivy, cloth_runs[2], True).status_code == 400 and cloth_finish(ivy, cloth_runs[2], -1).status_code == 400
+      and cloth_finish(bob, cloth_runs[2], 3).status_code == 404
+      and client.post("/api/minigames/finish", headers=ivy, json={"run": cloth_runs[2], "waves": 3}).status_code == 400)
+raw("UPDATE minigame_runs SET started_at = started_at - ? WHERE id = ?", (services.HEALER_RUN_KEPT_SECONDS + 10, cloth_runs[2]))
+check("  a run left too long pays nothing", (cloth_finish(ivy, cloth_runs[2], 5).get_json() or {}).get("gold") == 0)
+check("the owner runs it as often as they like", all(cloth_go(owner).status_code in (200, 404) for _ in range(4)))
+
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))
 print("=" * 60)
