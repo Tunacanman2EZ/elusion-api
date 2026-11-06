@@ -52,9 +52,12 @@ them, with each one's rank and its asking for the password again.
 import json
 import time
 
-from flask import g, request
+from flask import g, redirect, request
 
 from . import data, services
+
+# Where somebody who opens the server's bare address in a browser is sent.
+WEBSITE = "https://elusionrpg.com"
 
 
 def register(app, *, require_auth, require_owner, require_the_owner, require_fresh_password, get_db, bad_request,
@@ -63,6 +66,24 @@ def register(app, *, require_auth, require_owner, require_the_owner, require_fre
              receipts_on, min_client_build,
              current_build, co_owners_on, co_owners_changed, co_owner_names, post_broadcast, broadcast_limit,
              log_staff_action, online_window, end_player_sessions, open_trades):
+
+    def server_home():
+        """
+        The server's bare address, opened in a browser - sent on to the website
+        ---
+        tags:
+          - Status
+        responses:
+          302:
+            description: "On to Elusion's website"
+        """
+        # THE BARE ADDRESS IN A BROWSER. The owner, 5 Nov, opened
+        # api.elusionrpg.com and was told "This version of the game is too old
+        # to connect" - the build gate answering a browser, which sends no
+        # build. Somebody who types the server's address gets the website
+        # instead; the gate lets exactly "/" through (app.py
+        # _refuse_outdated_client()). The game never asks for "/".
+        return redirect(WEBSITE, code=302)
 
     def server_status():
         """
@@ -633,6 +654,7 @@ def register(app, *, require_auth, require_owner, require_the_owner, require_fre
     def owner_asked_again(view):
         return require_auth(require_owner(require_fresh_password(view)))
 
+    app.add_url_rule("/", endpoint="server_home", view_func=server_home, methods=["GET"])
     app.add_url_rule("/api/status", endpoint="server_status", view_func=server_status, methods=["GET"])
     app.add_url_rule("/api/server/maintenance", endpoint="set_maintenance",
                      view_func=owner_asked_again(set_maintenance), methods=["POST"])

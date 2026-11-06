@@ -1,6 +1,7 @@
 # The route table - test_routes.py. Written with --write; a diff here is a
 # change the game can see. One line a route and method:
 # METHOD PATH  ENDPOINT  auth|open  rank=  fresh=  lock=  doc=
+GET /  server_home  open  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/account  read_account  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/account/email  get_account_email  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/account/google  google_status  auth  rank=-  fresh=-  lock=yes  doc=yes

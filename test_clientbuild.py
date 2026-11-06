@@ -215,6 +215,18 @@ check("and it carries the number that refused them",
       res.get_json().get("min_client_build") == CURRENT,
       str(res.get_json().get("min_client_build")))
 
+# THE BARE ADDRESS. The owner opened api.elusionrpg.com in a browser and was
+# told "This version of the game is too old to connect" - a browser sends no
+# build. Exactly "/" goes on to the website; nothing under it is let through.
+res = client.get("/")
+check("the bare address answers a browser while the gate is armed",
+      res.status_code == 302, str(res.status_code))
+check("and sends it on to the website",
+      res.headers.get("Location") == "https://elusionrpg.com",
+      str(res.headers.get("Location")))
+res = client.get("/anything-else")
+check("only exactly / is let through", res.status_code == 426, str(res.status_code))
+
 # LOGIN IS NOT EXEMPT, deliberately. Being let in and then refused on every
 # subsequent request is worse than being told at the door, and the login screen
 # is the one place the client already knows how to display a refusal.

@@ -3684,3 +3684,14 @@ TIME). The ledger functions went with it.
   and nobody sees the owner's - the count is always shown, the addresses only to
   someone who could act. The owner panel calls it now (ownerpanel.gd); results still print to the
   console rather than into the panel, which needs scene work.
+
+## The bare address opens the website (5 Nov)
+
+The owner opened `api.elusionrpg.com` in a browser and was told
+`{"error":"Upgrade Required", ..., "your_build":0}`: the minimum-build gate
+answering a browser, which sends no build, on a path nothing served. Now
+`GET /` (switches/ `server_home()`) redirects 302 to `https://elusionrpg.com`
+(`WEBSITE`), and `_refuse_outdated_client()` lets exactly `/` through - an
+equality, not one more `_BUILD_EXEMPT` prefix, which would let every path
+through. The game never asks for `/`. test_clientbuild.py ("the bare
+address"), routes.lock.

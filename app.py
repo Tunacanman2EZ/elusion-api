@@ -883,6 +883,10 @@ def _refuse_outdated_client():
         return None
     if any(request.path.startswith(p) for p in _BUILD_EXEMPT):
         return None
+    # THE BARE ADDRESS, EXACTLY "/": a person in a browser, not a game - sent on
+    # to the website (switches/ server_home()) instead of told to update a game.
+    if request.path == "/":
+        return None
     if client_build() >= minimum:
         return None
     return {
