@@ -127,17 +127,31 @@ def spawn_ceiling(placed):
 MYTHIC_BROADCAST_KIND = "mythic"
 
 
+def boss_in_a_sentence(name):
+    """A boss's catalogue name as it reads mid-sentence: "The Crowned
+    Beholder" -> "the Crowned Beholder", "Ice The Crowned Beholder" -> "the
+    Ice Crowned Beholder". A name with no "The" is left as it is."""
+    words = name.split(" ")
+    if "The" not in words:
+        return name
+    words.remove("The")
+    return "the " + " ".join(words)
+
+
 def mythic_find_text(catalogue, username, item_id, enemy_id):
     """
-    "Tunacan found the Meteorite on a Dark Sprite!" The enemy is named because
-    a mythic off a light slime is a story worth telling. A boss is a name
-    ("The Crowned Beholder", "Fire The Crowned Beholder") and takes no article.
-    The names are the catalogue's (gamedata).
+    "Tunacan found the Meteorite from a Dark Sprite!" The enemy is named
+    because a mythic off a light slime is a story worth telling. A boss is a
+    name and takes "the" (boss_in_a_sentence()): "... from the Ice Crowned
+    Beholder!". It read "on Ice The Crowned Beholder" until the owner's first
+    mythic, 7 Nov 2026 (0.134.3). The names are the catalogue's (gamedata).
     """
     item = catalogue.item_row(item_id) or {}
     enemy = catalogue.ENEMIES.get(enemy_id, {})
     what = item.get("display_name") or item_id
     who = enemy.get("display_name") or enemy_id
-    if not enemy.get("slots_are_gear"):
+    if enemy.get("slots_are_gear"):
+        who = boss_in_a_sentence(who)
+    else:
         who = ("an " if who[:1].lower() in ("a", "e", "i", "o", "u") else "a ") + who
-    return "%s found the %s on %s!" % (username, what, who)
+    return "%s found the %s from %s!" % (username, what, who)

@@ -3695,3 +3695,14 @@ answering a browser, which sends no build, on a path nothing served. Now
 equality, not one more `_BUILD_EXEMPT` prefix, which would let every path
 through. The game never asks for `/`. test_clientbuild.py ("the bare
 address"), routes.lock.
+
+## A mythic's sentence names a boss as one (7 Nov, game 0.134.3)
+
+The owner's first mythic read "Tunacan found the Double Axe on Ice The Crowned
+Beholder!": a boss's catalogue name ("Ice The Crowned Beholder") dropped into
+the sentence as it is. kill/services.py `boss_in_a_sentence()` moves the "The"
+to the front, lower case ("the Ice Crowned Beholder", "the Crowned Beholder");
+a name with no "The" is left alone. And the sentence says "from", not "on":
+"Tunacan found the Double Axe from the Ice Crowned Beholder!", "... from a Dark
+Sprite!". test_packages.py ("a boss in the sentence"), test_quality.py,
+test_equipment.py.

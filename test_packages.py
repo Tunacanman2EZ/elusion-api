@@ -3660,7 +3660,7 @@ said = len(told)
 code, body = slay("boss")
 check("a mythic: told to everyone online in its own kind, the boss named as a name, and handed back",
       code == 200 and body.get("mythic") == "meteorite"
-      and told[said:] == [("mythic", "ann found the Meteorite on The Crowned Beholder!", "ann")], (body, told[said:]))
+      and told[said:] == [("mythic", "ann found the Meteorite from the Crowned Beholder!", "ann")], (body, told[said:]))
 with app_a.app_context():
     nothing = app_a.config["loot"].create_bag(2, 0, "slime", [])
     big_id, big = app_a.config["loot"].create_bag(2, 0, "slime", [{"item_id": "pebble", "quantity": 1}] * 12)
@@ -3669,8 +3669,14 @@ check("loot's own bag-maker, handed back: nothing dropped is no bag; a roll past
       and len(ann_says("SELECT position FROM loot_bag_items WHERE bag_id = ?", (big_id,))) == loot.LOOT_BAG_CAPACITY,
       (nothing, len(big)))
 check("  and any other monster with its article",
-      kill_package.mythic_find_text(KillCatalogue([]), "ann", "meteorite", "icebat") == "ann found the Meteorite on an Ice Bat!"
-      and kill_package.mythic_find_text(KillCatalogue([]), "ann", "rock", "bat") == "ann found the rock on a Bat!")
+      kill_package.mythic_find_text(KillCatalogue([]), "ann", "meteorite", "icebat") == "ann found the Meteorite from an Ice Bat!"
+      and kill_package.mythic_find_text(KillCatalogue([]), "ann", "rock", "bat") == "ann found the rock from a Bat!")
+# A boss reads as one mid-sentence (0.134.3): the owner's first mythic said
+# "found the Double Axe on Ice The Crowned Beholder!".
+check("a boss in the sentence takes 'the', its land first",
+      kill_package.boss_in_a_sentence("Ice The Crowned Beholder") == "the Ice Crowned Beholder"
+      and kill_package.boss_in_a_sentence("The Crowned Beholder") == "the Crowned Beholder"
+      and kill_package.boss_in_a_sentence("Grimbold") == "Grimbold")
 # THE RECEIPTS (0.57.0), handed in: with the switch on, a kill is paid only
 # against the books' own agreed death for it, and once.
 code, body = switch("/api/server/receipts", {"on": True})

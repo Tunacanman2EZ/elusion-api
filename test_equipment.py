@@ -1032,7 +1032,7 @@ _news = client.get("/api/server/broadcasts?since=%d" % _since, headers=MH).get_j
 _myth_news = [m for m in _news if m["kind"] == "mythic"]
 check("and everyone online is told, once, by name",
       len(_myth_news) == 1 and _myth_news[0]["by"] == "mythcheck"
-      and _myth_news[0]["body"] == "mythcheck found the %s on a Dark Sprite!"
+      and _myth_news[0]["body"] == "mythcheck found the %s from a Dark Sprite!"
       % (_gd.item_row(_myth_id) or {}).get("display_name"), _news)
 check("the notice is on the poll another player reads too",
       any(m["kind"] == "mythic" for m in client.get(

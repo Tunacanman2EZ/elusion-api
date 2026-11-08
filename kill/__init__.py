@@ -45,4 +45,4 @@ from .routes import register  # noqa: F401
 from .data import record_kill  # noqa: F401
 from .services import (KILL_BUCKET_CAPACITY, KILL_LOG_RETENTION_SECONDS, KILL_RESPAWN_FLOOR_SECONDS,  # noqa: F401
                        KILL_TOKENS_PER_SECOND, KILL_WINDOW_SECONDS, MYTHIC_BROADCAST_KIND, RECEIPT_BUILD,
-                       RECEIPT_RETRY_MS, RECEIPT_SECONDS, mythic_find_text)
+                       RECEIPT_RETRY_MS, RECEIPT_SECONDS, boss_in_a_sentence, mythic_find_text)

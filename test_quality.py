@@ -510,10 +510,10 @@ check("and takes it by its rolled id", res.status_code == 200 and holds("qalice"
 section("Q-6 THE MYTHIC NOTICE NAMES THE ROLL")
 # =============================================================================
 text = app_module.mythic_find_text("qalice", Q.perfect_id("meteorite"), "darksprite")
-check("a Perfect find is told as one", text == "qalice found the Perfect Meteorite on a Dark Sprite!", text)
+check("a Perfect find is told as one", text == "qalice found the Perfect Meteorite from a Dark Sprite!", text)
 text = app_module.mythic_find_text("qalice", "meteorite~d97p103", "darksprite")
 check("an ordinary roll is told by the piece's name, never its id",
-      text == "qalice found the Meteorite on a Dark Sprite!", text)
+      text == "qalice found the Meteorite from a Dark Sprite!", text)
 
 
 # =============================================================================
