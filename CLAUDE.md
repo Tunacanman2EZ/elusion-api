@@ -1480,6 +1480,41 @@ Perfect - as the LAST part of the roll: `jadechest~a104h96r605` is fire, 5%.
 test_equipment read dropped ids through `item_row()` / `base_id()` for the
 same reason the app does.
 
+## A poll that always answers (game 0.134.6)
+
+The owner, after a lesson on gateways: a request built from many parts
+should give up a part, not the whole answer. `GET /api/server/broadcasts` is
+that request - messages, maintenance, PvP, the lands, events, teleport,
+guild, party, trade, trade sync, chat news, asks, reports - and it is the
+HEARTBEAT: a game whose poll keeps failing says the server is gone after
+25 s and signs its player out at 90. So one part raising (a whisper notice, a
+guild query after a migration) answered 500 and would have signed out every
+player online. A POLL THAT ALWAYS ANSWERS in app.py:
+
+- **Every part that is not the heartbeat goes through `_poll_part()`**: one
+  that raises is logged with its traceback (`[POLL] <name> failed`), left
+  out (`fallback` - None, or {} for the parts spread into the answer, guild
+  and the report counts) and named in the answer's `"missing"`. The poll
+  still answers 200. `missing` is only there when something was left out.
+- **Vital, unguarded**: the beat (`stamp_presence`), the messages, their
+  cursor (`latest_id`) and `maintenance`. If those fail the poll should fail.
+- **A part that writes is rolled back** to where it began (`writes=True`, a
+  savepoint): the lands (`world_public` may start a stir and announce it),
+  events and the online sample - all "caller commits". Without it a part that
+  wrote half and then raised was committed with the beat. `_take_resync`
+  commits itself, so it takes no savepoint; a part that commits inside one
+  ends it, and the RELEASE after is passed over.
+- **A new part on this poll goes through `_poll_part()`**, with `writes=True`
+  if it writes and leaves the commit to the caller.
+- The game keeps what it has for a part named in `missing` (its CLAUDE.md, "A
+  part the server left out is kept").
+- `test_poll_parts.py`: a broken part still 200 and named, the others all
+  there, logged by name, a half-written part rolled back, two at once, the
+  spread parts left out rather than sent as "no guild", and whole again once
+  mended. Sabotage-caught: the guard re-raising (5 red), the lands without
+  their savepoint (the rollback check red).
+- **Deploy order: either** - see the game's note.
+
 ## Seeing each other: presence.py, a second process
 
 The owner, 5 Oct: "i want to make other players see each other" - over a live

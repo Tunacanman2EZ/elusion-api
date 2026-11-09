@@ -7272,15 +7272,23 @@ def read_broadcasts():
     # recorded as a beat - and committed with the read below rather than on its
     # own, so this is one transaction, not two.
     stamp_presence(db, playing)
+    # THE PARTS THIS POLL CARRIES THAT ARE NOT THE HEARTBEAT - see _poll_part().
+    # Any that fails is left out and named here.
+    missing = []
+    uid = int(g.user["id"])
     # THE STIRRING LANDS, asked before the messages are read: a stir this poll
     # begins is announced in this poll's own answer.
-    world = world_public(db)
+    world = _poll_part(db, missing, "world", lambda: world_public(db), writes=True)
     # THE WORLD'S EVENTS (game 0.48.0, events/): what is on, what is coming.
-    events_now = world_events.public(db) if world_events is not None else {"events": [], "next": []}
+    events_now = _poll_part(
+        db, missing, "events",
+        lambda: world_events.public(db) if world_events is not None else {"events": [], "next": []},
+        writes=True)
     # WHO IS ONLINE, counted for the event report (game 0.49.0) - at most once
-    # a minute per process, after this player's own beat above.
+    # a minute per process, after this player's own beat above. It puts
+    # nothing in the answer, so a failure is only logged.
     if world_events is not None:
-        world_events.sample(db)
+        _poll_part(db, [], "events_sample", lambda: world_events.sample(db), writes=True)
     db.commit()
 
     # A FIRST POLL ASKS FOR THE TAIL, NOT THE WHOLE TABLE. since=0 means "I just
@@ -7311,7 +7319,9 @@ def read_broadcasts():
     # to this is how it finds out.
     newest = db.execute("SELECT MAX(id) AS n FROM broadcasts").fetchone()["n"]
 
-    return {
+    is_mod = role_at_least(g.user, "mod")
+    pvp = _poll_part(db, missing, "pvp", lambda: (pvp_enabled(), pvp_since()), fallback=(None, None))
+    answer = {
         "messages": messages,
         "latest_id": int(newest or 0),
         "maintenance": maintenance_public(),
@@ -7319,11 +7329,11 @@ def read_broadcasts():
         # reason: it is a fact about the world that the HUD has to keep on
         # screen, and a second request every few seconds to learn one boolean
         # would be a second request every few seconds.
-        "pvp": pvp_enabled(),
+        "pvp": pvp[0],
         # WHEN IT WAS SWITCHED, because "PvP is ON" answers a different
         # question from the one a player who just logged in is asking. See
         # pvp_since(); 0 when it has never been touched.
-        "pvp_at": pvp_since(),
+        "pvp_at": pvp[1],
         # THE STIRRING LANDS (game 0.46.0): which land stirs, until when, and
         # how hard its monsters hit and how much resistance to it counts - the
         # two the game applies itself. See world_public().
@@ -7331,7 +7341,7 @@ def read_broadcasts():
         "events": events_now,
         # Rides the same poll as everything else. None when there is nowhere
         # to be; the client applies it and then acks it away.
-        "teleport": pending_teleport_for(g.user["id"]),
+        "teleport": _poll_part(db, missing, "teleport", lambda: pending_teleport_for(g.user["id"])),
         # YOUR OWN GUILD, ON THE POLL THAT ALREADY KNOWS WHO YOU ARE.
         #
         # The client draws the tag over your head, and a nameplate is a thing
@@ -7350,31 +7360,76 @@ def read_broadcasts():
         # and is already writing a presence stamp. It is the cheapest place in
         # the whole system to answer this, which is why it is answered here
         # rather than by a second timer in the client.
-        **_own_guild(db, int(g.user["id"])),
+        **_poll_part(db, missing, "guild", lambda: _own_guild(db, uid), fallback={}),
         # THE PARTY YOU ARE IN (game 0.42.0): its id, leader and members, so
         # the game colours their names and draws them on the map, and hears a
         # change within one poll. See _own_party().
-        "party": _own_party(db, int(g.user["id"])),
+        "party": _poll_part(db, missing, "party", lambda: _own_party(db, uid)),
         # THE TRADE YOU ARE IN, if any, in one line - so somebody who has not
         # opened the trade window finds out a trade was opened WITH them. The
         # window polls /api/trade itself, but only while it is open, and before
         # this nothing told the other person to open it.
-        "trade": _trade_summary(db, int(g.user["id"])),
+        "trade": _poll_part(db, missing, "trade", lambda: _trade_summary(db, uid)),
         # AND THE RESULT OF ONE THAT FINISHED WITHOUT YOU WATCHING. See
         # _take_resync(): whoever accepted first learns here that it went
         # through, and gets the bag and purse it went through with.
-        "trade_resync": _take_resync(db, int(g.user["id"])),
+        "trade_resync": _poll_part(db, missing, "trade_resync", lambda: _take_resync(db, uid)),
         # WHAT WAS SAID TO YOU WHILE YOU WERE NOT LOOKING. See _chat_news().
-        "chat_news": _chat_news(db, int(g.user["id"])),
+        "chat_news": _poll_part(db, missing, "chat_news", lambda: _chat_news(db, uid)),
         # WHAT IS WAITING ON YOUR ANSWER. See _waiting_asks().
-        "asks": _waiting_asks(db, int(g.user["id"])),
+        "asks": _poll_part(db, missing, "asks", lambda: _waiting_asks(db, uid)),
         # LINES WAITING FOR STAFF, for staff only - a report nobody sees is a
-        # report nobody reads. 0 for everyone else, not absent.
-        "open_reports": _open_report_count(db) if role_at_least(g.user, "mod") else 0,
-        # AND HOW MANY PLAYERS THOSE LINES ARE ABOUT, which is the number on
-        # the Staff button: one card each on the Reports tab.
-        "open_report_players": _open_report_players(db) if role_at_least(g.user, "mod") else 0,
-    }, 200
+        # report nobody reads. 0 for everyone else, not absent. AND HOW MANY
+        # PLAYERS THOSE LINES ARE ABOUT, which is the number on the Staff
+        # button: one card each on the Reports tab.
+        **_poll_part(db, missing, "open_reports", lambda: {
+            "open_reports": _open_report_count(db) if is_mod else 0,
+            "open_report_players": _open_report_players(db) if is_mod else 0,
+        }, fallback={}),
+    }
+    # WHAT WAS LEFT OUT, so the game keeps what it has on screen for those
+    # parts rather than reading a missing one as "none" (characterhud.gd
+    # _apply_broadcast). Only there when something was.
+    if missing:
+        answer["missing"] = missing
+    return answer, 200
+
+
+# A POLL THAT ALWAYS ANSWERS (game 0.134.6). The owner, after a lesson on
+# gateways: one request built from many parts should give up a part, not the
+# whole answer. This poll is that request - messages, maintenance, the lands,
+# events, teleport, guild, party, trade, chat, asks, reports - and it is also
+# the HEARTBEAT: a game whose poll keeps failing says the server is gone after
+# 25 s and signs its player out at 90 (characterhud.gd OFFLINE_*). So a bug in
+# any one part - a whisper notice, a guild query after a migration - answered
+# 500 and would have signed out every player online. Now each part that is
+# not the heartbeat (the beat itself, the messages, their cursor and
+# maintenance stay vital) is built here: one that raises is logged with its
+# traceback, left out (`fallback`) and named in the answer's "missing", and
+# what it wrote is rolled back to where it began (`writes`: a savepoint, for
+# the parts that write and leave the commit to the caller - _take_resync
+# commits itself, so it is not one). test_poll_parts.py.
+def _poll_part(db, missing, name, build, fallback=None, writes=False):
+    if writes:
+        db.execute("SAVEPOINT poll_part")
+    try:
+        value = build()
+    except Exception:
+        if writes:
+            try:
+                db.execute("ROLLBACK TO poll_part")
+                db.execute("RELEASE poll_part")
+            except sqlite3.Error:
+                pass
+        app.logger.exception("[POLL] %s failed - left out of this answer", name)
+        missing.append(name)
+        return fallback
+    if writes:
+        try:
+            db.execute("RELEASE poll_part")
+        except sqlite3.Error:
+            pass    # a part that committed itself has already ended it
+    return value
 
 
 def _chat_news(db, user_id):
