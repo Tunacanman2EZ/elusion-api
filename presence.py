@@ -591,7 +591,9 @@ TICK_ATTACKS = 1
 RUN_VERSION = 1
 MAX_RUN_BYTES = 32768
 MAX_RUN_HITS = 256
-RUN_SLOTS = 4096
+# Slots a swarm may number: 8,192 since game 0.148.0's 5,000 slimes (4,096
+# before, and a hit on slot 4,096 or above was dropped).
+RUN_SLOTS = 8192
 RUN_LINE_MOST = 16
 RUN_ME_MOST = 8
 RUN_BATCHES_MOST = 16

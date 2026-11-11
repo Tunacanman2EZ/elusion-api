@@ -2671,12 +2671,12 @@ async def the_run_between_a_party():
             got_a = await collect(a)
             check("the run's line and its slimes are the leader's alone: another's is dropped", not runs(got_a), got_a)
 
-            hits = {"t": "en", "h": [[0, 7, 31], [2999, 7, 12]]}
+            hits = {"t": "en", "h": [[0, 7, 31], [2999, 7, 12], [4999, 7, 5]]}
             await b.send(json.dumps(hits))
             got_a = await collect(a)
             check("hits on the swarm from any game reach the others", [m.get("h") for m in runs(got_a)] == [hits["h"]]
                   and runs(got_a)[0].get("id") == uid("runb"), got_a)
-            bad = [[[0, 7, 0]], [[0, 7, 1.5]], [[4096, 7, 3]], [[0, -1, 3]], [[0, 7, True]], [[0, 7]],
+            bad = [[[0, 7, 0]], [[0, 7, 1.5]], [[presence.RUN_SLOTS, 7, 3]], [[0, -1, 3]], [[0, 7, True]], [[0, 7]],
                    [[0, 7, presence.MAX_HIT + 1]], [[0, 1, 1]] * (presence.MAX_RUN_HITS + 1)]
             for h in bad:
                 await b.send(json.dumps({"t": "en", "h": h}))

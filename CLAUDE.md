@@ -1770,6 +1770,14 @@ RUN BETWEEN A PARTY); test_presence.py P-21 and P-22 hold it.
   list bounded (`MAX_RUN_HITS`, `RUN_SLOTS`, `RUN_BATCH_MOST`,
   `RUN_FULL_MOST`), and `MAX_RUN_BYTES` (32 KB) a message. Re-encoded, with
   `id`. What the numbers mean is the game's (endlessparty.gd).
+- **`RUN_SLOTS` is 8,192 since game 0.148.0** (the owner: "4 players
+  attacking with 5000 slimes"). It was 4,096, so with a crowd of 5,000 every
+  hit on a slime numbered 4,096 or above was dropped here and that slime
+  lived on in every other game. Above the swarm's most, never equal to it.
+  `RUN_FULL_MOST` (12,000) and `RUN_PARTS_MOST` (64) already fit 5,000 (a
+  slime is six numbers in a part of 400). test_presence.py P-22 hits slot
+  4,999 and refuses `RUN_SLOTS` itself. **Deploy this first**: a 0.148.0
+  game against an older server loses every hit past slot 4,095.
 - **No books in a party's arena** (`keeps_books()`): nothing there pays,
   and its elites are born mid-run where no map has them. The lead message
   carries `"b"`, and a game hearing `"b": 0` counts its monsters' health
