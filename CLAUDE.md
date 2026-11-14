@@ -2062,7 +2062,16 @@ P-27, two sabotages caught):
   (`SEES_ALL_ROLES`), the party-only rooms (`INSTANCED_PLACES`), no speed
   known (books off), and a step within `TELEPORT_SNAP_REACH` of where staff
   sent them lately (`teleport_to()` reads `pending_teleports`, in a thread, at
-  most every `TELEPORT_ASK_SECONDS` a player).
+  most every `TELEPORT_ASK_SECONDS` a player), and a step onto where one of
+  the area's own teleport pads lands (`lands_on_a_pad()`: gamedata.json's
+  `"arrivals"`, which the game's exporter writes from every teleporter.gd's
+  `destinationpoint` - the town's pad was 90 of the 115 jumps
+  `killwatch.py --moves` found in the two weeks before; re-export and copy
+  gamedata.json when a pad moves).
+- **A rebuilt world lands at once.** The game sends its first state from a
+  rebuilt world BEFORE its sync, so that state is held; the sync (when
+  allowed) puts the player where it last said (`player.claim`) and sends that
+  step, so nobody sees a walk across.
 - **`ELUSION_HOLD_MOVES`**, off unless on (envfile.KNOWN). Before it goes on,
   `killwatch.py --moves --days 14` lists the books' jumps and too-quick walks
   by area (DEPLOY.md, "Holding moves to a walk"); a place where honest play

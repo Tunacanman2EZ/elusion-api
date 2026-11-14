@@ -942,7 +942,8 @@ across an area on everyone else's screen. Since 0.157.0 presence.py can pass
 on each step only as far as the character could have walked - **HELD TO A
 WALK**, `ELUSION_HOLD_MOVES` in `/etc/elusion/elusion.env`. It ships **off**.
 Staff, the party-only rooms (the Endless, the Healer's Run, the Descent), a
-rebuilt world and a staff teleport are never held. Before switching it on,
+rebuilt world, a staff teleport and a step onto where one of the area's
+teleport pads lands are never held. Before switching it on,
 see where the books wrote down a jump or a too-quick walk in the last two
 weeks:
 

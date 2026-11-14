@@ -556,11 +556,12 @@ No comforting lies. These are known, named and open.
   the length of a teleport, and a hit from beyond any screen, but refuse none
   of them. Since 0.157.0 the server can hold every step it passes on to what
   the character could have walked (HELD TO A WALK, `test_presence.py` P-27):
-  a hop is seen as a fast walk, staff, the party-only rooms and a staff
-  teleport are free. It ships off - `ELUSION_HOLD_MOVES` - until the books'
+  a hop is seen as a fast walk; staff, the party-only rooms, a staff
+  teleport and the areas' own teleport pads are free. It ships off - `ELUSION_HOLD_MOVES` - until the books'
   flags (`killwatch.py --moves`) show honest play never jumps where no rule
-  frees it; and it holds what others SEE, not walls, which the server has no
-  map of. It
+  frees it. **It is on, since 14 November 2026**: the flags' two weeks were the
+  town's teleport pad, now free, and staff moves, already free. It holds
+  what others SEE, not walls, which the server has no map of. It
   cannot appear as somebody else, or show a rank, colour, guild or pet it does
   not hold - who a player is comes from the server's own rows, through a
   ticket tied to their login - and nothing over the socket deals damage or

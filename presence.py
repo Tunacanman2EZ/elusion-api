@@ -529,9 +529,13 @@ SEES_ALL_ROLES = ("owner", "coowner", "mod", "dev")
 # also how a cheat would ask); staff (SEES_ALL_ROLES: "Go to" moves them
 # beside somebody); the party-only rooms (INSTANCED_PLACES - the Endless's
 # wake-up teleport, and only the party sees there); a player with no speed
-# known (no books); and a step that lands within TELEPORT_SNAP_REACH of where
+# known (no books); a step that lands within TELEPORT_SNAP_REACH of where
 # staff sent them in the last TELEPORT_KEEP_SECONDS (app.py's
-# pending_teleports, asked in a thread, at most every TELEPORT_ASK_SECONDS).
+# pending_teleports, asked in a thread, at most every TELEPORT_ASK_SECONDS);
+# and one that lands within ARRIVAL_REACH of where one of the area's own
+# teleport pads puts a player (gamedata.json's "arrivals", the exporter's -
+# the town's pad was 90 of the 115 jumps the books wrote down in the two
+# weeks before this went in).
 # The books are fed the game's own word as before, so the flags still say
 # what was tried.
 #
@@ -546,6 +550,7 @@ SYNC_SNAP_SECONDS = 30.0
 TELEPORT_SNAP_REACH = 400.0
 TELEPORT_KEEP_SECONDS = 120
 TELEPORT_ASK_SECONDS = 2.0
+ARRIVAL_REACH = 96.0
 
 # Where the machine's network counters are (Linux); anywhere else, none.
 NET_DEV_PATH = "/proc/net/dev"
@@ -1213,6 +1218,9 @@ class Player:
         # last answer about a staff teleport (and when it was asked).
         self.walk_room = 0.0
         self.walk_at = 0.0
+        # Where its game last said it stands (x, y): what a rebuilt world
+        # snaps to at once.
+        self.claim = (0.0, 0.0)
         self.snap_next = False
         self.sync_snap_at = -SYNC_SNAP_SECONDS
         self.held_moves = 0
@@ -2263,8 +2271,10 @@ class PresenceServer:
         or - when that is further than it could have walked - as far toward
         it as it could."""
         now = time.monotonic()
+        player.claim = (x, y)
         speed = self.walk_speed(player)
-        if fresh or player.snap_next or not self.hold_moves or speed <= 0 or self.walks_free(player):
+        if fresh or player.snap_next or not self.hold_moves or speed <= 0 or self.walks_free(player) \
+                or self.lands_on_a_pad(player.where, x, y):
             player.snap_next = False
             player.walk_room, player.walk_at = self.walk_most(speed), now
             return x, y
@@ -2283,6 +2293,18 @@ class PresenceServer:
         share = player.walk_room / step
         player.walk_room = 0.0
         return player.x + (x - player.x) * share, player.y + (y - player.y) * share
+
+    @staticmethod
+    def lands_on_a_pad(area, x, y):
+        """True when (x, y) is within ARRIVAL_REACH of where one of this
+        area's own teleport pads puts a player (gamedata.json)."""
+        if gamedata is None:
+            return False
+        for point in (getattr(gamedata, "AREAS", {}).get(area, {}) or {}).get("arrivals", []) or []:
+            if isinstance(point, (list, tuple)) and len(point) == 2 \
+                    and math.hypot(x - float(point[0]), y - float(point[1])) <= ARRIVAL_REACH:
+                return True
+        return False
 
     async def _sent_there(self, player, x, y):
         """True when staff moved this player to near (x, y) in its area lately
@@ -2575,9 +2597,16 @@ class PresenceServer:
                 elif kind == "sync" and player.area:
                     # HELD TO A WALK: a rebuilt world may put its player
                     # anywhere - its next step lands free, once a while.
+                    # The game sends its first state from the new world
+                    # BEFORE its sync, so that state was held: it lands now.
                     if time.monotonic() - player.sync_snap_at >= SYNC_SNAP_SECONDS:
                         player.sync_snap_at = time.monotonic()
                         player.snap_next = True
+                        if self.hold_moves and (player.x, player.y) != player.claim:
+                            player.x, player.y = player.claim
+                            player.walk_room, player.walk_at = self.walk_most(self.walk_speed(player)), time.monotonic()
+                            player.steps.append(player.move())
+                            player.dirty = True
                     # A new world has nobody in it: whoever is near, afresh.
                     seen = self._wanted(player, fresh=True)
                     player.sees = {q.user_id for q in seen}

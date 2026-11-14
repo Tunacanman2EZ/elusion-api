@@ -2995,12 +2995,18 @@ async def held_to_a_walk():
                   moved(got_v).get(uid("hopm"), [0, 0])[1] == 2200.0, got_v)
 
             hub_w.walk_room = 0.0
-            await w.send(json.dumps({"t": "sync"}))
-            await collect(v)
             await w.send(state("field", x=600.0, y=900.0, m="idledown"))
             got_v = await collect(v)
-            check("a rebuilt world (sync) lets the next step land anywhere",
+            check("a rebuilt world's first state comes before its sync, so it is held",
+                  moved(got_v).get(uid("hopw"), [0, 0, 0])[1:3] != [600.0, 900.0], got_v)
+            await w.send(json.dumps({"t": "sync"}))
+            got_v = await collect(v)
+            check("  and its sync puts it where the game said, at once - no walk across",
                   moved(got_v).get(uid("hopw"), [0, 0, 0])[1:3] == [600.0, 900.0], got_v)
+            await w.send(state("field", x=1600.0, y=900.0, m="idledown"))
+            got_v = await collect(v)
+            check("  and the step after it lands anywhere too",
+                  moved(got_v).get(uid("hopw"), [0, 0, 0])[1:3] == [1600.0, 900.0], got_v)
             await w.send(json.dumps({"t": "sync"}))
             await collect(v)
             await w.send(state("field", x=2600.0, y=900.0, m="idledown"))
@@ -3021,6 +3027,27 @@ async def held_to_a_walk():
             check("  and only there: a hop somewhere else is still held",
                   moved(got_v).get(uid("hopw"), [0, 0])[1] > 200.0, got_v)
 
+            field_area = presence.gamedata.AREAS.setdefault("field", {})
+            kept_arrivals = field_area.get("arrivals")
+            field_area["arrivals"] = [[5000.0, 300.0]]
+            try:
+                hub_w.walk_room = 0.0
+                await w.send(state("field", x=5040.0, y=330.0, m="idledown"))
+                got_v = await collect(v)
+                check("a step onto where one of the area's teleport pads lands is free (gamedata's arrivals)",
+                      moved(got_v).get(uid("hopw"), [0, 0, 0])[1:3] == [5040.0, 330.0], got_v)
+                await w.send(state("field", x=5040.0 - 2 * presence.ARRIVAL_REACH - 1500.0, y=330.0, m="idledown"))
+                got_v = await collect(v)
+                check("  and only there", moved(got_v).get(uid("hopw"), [0, 0])[1]
+                      > 5040.0 - 2 * presence.ARRIVAL_REACH - 1500.0, got_v)
+            finally:
+                if kept_arrivals is None:
+                    field_area.pop("arrivals", None)
+                else:
+                    field_area["arrivals"] = kept_arrivals
+            check("every area's arrivals are where its pads land: the town has its pad",
+                  any(isinstance(p, list) and len(p) == 2 for p in presence.gamedata.AREAS.get("elusion", {}).get("arrivals", [])),
+                  presence.gamedata.AREAS.get("elusion", {}).get("arrivals"))
             check("a party's own room is never held (the Endless wakes you by the chest)",
                   presence.PresenceServer.walks_free(types.SimpleNamespace(identity={"role": "player"}, where="endless"))
                   and not presence.PresenceServer.walks_free(types.SimpleNamespace(identity={"role": "player"},
