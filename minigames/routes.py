@@ -43,6 +43,14 @@ AND THE HEALER'S RUN (game 0.99.0): three Go's a day, and its gold at Leave:
 
     gold_delta     app.py's gold_delta(): the only way gold changes, ledger
                    and balance together; no commit
+
+AND A DAY'S MINIGAME GOLD (14 Nov, services.py): every run's gold and every
+chest's coins counted against one allowance an account a day:
+
+    gold_a_day     () -> the cap, ELUSION_MINIGAME_GOLD_DAY's (0: none); None
+                   is no cap (a bare app)
+    money_worth    (item_id) -> the gold one of it cashes into, 0 for anything
+                   that is not gold (app.py's money_item_worth())
 """
 import time
 
@@ -53,8 +61,21 @@ from . import data, services
 
 def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, max_slot, catalogue,
              class_of, material_scale, store_in_chest, clear_chests, post_broadcast, mythic_text,
-             mythic_kind, gold_delta=None):
+             mythic_kind, gold_delta=None, gold_a_day=None, money_worth=None):
     """Add the five routes."""
+
+    def cap_now():
+        """The day's allowance for the caller: none for the owner and a co-owner
+        while let in, who skip the waits too (they test the minigames)."""
+        if gold_a_day is None or skips_wait(g.user["username"]):
+            return 0
+        return int(gold_a_day())
+
+    def day_paid(db, now):
+        return data.gold_since(db, g.user["id"], now - services.DAY)
+
+    def held_words(held):
+        return " (%d held back: the day's minigame gold is full)" % held if held > 0 else ""
 
     def listing(db, now):
         entries = data.entries_of(db, g.user["id"])
@@ -252,6 +273,8 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
             bosses = 1 if boss else 0
         if seconds > services.HEALER_RUN_KEPT_SECONDS:
             gold = 0
+        # A DAY'S MINIGAME GOLD: what is left of the account's allowance.
+        gold, held = services.gold_allowed(gold, day_paid(db, now), cap_now())
         if not data.finish_run(db, run_id, g.user["id"], now, believed_waves, bosses, goal, gold):
             return {"error": "Conflict", "message": "That run is already finished."}, 409
         purse = None
@@ -259,13 +282,14 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
             beaten = (", %d of %d bosses" % (bosses, services.HEALER_TIERS) if bosses else "") if tiered \
                 else (", the boss" if boss else "")
             purse = gold_delta(db, g.user["id"], int(run["slot"]), gold, "minigame",
-                               "%s run %d: %d waves%s%s" % (run["game"], run_id, believed_waves,
-                                                            beaten, ", the goal" if goal else ""))
+                               "%s run %d: %d waves%s%s%s" % (run["game"], run_id, believed_waves,
+                                                              beaten, ", the goal" if goal else "",
+                                                              held_words(held)))
             if purse is None:
                 gold = 0
         db.commit()
         answer = {"ok": True, "gold": gold, "waves": believed_waves, "boss": boss, "goal": goal,
-                  "status": {"gold": int(purse)} if purse is not None else {}}
+                  "held_back": held, "status": {"gold": int(purse)} if purse is not None else {}}
         if tiered:
             answer["bosses"] = bosses
         return answer, 200
@@ -283,17 +307,18 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
         gold = services.cloth_gold(believed)
         if seconds > services.HEALER_RUN_KEPT_SECONDS:
             gold = 0
+        gold, held = services.gold_allowed(gold, day_paid(db, now), cap_now())
         bosses = believed // services.CLOTH_BOSS_EVERY
         if not data.finish_run(db, int(run["id"]), g.user["id"], now, believed, bosses, False, gold):
             return {"error": "Conflict", "message": "That run is already finished."}, 409
         purse = None
         if gold > 0 and gold_delta is not None:
             purse = gold_delta(db, g.user["id"], int(run["slot"]), gold, "minigame",
-                               "cloth run %d: %d rounds" % (int(run["id"]), believed))
+                               "cloth run %d: %d rounds%s" % (int(run["id"]), believed, held_words(held)))
             if purse is None:
                 gold = 0
         db.commit()
-        return {"ok": True, "gold": gold, "rounds": believed, "bosses": bosses,
+        return {"ok": True, "gold": gold, "rounds": believed, "bosses": bosses, "held_back": held,
                 "status": {"gold": int(purse)} if purse is not None else {}}, 200
 
     def minigames_kill():
@@ -389,8 +414,15 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
             enemy_id, class_id, 1.0, 1.0, material_drop_scale=material_scale(db),
             rare_odds_scale=services.FORGE_RARE_SCALE if forge else 1,
             pets=not forge or data.pets_since(db, user_id, game_id, entered) < services.FORGE_PETS_A_DAY)
-        used, cut = store_in_chest(db, user_id, slot, game_id, rewards["contents"])
-        data.record_kill(db, user_id, slot, game_id, enemy_id, boss, now, pet=bool(rewards.get("pet_won")))
+        # A DAY'S MINIGAME GOLD: the coins only as far as the day's allowance
+        # goes; the gear, materials and pet always.
+        cap = cap_now()
+        left = max(0, cap - day_paid(db, now)) if cap > 0 else None
+        contents, coin_gold, held = services.coins_within(
+            rewards["contents"], money_worth if money_worth is not None else (lambda _id: 0), left)
+        used, cut = store_in_chest(db, user_id, slot, game_id, contents)
+        data.record_kill(db, user_id, slot, game_id, enemy_id, boss, now, pet=bool(rewards.get("pet_won")),
+                         gold=coin_gold)
         mythic = rewards.get("mythic", "")
         if mythic:
             post_broadcast(mythic_text(g.user["username"], mythic, enemy_id), mythic_kind, g.user["username"])
@@ -398,7 +430,7 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
                             g.user["username"], slot, class_id, mythic, enemy_id, game_id)
         db.commit()
         return {"ok": True, "game": game_id, "enemy_id": enemy_id, "boss": boss,
-                "added": rewards["contents"], "cut": cut, "used": used,
+                "added": contents, "cut": cut, "used": used, "held_back": held,
                 "chest_id": "chest:%s:%d" % (game_id, slot),
                 "mythic": mythic, "pet_won": bool(rewards.get("pet_won"))}, 200
 

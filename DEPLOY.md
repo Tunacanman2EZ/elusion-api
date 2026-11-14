@@ -764,7 +764,13 @@ a botched resize, a compromised box: the nightly copies in
    ```
 
    The first line lists the copies newest first; the second fetches one into
-   the folder you are in (Windows has both commands built in). The folder is
+   the folder you are in (Windows has both commands built in). Fetch
+   `elusion-deleted-accounts.txt` from the same folder with it: it is the
+   list of accounts players deleted (14 Nov). **Restoring** a copy on a new
+   machine, put it beside the database as `elusion.db.deleted` - a server
+   starting on that copy empties again every account on it, so nobody who
+   deleted their account comes back with an old backup. On the same machine
+   the live list is already there; nothing to do. The folder is
    mode 700 and `elusion`'s, so root can read it and no other user can. Treat the
    copy like the database it is: real password hashes, never in a repo, never
    in a synced folder you share.
@@ -928,6 +934,33 @@ the game's word, as before.
 defaults already do. This is the standing watch over **E-3** (below): combat is
 server-observed since 0.10.0, and the weekly digest's WATCHED pile is what
 decides when the server starts refusing kills its count does not back up.
+
+### Holding moves to a walk (0.157.0)
+
+Where a player stands is what their game says, so a modified game could hop
+across an area on everyone else's screen. Since 0.157.0 presence.py can pass
+on each step only as far as the character could have walked - **HELD TO A
+WALK**, `ELUSION_HOLD_MOVES` in `/etc/elusion/elusion.env`. It ships **off**.
+Staff, the party-only rooms (the Endless, the Healer's Run, the Descent), a
+rebuilt world and a staff teleport are never held. Before switching it on,
+see where the books wrote down a jump or a too-quick walk in the last two
+weeks:
+
+```
+ssh root@api.elusionrpg.com "sudo -u elusion /opt/elusion/venv/bin/python /opt/elusion/api/killwatch.py --db /var/lib/elusion/elusion.db --moves --days 14"
+```
+
+Each line is an area, a kind, how many flags and how many players. A place
+where honest play jumps shows up as many players in one area (a door or a
+ladder that moves its player inside the area, say) - send me the lines before
+switching on, and it gets its own free rule. A handful of flags on one player
+is what the hold is for. When it looks clean:
+
+1. `sudo nano /etc/elusion/elusion.env` and add the line `ELUSION_HOLD_MOVES=on`.
+2. `sudo systemctl restart elusion-presence`.
+
+Off again is the same two steps with `off`, and safe at any time: steps are
+passed on as the game says, as before.
 
 ---
 

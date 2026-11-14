@@ -88,6 +88,7 @@ import argparse
 import os
 import sqlite3
 import sys
+import time
 
 # gamedata carries placed_count (how many of each enemy exist), max_hp (which
 # enemies are bosses) and grants_rewards (which cannot be killed for profit). It
@@ -589,6 +590,40 @@ def _rank(dossier):
     return sorted(dossier.items(), key=key)
 
 
+# THE MOVES THE BOOKS WROTE DOWN (14 Nov), for presence.py's HELD TO A WALK:
+# before ELUSION_HOLD_MOVES is switched on, which areas honest play "jumps" or
+# walks "too_quick" in - a place where the game moves its player on purpose
+# shows up here as many players, a cheat as one. --moves prints them and
+# nothing else.
+MOVE_KINDS = ("jumped", "too_quick")
+
+
+def moves_by_area(con, days=14, now=None):
+    """[(area, kind, flags, players, newest detail)], most flags first, from
+    combat_flags over the last `days` days. [] without the table."""
+    if not _has_table(con, "combat_flags"):
+        return []
+    since = int(now if now is not None else time.time()) - int(days) * 86400
+    marks = ",".join("?" * len(MOVE_KINDS))
+    rows = con.execute(
+        "SELECT area, kind, SUM(count), COUNT(DISTINCT user_id),"
+        " (SELECT f2.detail FROM combat_flags f2 WHERE f2.area = f.area AND f2.kind = f.kind"
+        "  ORDER BY f2.last_at DESC LIMIT 1)"
+        " FROM combat_flags f WHERE kind IN (%s) AND last_at >= ? GROUP BY area, kind" % marks,
+        MOVE_KINDS + (since,)).fetchall()
+    return sorted(((str(r[0]), str(r[1]), int(r[2] or 0), int(r[3] or 0), str(r[4] or "")) for r in rows),
+                  key=lambda r: (-r[2], r[0], r[1]))
+
+
+def moves_lines(rows, days=14):
+    if not rows:
+        return ["moves: no jump or too-quick walk written down in %d days" % days]
+    lines = ["moves, last %d days (area, kind, flags, players, the newest):" % days]
+    for area, kind, flags, players, detail in rows:
+        lines.append("  %-16s %-9s %6d  %4d player(s)  %s" % (area or "-", kind, flags, players, detail))
+    return lines
+
+
 def main():
     ap = argparse.ArgumentParser(description="Read-only watch over claimed kills (E-3).")
     ap.add_argument("--db", default=os.environ.get("ELUSION_DB", "elusion.db"),
@@ -603,11 +638,25 @@ def main():
                     help="print nothing unless an IMPOSSIBLE (alarm) finding exists")
     ap.add_argument("--days", type=int, default=RECEIPTS_DAYS,
                     help="how many days the receipts line measures (default %d)" % RECEIPTS_DAYS)
+    ap.add_argument("--moves", action="store_true",
+                    help="print the jumps and too-quick walks the books wrote down, by area, and nothing else")
     args = ap.parse_args()
 
     if not os.path.exists(args.db):
         print("[KILLWATCH] FAIL: no database at %s" % args.db, file=sys.stderr)
         sys.exit(2)
+
+    if args.moves:
+        con = sqlite3.connect("file:%s?mode=ro" % args.db, uri=True)
+        try:
+            for line in moves_lines(moves_by_area(con, days=args.days), days=args.days):
+                print(line)
+        except sqlite3.Error as exc:
+            print("[KILLWATCH] FAIL: could not read the database: %s" % exc, file=sys.stderr)
+            sys.exit(2)
+        finally:
+            con.close()
+        sys.exit(0)
 
     con = sqlite3.connect("file:%s?mode=ro" % args.db, uri=True)
     try:

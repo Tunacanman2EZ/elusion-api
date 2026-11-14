@@ -335,6 +335,117 @@ old.execute("DELETE FROM users WHERE id = 2")
 check("  and an account that goes takes its rows with it now",
       old.execute("SELECT COUNT(*) FROM ignores").fetchone()[0] == 0)
 
+# =============================================================================
+section("AD-5  a restored backup does not bring a deleted account back (14 Nov)")
+# THE LIST BESIDE THE DATABASE: every deletion is a line - id, made, deleted -
+# and a server started on a restored copy empties again whoever is on it.
+check("services: a line is three whole numbers; a torn or strange one is passed over",
+      services.list_line(7, 100, 200) == "7 100 200\n"
+      and services.parse_list("7 100 200\n8 5\nx y z\n9 300 400\n10 1") == {7: 100, 9: 300}
+      and services.parse_list("") == {}
+      and services.deleted_list_path("/srv/elusion.db") == "/srv/elusion.db" + services.DELETED_SUFFIX)
+
+LIST_PATH = services.deleted_list_path(DB_PATH)
+before_list = del_data.read_list(LIST_PATH)
+back_token = register("comeback")
+character(back_token, 0, "warrior")
+back_id = uid("comeback")
+mint(back_id, 0, 900)
+friend_token = register("staysput")
+character(friend_token, 0, "mage")
+friend_id = uid("staysput")
+made = int(one("SELECT created_at FROM users WHERE id = ?", (back_id,)))
+now0 = int(time.time())
+# A guild "comeback" leads with "staysput" in it, and a trade open between
+# them - which the route would refuse, but a backup can hold.
+sql("INSERT INTO guilds (name, folded, founded_by, created_at) VALUES ('Backers', 'backers', 'comeback', ?)", (now0,))
+guild_id = int(one("SELECT id FROM guilds WHERE folded = 'backers'"))
+sql("INSERT INTO guild_members (user_id, guild_id, rank, joined_at) VALUES (?, ?, 'leader', ?), (?, ?, 'member', ?)",
+    (back_id, guild_id, now0 - 10, friend_id, guild_id, now0 - 5))
+
+# THE NIGHT'S BACKUP, taken while "comeback" was whole.
+RESTORED = os.path.join(testdir.PATH, "elusion_accountdelete_restored.db")
+for leftover in (RESTORED, RESTORED + services.DELETED_SUFFIX):
+    if os.path.exists(leftover):
+        os.remove(leftover)
+live = sqlite3.connect(DB_PATH)
+copy = sqlite3.connect(RESTORED)
+live.backup(copy)
+copy.execute("UPDATE guild_members SET rank = 'leader' WHERE user_id = ?", (back_id,))
+copy.execute("INSERT INTO trades (trade_id, a_user, a_slot, b_user, b_slot, state, created_at, updated_at)"
+             " VALUES ('t-restored', ?, 0, ?, 0, 'open', ?, ?)", (back_id, friend_id, now0, now0))
+copy.commit()
+copy.close()
+live.close()
+
+# Now the live server: "comeback" hands the guild on (the route asks it) and
+# deletes the account.
+sql("UPDATE guild_members SET rank = 'member' WHERE user_id = ?", (back_id,))
+sql("UPDATE guild_members SET rank = 'leader' WHERE user_id = ?", (friend_id,))
+res = delete(back_token, "comeback")
+check("the deletion itself is as before", res.status_code == 200 and res.get_json()["deleted"] is True,
+      res.get_json())
+listed_now = services.parse_list(del_data.read_list(LIST_PATH))
+check("  and it is a line on the list beside the database: its id and the second it was made",
+      listed_now.get(back_id) == made and len(listed_now) == len(services.parse_list(before_list)) + 1,
+      listed_now)
+check("  with no name in it", "comeback" not in del_data.read_list(LIST_PATH))
+
+# THE RESTORE: the night's copy, with the list beside it, and a server started
+# on it. A line for an id whose row was made at another second (somebody
+# else, in a world where ids could be reused) must not touch that row.
+with open(RESTORED + services.DELETED_SUFFIX, "w", encoding="ascii") as handle:
+    handle.write(del_data.read_list(LIST_PATH))
+    handle.write(services.list_line(friend_id, made - 1000, now0))
+
+
+def restored(statement, args=()):
+    conn = sqlite3.connect(RESTORED)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(statement, args).fetchall()
+    finally:
+        conn.close()
+
+
+check("the restored copy holds the account whole, as a backup would",
+      restored("SELECT deleted_at FROM users WHERE id = ?", (back_id,))[0]["deleted_at"] == 0
+      and restored("SELECT COUNT(*) AS n FROM saves WHERE user_id = ?", (back_id,))[0]["n"] == 1)
+os.environ["ELUSION_DB"] = os.path.join(testdir.PATH, "elusion_accountdelete_restored.db")
+spec_again = importlib.util.spec_from_file_location("elusion_app_restored", os.path.join(HERE, "app.py"))
+app_again = importlib.util.module_from_spec(spec_again)
+spec_again.loader.exec_module(app_again)
+os.environ["ELUSION_DB"] = DB_PATH
+gone_row = restored("SELECT username, deleted_at, password_hash FROM users WHERE id = ?", (back_id,))[0]
+check("a server started on it empties the account again: the name a stand-in, no password",
+      gone_row["deleted_at"] > 0 and gone_row["username"] == services.stand_in_name(back_id)
+      and gone_row["password_hash"] == "!", dict(gone_row))
+check("  every character gone", restored("SELECT COUNT(*) AS n FROM saves WHERE user_id = ?", (back_id,))[0]["n"] == 0)
+conn = sqlite3.connect(RESTORED)
+conn.row_factory = sqlite3.Row
+try:
+    supply_again = app_again.gold_supply(conn)
+finally:
+    conn.close()
+check("  its gold burned through the ledger, so the supply still adds up",
+      restored("SELECT COALESCE(SUM(delta), 0) AS d FROM gold_ledger WHERE user_id = ? AND reason = ?",
+               (back_id, services.DELETE_REASON))[0]["d"] == -900
+      and supply_again["balanced"] is True, supply_again)
+check("  the guild it led handed to the member there longest, not left without a leader",
+      [tuple(r) for r in restored("SELECT user_id, rank FROM guild_members WHERE guild_id = ?", (guild_id,))]
+      == [(friend_id, "leader")])
+check("  the trade the backup held open, called off",
+      restored("SELECT state FROM trades WHERE trade_id = 't-restored'")[0]["state"] == "cancelled")
+check("  and the staff log says why",
+      any(services.AGAIN_REASON in str(r["detail"]) for r in restored(
+          "SELECT detail FROM staff_actions WHERE action = 'account_deleted' AND target_id = ?", (back_id,))))
+check("a line whose second does not match its row touches nobody",
+      restored("SELECT deleted_at FROM users WHERE id = ?", (friend_id,))[0]["deleted_at"] == 0
+      and restored("SELECT COUNT(*) AS n FROM saves WHERE user_id = ?", (friend_id,))[0]["n"] == 1)
+check("started again, there is nobody left to delete", app_again._delete_again_after_restore() == [])
+check("on the live database the list belongs to, the start found nobody",
+      app_module._delete_again_after_restore() == [])
+
 print("\n=== %d passed, %d failed ===" % (passed, failed))
 if failures:
     print("\nfailed:")

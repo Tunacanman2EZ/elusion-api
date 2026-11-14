@@ -82,7 +82,7 @@ def register(app, *, require_auth, require_owner, require_role, require_fresh_pa
              levelup_grant_id, log_staff_action, valid_skills, max_skill_level, stack_limit, add_to_backpack,
              bag_cells, inventory_of, mark_gift, online_window, gifts_since_key, snapshots_kept, snapshot_every,
              find_open_trade, carry_cells, owns_item, has_owner_powers, queue_teleport, teleport_spacing,
-             post_broadcast, moderation_target, note_refill):
+             post_broadcast, moderation_target, note_refill, held_elsewhere=None, held_by=None):
 
     def staff_gold():
         """
@@ -883,9 +883,25 @@ def register(app, *, require_auth, require_owner, require_role, require_fresh_pa
         undo = take_snapshot(db, user_id, slot, "before-rollback")
         now = int(time.time())
 
-        data.restore_cells_and_skills(db, user_id, slot,
-                                      services.carried_rows(state, carry_cells),
-                                      services.skill_rows(state))
+        # A ROLLBACK HOLDS BACK WHAT WENT ELSEWHERE (services.py, 0.157.0): an
+        # item lost since the snapshot comes back only as far as it did not go
+        # to the bank, another character or another account. A snapshot from
+        # before 0.157.0 does not know where things were, and puts back what it
+        # held, as it always did - the answer says which.
+        rows = services.carried_rows(state, carry_cells)
+        equipment = state.get("equipment", {}) if isinstance(state.get("equipment"), dict) else {}
+        holds = {}
+        knew_where = isinstance(state.get("elsewhere"), dict) and held_elsewhere is not None and held_by is not None
+        if knew_where:
+            snap_held = held_by(state)
+            holds = services.held_back(snap_held, held_by(was), state["elsewhere"],
+                                       held_elsewhere(db, user_id, slot, snap_held),
+                                       data.traded_out(db, user_id, int(snap["taken_at"]), snap_held))
+            rows, equipment = services.without_held(rows, equipment, holds)
+        held_words = services.held_back_words(
+            holds, lambda item_id: str((catalogue.item_row(item_id) or {}).get("name") or item_id))
+
+        data.restore_cells_and_skills(db, user_id, slot, rows, services.skill_rows(state))
 
         # THE PURSE THROUGH THE LEDGER, by the difference, never written outright.
         gold_now = int(row["gold"] or 0)
@@ -899,7 +915,6 @@ def register(app, *, require_auth, require_owner, require_role, require_fresh_pa
         pet = str(state.get("active_pet_id", "") or "")
         if pet and not owns_item(user_id, slot, pet):
             pet = ""
-        equipment = state.get("equipment", {}) if isinstance(state.get("equipment"), dict) else {}
         level = max(1, int(state.get("level", 1)))
         data.put_back(db, user_id, slot, level, max(0, int(state.get("xp", 0))),
                       int(catalogue.xp_needed_for_level(level)), json.dumps(equipment), pet, now)
@@ -916,12 +931,14 @@ def register(app, *, require_auth, require_owner, require_role, require_fresh_pa
         log_staff_action(
             g.user, "rollback", target["username"], user_id,
             "%s (slot %d) to snapshot #%d of %s UTC: level %d -> %d, gold %d -> %d, %d -> %d"
-            " carried; undo is #%s; %d session(s) ended" % (
+            " carried; undo is #%s; %d session(s) ended%s" % (
                 row["name"], slot, snapshot_id,
                 time.strftime("%Y-%m-%d %H:%M", time.gmtime(int(snap["taken_at"]))),
                 was["level"], after["level"], was["gold"], after["gold"],
                 len(was["carry"]), len(after["carry"]),
-                undo if undo is not None else "-", ended),
+                undo if undo is not None else "-", ended,
+                "; held back, gone elsewhere since: %s" % held_words if held_words else
+                ("" if knew_where else "; an older snapshot: items given away since may now be twice")),
         )
         db.commit()
 
@@ -936,6 +953,12 @@ def register(app, *, require_auth, require_owner, require_role, require_fresh_pa
             "now": {"level": after["level"], "gold": after["gold"], "items": len(after["carry"])},
             "pet_cleared": bool(state.get("active_pet_id")) and pet == "",
             "sessions_ended": ended,
+            # 0.157.0: what was not put back because it went to the bank,
+            # another character or another account since; and whether the
+            # snapshot could tell (one from before 0.157.0 cannot).
+            "held_back": [{"item_id": i, "quantity": n} for i, n in sorted(holds.items())],
+            "held_back_words": held_words,
+            "knew_where": knew_where,
         }, 200
 
 

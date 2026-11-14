@@ -35,6 +35,7 @@ SCHEMA = """
             boss      INTEGER NOT NULL DEFAULT 0,
             at        INTEGER NOT NULL,
             pet       INTEGER NOT NULL DEFAULT 0,
+            gold      INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
 
@@ -90,3 +91,7 @@ def upgrade(db, add_column):
     Forge lets one through a day (minigames/routes.py). Every kill before it
     won none as far as the rule is concerned, which is what the default says."""
     add_column(db, "minigame_kills", "pet", "INTEGER NOT NULL DEFAULT 0")
+    # minigame_kills.gold (14 Nov, A DAY'S MINIGAME GOLD): what the coins a
+    # kill rolled into the chest are worth, counted against the day's cap. A
+    # kill from before counted nothing, which is what the default says.
+    add_column(db, "minigame_kills", "gold", "INTEGER NOT NULL DEFAULT 0")

@@ -31,8 +31,15 @@ game's own "Sure?". Refused while an open trade names the account (409), while
 it leads a guild with other members in it (409: hand it on first, as leaving
 would ask), and for the owner and the co-owners (403).
 
+KEPT DELETED (14 Nov): each deletion is also a line in a list beside the
+database (services.py, THE LIST THAT OUTLIVES A RESTORE), and register()
+answers `again(db, now)`, which app.py runs as a server starts: an account
+on the list that a restored backup brought back is emptied again.
+
 Built like clienterrors/: routes.py (the edge), services.py (pure), data.py
-(the SQL). It never imports app.py: register() is handed what it needs.
+(the SQL, and the list's file). It never imports app.py: register() is
+handed what it needs.
 """
+from . import data, services  # noqa: F401
 from .routes import register  # noqa: F401
 from .services import DELETE_REASON, STAND_IN_PREFIX, stand_in_name  # noqa: F401

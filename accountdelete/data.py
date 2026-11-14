@@ -5,7 +5,12 @@ caller's own, from the token), so nothing here can reach anybody else's rows -
 except the four places that are about two people: friends, ignores and party
 invitations (either side), and the names taken out of the staff log, the
 reports, the guild's history and the gifts ledger.
+
+And the one file that is not the database: the list of deleted accounts
+kept beside it (services.py, THE LIST THAT OUTLIVES A RESTORE) - remember()
+adds a line, read_list() reads it back.
 """
+import os
 
 # Rows that are the player's and go, by user_id - in an order where nothing
 # deleted later still points at something deleted earlier. loot_bag_items go
@@ -110,3 +115,61 @@ def empty(db, user_id, old_name, stand_in, now):
 def is_deleted(db, user_id):
     row = db.execute("SELECT deleted_at FROM users WHERE id = ?", (user_id,)).fetchone()
     return row is not None and int(row["deleted_at"] or 0) > 0
+
+
+def made_at(db, user_id):
+    """When the account was made, or None for no such row."""
+    row = db.execute("SELECT created_at FROM users WHERE id = ?", (user_id,)).fetchone()
+    return int(row["created_at"]) if row is not None else None
+
+
+def whole_again(db, listed):
+    """The listed accounts that are whole in this database - not emptied, and
+    made at the very second the list says: [(id, username)]. On a database
+    the list belongs to, none."""
+    back = []
+    for user_id, created_at in sorted(listed.items()):
+        row = db.execute("SELECT id, username, created_at, deleted_at FROM users WHERE id = ?",
+                         (user_id,)).fetchone()
+        if row is not None and int(row["deleted_at"] or 0) == 0 and int(row["created_at"]) == created_at:
+            back.append((int(row["id"]), str(row["username"])))
+    return back
+
+
+def call_off_trades(db, user_id, now):
+    """An open trade naming them, called off - as it would lapse. Only a
+    restored account can be in one when it goes; the route refuses."""
+    db.execute("UPDATE trades SET state = 'cancelled', updated_at = ?"
+               " WHERE state = 'open' AND (a_user = ? OR b_user = ?)", (now, user_id, user_id))
+
+
+def hand_on_guild(db, guild_id, user_id):
+    """Their guild to the member there longest, when they led it with others
+    in it. Only a restored account can; the route asks the leader to hand it
+    on first."""
+    heir = db.execute("SELECT user_id FROM guild_members WHERE guild_id = ? AND user_id != ?"
+                      " ORDER BY joined_at, user_id LIMIT 1", (guild_id, user_id)).fetchone()
+    if heir is not None:
+        db.execute("UPDATE guild_members SET rank = 'leader' WHERE user_id = ?", (heir["user_id"],))
+
+
+def remember(path, line):
+    """One line on the end of the list, on the disk before the deletion
+    commits: a crash between the two leaves an account deleted at the next
+    start that its owner had asked to delete, never the other way round."""
+    handle = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(handle, line.encode("ascii"))
+        os.fsync(handle)
+    finally:
+        os.close(handle)
+
+
+def read_list(path):
+    """The list's text, or "" when there is none yet."""
+    try:
+        with open(path, encoding="ascii", errors="replace") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return ""
+

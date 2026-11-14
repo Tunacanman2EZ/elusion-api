@@ -394,3 +394,66 @@ def best_believed(seconds_said, since_go):
     """How long a run is believed to have held: what it says, no longer than
     the time since the Go, nor FORGE_BEST_MOST."""
     return max(0, min(int(seconds_said), int(since_go), FORGE_BEST_MOST))
+
+
+# =============================================================================
+# A DAY'S MINIGAME GOLD (14 Nov)
+# =============================================================================
+# The owner: "lets fix issues in security", choosing a cap of 100,000. A
+# minigame is played on the player's machine and the server believes its
+# result as far as the time since its Go allows (SECURITY_NOTES E-22): a
+# modified game could claim the best run every time - 20,000 a Healer's Run
+# and 24,250 a Cut the Cloth, three of each a day, and every coin the
+# Endless's and the Forge's chests could roll. So one allowance an account
+# across all of them, in any 24 hours: the gold paid at Leave and the coins
+# rolled into a chest, counted together. A run past it is paid what is left;
+# a chest past it rolls its gear and no coins. A good honest day is well under
+# it; a perfect day at both gold games is 132,750 before any chest.
+#
+# ELUSION_MINIGAME_GOLD_DAY sets it on a server (envfile.KNOWN): a whole
+# number, 0 for no cap. Unset or not a number is GOLD_A_DAY - a typo never
+# switches the cap off.
+GOLD_A_DAY = 100000
+
+
+def gold_a_day(raw):
+    """The cap from the setting's text."""
+    text = str(raw if raw is not None else "").strip()
+    if text.isascii() and text.isdigit():
+        return int(text)
+    return GOLD_A_DAY
+
+
+def gold_allowed(want, paid_today, cap):
+    """(paid, held back): `want` gold, of which only what is left of the day's
+    `cap` after `paid_today`. A cap of 0 is none."""
+    want = max(0, int(want))
+    if int(cap) <= 0:
+        return want, 0
+    paid = min(want, max(0, int(cap) - int(paid_today)))
+    return paid, want - paid
+
+
+def coins_within(contents, worth, left):
+    """A chest's roll held to `left` gold: (contents kept, gold kept, gold
+    held back). `worth(item_id)` is the gold one of an item cashes into, 0 for
+    anything that is not gold - gear, materials, pets and lusions pass
+    untouched. Coins are kept in the order rolled, as many of each as fit;
+    `left` None is no cap."""
+    kept, gold, held = [], 0, 0
+    room = None if left is None else max(0, int(left))
+    for entry in contents:
+        per = int(worth(str(entry.get("item_id", ""))) or 0)
+        quantity = int(entry.get("quantity", 0))
+        if per <= 0:
+            kept.append(entry)
+            continue
+        fit = quantity if room is None else min(quantity, room // per)
+        if fit > 0:
+            kept.append(dict(entry, quantity=fit))
+            gold += fit * per
+            if room is not None:
+                room -= fit * per
+        held += (quantity - fit) * per
+    return kept, gold, held
+

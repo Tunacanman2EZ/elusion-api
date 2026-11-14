@@ -236,3 +236,22 @@ def clear_teleport(db, user_id, teleport_id):
         (user_id, teleport_id),
     )
     return cursor.rowcount > 0
+
+
+def traded_out(db, user_id, since, ids):
+    """{item_id: count} of `ids` the account's characters gave other accounts
+    in trades finished since `since` (A ROLLBACK HOLDS BACK WHAT WENT
+    ELSEWHERE, services.py)."""
+    counts = {str(item_id): 0 for item_id in ids}
+    if not counts:
+        return counts
+    marks = ",".join("?" * len(counts))
+    for r in db.execute(
+            "SELECT ti.item_id, SUM(ti.quantity) AS n FROM trade_items ti JOIN trades t ON t.trade_id = ti.trade_id"
+            " WHERE t.state = 'done' AND t.updated_at >= ? AND ti.item_id IN (%s)"
+            " AND ((ti.side = 'a' AND t.a_user = ?) OR (ti.side = 'b' AND t.b_user = ?))"
+            " GROUP BY ti.item_id" % marks,
+            (int(since),) + tuple(counts) + (int(user_id), int(user_id))):
+        counts[r["item_id"]] += int(r["n"] or 0)
+    return counts
+

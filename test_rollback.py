@@ -37,7 +37,7 @@ player's bag. SAVE SNAPSHOTS AND ROLLBACK in app.py.
         as "give", about the player.
   GV-6  A TRADE'S RESULT WINS THE FLAG, and the gift list is short.
 """
-import importlib.util, json, os, sqlite3, sys
+import importlib.util, json, os, sqlite3, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import testdir  # noqa: E402  (a private folder per run - testdir.py)
@@ -211,10 +211,11 @@ save(alice, 0, "warrior")
 save(alice, 0, "warrior")
 check("an unchanged character takes none, however long it has been",
       len(snapshots_of(me, 0)) == 2, len(snapshots_of(me, 0)))
-check("a snapshot is the character, not a whole save row: no area, no map, no pools",
+check("a snapshot is the character, not a whole save row: no area, no map, no pools"
+      " (and, since 0.157.0, where else the account held its items)",
       set(json.loads(snapshots_of(me, 0)[0]["snapshot"])) ==
       {"class_id", "name", "level", "xp", "xp_to_next", "gold", "active_pet_id",
-       "equipment", "carry", "skills"},
+       "equipment", "carry", "skills", "elsewhere"},
       sorted(json.loads(snapshots_of(me, 0)[0]["snapshot"])))
 
 
@@ -316,10 +317,10 @@ then_bag = bag(cid, 0)
 client.get("/api/account", headers=bearer(carol))
 raw("INSERT OR IGNORE INTO accounts (user_id) VALUES (?)", (cid,))
 raw("UPDATE accounts SET lusions = 7 WHERE user_id = ?", (cid,))
-raw("INSERT INTO bank_items (user_id, position, item_id, quantity) VALUES (?, 0, ?, 1)", (cid, SWORD))
+raw("INSERT INTO bank_items (user_id, position, item_id, quantity) VALUES (?, 0, 'ironhelm', 1)", (cid,))
 raw("DELETE FROM carry_items WHERE user_id = ? AND slot = 0", (cid,))
 put_cell(cid, 0, 2, "ironhelm", 1)
-put_cell(cid, 1, 0, POTION, 9)
+put_cell(cid, 1, 0, "tinyhealthpotion", 9)
 raw("UPDATE skills SET level = 12 WHERE user_id = ? AND slot = 0 AND skill_id = 'attack'", (cid,))
 raw("INSERT OR REPLACE INTO skills (user_id, slot, skill_id, level, xp) VALUES (?, 0, 'cooking', 3, 5)", (cid,))
 raw("UPDATE saves SET level = 18, xp = 5, equipment = '{}', area = 'cave', explored = ? WHERE user_id = ? AND slot = 0",
@@ -343,7 +344,7 @@ check("  the pet that was out, which is still in the bag", row["active_pet_id"] 
 check("the area and the map are where she is now, not where she was",
       row["area"] == "cave" and "cave" in json.loads(row["explored"]), (row["area"], row["explored"]))
 check("the bank is the account's and untouched",
-      [(r2["item_id"]) for r2 in raw("SELECT item_id FROM bank_items WHERE user_id = ?", (cid,))] == [SWORD])
+      [(r2["item_id"]) for r2 in raw("SELECT item_id FROM bank_items WHERE user_id = ?", (cid,))] == ["ironhelm"])
 check("  and so are the lusions", one("SELECT lusions FROM accounts WHERE user_id = ?", (cid,)) == 7)
 check("  and her other character", bag(cid, 1) == mage_bag, bag(cid, 1))
 check("the answer says what it was and what it is", out.get("was", {}).get("level") == 18
@@ -680,6 +681,85 @@ check("gifts pile up in one flag, the newest %d of them" % app_module.GIFTS_KEPT
       and len(json.loads(marker[len(app_module.GIFT_MARK):])) == app_module.GIFTS_KEPT, marker)
 check("a garbled flag reads as no gifts, not a crash", app_module._gifts_in("gift:{nope") == []
       and app_module._gifts_in("gift:{}") == [] and app_module._gifts_in(None) == [])
+# =============================================================================
+section("RB-11  what went elsewhere since is held back, not put back twice (0.157.0)")
+# =============================================================================
+check("services: held back is the smaller of what she lost and what went somewhere that keeps it",
+      app_module.ownertools_package.services.held_back(
+          {"a": 1, "b": 5, "c": 1}, {"b": 2}, {"a": 0, "b": 4, "c": 0}, {"a": 1, "b": 6, "c": 0}, {"c": 1})
+      == {"a": 1, "b": 2, "c": 1})
+check("  taken from the carried cells, the last first, then from what is worn",
+      app_module.ownertools_package.services.without_held(
+          [(0, "p", 3), (4, "p", 2), (6, "s", 1)], {"amulet": "s", "weapon": "x"}, {"p": 3, "s": 2})
+      == ([(0, "p", 2)], {"weapon": "x"}))
+dave = register("rbdave")
+make(dave, 0, "warrior")
+make(dave, 1, "mage")
+did = uid("rbdave")
+erin = register("rberin")
+make(erin, 0, "warrior")
+eid = uid("rberin")
+put_cell(did, 0, 0, "relicblade", 1)     # banked later
+put_cell(did, 0, 1, "relicaxe", 1)       # handed to the mage later
+put_cell(did, 0, 2, "relicbow", 1)       # traded to erin2 later
+put_cell(did, 0, 3, POTION, 5)           # three drunk later
+put_cell(did, 0, 4, "relicstaff", 1)     # sold later
+put_cell(did, 1, 0, POTION, 4)           # the mage's own potions
+raw("UPDATE saves SET equipment = ? WHERE user_id = ? AND slot = 0", (json.dumps({"amulet": "relicamulet"}), did))
+save(dave, 0, "warrior")
+snap = snapshots_of(did, 0)[0]
+held_then = json.loads(snap["snapshot"])["elsewhere"]
+check("the snapshot keeps where else the account held her items then",
+      held_then.get(POTION) == 4 and held_then.get("relicblade") == 0, held_then)
+# Then: the blade and the amulet into the bank, the axe to the mage, the bow
+# traded to erin2, three potions drunk, the staff sold - and the mage finds
+# two potions of her own.
+raw("DELETE FROM carry_items WHERE user_id = ? AND slot = 0", (did,))
+put_cell(did, 0, 3, POTION, 2)
+raw("UPDATE saves SET equipment = '{}' WHERE user_id = ? AND slot = 0", (did,))
+raw("INSERT OR IGNORE INTO accounts (user_id) VALUES (?)", (did,))
+raw("INSERT INTO bank_items (user_id, position, item_id, quantity) VALUES (?, 0, 'relicblade', 1), (?, 1, 'relicamulet', 1)",
+    (did, did))
+put_cell(did, 1, 1, "relicaxe", 1)
+put_cell(did, 1, 0, POTION, 6)
+now0 = int(time.time())
+raw("INSERT INTO trades (trade_id, a_user, a_slot, b_user, b_slot, state, created_at, updated_at)"
+    " VALUES ('rb11', ?, 0, ?, 0, 'done', ?, ?)", (did, eid, now0, now0))
+raw("INSERT INTO trade_items (trade_id, side, item_id, quantity) VALUES ('rb11', 'a', 'relicbow', 1)")
+put_cell(eid, 0, 0, "relicbow", 1)
+r = rollback(boss, "rbdave", snap["id"])
+out = r.get_json() or {}
+check("the owner rolls dave back", r.status_code == 200, (r.status_code, out))
+check("  what he used up or sold comes back (the purse goes back with a sale)",
+      (3, POTION, 3) in bag(did, 0) and (4, "relicstaff", 1) in bag(did, 0), bag(did, 0))
+check("  what went to the bank, to his mage and to another player does not: no second copies",
+      not any(cell[1] in ("relicblade", "relicaxe", "relicbow") for cell in bag(did, 0))
+      and json.loads(raw("SELECT equipment FROM saves WHERE user_id = ? AND slot = 0", (did,))[0]["equipment"]) == {},
+      (bag(did, 0), raw("SELECT equipment FROM saves WHERE user_id = ? AND slot = 0", (did,))[0]["equipment"]))
+check("  another character's new potions look like his: fewer come back, never more",
+      dict((c[1], c[2]) for c in bag(did, 0)).get(POTION) == 3, bag(did, 0))
+check("  each still where it went", one("SELECT COUNT(*) FROM bank_items WHERE user_id = ?", (did,)) == 2
+      and (1, "relicaxe", 1) in bag(did, 1) and (0, "relicbow", 1) in bag(eid, 0))
+check("the answer and the log say what was held back",
+      sorted((h["item_id"], h["quantity"]) for h in out.get("held_back", [])) ==
+      [(POTION, 2), ("relicamulet", 1), ("relicaxe", 1), ("relicblade", 1), ("relicbow", 1)]
+      and out.get("knew_where") is True
+      and "held back, gone elsewhere since" in one(
+          "SELECT detail FROM staff_actions WHERE action = 'rollback' AND target_id = ? ORDER BY id DESC LIMIT 1",
+          (did,)), out)
+# A snapshot from before 0.157.0 does not know where things were: it puts
+# back what it held, as it always did, and says so.
+old_state = json.loads(snap["snapshot"])
+del old_state["elsewhere"]
+raw("UPDATE save_snapshots SET snapshot = ? WHERE id = ?", (json.dumps(old_state), snap["id"]))
+raw("DELETE FROM carry_items WHERE user_id = ? AND slot = 0", (did,))
+out = rollback(boss, "rbdave", snap["id"]).get_json() or {}
+check("an older snapshot puts back all it held, and the answer and log say it could not tell",
+      (0, "relicblade", 1) in bag(did, 0) and out.get("knew_where") is False and out.get("held_back") == []
+      and "an older snapshot" in one(
+          "SELECT detail FROM staff_actions WHERE action = 'rollback' AND target_id = ? ORDER BY id DESC LIMIT 1",
+          (did,)), out)
+
 check("the supply balanced at the end", supply()["balanced"], supply())
 
 

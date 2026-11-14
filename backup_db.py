@@ -94,6 +94,40 @@ def make_backup(src_path, out_dir):
     return dest_path
 
 
+# THE LIST OF DELETED ACCOUNTS (14 Nov) lives beside the database
+# (accountdelete/, THE LIST THAT OUTLIVES A RESTORE): a server started on a
+# restored copy empties again every account on it. It is not inside the
+# copy - that is the point - so each night the newest list is copied into
+# the backup folder too, under one name (it only ever grows, so the newest
+# serves every copy). A server restored on a new machine from this folder
+# puts it back beside the database: DEPLOY.md, "Restoring".
+DELETED_SUFFIX = ".deleted"
+
+
+def deleted_list_name(base):
+    return "%s-deleted-accounts.txt" % base
+
+
+def copy_deleted_list(src_path, out_dir):
+    """The live list, copied into out_dir whole (a temporary file, then a
+    rename, so a copy is never half a list). Answers how many accounts are
+    on it, or None for no list yet."""
+    src = str(src_path) + DELETED_SUFFIX
+    try:
+        with open(src, "rb") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        return None
+    base = os.path.splitext(os.path.basename(src_path))[0] or "elusion"
+    dest = os.path.join(out_dir, deleted_list_name(base))
+    with open(dest + ".tmp", "wb") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(dest + ".tmp", dest)
+    return sum(1 for line in text.splitlines() if line.strip())
+
+
 def is_wal_file(path):
     """True if the file's header says WAL. Read from the bytes, not by opening it
     with SQLite, because opening a WAL database is what creates the sidecars."""
@@ -252,12 +286,15 @@ def main():
         sys.exit(1)
 
     base = os.path.splitext(os.path.basename(args.db))[0] or "elusion"
+    listed = copy_deleted_list(args.db, args.out)
     removed, kept = prune(args.out, base, args.keep)
     settled, swept = tidy(args.out, base)
 
     print("[BACKUP] OK  %s  (%s, %s)  in %.1fs"
           % (dest, human(os.path.getsize(dest)), detail, time.time() - started))
     print("[BACKUP] retention: %d kept, %d pruned (keep=%d)" % (kept, removed, args.keep))
+    if listed is not None:
+        print("[BACKUP] deleted accounts: the list of %d copied beside the backups" % listed)
     if settled or swept:
         print("[BACKUP] tidied: older copies made single files: %d, leftover "
               "-wal/-shm files removed: %d" % (settled, swept))

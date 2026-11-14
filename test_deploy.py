@@ -535,6 +535,22 @@ check("the command a cron runs exits 0 and says OK",
 check("and leaves exactly one file in the folder",
       len(os.listdir(cli_out)) == 1 and os.listdir(cli_out)[0].endswith(".db"),
       os.listdir(cli_out))
+# THE LIST OF DELETED ACCOUNTS (14 Nov) goes with the backups: a server
+# restored on a new machine from this folder must still know who left.
+with open(SRC + backup_db.DELETED_SUFFIX, "w", encoding="ascii") as handle:
+    handle.write("4 1700000000 1790000000\n9 1710000000 1791000000\n")
+result = subprocess.run([sys.executable, os.path.join(HERE, "backup_db.py"), "--db", SRC,
+                         "--out", cli_out, "--keep", "14"],
+                        capture_output=True, text=True, timeout=60)
+listed_copy = os.path.join(cli_out, backup_db.deleted_list_name("elusion"))
+check("with a list of deleted accounts beside the database, the night copies it into the folder whole",
+      result.returncode == 0 and os.path.exists(listed_copy)
+      and open(listed_copy, encoding="ascii").read() == open(SRC + backup_db.DELETED_SUFFIX, encoding="ascii").read()
+      and "the list of 2 copied" in result.stdout, result.stdout + result.stderr)
+check("  under one name, never half written, and never taken for a backup by prune()",
+      not any(f.endswith(".tmp") for f in os.listdir(cli_out))
+      and backup_db.prune(cli_out, "elusion", 1)[1] == 1 and os.path.exists(listed_copy),
+      os.listdir(cli_out))
 live.close()
 
 

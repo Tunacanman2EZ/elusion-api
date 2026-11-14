@@ -20,6 +20,12 @@ register() is handed app.py's own pieces - it never imports app.py:
     record_login_attempt  (db, username, ip, ok, reason) - the login log
     client_ip             () -> the caller's address
     log_staff_action      (actor, action, target_name, target_id, detail)
+    db_path               () -> the database's path, for the list of deleted
+                          accounts kept beside it (None: no list - a bare app)
+
+It answers with `again(db, now)`: on a database restored from a backup, the
+listed accounts that came back are emptied again (app.py runs it as a
+server starts - DELETED AGAIN AFTER A RESTORE).
 
 THE WRITE LOCK IS TAKEN (it is a POST): the burns read balances and then move
 them, which is what the lock is for. The password hash inside it costs the
@@ -35,7 +41,80 @@ from . import data, services
 
 def register(app, *, require_auth, get_db, bad_request, protected, find_open_trade, gold_delta,
              bank_gold_delta, lusion_delta, fix_party, drop_guild, log_guild_event, take_down_line,
-             record_login_attempt, client_ip, log_staff_action):
+             record_login_attempt, client_ip, log_staff_action, db_path=None):
+
+    def erase(db, user_id, username, now, why):
+        """Everything after the checks: the money through the ledgers, the
+        guild and the party left, their lines taken down, one line in the
+        staff log, the rows emptied. No commit - the caller's. Answers (gold
+        burned, lusions burned, pictures dropped)."""
+        stand_in = services.stand_in_name(user_id)
+        seat = data.guild_seat(db, user_id)
+
+        # THE MONEY THROUGH THE LEDGERS, before the rows go: SUM(gold_ledger)
+        # must still equal every purse and bank afterwards (test_economy.py).
+        burned = 0
+        for character in data.characters(db, user_id):
+            gold = int(character["gold"] or 0)
+            if gold > 0:
+                gold_delta(db, user_id, int(character["slot"]), -gold, services.DELETE_REASON,
+                           "carried gold of a deleted account's %s" % character["class_id"])
+                burned += gold
+        acct = data.account(db, user_id)
+        lusions = 0
+        if acct is not None:
+            bank = int(acct["bank_gold"] or 0)
+            if bank > 0:
+                bank_gold_delta(db, user_id, -bank, services.DELETE_REASON, "bank of a deleted account")
+                burned += bank
+            lusions = int(acct["lusions"] or 0)
+            if lusions > 0:
+                lusion_delta(db, user_id, None, -lusions, services.DELETE_REASON, "a deleted account's")
+
+        # THE GUILD AND THE PARTY are left as leaving would leave them.
+        if seat is not None:
+            if services.guild_blocks(seat[1], seat[2]):
+                data.hand_on_guild(db, seat[0], user_id)
+            db.execute("DELETE FROM guild_members WHERE user_id = ?", (user_id,))
+            remaining = db.execute("SELECT COUNT(*) FROM guild_members WHERE guild_id = ?",
+                                   (seat[0],)).fetchone()[0]
+            if remaining == 0:
+                drop_guild(db, seat[0])
+            else:
+                log_guild_event(db, seat[0], "left", stand_in)
+        party = data.party_of(db, user_id)
+        if party is not None:
+            db.execute("DELETE FROM party_members WHERE user_id = ?", (user_id,))
+            fix_party(db, party)
+
+        # THEIR CHAT LINES, off every screen that still shows them, as a mod's
+        # delete takes one down (chat/'s own writer), and the pictures they
+        # showed or put up, to be weighed once the rows are gone.
+        images = data.held_images(db, user_id)
+        for line in data.chat_lines(db, user_id):
+            if line["image_id"]:
+                images.add(line["image_id"])
+            take_down_line(db, line, now)
+        # One line in the staff log, before the name goes: that an account was
+        # deleted, by whom or why, and what it took with it.
+        log_staff_action({"id": user_id, "username": stand_in}, "account_deleted", stand_in, user_id,
+                         "%s; %d gold and %d lusions burned" % (why, burned, lusions))
+        data.empty(db, user_id, username, stand_in, now)
+        return burned, lusions, data.drop_orphan_images(db, images)
+
+    def again(db, now):
+        """DELETED AGAIN AFTER A RESTORE: every listed account that is whole in
+        this database, emptied as it was the first time - an open trade
+        called off, a guild it led handed to its longest member. No commit.
+        Answers the ids."""
+        path = db_path() if db_path is not None else None
+        if not path:
+            return []
+        back = data.whole_again(db, services.parse_list(data.read_list(services.deleted_list_path(path))))
+        for user_id, username in back:
+            data.call_off_trades(db, user_id, now)
+            erase(db, user_id, username, now, services.AGAIN_REASON)
+        return [user_id for user_id, _name in back]
 
     def delete_account():
         """
@@ -102,59 +181,16 @@ def register(app, *, require_auth, get_db, bad_request, protected, find_open_tra
 
         # ---- everything above this line is validation; everything below commits --
         now = int(time.time())
-        stand_in = services.stand_in_name(user_id)
-
-        # THE MONEY THROUGH THE LEDGERS, before the rows go: SUM(gold_ledger)
-        # must still equal every purse and bank afterwards (test_economy.py).
-        burned = 0
-        for character in data.characters(db, user_id):
-            gold = int(character["gold"] or 0)
-            if gold > 0:
-                gold_delta(db, user_id, int(character["slot"]), -gold, services.DELETE_REASON,
-                           "carried gold of a deleted account's %s" % character["class_id"])
-                burned += gold
-        acct = data.account(db, user_id)
-        lusions = 0
-        if acct is not None:
-            bank = int(acct["bank_gold"] or 0)
-            if bank > 0:
-                bank_gold_delta(db, user_id, -bank, services.DELETE_REASON, "bank of a deleted account")
-                burned += bank
-            lusions = int(acct["lusions"] or 0)
-            if lusions > 0:
-                lusion_delta(db, user_id, None, -lusions, services.DELETE_REASON, "a deleted account's")
-
-        # THE GUILD AND THE PARTY are left as leaving would leave them.
-        if seat is not None:
-            db.execute("DELETE FROM guild_members WHERE user_id = ?", (user_id,))
-            remaining = db.execute("SELECT COUNT(*) FROM guild_members WHERE guild_id = ?",
-                                   (seat[0],)).fetchone()[0]
-            if remaining == 0:
-                drop_guild(db, seat[0])
-            else:
-                log_guild_event(db, seat[0], "left", stand_in)
-        party = data.party_of(db, user_id)
-        if party is not None:
-            db.execute("DELETE FROM party_members WHERE user_id = ?", (user_id,))
-            fix_party(db, party)
-
-        # THEIR CHAT LINES, off every screen that still shows them, as a mod's
-        # delete takes one down (chat/'s own writer), and the pictures they
-        # showed or put up, to be weighed once the rows are gone.
-        images = data.held_images(db, user_id)
-        for line in data.chat_lines(db, user_id):
-            if line["image_id"]:
-                images.add(line["image_id"])
-            take_down_line(db, line, now)
-        # One line in the staff log, before the name goes: that an account was
-        # deleted, by its owner, and what it took with it.
-        log_staff_action({"id": user_id, "username": stand_in}, "account_deleted", stand_in, user_id,
-                         "deleted by its owner; %d gold and %d lusions burned" % (burned, lusions))
-        data.empty(db, user_id, username, stand_in, now)
-        dropped = data.drop_orphan_images(db, images)
+        # ON THE LIST FIRST, so no restored copy can bring it back (services.py,
+        # THE LIST THAT OUTLIVES A RESTORE).
+        if db_path is not None and db_path():
+            made = data.made_at(db, user_id)
+            data.remember(services.deleted_list_path(db_path()), services.list_line(user_id, made or 0, now))
+        burned, lusions, dropped = erase(db, user_id, username, now, "deleted by its owner")
         db.commit()
         return {"deleted": True, "gold_burned": burned, "lusions_burned": lusions, "pictures_removed": dropped,
                 "message": "Your account is deleted. Thank you for playing."}, 200
 
     app.add_url_rule("/api/account/delete", endpoint="delete_account",
                      view_func=require_auth(delete_account), methods=["POST"])
+    return again

@@ -615,6 +615,91 @@ raw("UPDATE minigame_runs SET started_at = started_at - ? WHERE id = ?", (servic
 check("  a run left too long pays nothing", (cloth_finish(ivy, cloth_runs[2], 5).get_json() or {}).get("gold") == 0)
 check("the owner runs it as often as they like", all(cloth_go(owner).status_code in (200, 404) for _ in range(4)))
 
+section("MG-16 A DAY'S MINIGAME GOLD (14 Nov): ONE ALLOWANCE AN ACCOUNT, RUNS AND CHEST COINS TOGETHER")
+check("the cap's setting: unset or unreadable is %d, a whole number is itself, 0 is no cap" % services.GOLD_A_DAY,
+      services.gold_a_day(None) == services.GOLD_A_DAY == 100000 and services.gold_a_day("") == 100000
+      and services.gold_a_day(" 5000 ") == 5000 and services.gold_a_day("0") == 0
+      and services.gold_a_day("-5") == 100000 and services.gold_a_day("lots") == 100000
+      and services.gold_a_day("\uff11\uff12") == 100000)
+ga = services.gold_allowed
+check("  a run is paid what is left of the day, the rest held back; no cap pays it all",
+      ga(1000, 0, 2000) == (1000, 0) and ga(1000, 1500, 2000) == (500, 500) and ga(1000, 2500, 2000) == (0, 1000)
+      and ga(1000, 99999, 0) == (1000, 0))
+worth = {"coppercoin": 1, "silvercoin": 50, "goldcoin": 1000}.get
+roll = [{"item_id": "goldcoin", "quantity": 2}, {"item_id": "ironsword", "quantity": 1},
+        {"item_id": "silvercoin", "quantity": 3}]
+check("  a chest's coins as far as the day goes, in the order rolled; the gear always",
+      services.coins_within(roll, lambda i: worth(i, 0), None) == (roll, 2150, 0)
+      and services.coins_within(roll, lambda i: worth(i, 0), 1100) == (
+          [{"item_id": "goldcoin", "quantity": 1}, {"item_id": "ironsword", "quantity": 1},
+           {"item_id": "silvercoin", "quantity": 2}], 1100, 1050)
+      and services.coins_within(roll, lambda i: worth(i, 0), 0) == ([{"item_id": "ironsword", "quantity": 1}], 0, 2150))
+
+os.environ["ELUSION_MINIGAME_GOLD_DAY"] = "2000"
+kai = register("mgkai")
+assert client.put("/api/save", headers=kai, json={"slot": 0, "class_id": "warrior", "name": "warrior"}).status_code in (200, 201)
+kai_purse = lambda: raw("SELECT gold FROM saves WHERE user_id = ? AND slot = 0", (uid("mgkai"),))[0][0]
+first = run_go(kai).get_json() or {}
+raw("UPDATE minigame_runs SET started_at = started_at - 600 WHERE id = ?", (first.get("run", 0),))
+body = finish(kai, first.get("run", 0), 25, True, True).get_json() or {}
+check("with the day's allowance at 2,000: a 1,000 run is paid whole", body.get("gold") == 1000
+      and body.get("held_back") == 0 and kai_purse() == 1000, body)
+cloth_first = cloth_go(kai).get_json() or {}
+raw("UPDATE minigame_runs SET started_at = started_at - 600 WHERE id = ?", (cloth_first.get("run", 0),))
+before = kai_purse()
+body = cloth_finish(kai, cloth_first.get("run", 0), 6).get_json() or {}
+check("  a 1,750 Cut the Cloth run after it - another minigame, the same day - is paid the 1,000 left",
+      body.get("gold") == 1000 and body.get("held_back") == 750 and kai_purse() == before + 1000, body)
+check("  and its ledger line says what was held back, and why",
+      "750 held back: the day's minigame gold is full" in
+      raw("SELECT detail FROM gold_ledger WHERE user_id = ? ORDER BY id DESC LIMIT 1", (uid("mgkai"),))[0][0])
+second = run_go(kai).get_json() or {}
+raw("UPDATE minigame_runs SET started_at = started_at - 600 WHERE id = ?", (second.get("run", 0),))
+before = kai_purse()
+lines_before = raw("SELECT COUNT(*) FROM gold_ledger WHERE user_id = ?", (uid("mgkai"),))[0][0]
+body = finish(kai, second.get("run", 0), 25, True, True).get_json() or {}
+check("  the day full, a run pays nothing and says so; no ledger line for nothing",
+      body.get("gold") == 0 and body.get("held_back") == 1000 and kai_purse() == before
+      and raw("SELECT COUNT(*) FROM gold_ledger WHERE user_id = ?", (uid("mgkai"),))[0][0] == lines_before, body)
+
+# THE CHEST'S COINS count against the same allowance. The roll is fixed here:
+# two gold coins and a sword.
+real_roll = app_module.gamedata.roll_kill_rewards
+app_module.gamedata.roll_kill_rewards = lambda *a, **k: {
+    "contents": [{"item_id": "goldcoin", "quantity": 2}, {"item_id": "ironsword", "quantity": 1}],
+    "pet_won": False, "mythic": ""}
+try:
+    assert go(kai).status_code == 200
+    raw("UPDATE minigame_entries SET entered_at = entered_at - 600 WHERE user_id = ? AND game = 'endless'", (uid("mgkai"),))
+    elite = next(e for e in app_module.gamedata.ENEMIES if services.sends(app_module.gamedata.ENDLESS, e) == "elite")
+    body = kill(kai, elite).get_json() or {}
+    check("a chest kill with the day full keeps its sword and none of its coins, and says what was held back",
+          body.get("ok") is True and body.get("added") == [{"item_id": "ironsword", "quantity": 1}]
+          and body.get("held_back") == 2000, body)
+    raw("UPDATE minigame_runs SET finished_at = finished_at - ? WHERE user_id = ?", (services.DAY + 5, uid("mgkai")))
+    raw("UPDATE minigame_kills SET at = at - ? WHERE user_id = ?", (services.DAY + 5, uid("mgkai")))
+    body = kill(kai, elite).get_json() or {}
+    check("  a day on, the allowance is whole again: the coins roll into the chest, and count",
+          body.get("held_back") == 0 and {"item_id": "goldcoin", "quantity": 2} in body.get("added", [])
+          and raw("SELECT gold FROM minigame_kills WHERE user_id = ? ORDER BY id DESC LIMIT 1", (uid("mgkai"),))[0][0] == 2000,
+          body)
+    body = kill(kai, elite).get_json() or {}
+    check("  and they filled it: the next kill's coins are held back", body.get("held_back") == 2000, body)
+    os.environ["ELUSION_MINIGAME_GOLD_DAY"] = "0"
+    body = kill(kai, elite).get_json() or {}
+    check("set to 0, there is no cap", body.get("held_back") == 0 and {"item_id": "goldcoin", "quantity": 2} in body.get("added", []),
+          body)
+    os.environ["ELUSION_MINIGAME_GOLD_DAY"] = "2000"
+    assert client.put("/api/save", headers=owner, json={"slot": 0, "class_id": "warrior", "name": "warrior"}).status_code in (200, 201)
+    go(owner)
+    raw("UPDATE minigame_entries SET entered_at = entered_at - 600 WHERE user_id = ? AND game = 'endless'", (uid("mgowner"),))
+    for _ in range(2):
+        body = kill(owner, elite).get_json() or {}
+    check("the owner, who skips the waits, skips the cap too", body.get("held_back") == 0, body)
+finally:
+    app_module.gamedata.roll_kill_rewards = real_roll
+    os.environ.pop("ELUSION_MINIGAME_GOLD_DAY", None)
+
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))
 print("=" * 60)

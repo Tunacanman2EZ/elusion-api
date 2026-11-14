@@ -317,6 +317,41 @@ check("receipts: the CLI prints the line, over the days asked for",
       "receipts: of 16 kills paid in the last 30000 days" in rd.stdout, rd.stdout[:600])
 
 # --------------------------------------------------------------------------- #
+# 10. THE MOVES (14 Nov, presence.py HELD TO A WALK): before holding moves is
+#     switched on, which areas the books saw jumps and too-quick walks in.
+print("-" * 68)
+con = fresh(); books_tables(con)
+now = 2000000000
+for user_id, area, kind, count, detail, at in (
+        (30, "field", "jumped", 3, "900 px in one step", now - 100),
+        (31, "field", "jumped", 2, "1200 px in one step", now - 50),
+        (31, "crypt", "too_quick", 1, "700 px/s, the most is 400", now - 60),
+        (32, "town", "jumped", 9, "an old one", now - 20 * 86400),
+        (33, "field", "too_fast", 4, "not a move", now - 10)):
+    con.execute("INSERT INTO combat_flags (user_id, area, kind, count, detail, first_at, last_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)", (user_id, area, kind, count, detail, at, at))
+rows = killwatch.moves_by_area(con, days=14, now=now)
+check("moves: by area and kind, most flags first, with how many players and the newest detail",
+      rows == [("field", "jumped", 5, 2, "1200 px in one step"), ("crypt", "too_quick", 1, 1, "700 px/s, the most is 400")],
+      rows)
+check("moves: older than the days asked for, or not a move, is left out",
+      all(r[0] != "town" for r in rows) and all(r[1] != "too_fast" for r in rows))
+check("moves: none says so in words",
+      killwatch.moves_lines([], days=14) == ["moves: no jump or too-quick walk written down in 14 days"]
+      and killwatch.moves_by_area(fresh(), days=14) == [])
+disk = sqlite3.connect(path)
+for statement in con.iterdump():
+    if statement.startswith(("CREATE TABLE", "INSERT")):
+        disk.execute(statement)
+disk.commit(); disk.close()
+rm = subprocess.run([sys.executable, os.path.join(HERE, "killwatch.py"), "--db", path, "--moves", "--days", "36500"],
+                    capture_output=True, text=True)
+os.remove(path)
+check("moves: --moves prints them and nothing else, read only, exit 0",
+      rm.returncode == 0 and "field" in rm.stdout and "jumped" in rm.stdout and "KILLWATCH" not in rm.stdout,
+      rm.stdout + rm.stderr)
+
+# --------------------------------------------------------------------------- #
 # EXIT-CODE CONTRACT (the cron promise), run end-to-end through the CLI.
 print("-" * 68)
 

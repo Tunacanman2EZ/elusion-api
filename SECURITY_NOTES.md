@@ -43,7 +43,7 @@ lives.
 | E-19 | Two games on one account each saved their own bag | medium (integrity) | **Closed** | Two copies of the game on one account overwrote each other's bag and lost items, and a stolen token kept working beside the owner's. | **One session at a time.** A login that gets its token, or a game resuming a remembered one, ends every other session on the account; resuming keeps the original end date. `test_accounts.py`. |
 | E-20 | **A staff password was the only thing between a guesser and the moderation desk** | **high (moderation)** | **Closed** — with a named limit | Staff names are public (the crown, the MOD and DEV badges), so their passwords are the ones worth guessing; one guessed password gives bans, notes and IP addresses. | **Second factor.** A staff login with a confirmed recovery address answers 202 and emails a six-digit code; only the code gets a token. A computer that proved itself is trusted for 30 days, at the rank it was trusted at. With no address or no mail it stands aside and says so. `test_staffcode.py`. |
 | E-21 | **Session tokens were stored as issued** | **high (accounts)** | **Closed** | A copy of `elusion.db` - a backup, a leaked file - logged its holder in as every player signed in, for up to 30 days, with no password needed. | **Hashing at rest.** `sessions` keeps only each token's SHA-256 (`token_hash`) and every lookup hashes the token it is sent, as `trusted_devices` and `ended_sessions` already did and as passwords always were (scrypt). A boot migration hashed every stored token in place, so nobody was signed out. `test_accounts.py` A-5, `test_api.py` MIGRATION. |
-| E-22 | **A minigame's result is the game's own claim** | medium (economy) | **Mitigated** — held to the day and the time; open, named in SECURITY.md | A modified game can claim the best run its time allows: up to 60,000 gold a day from the Healer's Run and 72,750 from Cut the Cloth, and every Endless and Forge kill their schedules allow, into its own chest. | **Bound by time and count.** One Go a day or three runs; each kill held to what the run's own schedule could have sent since the Go; each run's gold paid once, for the caller's own run, believed only as far as its time allows (`test_minigames.py`). A daily gold cap across the minigames is the next lever. |
+| E-22 | **A minigame's result is the game's own claim** | medium (economy) | **Mitigated** — held to the day, the time and, since 14 Nov, one gold allowance a day; the chests' gear still the run's word, named in SECURITY.md | A modified game can claim the best run its time allows: up to 60,000 gold a day from the Healer's Run and 72,750 from Cut the Cloth, and every Endless and Forge kill their schedules allow, into its own chest. | **Bound by time and count.** One Go a day or three runs; each kill held to what the run's own schedule could have sent since the Go; each run's gold paid once, for the caller's own run, believed only as far as its time allows (`test_minigames.py`). **Since 14 Nov, capped:** the runs' gold and the chests' coins together, at most `ELUSION_MINIGAME_GOLD_DAY` (100,000) an account a day (`test_minigames.py` MG-16). |
 
 Nineteen findings: eighteen closed, one mitigated (E-3, since 25 Oct 2026). Plus E-15, an audit that went
 looking and came back empty — kept, because a search that finds nothing is
@@ -1708,6 +1708,18 @@ elites and bosses are real monsters, so a run's could be booked as an area's
 are and paid against a receipt. A run's gold has no fight to book; a daily
 gold cap across the minigames - a number the owner sets, like the economy's -
 is the lever if the ceiling is too high.
+
+**Capped, 14 Nov.** The owner: "lets fix issues in security", with the cap at
+100,000. Every run's gold at Leave and every coin rolled into a chest now count
+against one allowance an account in any 24 hours (minigames/services.py, A
+DAY'S MINIGAME GOLD; `minigame_kills.gold` holds each kill's coins). A run past
+it is paid what is left and its ledger line says what was held back; a chest
+past it keeps the gear and drops the coins. So the most gold a modified game
+takes out of the minigames in a day is the owner's number, set with
+`ELUSION_MINIGAME_GOLD_DAY` (0 for none). Still open: the chests' gear,
+materials and pets, held to the schedule's count - the books, as above, are
+what would close those. `test_minigames.py` MG-16; three sabotages caught (the
+day's count left out, Cut the Cloth uncapped, the chest's coins uncapped).
 
 ## The security bot — attacking a running server, not the source
 

@@ -135,6 +135,9 @@ KNOWN = (
     "ELUSION_PRESENCE_URL", "ELUSION_BOOKS", "ELUSION_TRANSFER_GIB", "ELUSION_NEAR",
     "ELUSION_TURN_KEY_ID", "ELUSION_TURN_KEY_TOKEN", "ELUSION_VOICE_DIRECT",
     "ELUSION_DB_FRESH", "ELUSION_BACKUP_DIR", "ELUSION_STARTER_KIT", "ELUSION_GOOGLE_CLIENT_ID",
+    # 14 Nov: a day's minigame gold (minigames/), and moves held to what a
+    # character can walk (presence.py, HELD TO A WALK).
+    "ELUSION_MINIGAME_GOLD_DAY", "ELUSION_HOLD_MOVES",
 )
 _TRUE = ("1", "true", "yes", "on")
 _WEB_ROOTS = ("static", "public", "www", "htdocs", "wwwroot")
@@ -237,6 +240,14 @@ def check_env(environ):
             float(gib)
         except ValueError:
             warnings.append("ELUSION_TRANSFER_GIB %r is not a number; presence.py uses 1000." % gib)
+
+    day = _get(environ, "ELUSION_MINIGAME_GOLD_DAY")
+    if day and not (day.isascii() and day.isdigit()):
+        warnings.append("ELUSION_MINIGAME_GOLD_DAY %r is not a whole number; the minigames use "
+                        "100000 a day." % day)
+    hold = _get(environ, "ELUSION_HOLD_MOVES").lower()
+    if hold and hold not in _TRUE + ("0", "false", "no", "off"):
+        warnings.append("ELUSION_HOLD_MOVES %r is neither on nor off; presence.py leaves it off." % hold)
 
     # WITHOUT AN OWNER THERE IS NO OWNER. app.py fails closed already; finding
     # out from a staff route at 3am is worse than finding out at boot.

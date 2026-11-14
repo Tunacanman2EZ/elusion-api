@@ -255,8 +255,13 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     ends the player's sessions so their game reloads. A gift goes into the
     character they are playing, after a snapshot. Each is a line in the
     moderation log about the player. Everybody else gets the same bare 404 as a
-    route that does not exist.
-    → Held by: `test_rollback.py` — "nobody below the owner reads, restores or gives - the same bare 404 as no route at all", "the supply balances after a rollback", "the bank is the account's and untouched", "the snapshot taken before a rollback is returned", "a character in an open trade is a 409", "every rollback of carol is a line about carol, and no refusal is", "the gift is a 'give' line about lena, by the owner"
+    route that does not exist. **And it makes no second copies** (0.157.0):
+    an item lost since the snapshot comes back only as far as it did not go
+    to the account's bank, another of its characters, or another account in
+    a trade - the snapshot keeps where else the account held each item, the
+    rollback counts again - and the answer and the log say what was held
+    back.
+    → Held by: `test_rollback.py` — "  what went to the bank, to his mage and to another player does not: no second copies", "  what he used up or sold comes back (the purse goes back with a sale)", "the answer and the log say what was held back", "nobody below the owner reads, restores or gives - the same bare 404 as no route at all", "the supply balances after a rollback", "the bank is the account's and untouched", "the snapshot taken before a rollback is returned", "a character in an open trade is a 409", "every rollback of carol is a line about carol, and no refusal is", "the gift is a 'give' line about lena, by the owner"
     → and in the game: `src/tools/testrunner.gd` — `_test_give_and_save_history()`
 30. **The server keeps its own count of every monster's health, and writes down
     what does not fit** (0.10.0, E3_SCOPE.md option C, step 1). `presence.py`
@@ -414,8 +419,13 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     once, at Leave, for the caller's own run, believed only as far as its
     time allows; a run left too long pays nothing, a best time is never
     longer than since the Go. Every chest read and take is the caller's;
-    the next Go empties it.
-    → Held by: `test_minigames.py` — "a second Go inside the day is refused (409), with how long is left, in words", "the wait is the account's: one row per account and minigame, whichever character", "  loot only: no XP, no level, no kill record, no bag", "70 elites inside the first minute is all a run could have sent: the 71st is a 429, and pays nothing", "another account reads its own chest, never somebody else's, and cannot take from it", "  50 fire sprites at the Go is all there could be: the 51st is a 429 that names them", "  one pet a Go: the first kill's is kept, the second kill is not let roll one", "the fourth inside the day is refused (409) with when the next one is, in words", "a run that says it reached the goal 30 seconds after its Go is believed only as far as the time allows", "  once: a second Leave for the same run is refused (409)", "refused: somebody else's run (404), a bad body (400), not logged in (401)", "a run left too long pays nothing (closed without Leave)", "a run that says it cleared 12 rounds 40 seconds after its Go is believed for 2", "  no run is believed longer than since your Go"
+    the next Go empties it. **And all of it to one allowance a day** (14
+    Nov): the runs' gold and the coins rolled into chests, every minigame
+    and character together, at most `ELUSION_MINIGAME_GOLD_DAY` (100,000)
+    an account in any 24 hours - a run past it paid what is left, a chest
+    past it rolling its gear and no coins, the ledger line saying what was
+    held back. The owner, who skips the waits, skips it too.
+    → Held by: `test_minigames.py` — "  a 1,750 Cut the Cloth run after it - another minigame, the same day - is paid the 1,000 left", "a chest kill with the day full keeps its sword and none of its coins, and says what was held back", "  a day on, the allowance is whole again: the coins roll into the chest, and count", "a second Go inside the day is refused (409), with how long is left, in words", "the wait is the account's: one row per account and minigame, whichever character", "  loot only: no XP, no level, no kill record, no bag", "70 elites inside the first minute is all a run could have sent: the 71st is a 429, and pays nothing", "another account reads its own chest, never somebody else's, and cannot take from it", "  50 fire sprites at the Go is all there could be: the 51st is a 429 that names them", "  one pet a Go: the first kill's is kept, the second kill is not let roll one", "the fourth inside the day is refused (409) with when the next one is, in words", "a run that says it reached the goal 30 seconds after its Go is believed only as far as the time allows", "  once: a second Leave for the same run is refused (409)", "refused: somebody else's run (404), a bad body (400), not logged in (401)", "a run left too long pays nothing (closed without Leave)", "a run that says it cleared 12 rounds 40 seconds after its Go is believed for 2", "  no run is believed longer than since your Go"
 42. **Deleting your own account takes everything that was yours and nothing
     that is anybody else's** (game 0.90.0, accountdelete/). It asks three
     times - the name typed, the password (a wrong one counted as a failed
@@ -427,8 +437,13 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     kept, emptied - a stand-in name nobody can sign up as, no password, no
     address - because a bare delete would cascade through other people's
     trades and the ledgers, and the staff log keeps what was done, under the
-    stand-in.
-    → Held by: `test_accountdelete.py` — "the wrong password is a 401", "  counted as a failed login", "the owner's account cannot be deleted (403)", "an open trade naming them is a 409", "  and nothing was taken by any refusal", "THE ROW IS KEPT (a bare DELETE would cascade through other people's trades and the ledgers)", "  keeping only its id and a stand-in name - no password, no address, marked deleted", "THE SUPPLY STILL ADDS UP: what the ledger recorded is what purses and banks hold", "their chat line is taken off every screen (a deletion the feed carries)", "the staff log keeps what was done to them, under the stand-in"
+    stand-in. **A restored backup does not bring it back** (14 Nov): each
+    deletion is a line - id, the second the account was made, when it went;
+    no name - in a list beside the database, and a server starting on a
+    database where a listed account is whole again empties it again, the
+    same way (app.py, DELETED AGAIN AFTER A RESTORE). A line matches only
+    the row made at that second, and ids are never reused.
+    → Held by: `test_accountdelete.py` — "  and it is a line on the list beside the database: its id and the second it was made", "a server started on it empties the account again: the name a stand-in, no password", "  its gold burned through the ledger, so the supply still adds up", "a line whose second does not match its row touches nobody"; `test_deploy.py` — "with a list of deleted accounts beside the database, the night copies it into the folder whole"; `test_accountdelete.py` — "the wrong password is a 401", "  counted as a failed login", "the owner's account cannot be deleted (403)", "an open trade naming them is a 409", "  and nothing was taken by any refusal", "THE ROW IS KEPT (a bare DELETE would cascade through other people's trades and the ledgers)", "  keeping only its id and a stand-in name - no password, no address, marked deleted", "THE SUPPLY STILL ADDS UP: what the ledger recorded is what purses and banks hold", "their chat line is taken off every screen (a deletion the feed carries)", "the staff log keeps what was done to them, under the stand-in"
 43. **Who dealt what reaches only the owner, and only while the meter is
     open** (game 0.82.0 and on, presence.py's meter). The damage meter's
     report - every hit in a room, booked and claimed, deaths, health taken -
@@ -539,7 +554,13 @@ No comforting lies. These are known, named and open.
   stand inside a wall or hop across the area on other people's screens. Since
   0.10.0 the books write down a walk faster than the character can and a step
   the length of a teleport, and a hit from beyond any screen, but refuse none
-  of them. It
+  of them. Since 0.157.0 the server can hold every step it passes on to what
+  the character could have walked (HELD TO A WALK, `test_presence.py` P-27):
+  a hop is seen as a fast walk, staff, the party-only rooms and a staff
+  teleport are free. It ships off - `ELUSION_HOLD_MOVES` - until the books'
+  flags (`killwatch.py --moves`) show honest play never jumps where no rule
+  frees it; and it holds what others SEE, not walls, which the server has no
+  map of. It
   cannot appear as somebody else, or show a rank, colour, guild or pet it does
   not hold - who a player is comes from the server's own rows, through a
   ticket tied to their login - and nothing over the socket deals damage or
@@ -603,23 +624,33 @@ No comforting lies. These are known, named and open.
   six whole runs; claim the Healer's Run's goal no sooner than its waves'
   time - 20,000 gold a run, three runs, 60,000 a day; claim 30 rounds of Cut
   the Cloth no faster than 15 seconds a round - 24,250 a run, 72,750 a day;
-  and a Forge best time as long as it has been in. Once a day, and three
-  runs a day, are what cap it; a daily gold cap across the minigames is the
-  lever if that is too much.
+  and a Forge best time as long as it has been in. Since 14 Nov the gold is
+  held to one allowance an account a day - 100,000 unless the owner sets
+  `ELUSION_MINIGAME_GOLD_DAY` - across every run and every chest's coins, so
+  the most a modified game takes is that number, not the 132,750 the two
+  gold games' times allow. The chests' gear, materials and pets are still
+  the run's word, held to the schedule's count.
 
-- **A rollback can make a second copy of an item.** It puts back what the
-  character held when the snapshot was taken; an item traded, banked or sold
-  since then is still wherever it went, too. That is why only the owner (and a
-  co-owner, while let in) can do it, why each one is a line on the player's
-  record, and why the Save history window says so under the buttons. The gold
-  cannot be copied this way - it moves
-  through the ledger like any other mint or burn - but, like every burn, gold a
-  rollback takes away is counted on the Kingdom board as given.
+- **A rollback counts items by id, and a sale's gold can stay where it went.**
+  Since 0.157.0 it holds back what went to the bank, another character or
+  another account (invariant 29), counted by item id as the trade holds are:
+  a rolled piece is nearly one of a kind, but another character's new potions
+  look like this one's, and then fewer come back - never more. A snapshot
+  taken before 0.157.0 cannot tell where things went and puts back what it
+  held, as before; the answer and the log say so. And a sold item comes back
+  with the purse put back to what it was - but gold the character banked or
+  traded away since stays where it went, so a sale and then a deposit is gold
+  twice. That is why only the owner (and a co-owner, while let in) can do it,
+  and why each one is a line on the player's record. The gold moves through the
+  ledger like any other mint or burn, and, like every burn, gold a rollback
+  takes away is counted on the Kingdom board as given.
 
-- **A deleted account lives on in the backups** for as long as they are
-  kept (`backup_db.py` keeps 14 nights, and any copy taken off the machine);
-  a restore would bring it back. Deletion is immediate on the live server
-  (invariant 42), not in the copies.
+- **A deleted account is still inside the backup copies** for as long as
+  they are kept (`backup_db.py` keeps 14 nights, and any copy taken off the
+  machine). A server started on one empties it again (invariant 42) - but
+  only with the list of deleted accounts beside it. The nightly backup copies
+  the list into its folder (`elusion-deleted-accounts.txt`); a copy restored
+  without it, or opened by hand, still holds the account.
 
 Anything not on this list that later turns out to be true belongs on it.
 

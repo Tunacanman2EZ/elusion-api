@@ -6757,8 +6757,49 @@ SNAPSHOT_EVERY_SECONDS = 600
 SNAPSHOTS_KEPT = 20
 
 
+def _held_elsewhere(db, user_id, slot, ids):
+    """{item_id: count} for `ids`: how many the account holds anywhere but
+    this character - its other characters' bags and worn gear, and the bank.
+    A ROLLBACK HOLDS BACK WHAT WENT THERE (0.157.0): what a snapshot keeps of
+    it, set against the same count at the rollback, says how many of a lost
+    item moved to the bank or another character since (ownertools/services.py
+    held_back())."""
+    counts = {str(item_id): 0 for item_id in ids}
+    if not counts:
+        return counts
+    marks = ",".join("?" * len(counts))
+    for table, where, args in (("carry_items", "user_id = ? AND slot != ?", (user_id, slot)),
+                               ("bank_items", "user_id = ?", (user_id,))):
+        for r in db.execute("SELECT item_id, SUM(quantity) AS n FROM %s WHERE %s AND item_id IN (%s)"
+                            " GROUP BY item_id" % (table, where, marks), args + tuple(counts)):
+            counts[r["item_id"]] += int(r["n"] or 0)
+    for r in db.execute("SELECT equipment FROM saves WHERE user_id = ? AND slot != ?", (user_id, slot)):
+        worn = _stored_json(r["equipment"], {})
+        for item_id in (worn.values() if isinstance(worn, dict) else ()):
+            if isinstance(item_id, str) and item_id in counts:
+                counts[item_id] += 1
+    return counts
+
+
+def held_by(state):
+    """{item_id: count} a character state holds: its bag and keys, and what it
+    wears."""
+    counts = {}
+    for cell in state.get("carry", []):
+        if isinstance(cell, list) and len(cell) == 3:
+            counts[str(cell[1])] = counts.get(str(cell[1]), 0) + max(0, int(cell[2]))
+    worn = state.get("equipment", {})
+    for item_id in (worn.values() if isinstance(worn, dict) else ()):
+        if isinstance(item_id, str) and item_id:
+            counts[item_id] = counts.get(item_id, 0) + 1
+    return counts
+
+
 def _character_state(db, user_id, slot):
-    """What a snapshot keeps of one character, or None when there is none."""
+    """What a snapshot keeps of one character, or None when there is none.
+    `elsewhere` (0.157.0) is the account's count of each item it holds, held
+    anywhere else at that moment - not part of the character, so not part of
+    its fingerprint."""
     row = db.execute(
         "SELECT class_id, name, level, xp, xp_to_next, gold, active_pet_id, equipment"
         " FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone()
@@ -6770,7 +6811,7 @@ def _character_state(db, user_id, slot):
     skills = [[r["skill_id"], int(r["level"]), int(r["xp"])] for r in db.execute(
         "SELECT skill_id, level, xp FROM skills"
         " WHERE user_id = ? AND slot = ? ORDER BY skill_id", (user_id, slot))]
-    return {
+    state = {
         "class_id": row["class_id"],
         "name": row["name"],
         "level": int(row["level"] or 1),
@@ -6782,11 +6823,17 @@ def _character_state(db, user_id, slot):
         "carry": carry,
         "skills": skills,
     }
+    state["elsewhere"] = _held_elsewhere(db, user_id, slot, held_by(state))
+    return state
 
 
 def _state_fingerprint(state):
+    """The character, not the account around it: `elsewhere` changes when
+    another character or the bank does, and that is no reason for a new
+    snapshot of this one."""
+    mine = {k: v for k, v in state.items() if k != "elsewhere"}
     return hashlib.sha1(
-        json.dumps(state, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        json.dumps(mine, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def take_snapshot(db, user_id, slot, reason):
@@ -8104,6 +8151,9 @@ ownertools_package.register(
     playing_area=_playing_area,
     take_snapshot=take_snapshot,
     character_state=_character_state,
+    # A ROLLBACK HOLDS BACK WHAT WENT ELSEWHERE (0.157.0).
+    held_elsewhere=_held_elsewhere,
+    held_by=held_by,
     stored_json=_stored_json,
     derived_stats=_derived_stats,
     levelup_grant_id=LEVELUP_GRANT_ID,
@@ -9079,6 +9129,10 @@ minigames_package.register(
     mythic_kind=kill_package.MYTHIC_BROADCAST_KIND,
     # THE HEALER'S RUN'S GOLD (game 0.99.0): paid at Leave, through the ledger.
     gold_delta=lambda db, user_id, slot, delta, reason, detail="": gold_delta(db, user_id, slot, delta, reason, detail),
+    # A DAY'S MINIGAME GOLD (14 Nov): one allowance an account a day, runs and
+    # chest coins together - asked on every call, so a suite can set it.
+    gold_a_day=lambda: minigames_package.services.gold_a_day(os.environ.get("ELUSION_MINIGAME_GOLD_DAY")),
+    money_worth=lambda item_id: (lambda kind, each: each if kind == "gold" else 0)(*money_item_worth(item_id)),
 )
 
 
@@ -9092,7 +9146,7 @@ minigames_package.register(
 # accountdelete/__init__.py has the whole of it.
 import accountdelete as accountdelete_package  # noqa: E402
 
-accountdelete_package.register(
+_delete_again = accountdelete_package.register(
     app,
     require_auth=require_auth,
     get_db=get_db,
@@ -9111,6 +9165,8 @@ accountdelete_package.register(
     client_ip=lambda: client_ip(),
     log_staff_action=lambda actor, action, target_name, target_id=None, detail="": log_staff_action(
         actor, action, target_name, target_id, detail),
+    # The list of deleted accounts is kept beside the database (14 Nov).
+    db_path=lambda: DB_PATH,
 )
 
 
@@ -9174,6 +9230,54 @@ googlesignin_package.register(
     dummy_hash=_TIMING_DUMMY_HASH,
     trusted_device=_google_trusted_computer,
 )
+
+
+# =============================================================================
+# DELETED AGAIN AFTER A RESTORE (14 Nov) - accountdelete/
+# =============================================================================
+# A deleted account is emptied in the live database, and every backup taken
+# before still holds it whole: restoring one used to bring it back
+# (SECURITY.md's honest limits had it). Each deletion is now a line in a list
+# beside the database (accountdelete/services.py, THE LIST THAT OUTLIVES A
+# RESTORE), and here, as a server starts, any listed account that is whole
+# again is emptied again - the same steps as the first time.
+#
+# HERE, not in init_db(): it needs every package's helpers (the ledgers, the
+# guilds, chat's take-down), and init_db() runs before most of them exist
+# (CLAUDE.md, "init_db() runs at import time"). Every process that serves
+# the routes has run it before its first request.
+#
+# A CHEAP LOOK FIRST, on a connection of its own: on the database the list
+# belongs to, nobody listed is whole and nothing is opened for writing. Only
+# when somebody came back is a POST's context made, so get_db() takes THE
+# WRITE LOCK as every write route does; two workers starting together, the
+# second waits and finds nobody left.
+
+
+def _delete_again_after_restore():
+    listed = accountdelete_package.services.parse_list(accountdelete_package.data.read_list(
+        accountdelete_package.services.deleted_list_path(DB_PATH)))
+    if not listed:
+        return []
+    look = sqlite3.connect(DB_PATH, timeout=30)
+    look.row_factory = sqlite3.Row
+    try:
+        back = accountdelete_package.data.whole_again(look, listed)
+    finally:
+        look.close()
+    if not back:
+        return []
+    with app.test_request_context("/api/account/delete", method="POST"):
+        db = get_db()
+        ids = _delete_again(db, int(time.time()))
+        db.commit()
+    if ids:
+        app.logger.warning("[DELETED] %d account(s) deleted before came back with a restored backup and were"
+                           " deleted again: ids %s", len(ids), ", ".join(str(i) for i in ids))
+    return ids
+
+
+_delete_again_after_restore()
 
 
 # =============================================================================

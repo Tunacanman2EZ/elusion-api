@@ -41,6 +41,10 @@ where the wait stops being a courtesy - and only as many elites and bosses as
 the run's schedule could have sent since the Go (services.py). A modified game
 could still report all of those: one Go a day caps it at one long run.
 
+AND ONE ALLOWANCE A DAY (14 Nov, services.py, A DAY'S MINIGAME GOLD): every
+run's gold at Leave and every chest's coins, counted together, at most
+ELUSION_MINIGAME_GOLD_DAY (100,000 unless set) an account in any 24 hours.
+
 THE CHEST is loot/'s (a table of cells, taken from like a bag by
 /api/loot/take); this package fills it, a kill at a time, and empties it at
 the account's next Go. Owner, 28 Oct: the Endless pays loot only, no XP.
@@ -49,4 +53,5 @@ Built like killrecord/ (ARCHITECTURE.md): routes.py (the edge), services.py
 (the rules, pure), data.py (the SQL), schema.py (its table). It never imports
 app.py; register() is handed what it needs.
 """
+from . import services  # noqa: F401
 from .routes import register  # noqa: F401

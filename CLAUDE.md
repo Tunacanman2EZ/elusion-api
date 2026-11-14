@@ -2044,6 +2044,31 @@ finds. `test_combatbook.py` holds the books, `test_presence.py` P-8 the wiring.
   on the books yet**; step 2 makes a kill need an AGREED row, decided from what
   the first week of WATCHED says.
 
+## Held to a walk: what others see of a step (0.157.0, off until switched on)
+
+The owner, 14 Nov: "lets fix issues in security". Positions are the game's
+word (SECURITY.md), and the books only write down a jump or a too-quick walk.
+presence.py's HELD TO A WALK (its header has the rules; test_presence.py
+P-27, two sabotages caught):
+
+- **A store of distance a player**: the books' walking bound (sprint in it)
+  times combatbook's SLACK a second, at most `WALK_BURST_SECONDS` of it plus
+  `WALK_PAD`. `held_to_walk()` passes a step on where the game says when it
+  fits; past it, only as far as the store goes, toward it. `player.x/y` is
+  what is passed on - near-views, attack pictures, heals and the position
+  samples read it; the books are fed the game's own word first, unchanged.
+- **Free**: the first step in an area, the next after a `sync` (once in
+  `SYNC_SNAP_SECONDS` - a sync is how a cheat would ask too), staff
+  (`SEES_ALL_ROLES`), the party-only rooms (`INSTANCED_PLACES`), no speed
+  known (books off), and a step within `TELEPORT_SNAP_REACH` of where staff
+  sent them lately (`teleport_to()` reads `pending_teleports`, in a thread, at
+  most every `TELEPORT_ASK_SECONDS` a player).
+- **`ELUSION_HOLD_MOVES`**, off unless on (envfile.KNOWN). Before it goes on,
+  `killwatch.py --moves --days 14` lists the books' jumps and too-quick walks
+  by area (DEPLOY.md, "Holding moves to a walk"); a place where honest play
+  jumps is many players in one area, and gets its own free rule.
+- `hub.moves_held` and `player.held_moves` count what was held.
+
 ## Gear bonuses: a character's maximum includes what it wears
 
 Amulets add max health (`bonus_max_hp`), max mana (`bonus_max_mana`) or a
@@ -2269,10 +2294,25 @@ SNAPSHOTS AND ROLLBACK in app.py, `test_rollback.py`. All of it is
 - **`give`, `rollback` and `player_level` are in the "moderation" group** of the log, unlike
   `grant`: they are done to a player, and "has this player been rolled back
   before" is what a mod reading their record asks.
-- **The honest limit** (SECURITY.md): a rollback can return an item the
-  character has since traded away, which then exists twice. The owner's call,
-  logged on the player's record. And every burn counts as given on the Kingdom
-  board, a rollback's included.
+- **No second copies (game 0.157.0; the owner, 14 Nov: "lets fix issues in
+  security").** A rollback returned an item the character had since traded,
+  banked or handed to another character, which then existed twice. Now
+  `_character_state()` keeps `elsewhere` - the account's count of each item
+  the character holds, held anywhere else (other characters' bags and worn
+  gear, the bank: `_held_elsewhere()`) - left out of the fingerprint, so it
+  makes no new snapshots. The rollback counts again, adds what the account
+  gave away in finished trades since (ownertools/data.py `traded_out()`),
+  and holds back the smaller of what was lost and what went
+  (services.py `held_back()`), from the carried cells, the last first, then
+  from what is worn (`without_held()`). Used up, sold or thrown away comes
+  back, as it always did. Counted by id like the trade holds, so a stack can
+  come back short, never long. The answer has `held_back`,
+  `held_back_words` and `knew_where` (false for a snapshot from before, which
+  puts back all it held); the log line says either. test_rollback.py RB-11,
+  two sabotages caught.
+- **The honest limit left** (SECURITY.md): a sold item comes back with the
+  purse put back - but gold banked or traded since stays where it went. And
+  every burn counts as given on the Kingdom board, a rollback's included.
 
 ## The gifts ledger: what the owner has given away
 
@@ -3178,12 +3218,29 @@ give them the right. `accountdelete/` (routes, services, data), POST
   exists, so `_with_foreign_keys()` rebuilds one made before, once, keeping
   every row whose ends exist. The diagram had them as the only "who links to
   whom" tables the database did not hold to their accounts.
-- **Backups still hold a deleted account** for as long as backups are kept
-  (`backup_db.py`); a restore would bring it back. That is the honest limit.
-- test_accountdelete.py (AD-1 to AD-4; six sabotages caught: no gold burn, no
+- **A restored backup does not bring it back** (14 Nov; the owner: "lets fix
+  issues in security"). Backups still hold a deleted account, so each
+  deletion is also a line - id, the second it was made, when it went, no
+  name - in `<database>.deleted` beside the database (services.py, THE LIST
+  THAT OUTLIVES A RESTORE), written and fsynced before the deletion commits.
+  register() answers `again(db, now)`, and app.py runs it as a server starts
+  (DELETED AGAIN AFTER A RESTORE, just above ENTRY POINT - it needs every
+  package's helpers): a cheap look on a connection of its own, and only when
+  somebody listed is whole again a POST's context, so get_db() takes the
+  write lock. The same `erase()` as the route, with an open trade called off
+  and a guild it led handed to its longest member first (the route refuses
+  both; a backup can hold them). A line matches only the row made at that
+  second, and users.id is AUTOINCREMENT, so it can never empty anybody else.
+  `backup_db.py` copies the list into the backup folder each night
+  (`elusion-deleted-accounts.txt`); DEPLOY.md says to put it back beside a
+  database restored on a new machine. The limit left: a copy restored
+  without the list, or read by hand.
+- test_accountdelete.py (AD-1 to AD-5; six sabotages caught: no gold burn, no
   password check, the staff log keeping the name, sessions kept, a bare DELETE
-  of the row, the party not fixed); test_packages.py (the refusals on a bare
-  app).
+  of the row, the party not fixed; and three for the restore: the list never
+  written, a line matching another account's row, a guild left leaderless);
+  test_deploy.py (the list copied with the backups); test_packages.py (the
+  refusals on a bare app).
 
 ## Minigames and their wait (game 0.93.3)
 
@@ -3425,6 +3482,39 @@ GOLD) and `finish_cloth()` in `minigames/routes.py`; MG-15 in
   somebody else's run before it reads the body.
 - **The honest limit**: a modified game can claim at most 30 rounds (24,250
   gold) a run, no faster than 15 s a round, three runs a day.
+
+## A day's minigame gold: one allowance an account (game 0.157.0)
+
+The owner, 14 Nov: "lets fix issues in security", the cap at 100,000.
+SECURITY_NOTES E-22: a run is played on the player's machine, so its gold
+is a claim held to time; a modified game could take 132,750 a day from the
+two gold games alone, plus chest coins. minigames/services.py, A DAY'S
+MINIGAME GOLD.
+
+- **One allowance an account in any 24 hours** (rolling, like the plays):
+  `data.gold_since()` adds the runs' `gold` (minigame_runs, by
+  `finished_at`) and the chests' coins (`minigame_kills.gold`, new, by
+  `at`), every game and character together.
+- **A run past it is paid what is left** (`gold_allowed()`); what is
+  written to `minigame_runs.gold` is what was PAID, so the count is never
+  the claim. The ledger line ends "(N held back: the day's minigame gold is
+  full)", and the answer carries `held_back`. Nothing paid, no ledger line.
+- **A chest past it keeps the gear** (`coins_within()`): coins in the order
+  rolled, as many of each as fit, worth by app.py's `money_item_worth()`
+  (gold only - lusions, gear, materials and pets pass). The kill's `added`
+  is what went in; `held_back` the gold that did not.
+- **`ELUSION_MINIGAME_GOLD_DAY`** (envfile.KNOWN): a whole number, 0 for no
+  cap; unset or unreadable is 100,000 (a typo never switches it off), and
+  check_env() warns. Read on every call, through register()'s
+  `gold_a_day`; a bare app (no `gold_a_day`) has no cap.
+- **The owner and a co-owner while let in skip it**, as they skip the waits
+  (`skips_wait`).
+- **The game says it** (0.157.0): the Leave line names what was held back
+  (healerrunscreen.gd `paid_line()`, Cut the Cloth's too), and the chest
+  says once in ten minutes that no more coins will come today
+  (combat.gd `DAY_FULL_WORDS`).
+- test_minigames.py MG-16; three sabotages caught. `test_schema.json`
+  rewritten for the new column (its diff is that column alone).
 
 ## Signing in with Google (game 0.101.0)
 

@@ -511,6 +511,42 @@ FAR_Y = 400.0
 VIEW_TICKS = 3
 NEAR = os.environ.get("ELUSION_NEAR", "on").strip().lower() not in ("off", "0", "no", "false")
 SEES_ALL_ROLES = ("owner", "coowner", "mod", "dev")
+
+# HELD TO A WALK (14 Nov; the owner: "lets fix issues in security"). Where
+# somebody stands is what their game says, and the books only WRITE DOWN a
+# walk faster than the character can or a step the length of a teleport
+# (combatbook.py, "jumped" and "too_quick"); a modified game could still hop
+# across an area on everyone else's screen. With this on, the position passed
+# on is held to what the character could have walked: each player has a
+# store of distance - its walking speed (sprint included, the books' bound)
+# times the books' SLACK a second, up to WALK_BURST_SECONDS of it and
+# WALK_PAD over - and a step past it moves only as far as the store allows,
+# toward where the game says. A speed hack is seen walking at full speed; a
+# teleport is seen as a fast walk. Honest play never empties the store.
+#
+# FREE, never held: the first step in an area; the first after the game
+# rebuilt its world ("sync"), at most once in SYNC_SNAP_SECONDS (a sync is
+# also how a cheat would ask); staff (SEES_ALL_ROLES: "Go to" moves them
+# beside somebody); the party-only rooms (INSTANCED_PLACES - the Endless's
+# wake-up teleport, and only the party sees there); a player with no speed
+# known (no books); and a step that lands within TELEPORT_SNAP_REACH of where
+# staff sent them in the last TELEPORT_KEEP_SECONDS (app.py's
+# pending_teleports, asked in a thread, at most every TELEPORT_ASK_SECONDS).
+# The books are fed the game's own word as before, so the flags still say
+# what was tried.
+#
+# OFF unless ELUSION_HOLD_MOVES is on (envfile.KNOWN): the flags say first
+# whether honest play ever jumps where no rule above frees it - killwatch.py
+# --moves lists them by area (DEPLOY.md, "Holding moves to a walk").
+# test_presence.py P-27.
+HOLD_MOVES = os.environ.get("ELUSION_HOLD_MOVES", "off").strip().lower() in ("1", "true", "yes", "on")
+WALK_BURST_SECONDS = 1.0
+WALK_PAD = 100.0
+SYNC_SNAP_SECONDS = 30.0
+TELEPORT_SNAP_REACH = 400.0
+TELEPORT_KEEP_SECONDS = 120
+TELEPORT_ASK_SECONDS = 2.0
+
 # Where the machine's network counters are (Linux); anywhere else, none.
 NET_DEV_PATH = "/proc/net/dev"
 MEMINFO_PATH = "/proc/meminfo"
@@ -1078,6 +1114,24 @@ def parties_of(user_ids):
     return {int(r["user_id"]): int(r["party_id"]) for r in rows}
 
 
+def teleport_to(user_id, area):
+    """(x, y) where staff sent this player in `area` in the last
+    TELEPORT_KEEP_SECONDS, or None (HELD TO A WALK). Read in a thread."""
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT area, x, y FROM pending_teleports WHERE user_id = ? AND issued_at >= ?",
+                           (int(user_id), int(time.time()) - TELEPORT_KEEP_SECONDS)).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
+        return None
+    finally:
+        conn.close()
+    if row is None or str(row["area"]) != str(area):
+        return None
+    return float(row["x"]), float(row["y"])
+
+
 def still_valid(ticket_hashes, now=None):
     """Which of these ticket hashes are in date with their login alive."""
     hashes = list(ticket_hashes)
@@ -1153,6 +1207,17 @@ class Player:
         # walked into its current area - the leader is the earliest.
         self.version = 0
         self.joined_at = 0.0
+        # HELD TO A WALK: the distance it may still cover at once, when that
+        # was worked out (monotonic), whether its next step may land anywhere,
+        # when a sync last allowed that, how many steps were held, and the
+        # last answer about a staff teleport (and when it was asked).
+        self.walk_room = 0.0
+        self.walk_at = 0.0
+        self.snap_next = False
+        self.sync_snap_at = -SYNC_SNAP_SECONDS
+        self.held_moves = 0
+        self.tele_asked_at = -TELEPORT_ASK_SECONDS
+        self.tele_dest = None
         # ATTACKS RIDE THE TICK: this game takes them inside the moves.
         self.tick_attacks = False
         # THE SERVER OWNS THEIR HEALTH: this game draws the books' count.
@@ -1583,6 +1648,9 @@ class PresenceServer:
         # ONLY WHAT IS NEAR (0.89.0): on, and how often the views are looked at.
         self.near = NEAR
         self.view_ticks = VIEW_TICKS
+        # HELD TO A WALK: on, and how many steps were held since the start.
+        self.hold_moves = HOLD_MOVES
+        self.moves_held = 0
 
     # ---- sending -------------------------------------------------------------
     # EVERYTHING SENT IS COUNTED (game 0.78.0): a frame for each socket a text
@@ -2138,10 +2206,13 @@ class PresenceServer:
             return False
         moved_area = state["area"] != player.where
         was_at = (player.x, player.y)
-        player.x, player.y = state["x"], state["y"]
+        # The books hear the game's own word; everyone else sees it HELD TO A
+        # WALK (when on).
         if player.fighter is not None:
             self._book_safely(player.fighter.moved, state["area"], state["x"], state["y"],
                               time.time(), moved_area)
+        player.x, player.y = await self.held_to_walk(player, state["x"], state["y"],
+                                                     moved_area or state["area"] in INSTANCED_PLACES)
         if state["anim"].startswith("death") and not player.anim.startswith("death") and not moved_area:
             self.metered_event(player.area, "fell", player.user_id, str(player.identity.get("name", "")))
         look_was = (player.anim, player.fx, player.pet, player.aim, player.hp)
@@ -2153,7 +2224,7 @@ class PresenceServer:
         # to the others, and is not passed on.
         if self.took_state(player, state) and not moved_area \
                 and look_was == (player.anim, player.fx, player.pet, player.aim, player.hp) \
-                and was_at == (state["x"], state["y"]):
+                and was_at == (player.x, player.y):
             return True
         if moved_area:
             player.steps = []
@@ -2166,6 +2237,63 @@ class PresenceServer:
                 del player.steps[0]
             player.dirty = True
         return True
+
+    # ---- HELD TO A WALK (14 Nov) -----------------------------------------------
+
+    @staticmethod
+    def walk_speed(player):
+        """How fast this player may be seen to move, px a second: the books'
+        walking bound (sprint included) times their SLACK; 0 when unknown."""
+        bounds = player.fighter.bounds if player.fighter is not None else None
+        if combatbook is None or not bounds:
+            return 0.0
+        return float(bounds.get("speed") or 0.0) * combatbook.SLACK
+
+    @staticmethod
+    def walk_most(speed):
+        return speed * WALK_BURST_SECONDS + WALK_PAD
+
+    @staticmethod
+    def walks_free(player):
+        """Staff, and anybody in a party-only room, are never held."""
+        return str(player.identity.get("role", "player")) in SEES_ALL_ROLES or player.where in INSTANCED_PLACES
+
+    async def held_to_walk(self, player, x, y, fresh):
+        """Where this player is passed on as standing: (x, y) as its game says,
+        or - when that is further than it could have walked - as far toward
+        it as it could."""
+        now = time.monotonic()
+        speed = self.walk_speed(player)
+        if fresh or player.snap_next or not self.hold_moves or speed <= 0 or self.walks_free(player):
+            player.snap_next = False
+            player.walk_room, player.walk_at = self.walk_most(speed), now
+            return x, y
+        most = self.walk_most(speed)
+        player.walk_room = min(most, player.walk_room + speed * max(0.0, now - player.walk_at))
+        player.walk_at = now
+        step = math.hypot(x - player.x, y - player.y)
+        if step <= player.walk_room:
+            player.walk_room -= step
+            return x, y
+        if await self._sent_there(player, x, y):
+            player.walk_room = most
+            return x, y
+        player.held_moves += 1
+        self.moves_held += 1
+        share = player.walk_room / step
+        player.walk_room = 0.0
+        return player.x + (x - player.x) * share, player.y + (y - player.y) * share
+
+    async def _sent_there(self, player, x, y):
+        """True when staff moved this player to near (x, y) in its area lately
+        (app.py's pending_teleports). Asked in a thread, at most every
+        TELEPORT_ASK_SECONDS a player; the answer is kept between."""
+        now = time.monotonic()
+        if now - player.tele_asked_at >= TELEPORT_ASK_SECONDS:
+            player.tele_asked_at = now
+            player.tele_dest = await asyncio.to_thread(teleport_to, player.user_id, player.where)
+        dest = player.tele_dest
+        return dest is not None and math.hypot(x - dest[0], y - dest[1]) <= TELEPORT_SNAP_REACH
 
     def took_state(self, player, state):
         """THE ENEMY METER (0.83.0): what this state's totals add since the
@@ -2445,6 +2573,11 @@ class PresenceServer:
                 elif kind == "renew":
                     await self.renew(player, message)
                 elif kind == "sync" and player.area:
+                    # HELD TO A WALK: a rebuilt world may put its player
+                    # anywhere - its next step lands free, once a while.
+                    if time.monotonic() - player.sync_snap_at >= SYNC_SNAP_SECONDS:
+                        player.sync_snap_at = time.monotonic()
+                        player.snap_next = True
                     # A new world has nobody in it: whoever is near, afresh.
                     seen = self._wanted(player, fresh=True)
                     player.sees = {q.user_id for q in seen}

@@ -17,7 +17,7 @@ out - takes the player off everybody's screen within seconds.
 It runs the real presence server in this process, on a free port, against a
 throwaway database in the temp folder - never elusion.db.
 """
-import ast, asyncio, contextlib, importlib.util, inspect, io, json, math, os, re, sqlite3, sys, time
+import ast, asyncio, contextlib, importlib.util, inspect, io, json, math, os, re, sqlite3, sys, time, types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import testdir  # noqa: E402  (a private folder per run - testdir.py)
@@ -2938,7 +2938,108 @@ def the_loop_never_waits():
           "handed()" not in said, planted)
 
 
+async def held_to_a_walk():
+    """P-27: HELD TO A WALK (14 Nov) - with ELUSION_HOLD_MOVES on, a step
+    further than the character could have walked is passed on only as far as
+    it could; staff, a party's room, a rebuilt world (once a while) and a
+    staff teleport are free."""
+    section("P-27 HELD TO A WALK: OTHERS SEE A HOP AS A WALK, AND HONEST PLAY NEVER NOTICES")
+    check("it ships off: ELUSION_HOLD_MOVES unset is off, and the setting is one the server knows",
+          os.environ.get("ELUSION_HOLD_MOVES") is not None or presence.HOLD_MOVES is False)
+    W, V, M = account("hopw"), account("hopv"), account("hopm")
+    sql("UPDATE users SET role = 'mod' WHERE username = 'hopm'")
+    server = presence.PresenceServer(sweep_seconds=60, tick_seconds=0.05)
+    server.near = False
+    server.hold_moves = True
+    server.start_clocks()
+    async with serve(server.handler, "127.0.0.1", 0, max_size=presence.MAX_SOCKET_BYTES) as ws_server:
+        port = list(ws_server.sockets)[0].getsockname()[1]
+        try:
+            w, _ = await enter(port, W, "field", x=100.0, y=200.0)
+            v, _ = await enter(port, V, "field", x=150.0, y=260.0)
+            await collect(w)
+            await collect(v)
+            hub_w = next(p for p in server.players.values() if p.user_id == uid("hopw"))
+            speed = server.walk_speed(hub_w)
+            check("the store is the books' walking bound (sprint in it) times their SLACK",
+                  speed > 0 and speed == hub_w.fighter.bounds["speed"] * combatbook.SLACK, speed)
+            await w.send(state("field", x=140.0, y=200.0, m="walkright"))
+            got_v = await collect(v)
+            check("an ordinary step is passed on where the game says", moved(got_v).get(uid("hopw"), [0, 0])[1] == 140.0,
+                  got_v)
+            await w.send(state("field", x=3140.0, y=200.0, m="walkright"))
+            got_v = await collect(v)
+            # Looked at at once: the books' flags move on to the hub at its
+            # tick and to the database at its flush.
+            jumps = [f for f in hub_w.fighter.flags if f[2] == "jumped"] + [
+                k for k in server._flags if k[0] == uid("hopw") and k[2] == "jumped"]
+            seen = moved(got_v).get(uid("hopw"), [0, 0])[1]
+            check("a teleport across the area is seen as far as it could walk, not where it says",
+                  140.0 < seen < 140.0 + server.walk_most(speed) + 1 and hub_w.held_moves == 1, (seen, speed))
+            await asyncio.sleep(0.5)
+            await w.send(state("field", x=3140.0, y=200.0, m="walkright"))
+            got_v = await collect(v)
+            later = moved(got_v).get(uid("hopw"), [0, 0])[1]
+            check("  and it walks there at the most it could, a step at a time",
+                  seen < later < 3140.0 and later - seen <= speed * 0.9 + 1, (seen, later, speed))
+            check("  while the books still hear the game's own word, and write the jump down",
+                  len(jumps) >= 1 or any("jumped" in str(r) for r in sql(
+                      "SELECT kind FROM combat_flags WHERE user_id = ?", (uid("hopw"),))), jumps)
+
+            m, _ = await enter(port, M, "field", x=200.0, y=300.0)
+            await collect(m)
+            await collect(v)
+            await m.send(state("field", x=2200.0, y=300.0, m="walkright"))
+            got_v = await collect(v)
+            check("staff are never held: a mod's \"Go to\" lands where it lands",
+                  moved(got_v).get(uid("hopm"), [0, 0])[1] == 2200.0, got_v)
+
+            hub_w.walk_room = 0.0
+            await w.send(json.dumps({"t": "sync"}))
+            await collect(v)
+            await w.send(state("field", x=600.0, y=900.0, m="idledown"))
+            got_v = await collect(v)
+            check("a rebuilt world (sync) lets the next step land anywhere",
+                  moved(got_v).get(uid("hopw"), [0, 0, 0])[1:3] == [600.0, 900.0], got_v)
+            await w.send(json.dumps({"t": "sync"}))
+            await collect(v)
+            await w.send(state("field", x=2600.0, y=900.0, m="idledown"))
+            got_v = await collect(v)
+            check("  but only once in %d s: a second sync straight after frees nothing" % presence.SYNC_SNAP_SECONDS,
+                  moved(got_v).get(uid("hopw"), [0, 0])[1] < 2600.0, got_v)
+
+            sql("INSERT OR REPLACE INTO pending_teleports (id, user_id, area, x, y, slot_index, group_size, issued_by,"
+                " issued_at) VALUES (1, ?, 'field', 4000.0, 1500.0, 0, 1, 'hopm', ?)", (uid("hopw"), int(time.time())))
+            hub_w.tele_asked_at = -presence.TELEPORT_ASK_SECONDS
+            await w.send(state("field", x=4030.0, y=1520.0, m="idledown"))
+            got_v = await collect(v)
+            check("a player staff just moved lands where staff sent them, not walked there",
+                  moved(got_v).get(uid("hopw"), [0, 0, 0])[1:3] == [4030.0, 1520.0], got_v)
+            hub_w.tele_asked_at = -presence.TELEPORT_ASK_SECONDS
+            await w.send(state("field", x=200.0, y=200.0, m="idledown"))
+            got_v = await collect(v)
+            check("  and only there: a hop somewhere else is still held",
+                  moved(got_v).get(uid("hopw"), [0, 0])[1] > 200.0, got_v)
+
+            check("a party's own room is never held (the Endless wakes you by the chest)",
+                  presence.PresenceServer.walks_free(types.SimpleNamespace(identity={"role": "player"}, where="endless"))
+                  and not presence.PresenceServer.walks_free(types.SimpleNamespace(identity={"role": "player"},
+                                                                                     where="field")))
+            server.hold_moves = False
+            hub_w.walk_room = 0.0
+            await w.send(state("field", x=3000.0, y=200.0, m="idledown"))
+            got_v = await collect(v)
+            check("switched off, a step is passed on as the game says it, as before",
+                  moved(got_v).get(uid("hopw"), [0, 0])[1] == 3000.0, got_v)
+            check("the hub counts the steps it held", server.moves_held >= 3, server.moves_held)
+            for ws in (w, v, m):
+                await ws.close()
+        finally:
+            server.stop_clocks()
+
+
 async def main():
+    await held_to_a_walk()
     the_loop_never_waits()
     await kills_written_soon()
     await positions_written()

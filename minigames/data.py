@@ -29,13 +29,27 @@ def kills_since(db, user_id, game, since, boss):
     ).fetchone()[0]
 
 
-def record_kill(db, user_id, slot, game, enemy_id, boss, now, pet=False):
-    """One paid kill (pet: it won its pet) - and every one older than
+def record_kill(db, user_id, slot, game, enemy_id, boss, now, pet=False, gold=0):
+    """One paid kill (pet: it won its pet; gold: what its coins rolled into
+    the chest are worth, 14 Nov) - and every one older than
     KILLS_KEPT_SECONDS out."""
     db.execute(
-        "INSERT INTO minigame_kills (user_id, slot, game, enemy_id, boss, at, pet) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (int(user_id), int(slot), str(game), str(enemy_id), 1 if boss else 0, int(now), 1 if pet else 0),
+        "INSERT INTO minigame_kills (user_id, slot, game, enemy_id, boss, at, pet, gold)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (int(user_id), int(slot), str(game), str(enemy_id), 1 if boss else 0, int(now), 1 if pet else 0,
+         int(gold)),
     )
+
+
+def gold_since(db, user_id, since):
+    """A DAY'S MINIGAME GOLD (services.py): what the account's minigames have
+    paid since `since` - runs' gold at Leave and coins rolled into chests -
+    every character and every minigame."""
+    runs = db.execute("SELECT COALESCE(SUM(gold), 0) FROM minigame_runs WHERE user_id = ? AND finished_at > ?",
+                      (int(user_id), int(since))).fetchone()[0]
+    chests = db.execute("SELECT COALESCE(SUM(gold), 0) FROM minigame_kills WHERE user_id = ? AND at > ?",
+                        (int(user_id), int(since))).fetchone()[0]
+    return int(runs) + int(chests)
 
 
 def pets_since(db, user_id, game, since):
