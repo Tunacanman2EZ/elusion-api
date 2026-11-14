@@ -31,7 +31,7 @@ Role definitions, the ladder and how the owner is named: [`CLAUDE.md` → Ranks]
 | Actor | Can, by design | Is **not** trusted with |
 |---|---|---|
 | **Anonymous** | `GET /api/status`, register, log in | Any state at all. Three routes, and `/api/status` exists because a login screen has to ask "are you there?" before anyone has logged in |
-| **Logged-in player** | Move, chat, save, and *request* loot, trades, purchases, revives, cooking, fishing — each as a claim the server re-derives | Their own level, XP, stat maxima, loot rolls, gold totals, lusion totals, any of the six skills, or any row that is not theirs |
+| **Logged-in player** | Move, chat, save, and *request* loot, trades, purchases, revives, cooking, fishing, a minigame's Go and its pay — each as a claim the server re-derives | Their own level, XP, stat maxima, loot rolls, gold totals, lusion totals, any of the six skills, a minigame's pay past what its day and its time allow, or any row that is not theirs |
 | **Mod** | Kick, ban up to 30 days, mute up to a day, take a chat line down, read and close chat reports, read the staff user list, the moderation log and linked accounts, write staff-only notes and warnings | Banning at or above their own rank, banning permanently, granting a rank at or above their own, touching the economy — including creating any item, which since 6 Oct 2026 no rank below the owner can do (`test_security.py` E-1, `test_api.py` STAFF GRANTS) |
 | **Dev** | Everything a mod can, plus permanent bans, longer mutes, teleporting a player, reading economy supply | Granting dev or owner, moving the whole server, minting gold, the metrics endpoint |
 | **Co-owner** (0.21.0) | Everything the owner can — the GM panel, items, gold, levels (theirs and a player's), the save history, the server switches — while the owner's co-owner switch is on. Every gift goes in the gifts ledger under their name | Anything done to the owner's account (moderating, ranking, giving to, levelling, reading the history of or rolling it back), throwing their own switch, or being named anywhere a request can write: `ELUSION_CO_OWNERS` is an environment variable like the owner's. Off, they are the rank their row says (`test_coowner.py`) |
@@ -400,6 +400,73 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     reach "Forgot password" already gives whoever reads that inbox - and
     never a staff, deleted or already-linked account.
     → Held by: `test_googlesignin.py` — "  and the code is still waiting for a good one", "another computer cannot collect it - the same 404 as a code that never was", "  a computer not proved with the password and code - or proved at another rank, or run out - is refused", "  so an admin power asks for the password first (confirm_password), and bans nobody", "no Google sign-up may take the owner's name", "one Google account, one game account: it is never asked for a name again, and no second is made", "  a name not offered cannot be claimed: unconfirmed, staff, deleted, linked or made up (404)"
+41. **A minigame pays only inside its day, at most its runs, and never more
+    than the time since its Go allows** (game 0.93.3 to 0.131.0,
+    minigames/). Going in is the day: one Go a day for the Endless and the
+    Forge, three rolling runs for the Healer's Run and Cut the Cloth, per
+    account whichever character - the owner skips the wait and is written
+    all the same. A kill in the Endless or the Forge pays loot only (no XP,
+    no level, no kill record, no bag) into that character's own chest, and
+    only as many as the run's own schedule - gamedata.json, from the game's
+    exporter - could have sent since the Go at the biggest party; a Forge
+    sprite rolls its pet and mythic ten times rarer, one pet a Go. A run's
+    gold (the Healer's Run's waves and bosses, the Cloth's rounds) is paid
+    once, at Leave, for the caller's own run, believed only as far as its
+    time allows; a run left too long pays nothing, a best time is never
+    longer than since the Go. Every chest read and take is the caller's;
+    the next Go empties it.
+    → Held by: `test_minigames.py` — "a second Go inside the day is refused (409), with how long is left, in words", "the wait is the account's: one row per account and minigame, whichever character", "  loot only: no XP, no level, no kill record, no bag", "70 elites inside the first minute is all a run could have sent: the 71st is a 429, and pays nothing", "another account reads its own chest, never somebody else's, and cannot take from it", "  50 fire sprites at the Go is all there could be: the 51st is a 429 that names them", "  one pet a Go: the first kill's is kept, the second kill is not let roll one", "the fourth inside the day is refused (409) with when the next one is, in words", "a run that says it reached the goal 30 seconds after its Go is believed only as far as the time allows", "  once: a second Leave for the same run is refused (409)", "refused: somebody else's run (404), a bad body (400), not logged in (401)", "a run left too long pays nothing (closed without Leave)", "a run that says it cleared 12 rounds 40 seconds after its Go is believed for 2", "  no run is believed longer than since your Go"
+42. **Deleting your own account takes everything that was yours and nothing
+    that is anybody else's** (game 0.90.0, accountdelete/). It asks three
+    times - the name typed, the password (a wrong one counted as a failed
+    login), the game's second press - and refuses the owner, an open trade
+    and a guild led with others in it. Every row that was the player's
+    goes; their gold and lusions are burned through the ledger, so the
+    supply still adds up; their chat lines come off every screen; every
+    session, trusted computer and presence ticket goes. The users row is
+    kept, emptied - a stand-in name nobody can sign up as, no password, no
+    address - because a bare delete would cascade through other people's
+    trades and the ledgers, and the staff log keeps what was done, under the
+    stand-in.
+    → Held by: `test_accountdelete.py` — "the wrong password is a 401", "  counted as a failed login", "the owner's account cannot be deleted (403)", "an open trade naming them is a 409", "  and nothing was taken by any refusal", "THE ROW IS KEPT (a bare DELETE would cascade through other people's trades and the ledgers)", "  keeping only its id and a stand-in name - no password, no address, marked deleted", "THE SUPPLY STILL ADDS UP: what the ledger recorded is what purses and banks hold", "their chat line is taken off every screen (a deletion the feed carries)", "the staff log keeps what was done to them, under the stand-in"
+43. **Who dealt what reaches only the owner, and only while the meter is
+    open** (game 0.82.0 and on, presence.py's meter). The damage meter's
+    report - every hit in a room, booked and claimed, deaths, health taken -
+    is sent to an owner or a co-owner who opened it, for their own room
+    alone, and nothing is even kept for a room nobody meters. A meter field
+    a game sends that is out of bounds is dropped and the state kept.
+    → Held by: `test_presence.py` — "a player who is not owner or co-owner cannot open it; 'on' must be true or false", "  only to those metering, each its own room: the plain player and the co-owner hear nothing", "  and a death or an event in a room nobody meters is not even kept", "shut: nothing sent, nothing metered", "a bad meter field is dropped and the state kept: health over its most, a total not whole"
+44. **A game hears only the players near it, and a party's run only its
+    party** (game 0.89.0, 0.93.3, 0.105.0, 0.126.0). Where somebody stands
+    goes only to the games within a screen and a margin of them - their
+    party wherever they are, staff everywhere - so a modified game cannot
+    map a whole area's players. The Endless, the Healer's Run and the
+    Descent seat each party in a room the server chooses from its own party
+    rows and never names, so nobody walks into somebody else's run, and a
+    run's messages pass only inside its own room.
+    → Held by: `test_presence.py` — "two players far apart in one area are not drawn on each other's screens", "past far, it is taken off the other's screen with a leave, both ways", "staff see everyone (Go to finds them)", "party members see each other wherever they stand (the party window's health)", "two of a party playing the run share its room, the party's own; a stranger has one of their own", "two of a party in the Descent share its room, the party's own; a stranger has one of their own", "  never back to the leader, never to a game that does not speak it, never to another arena", "anywhere but a party's arena the run is nobody's business: dropped"
+45. **A crowd cannot run up the month's bill** (game 0.79.0, THE DATA
+    GUARD). presence.py counts what the machine sends every minute and
+    tightens itself a level at a time - full, half, rooms of a crowd, alone
+    - when the month's allowance would run out, and loosens again when it
+    allows; spent, it is alone at once. So a flood of logins slows the game
+    for everyone rather than costing money nobody has. That is a choice of
+    availability for cost, and it is the owner's to turn off.
+    → Held by: `test_presence.py` — "full: every step passed on; half: every other one", "crowd: GUARD_CROWD (%d) to a room, the next in a second room of the area", "alone: everyone seated in a room of their own - the earliest stays, the rest move", "the month's allowance spent: alone at once, whatever the clocks"
+46. **The game's own error reports cannot fill the disk or name anyone**
+    (clienterrors/). A logged-in game may report what broke; each report
+    is held to a size, each account to a number of distinct errors a day,
+    every message cut to one line, and old rows go. Only the owner reads
+    them, and the owner's view names nobody.
+    → Held by: `test_clienterrors.py` — "not a report is a 400, and no login a 401", "at most ERRORS_PER_POST a report; the rest dropped and said", "one account keeps at most ROWS_PER_DAY distinct errors a day - a broken build cannot fill the disk", "the message is one line: control characters gone, spaces folded, cut to WHAT_MOST", "a player gets the bare 404, no login the 401", "  and no name in it anywhere - not a player's, not the owner's"
+47. **The economy's numbers are the owner's, and their bounds cannot mint**
+    (game 0.74.0, economyrules/). The trade tax, the shop's prices and the
+    materials' scales can be changed on the server without a new version -
+    by the owner alone, with the password asked again on a hardened login,
+    each change written down - and every number has a lowest and highest:
+    the shop must always pay less than it charges, and the tax's floor is
+    at least one gold, the laundering the floor exists to stop.
+    → Held by: `test_economyrules.py` — "a player: the four numbers, and the bare 404 from the owner's table and its change", "  and her change is the owner's alone: the bare 404, nothing written", "  a change on a hardened login with a stale confirm asks for the password again, and writes nothing", "  out of bounds, either side, is refused saying them", "the shop must pay less than it charges: sell at or above price is refused, either way round", "  the tax's floor is whole gold, and at least 1 - a floor of 0 is the laundering the floor exists to stop"
 
 ---
 
@@ -514,17 +581,31 @@ No comforting lies. These are known, named and open.
   caps the few numbers the leader sends, and is paid only against the
   server's count (E-3). A game older than 0.87.0 still shows the leader's
   health.
-- **In a party's arena the run is the party's word** (game 0.93.3). The
-  Endless gives each party a room of its own, chosen by the server from its
-  own `party_members` rows - a game names only the area, so nobody can walk
-  into another party's run (`test_presence.py` P-21). Inside it, the games
+- **In a party's run the run is the party's word** (the Endless 0.93.3,
+  the Healer's Run 0.105.0, the Descent 0.126.0). Each party has a room of
+  its own, chosen by the server from its own `party_members` rows - a game
+  names only the area, so nobody can walk into another party's run
+  (`test_presence.py` P-21, P-24, P-26, invariant 44). Inside it, the games
   pass the run between them (`"en"`): the leader's clock and its slimes, and
   everybody's hits on the swarm, checked for shape and size but not for
-  truth, and nothing in the arena is booked. So a modified game in your party
-  can kill slimes it never hit, start or end the run, or - as the room's
-  leader - set the elites' health. None of it pays: the swarm, the elites and
-  the bosses there report no kill, and the run's chest is not built
-  (`test_presence.py` P-22).
+  truth, and nothing there is booked. So a modified game in your party can
+  kill slimes it never hit, start or end the run, or - as the room's leader
+  - set the elites' health. The swarm and the Descent pay nothing. What does
+  pay is held apart from the party: an Endless elite or boss pays loot only,
+  into the reporting player's own chest, held to the run's schedule since
+  their own Go, and the Healer's Run pays each player their own run at
+  Leave (invariant 41) - so a party member can spoil a run, never fill
+  somebody's purse or chest past what their own day allows.
+- **A minigame's result is the game's word, held to what its time allows**
+  (invariant 41). The server does not watch a run. A modified game can
+  report every Endless elite and boss the run's schedule allows inside its
+  Go's day (about 1,400 elites and 7 bosses) and every Forge fire sprite of
+  six whole runs; claim the Healer's Run's goal no sooner than its waves'
+  time - 20,000 gold a run, three runs, 60,000 a day; claim 30 rounds of Cut
+  the Cloth no faster than 15 seconds a round - 24,250 a run, 72,750 a day;
+  and a Forge best time as long as it has been in. Once a day, and three
+  runs a day, are what cap it; a daily gold cap across the minigames is the
+  lever if that is too much.
 
 - **A rollback can make a second copy of an item.** It puts back what the
   character held when the snapshot was taken; an item traded, banked or sold
@@ -535,6 +616,11 @@ No comforting lies. These are known, named and open.
   through the ledger like any other mint or burn - but, like every burn, gold a
   rollback takes away is counted on the Kingdom board as given.
 
+- **A deleted account lives on in the backups** for as long as they are
+  kept (`backup_db.py` keeps 14 nights, and any copy taken off the machine);
+  a restore would bring it back. Deletion is immediate on the live server
+  (invariant 42), not in the copies.
+
 Anything not on this list that later turns out to be true belongs on it.
 
 ---
@@ -543,9 +629,10 @@ Anything not on this list that later turns out to be true belongs on it.
 
 | For | Read |
 |---|---|
-| Threat model, and every finding E-1…E-21 with what happened to it | [`SECURITY_NOTES.md`](SECURITY_NOTES.md) |
+| Threat model, and every finding E-1…E-22 with what happened to it | [`SECURITY_NOTES.md`](SECURITY_NOTES.md) |
 | Who owns which field, and the exact request/response of every route | [`docs/apicontract.md`](../../Elusion_RPG/docs/apicontract.md) *(game repo)* |
 | TLS, the proxy setting, secrets, backups, monitoring, "before the first stranger connects" | [`DEPLOY.md`](DEPLOY.md) |
+| The pieces, how they talk, who owns which data, the measured limits | [`ARCHITECTURE.md`](ARCHITECTURE.md) |
 | Ranks, conventions, and the traps that cost a day each | [`CLAUDE.md`](CLAUDE.md) |
 
 Secrets, for the avoidance of doubt: `.env` and `elusion.db` are never committed,

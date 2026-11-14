@@ -43,6 +43,7 @@ lives.
 | E-19 | Two games on one account each saved their own bag | medium (integrity) | **Closed** | Two copies of the game on one account overwrote each other's bag and lost items, and a stolen token kept working beside the owner's. | **One session at a time.** A login that gets its token, or a game resuming a remembered one, ends every other session on the account; resuming keeps the original end date. `test_accounts.py`. |
 | E-20 | **A staff password was the only thing between a guesser and the moderation desk** | **high (moderation)** | **Closed** — with a named limit | Staff names are public (the crown, the MOD and DEV badges), so their passwords are the ones worth guessing; one guessed password gives bans, notes and IP addresses. | **Second factor.** A staff login with a confirmed recovery address answers 202 and emails a six-digit code; only the code gets a token. A computer that proved itself is trusted for 30 days, at the rank it was trusted at. With no address or no mail it stands aside and says so. `test_staffcode.py`. |
 | E-21 | **Session tokens were stored as issued** | **high (accounts)** | **Closed** | A copy of `elusion.db` - a backup, a leaked file - logged its holder in as every player signed in, for up to 30 days, with no password needed. | **Hashing at rest.** `sessions` keeps only each token's SHA-256 (`token_hash`) and every lookup hashes the token it is sent, as `trusted_devices` and `ended_sessions` already did and as passwords always were (scrypt). A boot migration hashed every stored token in place, so nobody was signed out. `test_accounts.py` A-5, `test_api.py` MIGRATION. |
+| E-22 | **A minigame's result is the game's own claim** | medium (economy) | **Mitigated** — held to the day and the time; open, named in SECURITY.md | A modified game can claim the best run its time allows: up to 60,000 gold a day from the Healer's Run and 72,750 from Cut the Cloth, and every Endless and Forge kill their schedules allow, into its own chest. | **Bound by time and count.** One Go a day or three runs; each kill held to what the run's own schedule could have sent since the Go; each run's gold paid once, for the caller's own run, believed only as far as its time allows (`test_minigames.py`). A daily gold cap across the minigames is the next lever. |
 
 Nineteen findings: eighteen closed, one mitigated (E-3, since 25 Oct 2026). Plus E-15, an audit that went
 looking and came back empty — kept, because a search that finds nothing is
@@ -1671,6 +1672,42 @@ an old-shaped table holding a raw token and checks it is hashed, still signs in,
 and is not hashed twice on the next boot. Broken five ways on purpose (raw token
 stored, migration skipped, renamed without hashing, the kept session compared
 unhashed, the heartbeat stamping by the raw token) - each one went red.
+
+### E-22 — A minigame's result is the game's own claim · MITIGATED (13 Nov 2026)
+
+Found in the review of 13 Nov (game 0.156.0), which read everything added since
+the last pass: the minigames (the Endless and its chest, the Healer's Run, the
+Forge, Cut the Cloth, the Descent), the party rooms, the damage meter's
+reports, only-what-is-near, the data guard, account deletion, the game's own
+error reports, the economy's numbers and Google sign-in. Every route was
+scoped to its caller and every cited suite was green (test_minigames 91,
+test_accountdelete 41, test_clienterrors 22, test_economyrules 70,
+test_security 301, test_ownership 150, test_googlesignin 73, test_routes 8,
+test_presence 363). What it found is not a hole but a shape the E-3 work already
+named for kills: **a run is played on the player's machine, so what it says
+happened is a claim.**
+
+**What it costs if exploited.** The server checks the claim against time and
+count, not against a fight it watched. A modified game can report every
+Endless elite and boss the run's schedule allows inside its Go's day (about
+1,400 elites and 7 bosses) and every Forge fire sprite of six whole runs, each
+paying its loot into that character's chest; claim the Healer's Run's goal no
+sooner than its waves take - 20,000 gold a run, 60,000 a day; claim 30 rounds
+of Cut the Cloth at 15 seconds a round - 24,250 a run, 72,750 a day.
+
+**What bounds it.** One Go a day (the Endless, the Forge) or three rolling
+runs (the Healer's Run, the Cloth), per account; a kill only of a monster the
+run sends, only while its Go's day lasts, never past the schedule's count; a
+run's gold paid once, for the caller's own run, believed as far as its time
+allows, nothing for a run left too long; a pet out of the Forge ten times
+rarer and one a Go. All of it is in SECURITY.md (invariant 41, and under
+Honest limits).
+
+**What would close it.** For kills, what closed E-3: the books. The Endless's
+elites and bosses are real monsters, so a run's could be booked as an area's
+are and paid against a receipt. A run's gold has no fight to book; a daily
+gold cap across the minigames - a number the owner sets, like the economy's -
+is the lever if the ceiling is too high.
 
 ## The security bot — attacking a running server, not the source
 
