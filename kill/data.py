@@ -64,21 +64,34 @@ def bank(db, user_id, slot, level, xp, xp_to_next, derived, now_ms, tokens, now)
         )
 
 
-def receipt_for(db, user_id, slot, enemy_id, since):
+def receipt_for(db, user_id, slot, enemy_id, since, area=None, not_areas=()):
     """The oldest AGREED death in the books for this account and monster since
     `since` that has not paid a kill yet - this character's, or one the books
     could not put a character to - as its combat_kills id, or None.
 
+    ONE PLACE'S DEATHS PAY ONE PLACE'S KILLS (game 0.159.0). The Endless is
+    booked too, and its elites are the fields' own monsters (a bush mage is a
+    bush mage), so a death there must never pay an ordinary kill - XP and a bag
+    for a chest's elite - nor a field's death a chest kill. `area` takes only
+    that area's deaths; `not_areas` leaves those out.
+
     None as well on a database with no books at all, which is a server that
     cannot pay a kill this way; the route says so as "not yet"."""
+    where, args = "", []
+    if area is not None:
+        where += " AND area = ?"
+        args.append(str(area))
+    for place in not_areas or ():
+        where += " AND area != ?"
+        args.append(str(place))
     try:
         row = db.execute(
             "SELECT id FROM combat_kills"
             " WHERE user_id = ? AND enemy_id = ? AND verdict = 'agreed' AND at >= ?"
-            "   AND slot IN (?, -1)"
+            "   AND slot IN (?, -1)" + where +
             "   AND id NOT IN (SELECT combat_kill_id FROM kill_receipts WHERE at >= ?)"
             " ORDER BY at, id LIMIT 1",
-            (user_id, str(enemy_id)[:64], since, slot, since - services.RECEIPT_SECONDS),
+            [user_id, str(enemy_id)[:64], since, slot] + args + [since - services.RECEIPT_SECONDS],
         ).fetchone()
     except Exception as exc:  # noqa: BLE001 - sqlite3.OperationalError: no such table
         if "no such table" in str(exc):

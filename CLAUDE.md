@@ -2092,6 +2092,34 @@ P-27, two sabotages caught):
   jumps is many players in one area, and gets its own free rule.
 - `hub.moves_held` and `player.held_moves` count what was held.
 
+## The Endless's receipts (game 0.159.0)
+
+The owner chose to close most of E-22: an Endless chest kill paid only
+against the server's own count of the fight.
+
+- **The Endless is booked** (presence.py `BOOKED_RUNS`, `keeps_books()`): each
+  arena - `endless#p<party>` or `endless#u<account>` - keeps a book like a
+  field's, and its lead says `"b": 1`, so the game sends its world alone and
+  draws the server's count in company, as in the Field. The Healer's Run and
+  the Descent stay unbooked.
+- **A run's own monsters** (combatbook.py `RUN_MARK`, `AreaBook.run_brings`):
+  a record carrying `"rx": 1` (BaseEnemy.net_props(), a run's elite) of an id
+  the run sends (`run_brings()`, gamedata.json's Endless schedule) is
+  accounted for anywhere; any other `rx` monster is from nowhere.
+- **One place's deaths for one place's kills** (kill/data.py `receipt_for()`,
+  `area` / `not_areas`): `/api/combat/kill` never takes an Endless death
+  (kill/services.py `RUN_AREAS`), and the chest takes only the Endless's. The
+  elites are the fields' own monsters, so without this one death pays twice.
+- **The switch**: `ELUSION_ENDLESS_RECEIPTS` (envfile.KNOWN), off unless on,
+  read each request (app.py `endless_receipts_on()`). On: no receipt is a 202
+  "not yet" (minigames/services.py `RECEIPT_GAMES`, after every cheaper
+  refusal), a game below build 8 (`ENDLESS_RECEIPT_BUILD`) a 409 to update.
+  `CURRENT_CLIENT_BUILD` is 8.
+- **killwatch.py** prints `endless receipts:` (`receipts_backing(...,
+  endless=True)`), and its ordinary `receipts:` line no longer counts Endless
+  deaths. DEPLOY.md, "The Endless's receipts", is switching it on.
+- test_receipts R-9, test_combatbook CB-16, test_presence P-22, test_killwatch.
+
 ## Levers only from near (game 0.158.0)
 
 A lever pull ("l") was anybody's in its area, from anywhere in it. presence.py

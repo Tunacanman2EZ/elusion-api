@@ -291,6 +291,33 @@ edge.execute("INSERT INTO combat_kills (at, area, enemy_id, user_id, slot, verdi
 edged = killwatch.receipts_backing(edge, days=1, now=2001000)
 check("receipts: a death written while the game still asks pays; one after it gave up, or a minute before, "
       "or another character's, does not", (edged["paid"], edged["backed"], edged["never"]) == (4, 1, 3), edged)
+# THE ENDLESS'S RECEIPTS (game 0.159.0): its chest kills (minigame_kills) put
+# only to the Endless's deaths, and its deaths never back an ordinary kill.
+run = fresh(); books_tables(run)
+add_user(run, 40, "runner")
+run.execute("CREATE TABLE minigame_kills (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, slot INTEGER,"
+            " game TEXT, enemy_id TEXT, boss INTEGER DEFAULT 0, at INTEGER, pet INTEGER DEFAULT 0,"
+            " gold INTEGER DEFAULT 0)")
+for at in (3000100, 3000200, 3000300):
+    run.execute("INSERT INTO minigame_kills (user_id, slot, game, enemy_id, at) VALUES (40, 0, 'endless', 'bushmage', ?)",
+                (at,))
+run.execute("INSERT INTO combat_kills (at, area, enemy_id, user_id, slot, verdict, damage)"
+            " VALUES (3000100, 'endless', 'bushmage', 40, 0, 'agreed', 100)")
+run.execute("INSERT INTO combat_kills (at, area, enemy_id, user_id, slot, verdict, damage)"
+            " VALUES (3000200, 'field', 'bushmage', 40, 0, 'agreed', 100)")
+kill(run, 40, "bushmage", 3000100)
+chest = killwatch.receipts_backing(run, days=1, now=3000500, endless=True)
+field = killwatch.receipts_backing(run, days=1, now=3000500)
+check("endless receipts: a chest kill is backed by an Endless death only - never a field's",
+      (chest["paid"], chest["backed"], chest["never"]) == (3, 1, 2), chest)
+check("  and an Endless death backs no ordinary kill, though the monster and moment match",
+      (field["paid"], field["backed"]) == (1, 0), field)
+check("  its own line, worded for the chest",
+      killwatch.receipts_line(chest, days=1, endless=True).startswith(
+          "endless receipts: of 3 chest kills paid in the last 1 days, 1 (33.3%) had the books' receipt"),
+      killwatch.receipts_line(chest, days=1, endless=True))
+check("  a database with no chest kills table gives no line",
+      killwatch.receipts_backing(con, days=1, now=1000700, endless=True) is None)
 check("receipts: no books, no line; no kills lately, a line that says so",
       killwatch.receipts_backing(plain) is None and killwatch.receipts_line(None) is None
       and killwatch.receipts_line(killwatch.receipts_backing(con, days=1, now=5000000), days=1)

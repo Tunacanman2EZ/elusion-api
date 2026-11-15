@@ -516,7 +516,8 @@ No comforting lies. These are known, named and open.
   whose presence link is down, is not seen by the books at all.
 - **hp, mana and stamina are clamped, not verified** (E-9). Every rise is
   reconciled against what regeneration plus authorised potions could produce and
-  trimmed past a 3× margin. A bound, not a proof.
+  trimmed past a 2.25× margin (3× until 14 Nov 2026, when a month of live logs
+  showed honest play needing at most 1.72×). A bound, not a proof.
 - **A new computer defeats ban evasion** (E-11). A new account is refused from
   an address or a computer holding a live ban, and staff see linked accounts
   rated strong or weak. But the install id is whatever the game sends:
@@ -640,7 +641,13 @@ No comforting lies. These are known, named and open.
   `ELUSION_MINIGAME_GOLD_DAY` - across every run and every chest's coins, so
   the most a modified game takes is that number, not the 132,750 the two
   gold games' times allow. The chests' gear, materials and pets are still
-  the run's word, held to the schedule's count.
+  the run's word, held to the schedule's count - except, once the owner
+  switches `ELUSION_ENDLESS_RECEIPTS` on (game 0.159.0), the Endless's: the
+  server books its elites and bosses as it books a field's monsters, and a
+  chest kill there is paid only against an AGREED death in those books, in
+  the Endless (`test_receipts.py` R-9, `test_combatbook.py` CB-16). A
+  field's death never pays a chest, nor the Endless's a field's kill. The
+  Forge's fire sprites are not booked yet.
 
 - **A rollback counts items by id, and a sale's gold can stay where it went.**
   Since 0.157.0 it holds back what went to the bank, another character or

@@ -399,6 +399,11 @@ TIGHT = app_module.HEAL_ALLOWANCE_MARGIN
 LOOSE = app_module.HEAL_CLAMP_MARGIN
 check("the enforced line is looser than the logged one", LOOSE > TIGHT,
       "%s vs %s" % (LOOSE, TIGHT))
+# MEASURED, 14 Nov 2026: thirty days of live lines, the highest honest heal
+# needing 1.72 of this margin. Tightened from 3.00 to 2.25; never wider again
+# without a reason in the log, and never under what honest play was seen to need.
+check("the enforced line is 2.25 or tighter, and above the 1.72 honest play needed (14 Nov)",
+      1.72 < LOOSE <= 2.25, LOOSE)
 
 
 def stored_hp():

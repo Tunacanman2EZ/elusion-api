@@ -4054,7 +4054,12 @@ CLIENT_BUILD_HEADER = "X-Elusion-Build"
 # paid nothing. A build-6 game plays on, and is paid as before while the
 # receipts switch is off; with it on, a kill the books have not counted yet is
 # a 409 telling it to update. Set the minimum to 7 before switching receipts on.
-CURRENT_CLIENT_BUILD = 7
+# 8 (game 0.159.0): an Endless elite's or boss's chest kill waits for the
+# server's receipt too - a 202 from /api/minigames/kill is "not yet", asked
+# again (combat.gd). A build-7 game fills its chest as before while
+# ELUSION_ENDLESS_RECEIPTS is off; with it on, it is told to update. Set the
+# minimum to 8 before switching the Endless's receipts on.
+CURRENT_CLIENT_BUILD = 8
 
 MAINTENANCE_DEFAULT_MESSAGE = "Update in progress - please come back later."
 
@@ -5933,7 +5938,17 @@ HEAL_ALLOWANCE_MARGIN = 1.25
 # gap can be made from data. A band that stays empty across real play is the
 # argument for lowering this to 1.25; a band that fills with honest players is
 # the proof that shipping the tight clamp would have broken them.
-HEAL_CLAMP_MARGIN = 3.00
+#
+# MEASURED, 14 Nov 2026: the live server's last thirty days held four
+# `unexplained heal` lines and no `heal clamped` - six pools in all, every one
+# two or three seconds after the last save (the HEAL_MINIMUM_ELAPSED_SECONDS
+# floor), at 1.06x to 1.375x the allowance. So the band is NOT empty, and 1.25
+# would have trimmed four honest saves; the most any honest one needed was the
+# equivalent of 1.72 here. 2.25 is that with a third to spare, and takes what
+# a modified game may heal unexplained from 2.4x the allowance to 1.8x. Lower
+# it again only from another month of lines - the same command, DEPLOY.md
+# "Watching the heal check".
+HEAL_CLAMP_MARGIN = 2.25
 
 # ENFORCEMENT IS OFF, AND THIS IS WHY.
 #
@@ -9111,6 +9126,21 @@ def _class_of(db, user_id, slot):
     return row["class_id"] if row is not None else None
 
 
+def endless_receipts_on():
+    """Whether an Endless chest kill needs the books' receipt: off unless
+    ELUSION_ENDLESS_RECEIPTS is on. Read each time, so a suite can turn it on
+    and off."""
+    return os.environ.get("ELUSION_ENDLESS_RECEIPTS", "off").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _take_run_receipt(db, user_id, slot, enemy_id, now, area):
+    """The oldest unused AGREED death of `enemy_id` for this account in
+    `area`'s books, taken (kill_receipts) - True - or none to take."""
+    found = kill_package.data.receipt_for(db, user_id, slot, enemy_id,
+                                          int(now) - kill_package.services.RECEIPT_SECONDS, area=area)
+    return found is not None and kill_package.data.use_receipt(db, found, user_id, slot, int(now))
+
+
 minigames_package.register(
     app,
     require_auth=require_auth,
@@ -9133,6 +9163,12 @@ minigames_package.register(
     # chest coins together - asked on every call, so a suite can set it.
     gold_a_day=lambda: minigames_package.services.gold_a_day(os.environ.get("ELUSION_MINIGAME_GOLD_DAY")),
     money_worth=lambda item_id: (lambda kind, each: each if kind == "gold" else 0)(*money_item_worth(item_id)),
+    # THE ENDLESS'S RECEIPTS (game 0.159.0): with ELUSION_ENDLESS_RECEIPTS on,
+    # a chest kill there is paid only against the books' count, in the
+    # Endless - kill/'s receipt, held to the area (kill/data.receipt_for).
+    receipts_on=endless_receipts_on,
+    take_receipt=_take_run_receipt,
+    client_build=client_build,
 )
 
 

@@ -290,6 +290,82 @@ switch(BOSS, False)
 check("and off again, a kill nobody saw is paid once more", kill_claim(ANN, ENEMY).status_code == 200)
 
 
+
+# =============================================================================
+print("\n--- R-9 the Endless's receipts (game 0.159.0) ---")
+# =============================================================================
+# The Endless is booked now (presence.py BOOKED_RUNS), and with
+# ELUSION_ENDLESS_RECEIPTS on a chest kill there is paid only against an
+# AGREED death in those books, in the Endless. Its elites are the fields' own
+# monsters, so the two places' deaths must never pay each other's kills.
+ELITE = list(gamedata.ENDLESS["elites"])[0]
+ERIN = register("erin")
+client.put("/api/save", headers=headers(ERIN), json={"slot": 0, "class_id": "mage", "name": "Erin"})
+check("the Go into the Endless", client.post("/api/minigames/enter", headers=headers(ERIN),
+                                            json={"game": "endless"}).status_code == 200)
+
+
+def chest_kill(token, enemy=ELITE, build=8):
+    return client.post("/api/minigames/kill", headers=headers(token, build),
+                       json={"game": "endless", "slot": 0, "enemy_id": enemy})
+
+
+def endless_died(username, enemy=ELITE, slot=0, verdict="agreed"):
+    sql("INSERT INTO combat_kills (at, area, enemy_id, origin, leader_id, user_id, slot, verdict, damage)"
+        " VALUES (?, 'endless', ?, '', ?, ?, ?, ?, 100)",
+        (int(time.time()), enemy, uid(username), uid(username), slot, verdict))
+    return int(sql("SELECT MAX(id) AS id FROM combat_kills")[0]["id"])
+
+
+def chest_kills(username):
+    return int(sql("SELECT COUNT(*) AS n FROM minigame_kills WHERE user_id = ? AND game = 'endless'",
+                   (uid(username),))[0]["n"])
+
+
+os.environ.pop("ELUSION_ENDLESS_RECEIPTS", None)
+before = chest_kills("erin")
+check("off (unset), a chest kill is paid on the game's word, as before",
+      chest_kill(ERIN).status_code == 200 and chest_kills("erin") == before + 1)
+os.environ["ELUSION_ENDLESS_RECEIPTS"] = "on"
+before = chest_kills("erin")
+res = chest_kill(ERIN)
+check("on, with nothing in the books: 202 'not yet', and nothing in the chest",
+      res.status_code == 202 and (res.get_json() or {}).get("pending") is True and chest_kills("erin") == before,
+      (res.status_code, res.get_json()))
+field_death = sql("INSERT INTO combat_kills (at, area, enemy_id, origin, leader_id, user_id, slot, verdict, damage)"
+                  " VALUES (?, 'field', ?, 'o', ?, ?, 0, 'agreed', 100)",
+                  (int(time.time()), ELITE, uid("erin"), uid("erin")))
+check("  a field's death of the same monster pays no chest kill",
+      chest_kill(ERIN).status_code == 202 and chest_kills("erin") == before)
+here = endless_died("erin")
+res = chest_kill(ERIN)
+check("an AGREED death in the Endless's books: paid once, and the death is used",
+      res.status_code == 200 and chest_kills("erin") == before + 1 and here in receipts_of("erin"),
+      (res.status_code, receipts_of("erin")))
+check("  a second claim on the same death is 'not yet' again", chest_kill(ERIN).status_code == 202)
+endless_died("erin", verdict="short")
+check("  a SHORT death in the Endless pays nothing", chest_kill(ERIN).status_code == 202)
+res = chest_kill(ERIN, build=7)
+check("a game too old to ask again (build 7) is told to update, not paid nothing",
+      res.status_code == 409 and "update" in (res.get_json() or {}).get("message", ""), (res.status_code, res.get_json()))
+endless_died("erin")
+check("  and is still paid when the receipt is there", chest_kill(ERIN, build=7).status_code == 200)
+switch(BOSS, True)
+# The field's death above is a real receipt for an ordinary kill - spent here,
+# so the only death left for this monster is the Endless's.
+sql("INSERT INTO kill_receipts (combat_kill_id, user_id, slot, at) SELECT MAX(id), ?, 0, ? FROM combat_kills"
+    " WHERE area = 'field' AND user_id = ?", (uid("erin"), int(time.time()), uid("erin")))
+endless_died("erin", enemy=ELITE)
+xp_before = xp_of("erin")
+res = kill_claim(ERIN, ELITE)
+check("an Endless death never pays an ordinary kill: /api/combat/kill waits ('not yet') with only that",
+      res.status_code == 202 and xp_of("erin") == xp_before, (res.status_code, res.get_json()))
+switch(BOSS, False)
+os.environ["ELUSION_ENDLESS_RECEIPTS"] = "off"
+check("and off again, a chest kill nobody saw is paid once more", chest_kill(ERIN).status_code == 200)
+os.environ.pop("ELUSION_ENDLESS_RECEIPTS", None)
+
+
 # =============================================================================
 print("\n%d passed, %d failed" % (passed, failed))
 if failures:

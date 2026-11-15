@@ -2625,8 +2625,9 @@ async def the_descent_together():
 async def the_run_between_a_party():
     """P-22: THE RUN BETWEEN A PARTY (game 0.93.3) - "en" passes the run
     between the games in a party's arena, checked; the leader's keys are the
-    leader's; nothing there is booked."""
-    section("P-22 THE RUN BETWEEN A PARTY: THE ARENA'S GAMES PASS THE RUN, CHECKED, AND NOTHING THERE IS BOOKED")
+    leader's; since game 0.159.0 the arena keeps its own book of the run's
+    elites and bosses."""
+    section("P-22 THE RUN BETWEEN A PARTY: THE ARENA'S GAMES PASS THE RUN, CHECKED, AND ITS ELITES ARE BOOKED (0.159.0)")
     A, B, C, D, E = (account("runa"), account("runb", "mage"), account("runc", "tank"), account("rund", "healer"),
                      account("rune"))
     now = int(time.time())
@@ -2649,8 +2650,9 @@ async def the_run_between_a_party():
             got_a = await collect(a)
             check("the welcome says this server passes the run", welcome.get("en") == presence.RUN_VERSION == 1,
                   welcome)
-            check("  and the arena's lead says nothing in it is booked (\"b\": 0)",
-                  (last_lead(got_a) or {}).get("b") == 0, got_a)
+            check("  and the arena's lead says it is booked (\"b\": 1, game 0.159.0: its elites fill a chest)",
+                  (last_lead(got_a) or {}).get("b") == booked("endless")
+                  and presence.PresenceServer.keeps_books("endless") == bool(presence.BOOKS), got_a)
             b, _ = await enter(port, B, "endless", v=2, en=1, x=780.0, y=1100.0)
             d, _ = await enter(port, D, "endless", v=2, x=790.0, y=1100.0)
             c, _ = await enter(port, C, "endless", v=2, en=1, x=790.0, y=1100.0)
@@ -2711,14 +2713,25 @@ async def the_run_between_a_party():
             got_g = await collect(g)
             check("anywhere but a party's arena the run is nobody's business: dropped", not runs(got_g), got_g)
             check("  and there the lead says what the books keep, as before",
-                  not presence.PresenceServer.keeps_books("endless")
-                  and (last_lead(got_f) or {}).get("b", -1) == booked("field"), [last_lead(got_f), presence.BOOKS])
+                  (last_lead(got_f) or {}).get("b", -1) == booked("field"), [last_lead(got_f), presence.BOOKS])
+            check("  the Healer's Run and the Descent stay unbooked; the Endless alone of the runs is booked",
+                  not presence.PresenceServer.keeps_books("healerrun")
+                  and not presence.PresenceServer.keeps_books("descent")
+                  and presence.BOOKED_RUNS == frozenset({"endless"}))
             await a.send(json.dumps({"t": "w", "d": {"ev": [{"k": "spawn", "r": {"id": 1, "o": "", "s":
                          "res://scene/enemy/lightsprite.tscn", "pp": "", "x": 700, "y": 600, "a": "idledown",
                          "hp": 50, "mh": 50, "p": {}}}]}}))
             await collect(b)
-            check("  and the arena keeps no books, whatever its leader sends",
-                  not any(k.startswith("endless") for k in server.books), sorted(server.books))
+            booked_rooms = [k for k in server.books if k.startswith("endless")]
+            arena_book = server.books.get(booked_rooms[0]) if booked_rooms else None
+            check("  and the arena keeps a book of its own, knowing the run's elites and bosses",
+                  not presence.BOOKS or (len(booked_rooms) == 1 and booked_rooms[0].startswith("endless#")
+                                         and arena_book.run_brings == presence.run_brings("endless")
+                                         and len(arena_book.run_brings) > 0), sorted(server.books))
+            check("  where a monster nobody can account for is never due, as in any field",
+                  not presence.BOOKS or (arena_book is not None and 1 in arena_book.monsters
+                                         and arena_book.monsters[1].not_due),
+                  arena_book.monsters if arena_book is not None else None)
             await a.send(json.dumps({"t": "en", "full": list(range(5000)) * 2, "part": 0, "parts": 1}))
             got_a = await collect(a, 0.5)
             check("  a message past MAX_RUN_BYTES closes the socket, as any too big", "too big" in byes(got_a)

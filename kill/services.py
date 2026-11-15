@@ -99,6 +99,10 @@ KILL_LOG_RETENTION_SECONDS = 60 * 60 * 24 * 14
 RECEIPT_SECONDS = 60
 RECEIPT_RETRY_MS = 400
 RECEIPT_BUILD = 7
+# Where the books count monsters whose death pays something else (game
+# 0.159.0): the Endless's elites and bosses fill its chest, through
+# /api/minigames/kill. Their deaths never pay an ordinary kill (receipt_for).
+RUN_AREAS = ("endless",)
 
 
 def tokens_now(stored, last_kill_ms, now_ms):

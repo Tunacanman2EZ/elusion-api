@@ -375,10 +375,19 @@ status("an unknown shop", client.get("/api/shop/nosuchshop", headers=H), 404)
 # standing on one spawn point does not. It also keeps the gold honest - the
 # ledger invariant this suite checks would break if the purse were written
 # directly, so the gold has to be genuinely earned.
+# THE PRICE IS READ, NOT TYPED. It was a literal 50 here, and the owner's 5 Oct
+# price pass (potions x4) turned five checks red that were only ever about the
+# ledger. What these checks hold is that the SERVER priced the purchase and
+# burned exactly that - whatever the catalogue says a potion costs this week.
+# AND THE FARM STOPS AT WHAT THE SHOP WILL ASK (14 Nov 2026). It stopped at a
+# typed 300 while three potions cost 600 since the price pass, so a run whose
+# piles came to between the two failed "farmed enough" - a flake decided by
+# the loot roll, seen once in a full run and gone on the next.
+UNIT = int(app_module.gamedata.ITEMS["tinyhealthpotion"]["value"])
 conn = db_conn()
 for _n in range(250):
     purse = conn.execute("SELECT gold FROM saves WHERE slot = 0").fetchone()
-    if purse and int(purse["gold"]) >= 300:
+    if purse and int(purse["gold"]) >= 3 * UNIT:
         break
     killed = client.post("/api/combat/kill", headers=H,
                          json={"slot": 0, "enemy_id": ROSTER[_n % len(ROSTER)]}).get_json() or {}
@@ -391,11 +400,6 @@ for _n in range(250):
                     json={"bag_id": killed["bag_id"], "position": piles[0]["position"]})
 purse = int(conn.execute("SELECT gold FROM saves WHERE slot = 0").fetchone()["gold"])
 conn.close()
-# THE PRICE IS READ, NOT TYPED. It was a literal 50 here, and the owner's 5 Oct
-# price pass (potions x4) turned five checks red that were only ever about the
-# ledger. What these checks hold is that the SERVER priced the purchase and
-# burned exactly that - whatever the catalogue says a potion costs this week.
-UNIT = int(app_module.gamedata.ITEMS["tinyhealthpotion"]["value"])
 check("farmed enough to shop with", purse >= 3 * UNIT, "have %d" % purse)
 
 status("a shop that does not exist", client.post(

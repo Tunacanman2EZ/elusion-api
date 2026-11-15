@@ -55,6 +55,7 @@ Exit code is 0 only if nothing broke an invariant.
 """
 
 import argparse
+import importlib
 import json
 import os
 import random
@@ -916,6 +917,151 @@ def attack_loot_double_take(p):
     }
 
 
+def _repo_module(path):
+    """A module of this repository, for an attack that must know a rule's own
+    number (a ceiling, a cost) - read, never written to."""
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    return importlib.import_module(path)
+
+
+def attack_minigame_gold_claim(srv, p, victim):
+    # A MINIGAME'S GOLD IS THE GAME'S CLAIM (E-22), held to the time since the
+    # Go. So the claim a modified game makes is the whole run, a second after
+    # going in: every wave, the boss, the goal; all thirty rounds of Cut the
+    # Cloth. The server must pay what the time allows (nothing, a second in),
+    # pay a run once, and never finish somebody else's run.
+    before = p.db_gold()
+    code_go, go = p.call("POST", "/api/minigames/enter", {"game": "healerrun", "slot": p.slot})
+    run_id = (go or {}).get("run")
+    if code_go != 200 or not isinstance(run_id, int):
+        return {"name": "claim a whole minigame run a second in", "target": "E-22",
+                "broke": False, "skipped": True,
+                "detail": "the Go into the Healer's Run said %s %s" % (code_go, go)}
+    first, _ = p.call("POST", "/api/minigames/finish",
+                      {"run": run_id, "waves": 999, "boss": True, "goal": True})
+    again, _ = p.call("POST", "/api/minigames/finish",
+                      {"run": run_id, "waves": 999, "boss": True, "goal": True})
+    code_cloth, cloth = p.call("POST", "/api/minigames/enter", {"game": "cloth", "slot": p.slot})
+    cloth_run = (cloth or {}).get("run")
+    if isinstance(cloth_run, int):
+        p.call("POST", "/api/minigames/finish", {"run": cloth_run, "rounds": 30})
+    # Somebody else's run: the victim goes in, the attacker finishes it.
+    _, theirs = victim.call("POST", "/api/minigames/enter", {"game": "healerrun", "slot": victim.slot})
+    theirs_id = (theirs or {}).get("run")
+    stolen = None
+    if isinstance(theirs_id, int):
+        stolen, _ = p.call("POST", "/api/minigames/finish", {"run": theirs_id, "waves": 1})
+    gained = p.db_gold() - before
+    return {"name": "claim a whole minigame run a second in", "target": "E-22",
+            "broke": gained > 0 or again == 200 or stolen == 200,
+            "detail": "the run's finish said %s, again %s, Cut the Cloth's %s, somebody else's run %s; "
+                      "gold gained %d (want 0: a second allows no wave)"
+                      % (first, again, code_cloth, stolen, gained)}
+
+
+def attack_minigame_chest_flood(p):
+    # THE CHEST PAST ITS SCHEDULE (E-22). Every Endless elite and boss kill
+    # rolls loot into the character's chest, so the flood a modified game
+    # sends is hundreds of kills the moment it goes in. Without a Go it must
+    # be refused; after one, never more than the run's schedule could have
+    # sent by then (services.elites_ceiling / bosses_ceiling) - re-derived
+    # from minigame_kills, not from the answers.
+    services = _repo_module("minigames.services")
+    catalogue = _repo_module("gamedata")
+    schedule = getattr(catalogue, "ENDLESS", {}) or {}
+    elites, bosses = list(schedule.get("elites") or []), list(schedule.get("bosses") or [])
+    if not elites or not bosses:
+        return {"name": "flood the Endless chest past its schedule", "target": "E-22",
+                "broke": False, "skipped": True, "detail": "this catalogue has no Endless schedule"}
+    count = lambda: int(p.srv.one("SELECT COUNT(*) FROM minigame_kills WHERE user_id = ? AND game = 'endless'",
+                                  (p.user_id,)) or 0)
+    before = count()
+    no_go, _ = p.call("POST", "/api/minigames/kill", {"game": "endless", "slot": p.slot, "enemy_id": elites[0]})
+    without = count() - before
+    code_go, _ = p.call("POST", "/api/minigames/enter", {"game": "endless"})
+    if code_go != 200:
+        return {"name": "flood the Endless chest past its schedule", "target": "E-22",
+                "broke": without > 0, "skipped": without == 0,
+                "detail": "a kill with no Go said %s; the Go itself said %s" % (no_go, code_go)}
+    went_in = time.time()
+    for n in range(160):
+        p.call("POST", "/api/minigames/kill", {"game": "endless", "slot": p.slot, "enemy_id": elites[n % len(elites)]})
+    for n in range(12):
+        p.call("POST", "/api/minigames/kill", {"game": "endless", "slot": p.slot, "enemy_id": bosses[n % len(bosses)]})
+    elapsed = int(time.time() - went_in) + 2
+    most = services.elites_ceiling(schedule, elapsed) + services.bosses_ceiling(schedule, elapsed)
+    paid = count() - before - without
+    return {"name": "flood the Endless chest past its schedule", "target": "E-22",
+            "broke": without > 0 or paid > most,
+            "detail": "a kill with no Go said %s (%d paid, want 0); 172 kills in %ds after the Go paid %d, "
+                      "the schedule's most %d" % (no_go, without, elapsed, paid, most)}
+
+
+def attack_delete_someone_else(srv, attacker, victim):
+    # DELETING AN ACCOUNT names no account - the route works on the caller -
+    # but asks for the account's name typed and its password. Every bot here
+    # shares one password, so the attack is the honest-looking one: the
+    # attacker's own token, the victim's name, the password that is right for
+    # both. And the attacker's own account with a wrong password. Both must be
+    # refused, and both accounts must still be whole in the users table.
+    code_other, _ = attacker.call("POST", "/api/account/delete",
+                                  {"confirm": victim.name, "password": "password123"})
+    code_wrong, _ = attacker.call("POST", "/api/account/delete",
+                                  {"confirm": attacker.name, "password": "not-the-password"})
+    code_owner, _ = attacker.call("POST", "/api/account/delete",
+                                  {"confirm": OWNER_NAME, "password": "password123"})
+    whole = [n for n in (victim.name, attacker.name, OWNER_NAME)
+             if srv.one("SELECT COUNT(*) FROM users WHERE username = ?", (n,)) == 1]
+    return {"name": "delete somebody else's account", "target": "accounts",
+            "broke": len(whole) != 3 or 200 in (code_other, code_wrong, code_owner),
+            "detail": "the victim's name said %s, a wrong password %s, the owner's name %s; "
+                      "accounts still whole: %d of 3" % (code_other, code_wrong, code_owner, len(whole))}
+
+
+def attack_owner_tools_as_player(srv, attacker, victim):
+    # THE OWNER'S TOOLS (rollback, snapshots, the gifts ledger, setting a
+    # level): all require_owner, a bare 404 to anybody else. A rollback also
+    # ends every session of the account it is aimed at, so the victim's
+    # sessions are counted too - a refusal that still did the work is the
+    # failure a status code would hide.
+    sessions = lambda: int(srv.one("SELECT COUNT(*) FROM sessions JOIN users ON users.id = sessions.user_id"
+                                   " WHERE users.username = ?", (victim.name,)) or 0)
+    before = sessions()
+    level_before = int(srv.one("SELECT level FROM saves JOIN users ON users.id = saves.user_id"
+                               " WHERE users.username = ? AND slot = ?", (victim.name, victim.slot)) or 0)
+    codes = [
+        attacker.call("POST", "/api/staff/rollback", {"username": victim.name, "snapshot_id": 1})[0],
+        attacker.call("GET", "/api/staff/snapshots?username=%s" % victim.name)[0],
+        attacker.call("GET", "/api/staff/gifts")[0],
+        attacker.call("POST", "/api/staff/level", {"username": victim.name, "level": 22})[0],
+    ]
+    level_after = int(srv.one("SELECT level FROM saves JOIN users ON users.id = saves.user_id"
+                              " WHERE users.username = ? AND slot = ?", (victim.name, victim.slot)) or 0)
+    return {"name": "use the owner's rollback, snapshots, gifts and levels", "target": "authz",
+            "broke": any(c != 404 for c in codes) or sessions() < before or level_after != level_before,
+            "detail": "answers %s (want 404 each); victim's sessions %d -> %d, level %d -> %d"
+                      % (codes, before, sessions(), level_before, level_after)}
+
+
+def attack_smith_unheld(p):
+    # THE SMITH tempers the piece in one carried cell for materials and gold.
+    # The cell must hold the item named, the materials must be there, and the
+    # gold must be paid - so tempering a perfect ember sword the bot does not
+    # hold, in a cell it never had, has to come back refused with the bag and
+    # the purse exactly as they were.
+    bag = lambda: sorted(str(r) for r in p.srv.all(
+        "SELECT position || ':' || item_id || ':' || quantity FROM carry_items WHERE user_id = ? AND slot = ?",
+        (p.user_id, p.slot)))
+    bag_before, gold_before = bag(), p.db_gold()
+    codes = [p.call("POST", "/api/smith/temper", {"slot": p.slot, "position": pos, "item_id": item})[0]
+             for pos, item in ((0, "embersword~d115p115"), (3, "jadechest~a104h96"), (25, "ironsword~d100"))]
+    return {"name": "temper a piece not held, or not paid for", "target": "E-1/E-8",
+            "broke": 200 in codes or bag() != bag_before or p.db_gold() != gold_before,
+            "detail": "answers %s; bag unchanged: %s; gold %d -> %d"
+                      % (codes, bag() == bag_before, gold_before, p.db_gold())}
+
+
 def attack_revive_underpay(p):
     # THE REVIVE FLOOR, FROM BELOW.
     #
@@ -1352,6 +1498,13 @@ def run(srv, player_count):
     attack_results.append(attack_chat_delete_others(srv, attacker, victim))
     attack_results.append(attack_loot_double_take(attacker))
     attack_results.append(attack_revive_underpay(attacker))
+    # THE NEWEST SURFACES (14 Nov 2026): the minigames' gold and chest, the
+    # account's own delete, the owner's tools, the smith.
+    attack_results.append(attack_minigame_gold_claim(srv, attacker, victim))
+    attack_results.append(attack_minigame_chest_flood(attacker))
+    attack_results.append(attack_delete_someone_else(srv, attacker, victim))
+    attack_results.append(attack_owner_tools_as_player(srv, attacker, victim))
+    attack_results.append(attack_smith_unheld(attacker))
 
     # measured sweeps run BEFORE the invariants, so anything the fuzzer or the
     # race storm knocked loose is caught by the ground-truth re-derivation.

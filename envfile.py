@@ -137,7 +137,7 @@ KNOWN = (
     "ELUSION_DB_FRESH", "ELUSION_BACKUP_DIR", "ELUSION_STARTER_KIT", "ELUSION_GOOGLE_CLIENT_ID",
     # 14 Nov: a day's minigame gold (minigames/), and moves held to what a
     # character can walk (presence.py, HELD TO A WALK).
-    "ELUSION_MINIGAME_GOLD_DAY", "ELUSION_HOLD_MOVES",
+    "ELUSION_MINIGAME_GOLD_DAY", "ELUSION_HOLD_MOVES", "ELUSION_ENDLESS_RECEIPTS",
 )
 _TRUE = ("1", "true", "yes", "on")
 _WEB_ROOTS = ("static", "public", "www", "htdocs", "wwwroot")
@@ -248,6 +248,10 @@ def check_env(environ):
     hold = _get(environ, "ELUSION_HOLD_MOVES").lower()
     if hold and hold not in _TRUE + ("0", "false", "no", "off"):
         warnings.append("ELUSION_HOLD_MOVES %r is neither on nor off; presence.py leaves it off." % hold)
+    endless = _get(environ, "ELUSION_ENDLESS_RECEIPTS").lower()
+    if endless and endless not in _TRUE + ("0", "false", "no", "off"):
+        warnings.append("ELUSION_ENDLESS_RECEIPTS %r is neither on nor off; the Endless's chest "
+                        "is paid as before." % endless)
 
     # WITHOUT AN OWNER THERE IS NO OWNER. app.py fails closed already; finding
     # out from a staff route at 3am is worse than finding out at boot.

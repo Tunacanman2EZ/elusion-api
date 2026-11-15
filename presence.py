@@ -297,10 +297,13 @@ who sent it - added:
 "r", "sp" and "full" are the leader's alone; "go" and "need" go to the leader
 alone; "to" sends to one game. Only in an area in INSTANCED_PLACES, every
 value a whole number (clean_run()). What the numbers mean is the games'
-business (the game's endlessparty.gd). Nothing in a party's arena keeps BOOKS
-(keeps_books()): nothing in it pays, and its elites are born mid-run where no
-map has them. The lead message says so ("b": 0), and a game then counts its
-monsters' health itself, as before 0.87.0.
+business (the game's endlessparty.gd). The Healer's Run and the Descent keep
+no BOOKS (keeps_books()): nothing in them pays per kill. The lead message says
+so ("b": 0), and a game then counts its monsters' health itself, as before
+0.87.0. THE ENDLESS IS BOOKED since game 0.159.0 (BOOKED_RUNS): its elites and
+bosses fill a chest, so each arena - a party's or one player's - keeps a book
+like a field's ("b": 1), its run's monsters accounted for by their mark
+(combatbook.RUN_MARK, run_brings()), and a chest kill can be paid against it.
 
 PARTY VOICE (game 0.43.0). The owner: "I really really want the option for voice
 chat in game for parties". The voice itself never comes here: each game's
@@ -574,6 +577,21 @@ AREA_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
 # room of its own in - instance_room(). "healerrun" since game 0.105.0: the
 # Healer's Run with a party (THE HEALER'S RUN TOGETHER, below).
 INSTANCED_PLACES = frozenset({"endless", "healerrun", "descent"})
+# THE ENDLESS IS BOOKED (game 0.159.0). Its elites and bosses roll loot into a
+# chest (/api/minigames/kill), so they are counted as a field's monsters are -
+# every arena its own book, a party's or one player's - and a chest kill can
+# be paid against that count (ELUSION_ENDLESS_RECEIPTS, minigames/). The
+# Healer's Run and the Descent pay nothing per kill and stay unbooked.
+BOOKED_RUNS = frozenset({"endless"})
+
+
+def run_brings(place):
+    """The enemy ids a booked run brings mid-run (its elites and bosses, from
+    gamedata.json's schedule), or none for any other area."""
+    if place not in BOOKED_RUNS or gamedata is None:
+        return frozenset()
+    schedule = getattr(gamedata, place.upper(), None) or {}
+    return frozenset(str(e) for e in list(schedule.get("elites") or []) + list(schedule.get("bosses") or []))
 # Said in the welcome ("hr"): this server seats the Healer's Run a room per
 # party, so a game may say it is there (game 0.105.0). A game against a server
 # without it plays the run alone, as before.
@@ -1895,10 +1913,12 @@ class PresenceServer:
     @staticmethod
     def keeps_books(place):
         """Whether the monsters of this area are booked: books on, an area the
-        catalogue has a map of, and not a party's arena (THE RUN BETWEEN A
-        PARTY - nothing in it pays, and its elites are born where no map has
-        them)."""
-        return bool(BOOKS and place and place in gamedata.AREAS and place not in INSTANCED_PLACES)
+        catalogue has a map of, and not a party's own room (THE RUN BETWEEN A
+        PARTY) - except a run whose monsters pay (BOOKED_RUNS, game 0.159.0:
+        the Endless's elites and bosses fill a chest, so the server counts
+        them as it counts a field's)."""
+        return bool(BOOKS and place and place in gamedata.AREAS
+                    and (place not in INSTANCED_PLACES or place in BOOKED_RUNS))
 
     def _book(self, area):
         """The books on this room's monsters, or None: books off, or an area
@@ -1911,6 +1931,7 @@ class PresenceServer:
         book = self.books.get(area)
         if book is None:
             book = self.books[area] = combatbook.AreaBook(place, gamedata.AREAS[place])
+            book.run_brings = run_brings(place)
             book.stirred_lands = self.stirred
             book.swell = self.swell
             book.owns_health = True

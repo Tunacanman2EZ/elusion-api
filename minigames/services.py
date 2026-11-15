@@ -415,6 +415,18 @@ def best_believed(seconds_said, since_go):
 # switches the cap off.
 GOLD_A_DAY = 100000
 
+# THE ENDLESS'S RECEIPTS (game 0.159.0). presence.py books the Endless now
+# (BOOKED_RUNS), so with ELUSION_ENDLESS_RECEIPTS on, a chest kill there is
+# paid only against an AGREED death in those books for this account and
+# monster, in the Endless, in the last RECEIPT_SECONDS (kill/'s receipt rule,
+# held to the area: a field's death never pays a chest, nor the Endless's a
+# field's kill). None yet is a 202 the game asks again on, for a few seconds;
+# a game too old to ask (below ENDLESS_RECEIPT_BUILD) is told to update. The
+# Forge's fire sprites are not booked yet, so they are not asked.
+RECEIPT_GAMES = ("endless",)
+ENDLESS_RECEIPT_BUILD = 8
+RECEIPT_RETRY_MS = 400
+
 
 def gold_a_day(raw):
     """The cap from the setting's text."""

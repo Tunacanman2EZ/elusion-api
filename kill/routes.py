@@ -126,7 +126,8 @@ def register(app, *, require_auth, get_db, bad_request, parse_slot, max_slot, ca
         receipt = None
         if receipts_on():
             receipt = data.receipt_for(db, user_id, slot, enemy_id,
-                                       int(time.time()) - services.RECEIPT_SECONDS)
+                                       int(time.time()) - services.RECEIPT_SECONDS,
+                                       not_areas=services.RUN_AREAS)
             if receipt is None:
                 if client_build() < services.RECEIPT_BUILD:
                     return {

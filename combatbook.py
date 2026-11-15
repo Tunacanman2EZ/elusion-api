@@ -84,6 +84,15 @@ STIRRED_MAX_TIMES = 3
 # ("...#swell1"). They are judged by _judge_swell(), not against the map.
 SWELL_MARK = "#swell"
 SWELL_AREA = "bigfield"
+# A RUN'S OWN MONSTERS (game 0.159.0): the Endless brings its elites and
+# bosses mid-run, anywhere in its arena, any number of times - no map holds
+# them. Their record says so ("rx": 1, BaseEnemy.net_props()), and a book whose
+# area is a run's (presence.py hands it run_brings, the run's schedule from
+# gamedata.json) takes one of those ids as accounted for. The schedule itself,
+# not the books, bounds how many: the minigames route holds the chest's kills
+# to it. A run monster anywhere else, or one the run never sends, is
+# unaccounted for, like any monster from nowhere.
+RUN_MARK = "rx"
 # BOSSES THAT SCALE (game 0.80.0): a boss's health is raised by who fights it
 # (bossenemy.gd, scale_for() - the fighters' levels above its band, how many
 # they are, the Crowned's own 2.5), on the game that runs it, and told in a
@@ -344,6 +353,9 @@ class AreaBook:
         # THE SWELL: how many of each stirring monster the Big Field may hold
         # (1: none added), as presence.py last read it (swell_size()).
         self.swell = 1
+        # A RUN'S OWN MONSTERS: the enemy ids this area's run brings (the
+        # Endless's elites and bosses); empty for every map.
+        self.run_brings = frozenset()
         # THE DAMAGE METER (game 0.81.0): presence.py's ear on every hit these
         # books count - on_hit(user_id, booked, claimed, boss, monster,
         # element) - and (0.82.0, THE FIGHT LOG) on every death - on_kill(
@@ -596,6 +608,12 @@ class AreaBook:
 
     def _judge_spawn(self, m, enemy, props, now, kind):
         leader = self.leader_id if self.leader_id is not None else 0
+        if props.get(RUN_MARK) == 1:
+            if m.enemy_id in self.run_brings:
+                return
+            m.not_due = True
+            self._flag(leader, "unaccounted_spawn", "a run %s where no run sends one" % m.enemy_id, now)
+            return
         if SWELL_MARK in m.origin:
             self._judge_swell(m, enemy, props, now, leader)
             return

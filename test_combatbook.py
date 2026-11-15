@@ -1009,6 +1009,50 @@ else:
     check("  and in any area but the Big Field: flagged",
           swollen(elsewhere, 2, kind, spot["o"] + combatbook.SWELL_MARK + "1", 1.0) == ["unaccounted_spawn"])
 
+# =============================================================================
+section("CB-16 A RUN'S OWN MONSTERS: THE ENDLESS'S ELITES AND BOSSES (game 0.159.0)")
+# =============================================================================
+# The Endless brings its elites and bosses mid-run, anywhere, any number of
+# times; their record carries the run's mark (rx). A book whose area is the
+# run's takes them as accounted for and counts their fight like a field's; a
+# run monster anywhere else, or one the run never sends, is from nowhere.
+ENDLESS = gamedata.ENDLESS
+brings = frozenset(list(ENDLESS["elites"]) + list(ENDLESS["bosses"]))
+elite = list(ENDLESS["elites"])[0]
+boss = list(ENDLESS["bosses"])[0]
+run = AreaBook("endless", gamedata.AREAS["endless"])
+run.run_brings = brings
+lead = warrior(1)
+lead.scene_at = 0.0
+run.world(lead, {"full": True, "reset": True, "part": 0, "parts": 1, "spawn": []}, 0.5)
+run.take()
+run.world(lead, {"ev": [{"k": "spawn", "r": record(1, elite, origin="", x=300.0, y=300.0, rx=1)},
+                        {"k": "spawn", "r": record(2, elite, origin="", x=900.0, y=300.0, rx=1)},
+                        {"k": "spawn", "r": record(3, boss, origin="", x=600.0, y=200.0, rx=1,
+                                                   mh=int(gamedata.ENEMIES[boss]["max_hp"] * 3.25))}]}, 1.0)
+check("the run's elites and a boss (its health raised by a party of four) are taken anywhere, unflagged",
+      set(run.monsters) == {1, 2, 3} and not kinds(run.take()[1]), run.monsters)
+hp = gamedata.ENEMIES[elite]["max_hp"]
+lead.moved("endless", 330.0, 300.0, 1.0, fresh=True)
+now = fight(run, lead, 1, hp, 1.5)
+run.world(lead, {"ev": [{"k": "die", "id": 1, "x": 300.0, "y": 300.0}]}, now)
+run.tick(now + combatbook.HOLD_SECONDS)
+kills, flags = run.take()
+check("its fight is counted and its death agreed - written under the Endless, which is what pays a chest",
+      [k["verdict"] for k in kills] == ["agreed"] and kills[0]["death"].startswith("endless:1:") and not flags,
+      (kills, flags))
+other = next(e for e in gamedata.ENEMIES if e not in brings and gamedata.ENEMIES[e].get("grants_rewards", True))
+run.world(lead, {"ev": [{"k": "spawn", "r": record(4, other, origin="", rx=1)}]}, now + 2)
+check("a run monster the run never sends is from nowhere: flagged",
+      kinds(run.take()[1]) == ["unaccounted_spawn"])
+field_book, field_lead = fresh_field()
+field_book.world(field_lead, {"full": True, "reset": True, "part": 0, "parts": 1, "spawn": []}, 0.5)
+field_book.take()
+field_book.world(field_lead, {"ev": [{"k": "spawn", "r": record(5, elite, origin="", rx=1)}]}, 1.0)
+check("and a run monster in a field is from nowhere: flagged, its death never due",
+      kinds(field_book.take()[1]) == ["unaccounted_spawn"] and field_book.monsters[5].not_due)
+
+
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))
 print("=" * 60)

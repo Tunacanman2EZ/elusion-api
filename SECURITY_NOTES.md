@@ -43,7 +43,7 @@ lives.
 | E-19 | Two games on one account each saved their own bag | medium (integrity) | **Closed** | Two copies of the game on one account overwrote each other's bag and lost items, and a stolen token kept working beside the owner's. | **One session at a time.** A login that gets its token, or a game resuming a remembered one, ends every other session on the account; resuming keeps the original end date. `test_accounts.py`. |
 | E-20 | **A staff password was the only thing between a guesser and the moderation desk** | **high (moderation)** | **Closed** — with a named limit | Staff names are public (the crown, the MOD and DEV badges), so their passwords are the ones worth guessing; one guessed password gives bans, notes and IP addresses. | **Second factor.** A staff login with a confirmed recovery address answers 202 and emails a six-digit code; only the code gets a token. A computer that proved itself is trusted for 30 days, at the rank it was trusted at. With no address or no mail it stands aside and says so. `test_staffcode.py`. |
 | E-21 | **Session tokens were stored as issued** | **high (accounts)** | **Closed** | A copy of `elusion.db` - a backup, a leaked file - logged its holder in as every player signed in, for up to 30 days, with no password needed. | **Hashing at rest.** `sessions` keeps only each token's SHA-256 (`token_hash`) and every lookup hashes the token it is sent, as `trusted_devices` and `ended_sessions` already did and as passwords always were (scrypt). A boot migration hashed every stored token in place, so nobody was signed out. `test_accounts.py` A-5, `test_api.py` MIGRATION. |
-| E-22 | **A minigame's result is the game's own claim** | medium (economy) | **Mitigated** — held to the day, the time and, since 14 Nov, one gold allowance a day; the chests' gear still the run's word, named in SECURITY.md | A modified game can claim the best run its time allows: up to 60,000 gold a day from the Healer's Run and 72,750 from Cut the Cloth, and every Endless and Forge kill their schedules allow, into its own chest. | **Bound by time and count.** One Go a day or three runs; each kill held to what the run's own schedule could have sent since the Go; each run's gold paid once, for the caller's own run, believed only as far as its time allows (`test_minigames.py`). **Since 14 Nov, capped:** the runs' gold and the chests' coins together, at most `ELUSION_MINIGAME_GOLD_DAY` (100,000) an account a day (`test_minigames.py` MG-16). |
+| E-22 | **A minigame's result is the game's own claim** | medium (economy) | **Mitigated** — held to the day, the time and, since 14 Nov, one gold allowance a day; the chests' gear still the run's word, named in SECURITY.md - the Endless's booked since game 0.159.0, paid against the books once `ELUSION_ENDLESS_RECEIPTS` is on | A modified game can claim the best run its time allows: up to 60,000 gold a day from the Healer's Run and 72,750 from Cut the Cloth, and every Endless and Forge kill their schedules allow, into its own chest. | **Bound by time and count.** One Go a day or three runs; each kill held to what the run's own schedule could have sent since the Go; each run's gold paid once, for the caller's own run, believed only as far as its time allows (`test_minigames.py`). **Since 14 Nov, capped:** the runs' gold and the chests' coins together, at most `ELUSION_MINIGAME_GOLD_DAY` (100,000) an account a day (`test_minigames.py` MG-16). |
 | E-23 | **The chat's picture reader ran 42 known flaws, and tried every format it knew** | **high** | **Closed** (14 Nov 2026) | Any signed-in player can hand the server 8 MB of bytes or a link to decode. Pillow 12.3.0 carried 42 published flaws - heap overflows in the JPEG, TIFF and FlashPix readers among them - and, given no list, tried every reader it has, EPS through Ghostscript included, on whatever arrived. At best a crash of the process that holds the database; at worst code run inside it. | **Patch + allowlist.** Pillow pinned at 13.0.0, which fixes all 42, installed on the server by `update_server.sh` the update it lands; and `Image.open(..., formats=PICTURE_FORMATS)`: PNG, JPEG, GIF, WebP and BMP, the five the game sends, so no other reader sees a player's bytes. Found by `pip-audit`. `test_chatrooms.py`; SECURITY.md invariant 48. |
 
 Twenty-two findings: twenty closed, two mitigated (E-3, since 25 Oct 2026, and E-22, since 13 Nov). Plus E-15, an audit that went
@@ -771,12 +771,19 @@ longer claimed by the client at all - E-1.)
 | | | |
 |---|---|---|
 | `HEAL_ALLOWANCE_MARGIN` | 1.25x | the honest estimate — **logged, never enforced** |
-| `HEAL_CLAMP_MARGIN` | 3.00x | **enforced** |
+| `HEAL_CLAMP_MARGIN` | 2.25x (3.00x until 14 Nov 2026) | **enforced** |
 
 Enforcing at 1.25x on the evidence available would have been the E-2 mistake
 in a new place: a threshold taken from eighteen simulated scenarios rather than
 from real traffic. Enforcing at 3x cannot plausibly catch an honest player —
 it is three times more healing than the game can produce.
+
+**Measured, 14 Nov 2026.** Thirty days of the live server's log held four
+`unexplained heal` lines and no `heal clamped`: six pools, every one two or
+three seconds after the save before it, at 1.06x to 1.375x the allowance - the
+equivalent of an enforced margin of 1.72 at most. So the band is not empty and
+1.25 would have trimmed four honest saves; 2.25 is the highest honest need with
+a third to spare, and `test_healing.py` holds it between the two.
 
 The point is what happens *between* them. Every rise landing in that band is
 logged as a rise a tight clamp would have caught, and stored untouched. That
@@ -1722,6 +1729,22 @@ materials and pets, held to the schedule's count - the books, as above, are
 what would close those. `test_minigames.py` MG-16; three sabotages caught (the
 day's count left out, Cut the Cloth uncapped, the chest's coins uncapped).
 
+**Booked, 14 Nov (game 0.159.0).** The owner chose the bigger step: the
+Endless is booked now. presence.py keeps a book for every Endless arena - a
+party's or one player's (`BOOKED_RUNS`) - and its elites and bosses, which a
+run brings anywhere, any number of times, are accounted for by their mark
+(`rx`, combatbook.py `RUN_MARK` and `run_brings`); a run monster anywhere else,
+or one the run never sends, is from nowhere. With `ELUSION_ENDLESS_RECEIPTS`
+on, `/api/minigames/kill` pays an Endless chest kill only against an AGREED
+death in those books (kill/'s receipt, held to the area - a field's death never
+pays a chest, and the Endless's never pays an ordinary kill: the elites are
+the fields' own monsters, so without that rule one death would have paid
+twice); "not yet" is a 202 the game (build 8) asks again on. It ships off;
+`killwatch.py` prints an `endless receipts:` line to decide by. The Forge's
+fire sprites are not booked yet. `test_receipts.py` R-9, `test_combatbook.py`
+CB-16, `test_presence.py` P-22, `test_killwatch.py`; sabotages caught (the
+run's mark ignored, either half of the area rule left out).
+
 ### E-23 — The chat's picture reader ran 42 known flaws · CLOSED (14 Nov 2026)
 
 Found by asking the dependencies rather than the code: `pip-audit -r
@@ -1982,7 +2005,9 @@ done.
    margin with the honest one still logging, so the band between the two is the
    evidence for tightening it later. The one follow-up worth remembering is not
    code: **watch that band, and lower `HEAL_CLAMP_MARGIN` to 1.25 once it has
-   stayed empty across real play.**
+   stayed empty across real play.** Watched 14 Nov 2026: not empty - four
+   honest-looking lines a month, the highest needing 1.72 - so it went from 3.00
+   to 2.25, not to 1.25 (DEPLOY.md, "Watching the heal check").
 9. ~~Give defense, agility and magic server-granted XP~~ → done, as E-2
    records: the client reports raw activity to `/api/skill/train` and the
    server clamps each skill to a per-second ceiling times elapsed time. That is

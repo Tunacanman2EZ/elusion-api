@@ -941,6 +941,22 @@ defaults already do. This is the standing watch over **E-3** (below): combat is
 server-observed since 0.10.0, and the weekly digest's WATCHED pile is what
 decides when the server starts refusing kills its count does not back up.
 
+### The Endless's receipts (0.159.0)
+
+Since game 0.159.0 the server books the Endless's elites and bosses, and can
+fill a chest only when its own count backs the kill - `ELUSION_ENDLESS_RECEIPTS`
+in `/etc/elusion/elusion.env`. It ships **off**. After a few days of play,
+killwatch.py prints a line under `receipts:`:
+
+`endless receipts: of 180 chest kills paid in the last 7 days, 176 (97.8%) had
+the books' receipt; ...`
+
+Near 100%, with few "never seen", is the moment. Then **set "Old versions must
+update" to 8 first** (a game older than 0.159.0 cannot wait for the count),
+add `ELUSION_ENDLESS_RECEIPTS=on`, and restart the API:
+`sudo systemctl restart elusion-api`. Off again is the same line set to `off`
+and a restart; chest kills are then paid on the game's word, as before.
+
 ### Holding moves to a walk (0.157.0)
 
 Where a player stands is what their game says, so a modified game could hop
@@ -970,6 +986,22 @@ Off again is the same two steps with `off`, and safe at any time: steps are
 passed on as the game says, as before.
 
 ---
+
+### Watching the heal check
+
+`unexplained heal` is a rise past the honest estimate (1.25x), logged and left;
+`heal clamped` is one past the enforced line (`HEAL_CLAMP_MARGIN`), trimmed. A
+month of them, player ids hidden, from the PC:
+
+```
+ssh root@api.elusionrpg.com "journalctl -u elusion-api --since '30 days ago' --no-pager > /tmp/h.txt; grep -E 'unexplained heal|heal clamped' /tmp/h.txt | sed -E 's/user=[0-9]+/user=*/' | tail -60; echo; echo unexplained:; grep -c 'unexplained heal' /tmp/h.txt; echo clamped:; grep -c 'heal clamped' /tmp/h.txt; rm /tmp/h.txt"
+```
+
+Nothing with `$(...)` in it: PowerShell would run that part on the PC. For each
+line, the gain over the regen allowance, times 1.25, is the margin that heal
+needed. 14 Nov 2026: four lines in a month, the highest needing 1.72, so the
+margin went from 3.00 to 2.25. A `heal clamped` line for somebody playing
+honestly is the one thing that says it went too far.
 
 ## What is still open when it goes live
 
