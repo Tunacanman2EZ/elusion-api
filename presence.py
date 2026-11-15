@@ -271,6 +271,17 @@ Leave by the minigames route, each player's own run. Each game's own line
 through, power-ups, lives, kills and gold - for the Ready, the countdown and
 the party's board.
 
+THE MAGE'S STAND TOGETHER (game 0.161.0). The owner: "the forge should be
+4 player mages stand also". The Stand is played over the town as the
+Healer's Run is; a game playing it with the server's "ms" says it stands in
+"magestand", where it is seated in its party's room (up to four mages, two
+each side of the gate), its steps are where its mage walks the wall, and the
+run crosses as "en" - the leader's line ("r": the waves, the gate, the wall,
+the portal, the star, the countdown), the groups it sends in ("sp"), every
+game's hits ("h") and each player's own line ("me": ready, picking, kills,
+the star's hits, Repair and the star called). Nothing there pays or is
+booked: the Stand pays nothing. A game from before never says "magestand".
+
 THE DESCENT TOGETHER (game 0.126.0). The owner: "lets set up party". The
 Descent is a room per party as the Endless is ("dr" in the welcome): a party's
 games share it, the first in leads (its monsters are the room's, shared as
@@ -581,8 +592,9 @@ ANIM_PATTERN = re.compile(r"^(idle|walk|attack|death|hitflash)(up|down|left|righ
 AREA_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
 # ONE ARENA A PARTY: the areas each party (or each player with none) has a
 # room of its own in - instance_room(). "healerrun" since game 0.105.0: the
-# Healer's Run with a party (THE HEALER'S RUN TOGETHER, below).
-INSTANCED_PLACES = frozenset({"endless", "healerrun", "descent", "forge"})
+# Healer's Run with a party (THE HEALER'S RUN TOGETHER, below); "magestand"
+# since game 0.161.0 (THE MAGE'S STAND TOGETHER).
+INSTANCED_PLACES = frozenset({"endless", "healerrun", "descent", "forge", "magestand"})
 # THE FORGE TOGETHER (game 0.160.0). Its fire sprites are booked now, so its
 # room must hold one run: a party's, for the games that say they play it as
 # one ("fp" in the hello, FORGE_ROOMS) - the first in runs the heat, the
@@ -613,6 +625,10 @@ def run_brings(place):
 # party, so a game may say it is there (game 0.105.0). A game against a server
 # without it plays the run alone, as before.
 HEALER_ROOMS = 1
+# Said in the welcome ("ms"): this server seats the Mage's Stand a room per
+# party (game 0.161.0, THE MAGE'S STAND TOGETHER), so a game may say it is
+# there. A game against a server without it plays the Stand alone, as before.
+MAGE_ROOMS = 1
 # Said in the welcome ("dr"): this server seats the Descent a room per party
 # (game 0.126.0), so a party may run it together. A game against a server
 # without it plays the Descent alone, as before.
@@ -2647,7 +2663,8 @@ class PresenceServer:
             print("[PRESENCE] could not read a party: %r" % exc, flush=True)
         await self._send(player, {"t": "welcome", "id": user_id, "v": SHARED_VERSION, "books": BOOKS,
                                   "x": RELAY_VERSION, "sh": SERVER_HEALTH if BOOKS else 0, "en": RUN_VERSION,
-                                  "hr": HEALER_ROOMS, "dr": DESCENT_ROOMS, "fr": FORGE_ROOMS})
+                                  "hr": HEALER_ROOMS, "dr": DESCENT_ROOMS, "fr": FORGE_ROOMS,
+                                  "ms": MAGE_ROOMS})
 
         try:
             async for raw in ws:

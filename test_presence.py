@@ -230,7 +230,8 @@ async def run(port, server):
                       "books": presence.BOOKS, "x": presence.RELAY_VERSION,
                       "sh": presence.SERVER_HEALTH if presence.BOOKS else 0,
                       "en": presence.RUN_VERSION, "hr": presence.HEALER_ROOMS,
-                      "dr": presence.DESCENT_ROOMS, "fr": presence.FORGE_ROOMS}, welcome)
+                      "dr": presence.DESCENT_ROOMS, "fr": presence.FORGE_ROOMS,
+                      "ms": presence.MAGE_ROOMS}, welcome)
     await a.close()
 
     # =========================================================================
@@ -2574,6 +2575,66 @@ async def the_healers_run_together():
             sql("DELETE FROM party_members WHERE party_id = ?", (party,))
 
 
+async def the_stand_together():
+    """P-29: THE MAGE'S STAND TOGETHER (game 0.161.0) - "magestand" is a room
+    per party, as the Healer's Run is; the welcome says so; "en" crosses
+    there, and nothing there is booked."""
+    section("P-29 THE MAGE'S STAND TOGETHER: A ROOM PER PARTY, AND THE RUN CROSSES IT")
+    check("the Mage's Stand is an area every party has its own copy of, and it is not booked",
+          "magestand" in presence.INSTANCED_PLACES and "magestand" not in presence.BOOKED_RUNS
+          and "magestand" not in presence.SOLO_PLACES and not presence.run_brings("magestand"))
+    A, B, C = account("mspa"), account("mspb", "mage"), account("mspc", "tank")
+    now = int(time.time())
+    sql("INSERT INTO parties (created_at) VALUES (?)", (now,))
+    party = int(sql("SELECT MAX(id) AS id FROM parties")[0]["id"])
+    for who, lead, at in (("mspa", 1, now), ("mspb", 0, now + 1)):
+        sql("INSERT INTO party_members (user_id, party_id, is_leader, joined_at) VALUES (?, ?, ?, ?)",
+            (uid(who), party, lead, at))
+    server = presence.PresenceServer(sweep_seconds=60, tick_seconds=0.05)
+    server.view_ticks = 1
+    server.near = False
+    server.start_clocks()
+
+    def runs(messages):
+        return [m for m in messages if m.get("t") == "en"]
+
+    async with serve(server.handler, "127.0.0.1", 0, max_size=presence.MAX_SOCKET_BYTES) as ws_server:
+        port = list(ws_server.sockets)[0].getsockname()[1]
+        try:
+            a, welcome = await enter(port, A, "magestand", v=3, en=1, x=330.0, y=394.0)
+            got_a = await collect(a)
+            check("the welcome says this server seats the Stand a room per party (\"ms\": 1)",
+                  welcome.get("ms") == presence.MAGE_ROOMS == 1, welcome)
+            b, _ = await enter(port, B, "magestand", v=3, en=1, x=630.0, y=394.0)
+            c, _ = await enter(port, C, "magestand", v=3, en=1, x=330.0, y=394.0)
+            got_a, got_b, got_c = await collect(a), await collect(b), await collect(c)
+            pa, pb, pc = server.players[uid("mspa")], server.players[uid("mspb")], server.players[uid("mspc")]
+            check("two of a party at the Stand share its room, the party's own; a stranger has one of their own",
+                  pa.area == pb.area == "magestand#p%d" % party and pc.area == "magestand#u%d" % uid("mspc"),
+                  (pa.area, pb.area, pc.area))
+            check("  the party sees each other's mages, the first in leads, and nothing there is booked",
+                  uid("mspb") in joined(got_a) and uid("mspa") in joined(got_b)
+                  and (last_lead(got_b) or {}).get("id") == uid("mspa") and (last_lead(got_b) or {}).get("a") == "magestand"
+                  and (last_lead(got_b) or {}).get("b") == 0 and not presence.PresenceServer.keeps_books("magestand"),
+                  got_b)
+            line = {"t": "en", "r": [55, 1, 4, 3, 3200, 97, 301302301, 301301301, 2, 1, 1004000870, 120, 2, 1, 0, 840],
+                    "sp": [[55, 9, 1, 777, 4, 2, 12, 36, 20]]}
+            await a.send(json.dumps(line))
+            await b.send(json.dumps({"t": "en", "h": [[7, 55 * 2000 + 9, 3]], "me": [55, 1, 3, 14, 2, 1, 0]}))
+            got_a, got_b, got_c = await collect(a), await collect(b), await collect(c)
+            check("  the leader's line of sixteen and its groups reach the party; hits and a line reach the leader; never the stranger",
+                  [m.get("r") for m in runs(got_b)] == [line["r"]] and [m.get("sp") for m in runs(got_b)] == [line["sp"]]
+                  and [m.get("h") for m in runs(got_a)] == [[[7, 110009, 3]]]
+                  and [m.get("me") for m in runs(got_a)] == [[55, 1, 3, 14, 2, 1, 0]] and not runs(got_c),
+                  (got_a, got_b, got_c))
+            await b.send(json.dumps({"t": "en", "r": [55, 1, 4]}))
+            got_a = await collect(a)
+            check("  and a line from a game that does not lead goes nowhere", not runs(got_a), got_a)
+        finally:
+            server.stop_clocks()
+            sql("DELETE FROM party_members WHERE party_id = ?", (party,))
+
+
 async def the_descent_together():
     """P-26: THE DESCENT TOGETHER (game 0.126.0) - "descent" is a room per
     party, as the Endless is; the welcome says so; "en" crosses there."""
@@ -3194,6 +3255,7 @@ async def main():
     await the_run_between_a_party()
     await the_healers_run_together()
     await the_descent_together()
+    await the_stand_together()
     await clocks_carry_on()
     presence.HELLO_SECONDS = 0.5
     combatbook.HOLD_SECONDS = 0.2

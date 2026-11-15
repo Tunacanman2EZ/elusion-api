@@ -215,7 +215,8 @@ something for a tenth of a second, so none of it touches the database but
 the samples, the health rows and the books, each on its own clock.
 
 - **Rooms.** An area is a room, except the ones played as a party
-  (`INSTANCED_PLACES`: the Endless, the Healer's Run, the Descent): a room
+  (`INSTANCED_PLACES`: the Endless, the Healer's Run, the Descent, the
+  Forge, the Mage's Stand): a room
   per party, or per player alone, chosen by the server and never named to
   the game, so nobody can walk into somebody else's.
 - **The tick** (`TICK_SECONDS`, a tenth of a second): who moved, every step

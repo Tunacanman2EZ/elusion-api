@@ -2120,6 +2120,21 @@ against the server's own count of the fight.
   deaths. DEPLOY.md, "The Endless's receipts", is switching it on.
 - test_receipts R-9, test_combatbook CB-16, test_presence P-22, test_killwatch.
 
+## The Mage's Stand together (game 0.161.0)
+
+The owner: "the forge should be 4 player mages stand also". presence.py THE
+MAGE'S STAND TOGETHER: "magestand" is in `INSTANCED_PLACES` (not
+`BOOKED_RUNS`, not `SOLO_PLACES` - the Stand pays nothing), and the welcome
+says `"ms": MAGE_ROOMS`. A game playing the Stand with a party says it stands
+in "magestand" and is seated `magestand#p<party>` (a stranger
+`magestand#u<account>`); its steps are where its mage walks the wall. The run
+crosses as "en" as the Healer's Run's does (`clean_run()`): the leader's line
+of sixteen ("r"), the groups it sends in and the star dropped and called
+("sp"), every game's hits ("h" - a batch under 2,000 is the game's picture of
+a meteor, still three whole numbers in range), and each player's own line of
+seven ("me"). A game from before never says "magestand", so nothing needs a
+build. test_presence P-29.
+
 ## The Forge's receipts, and the Forge together (game 0.160.0)
 
 The same for the Forge's fire sprites, which carried the stress test's mark
