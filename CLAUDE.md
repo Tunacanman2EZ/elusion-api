@@ -2135,6 +2135,23 @@ a meteor, still three whole numbers in range), and each player's own line of
 seven ("me"). A game from before never says "magestand", so nothing needs a
 build. test_presence P-29.
 
+## Cut the Cloth together (game 0.161.0)
+
+The owner: "i was thinking of making cut the cloth 4 player and if players
+lines crash into each other they also die", and of who loses a life, "only
+the player that crashed into it". presence.py CUT THE CLOTH TOGETHER:
+"cloth" is in `INSTANCED_PLACES` (not booked, not solo - nothing there pays
+per kill; each player's gold is their own run, paid at Leave), and the
+welcome says `"cc": CLOTH_ROOMS`. A game cutting with a party says it stands
+in "cloth" and is seated `cloth#p<party>`; its steps are where its shot
+rides. The run crosses as "en" (`clean_run()`): the leader's line ("r"),
+what it decides ("sp" - a round's seed, each piece cut away as row spans of
+three, the slimes and saws, pickups, flares, gusts), every game's own cut
+("h": `[x, key * 16 + kind, row + 1]` - a cell added, the cut lost, closed,
+a pickup taken) and each player's line ("me": ready, lives, out). A game from
+before never says "cloth". test_presence P-30. **Deploy this first**: a
+0.161.0 game against an older server hears no "cc" and cuts alone.
+
 ## The Forge's receipts, and the Forge together (game 0.160.0)
 
 The same for the Forge's fire sprites, which carried the stress test's mark

@@ -282,6 +282,19 @@ game's hits ("h") and each player's own line ("me": ready, picking, kills,
 the star's hits, Repair and the star called). Nothing there pays or is
 booked: the Stand pays nothing. A game from before never says "magestand".
 
+CUT THE CLOTH TOGETHER (game 0.161.0). The owner: "i was thinking of making
+cut the cloth 4 player and if players lines crash into each other they also
+die" - "only the player that crashed into it". One cloth for up to four
+cutters, played over the town as the Stand is; a game playing it with the
+server's "cc" says it stands in "cloth", where it is seated in its party's
+room, its steps are where its shot rides. The run crosses as "en": the
+leader's line ("r": the round, the countdown, how much is cut), what it
+decides ("sp": a round's seed, each piece cut away as row spans, the slimes
+and saws where they are, the pickups, flares and gusts), every game's own cut
+("h": a cell added, the cut lost or closed, a pickup taken - [x, code, row])
+and each player's own line ("me": ready, lives, out). Nothing there is booked:
+each player's gold is their own run, paid at Leave by the minigames route.
+
 THE DESCENT TOGETHER (game 0.126.0). The owner: "lets set up party". The
 Descent is a room per party as the Endless is ("dr" in the welcome): a party's
 games share it, the first in leads (its monsters are the room's, shared as
@@ -593,8 +606,9 @@ AREA_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
 # ONE ARENA A PARTY: the areas each party (or each player with none) has a
 # room of its own in - instance_room(). "healerrun" since game 0.105.0: the
 # Healer's Run with a party (THE HEALER'S RUN TOGETHER, below); "magestand"
-# since game 0.161.0 (THE MAGE'S STAND TOGETHER).
-INSTANCED_PLACES = frozenset({"endless", "healerrun", "descent", "forge", "magestand"})
+# since game 0.161.0 (THE MAGE'S STAND TOGETHER); "cloth" since game 0.161.0
+# (CUT THE CLOTH TOGETHER).
+INSTANCED_PLACES = frozenset({"endless", "healerrun", "descent", "forge", "magestand", "cloth"})
 # THE FORGE TOGETHER (game 0.160.0). Its fire sprites are booked now, so its
 # room must hold one run: a party's, for the games that say they play it as
 # one ("fp" in the hello, FORGE_ROOMS) - the first in runs the heat, the
@@ -629,6 +643,10 @@ HEALER_ROOMS = 1
 # party (game 0.161.0, THE MAGE'S STAND TOGETHER), so a game may say it is
 # there. A game against a server without it plays the Stand alone, as before.
 MAGE_ROOMS = 1
+# Said in the welcome ("cc"): this server seats Cut the Cloth a room per party
+# (game 0.161.0, CUT THE CLOTH TOGETHER). A game against a server without it
+# cuts its cloth alone, as before.
+CLOTH_ROOMS = 1
 # Said in the welcome ("dr"): this server seats the Descent a room per party
 # (game 0.126.0), so a party may run it together. A game against a server
 # without it plays the Descent alone, as before.
@@ -2664,7 +2682,7 @@ class PresenceServer:
         await self._send(player, {"t": "welcome", "id": user_id, "v": SHARED_VERSION, "books": BOOKS,
                                   "x": RELAY_VERSION, "sh": SERVER_HEALTH if BOOKS else 0, "en": RUN_VERSION,
                                   "hr": HEALER_ROOMS, "dr": DESCENT_ROOMS, "fr": FORGE_ROOMS,
-                                  "ms": MAGE_ROOMS})
+                                  "ms": MAGE_ROOMS, "cc": CLOTH_ROOMS})
 
         try:
             async for raw in ws:

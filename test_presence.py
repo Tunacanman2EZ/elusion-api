@@ -231,7 +231,7 @@ async def run(port, server):
                       "sh": presence.SERVER_HEALTH if presence.BOOKS else 0,
                       "en": presence.RUN_VERSION, "hr": presence.HEALER_ROOMS,
                       "dr": presence.DESCENT_ROOMS, "fr": presence.FORGE_ROOMS,
-                      "ms": presence.MAGE_ROOMS}, welcome)
+                      "ms": presence.MAGE_ROOMS, "cc": presence.CLOTH_ROOMS}, welcome)
     await a.close()
 
     # =========================================================================
@@ -2635,6 +2635,69 @@ async def the_stand_together():
             sql("DELETE FROM party_members WHERE party_id = ?", (party,))
 
 
+async def the_cloth_together():
+    """P-30: CUT THE CLOTH TOGETHER (game 0.161.0) - "cloth" is a room per
+    party, as the Stand is; the welcome says so; "en" crosses there, and
+    nothing there is booked."""
+    section("P-30 CUT THE CLOTH TOGETHER: A ROOM PER PARTY, AND THE CUTS CROSS IT")
+    check("Cut the Cloth is an area every party has its own copy of, and it is not booked",
+          "cloth" in presence.INSTANCED_PLACES and "cloth" not in presence.BOOKED_RUNS
+          and "cloth" not in presence.SOLO_PLACES and not presence.run_brings("cloth"))
+    A, B, C = account("ccpa"), account("ccpb", "mage"), account("ccpc", "tank")
+    now = int(time.time())
+    sql("INSERT INTO parties (created_at) VALUES (?)", (now,))
+    party = int(sql("SELECT MAX(id) AS id FROM parties")[0]["id"])
+    for who, lead, at in (("ccpa", 1, now), ("ccpb", 0, now + 1)):
+        sql("INSERT INTO party_members (user_id, party_id, is_leader, joined_at) VALUES (?, ?, ?, ?)",
+            (uid(who), party, lead, at))
+    server = presence.PresenceServer(sweep_seconds=60, tick_seconds=0.05)
+    server.view_ticks = 1
+    server.near = False
+    server.start_clocks()
+
+    def runs(messages):
+        return [m for m in messages if m.get("t") == "en"]
+
+    async with serve(server.handler, "127.0.0.1", 0, max_size=presence.MAX_SOCKET_BYTES) as ws_server:
+        port = list(ws_server.sockets)[0].getsockname()[1]
+        try:
+            a, welcome = await enter(port, A, "cloth", v=3, en=1, x=320.0, y=352.0)
+            got_a = await collect(a)
+            check("the welcome says this server seats Cut the Cloth a room per party (\"cc\": 1)",
+                  welcome.get("cc") == presence.CLOTH_ROOMS == 1, welcome)
+            b, _ = await enter(port, B, "cloth", v=3, en=1, x=320.0, y=32.0)
+            c, _ = await enter(port, C, "cloth", v=3, en=1, x=320.0, y=352.0)
+            got_a, got_b, got_c = await collect(a), await collect(b), await collect(c)
+            pa, pb, pc = server.players[uid("ccpa")], server.players[uid("ccpb")], server.players[uid("ccpc")]
+            check("two of a party at the cloth share its room, the party's own; a stranger has one of their own",
+                  pa.area == pb.area == "cloth#p%d" % party and pc.area == "cloth#u%d" % uid("ccpc"),
+                  (pa.area, pb.area, pc.area))
+            check("  the party sees each other's shots, the first in leads, and nothing there is booked",
+                  uid("ccpb") in joined(got_a) and uid("ccpa") in joined(got_b)
+                  and (last_lead(got_b) or {}).get("id") == uid("ccpa") and (last_lead(got_b) or {}).get("a") == "cloth"
+                  and (last_lead(got_b) or {}).get("b") == 0 and not presence.PresenceServer.keeps_books("cloth"),
+                  got_b)
+            # A piece cut away: row spans, as many as a part holds.
+            spans = [41, 3, 2, 7, 88] + [r for row in range(2, 79) for r in (row, 2, 40)]
+            line = {"t": "en", "r": [41, 0, 3, 1, 0, 812, 1000, 0, 2, 7, 0, 0],
+                    "sp": [[41, 7, 2, 4321, 3, 1], spans]}
+            await a.send(json.dumps(line))
+            await b.send(json.dumps({"t": "en", "h": [[60, 41 * 16 + 1, 22], [61, 41 * 16 + 1, 22], [0, 41 * 16 + 3, 1]],
+                                     "me": [41, 1, 3, 0, 2]}))
+            got_a, got_b, got_c = await collect(a), await collect(b), await collect(c)
+            check("  the leader's line, its round and a piece cut away reach the party; a cut's cells and its close reach the leader; never the stranger",
+                  [m.get("r") for m in runs(got_b)] == [line["r"]] and [m.get("sp") for m in runs(got_b)] == [line["sp"]]
+                  and [m.get("h") for m in runs(got_a)] == [[[60, 657, 22], [61, 657, 22], [0, 659, 1]]]
+                  and [m.get("me") for m in runs(got_a)] == [[41, 1, 3, 0, 2]] and not runs(got_c),
+                  (got_a, got_b, got_c))
+            await b.send(json.dumps({"t": "en", "sp": [[41, 8, 2, 1, 1, 1]]}))
+            got_a = await collect(a)
+            check("  and a cut from a game that does not lead goes nowhere", not runs(got_a), got_a)
+        finally:
+            server.stop_clocks()
+            sql("DELETE FROM party_members WHERE party_id = ?", (party,))
+
+
 async def the_descent_together():
     """P-26: THE DESCENT TOGETHER (game 0.126.0) - "descent" is a room per
     party, as the Endless is; the welcome says so; "en" crosses there."""
@@ -3256,6 +3319,7 @@ async def main():
     await the_healers_run_together()
     await the_descent_together()
     await the_stand_together()
+    await the_cloth_together()
     await clocks_carry_on()
     presence.HELLO_SECONDS = 0.5
     combatbook.HOLD_SECONDS = 0.2
