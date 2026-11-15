@@ -421,10 +421,15 @@ GOLD_A_DAY = 100000
 # monster, in the Endless, in the last RECEIPT_SECONDS (kill/'s receipt rule,
 # held to the area: a field's death never pays a chest, nor the Endless's a
 # field's kill). None yet is a 202 the game asks again on, for a few seconds;
-# a game too old to ask (below ENDLESS_RECEIPT_BUILD) is told to update. The
-# Forge's fire sprites are not booked yet, so they are not asked.
-RECEIPT_GAMES = ("endless",)
+# a game too old to ask (below ENDLESS_RECEIPT_BUILD) is told to update.
+#
+# AND THE FORGE'S (game 0.160.0), under ELUSION_FORGE_RECEIPTS: its fire
+# sprites are booked since that build numbers them (before, they carried the
+# stress test's mark and no server ever saw one), so its minimum is 9.
+# RECEIPT_GAMES: the game -> the first build that can be paid that way.
 ENDLESS_RECEIPT_BUILD = 8
+FORGE_RECEIPT_BUILD = 9
+RECEIPT_GAMES = {"endless": ENDLESS_RECEIPT_BUILD, "forge": FORGE_RECEIPT_BUILD}
 RECEIPT_RETRY_MS = 400
 
 

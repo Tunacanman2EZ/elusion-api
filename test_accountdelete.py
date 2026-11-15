@@ -158,6 +158,18 @@ check("  counted as a failed login", int(one(
     "SELECT COUNT(*) FROM login_attempts WHERE username = 'delvictim' AND reason = 'bad-password-on-delete'")) == before + 1)
 check("  and the session is still good (a 401 here is not a sign-out)",
       client.get("/api/save", headers=auth(victim)).status_code == 200)
+# THROTTLED LIKE LOGIN (14 Nov review): a stolen session must not be able to
+# guess at the password here for ever. The misses count toward the account's
+# lockout, and a locked account is refused before the password is read.
+guesser = register("delguess")
+gues = [delete(guesser, "delguess", "guess-%d" % n).status_code for n in range(app_module.LOGIN_MAX_ATTEMPTS)]
+res = delete(guesser, "delguess")
+check("LOGIN_MAX_ATTEMPTS wrong passwords lock it: the right one is then a 429, and nothing is deleted",
+      gues == [401] * app_module.LOGIN_MAX_ATTEMPTS and res.status_code == 429
+      and one("SELECT username FROM users WHERE id = ?", (uid("delguess"),)) == "delguess", (gues, res.get_json()))
+check("  and the login is locked by the same guesses",
+      client.post("/api/auth/login", json={"username": "delguess", "password": "password123"},
+                  environ_base={"REMOTE_ADDR": "203.0.113.77"}).status_code == 429)
 res = delete(owner, "delowner")
 check("the owner's account cannot be deleted (403)", res.status_code == 403, res.get_json())
 now = int(time.time())

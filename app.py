@@ -192,7 +192,11 @@ IP_LOCKOUT_SECONDS = 15 * 60
 # An ALLOWLIST rather than a longer NOT-LIKE, because the denylist version had
 # already needed extending once and its failure mode is silent: a refusal
 # reason added later becomes evidence by default, and nothing says so.
-THROTTLE_EVIDENCE_REASONS = ("no-such-user", "bad-password", "bad-password-on-change")
+#
+# The recovery address and deleting the account ask the password too (14 Nov
+# review): their misses are the same guesses, from a session.
+THROTTLE_EVIDENCE_REASONS = ("no-such-user", "bad-password", "bad-password-on-change",
+                             "bad-password-on-email", "bad-password-on-delete")
 
 # REGISTRATION PROBING, which is the same question asked at a different door.
 #
@@ -4059,7 +4063,13 @@ CLIENT_BUILD_HEADER = "X-Elusion-Build"
 # again (combat.gd). A build-7 game fills its chest as before while
 # ELUSION_ENDLESS_RECEIPTS is off; with it on, it is told to update. Set the
 # minimum to 8 before switching the Endless's receipts on.
-CURRENT_CLIENT_BUILD = 8
+# 9 (game 0.160.0): the Forge's fire sprites are numbered and shared with the
+# server (they carried the stress test's mark, which no server ever hears of),
+# so its books can back a Forge chest kill. A build-8 game's sprites are never
+# booked: set the minimum to 9 before switching ELUSION_FORGE_RECEIPTS on.
+# The same build plays a party's Forge as one run, seated together because it
+# says "fp" in its hello (presence.py THE FORGE TOGETHER).
+CURRENT_CLIENT_BUILD = 9
 
 MAINTENANCE_DEFAULT_MESSAGE = "Update in progress - please come back later."
 
@@ -6455,6 +6465,7 @@ accountsettings_package.register(
     store_code=lambda db, user_id, purpose, code, target, now: _store_code(db, user_id, purpose, code, target, now),
     consume_code=lambda db, user_id, purpose, code, now: _consume_code(db, user_id, purpose, code, now),
     code_ttl=lambda: RESET_CODE_TTL_SECONDS,
+    password_refusal=lambda db, row, password, reason: _current_password_refusal(db, row, password, reason),
 )
 
 
@@ -9126,11 +9137,15 @@ def _class_of(db, user_id, slot):
     return row["class_id"] if row is not None else None
 
 
-def endless_receipts_on():
-    """Whether an Endless chest kill needs the books' receipt: off unless
-    ELUSION_ENDLESS_RECEIPTS is on. Read each time, so a suite can turn it on
-    and off."""
-    return os.environ.get("ELUSION_ENDLESS_RECEIPTS", "off").strip().lower() in ("1", "true", "yes", "on")
+RECEIPT_SETTINGS = {"endless": "ELUSION_ENDLESS_RECEIPTS", "forge": "ELUSION_FORGE_RECEIPTS"}
+
+
+def endless_receipts_on(game_id="endless"):
+    """Whether a chest kill in `game_id` (the Endless, or since 0.160.0 the
+    Forge) needs the books' receipt: off unless its setting is on. Read each
+    time, so a suite can turn it on and off."""
+    name = RECEIPT_SETTINGS.get(str(game_id))
+    return bool(name) and os.environ.get(name, "off").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _take_run_receipt(db, user_id, slot, enemy_id, now, area):
@@ -9179,6 +9194,39 @@ minigames_package.register(
 # every row that is the player's goes, their gold and lusions burned through
 # the ledgers first, and the users row stays as a numbered stand-in ("deleted
 # player #12") so other people's trades and the ledgers keep their history.
+
+
+def _current_password_refusal(db, row, password, reason):
+    """THE CURRENT PASSWORD, THROTTLED LIKE LOGIN (14 Nov review). Changing the
+    recovery address and deleting the account ask for the password, so a
+    stolen session cannot do either - and both checked it with no limit at
+    all: a thief holding a token could guess at it there for ever, where the
+    login and the password change lock after LOGIN_MAX_ATTEMPTS. Now the same
+    two ceilings as the password change (auth/routes.py): the address's, and
+    the account's lockout, read BEFORE the hash; a miss counts against both.
+    None when the password is right; otherwise the answer to give."""
+    now = int(time.time())
+    ip = client_ip()
+    ip_state = _ip_throttle_state(db, ip, now)
+    if ip_state is not None:
+        why, retry = ip_state
+        _record_login_attempt(db, row["username"], ip, False, why)
+        db.commit()
+        return {"error": "Too Many Requests",
+                "message": "Too many failed attempts from this address. Try again in %s." % _wait_words(retry)}, 429
+    if _row_int(row, "lockout_until") > now:
+        _record_login_attempt(db, row["username"], ip, False, "account-locked")
+        db.commit()
+        return {"error": "Too Many Requests",
+                "message": "Too many failed attempts. Try again in %s." % _wait_words(_row_int(row, "lockout_until") - now)}, 429
+    if not isinstance(password, str) or not check_password_hash(row["password_hash"], password):
+        _register_failed_login(db, row, now)
+        _record_login_attempt(db, row["username"], ip, False, reason)
+        db.commit()
+        return {"error": "Unauthorized", "message": "That password is not correct."}, 401
+    return None
+
+
 # accountdelete/__init__.py has the whole of it.
 import accountdelete as accountdelete_package  # noqa: E402
 
@@ -9199,6 +9247,7 @@ _delete_again = accountdelete_package.register(
     take_down_line=lambda db, row, now: chat.data.take_down(db, row, now),
     record_login_attempt=lambda db, username, ip, ok, reason="": _record_login_attempt(db, username, ip, ok, reason),
     client_ip=lambda: client_ip(),
+    password_refusal=lambda db, row, password, reason: _current_password_refusal(db, row, password, reason),
     log_staff_action=lambda actor, action, target_name, target_id=None, detail="": log_staff_action(
         actor, action, target_name, target_id, detail),
     # The list of deleted accounts is kept beside the database (14 Nov).

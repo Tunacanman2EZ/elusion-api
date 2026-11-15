@@ -1053,6 +1053,52 @@ check("and a run monster in a field is from nowhere: flagged, its death never du
       kinds(field_book.take()[1]) == ["unaccounted_spawn"] and field_book.monsters[5].not_due)
 
 
+section("CB-17 THE FORGE'S SPRITES, STRONGER EACH FLOOD (game 0.160.0)")
+# =============================================================================
+# The Forge's fire sprites carry the run's mark since build 9, and each comes
+# HEALTH_PER_FLOOD (0.15) stronger a flood - 2.2 times at the eighth. Counted
+# at what they were sent with, up to RUN_RAISED_MOST; past it, or raised
+# without the mark, the health is flagged.
+sprite = list(gamedata.FORGE["sprites"])[0]
+base = int(gamedata.ENEMIES[sprite]["max_hp"])
+forge = AreaBook("forge", gamedata.AREAS["forge"])
+forge.run_brings = frozenset(gamedata.FORGE["sprites"])
+smith = warrior(1)
+smith.scene_at = 0.0
+forge.world(smith, {"full": True, "reset": True, "part": 0, "parts": 1, "spawn": []}, 0.5)
+forge.take()
+strong = round(base * 2.2)
+forge.world(smith, {"ev": [{"k": "spawn", "r": record(1, sprite, origin="", x=300.0, y=300.0, rx=1, mh=strong)}]},
+            1.0)
+check("a sprite of the eighth flood (2.2x) is taken at its raised health, unflagged",
+      forge.monsters[1].max_hp == strong and forge.monsters[1].hp == strong and not kinds(forge.take()[1]),
+      (forge.monsters[1].max_hp, forge.monsters[1].hp))
+smith.moved("forge", 330.0, 300.0, 1.0, fresh=True)
+now = fight(forge, smith, 1, base, 1.5)
+forge.world(smith, {"ev": [{"k": "die", "id": 1, "x": 300.0, "y": 300.0}]}, now)
+forge.tick(now + combatbook.HOLD_SECONDS)
+kills, _flags = forge.take()
+check("  so its catalogue health in hits is not its death: the books do not agree",
+      [k["verdict"] for k in kills] != ["agreed"], kills)
+party = round(base * 2.2 * 1.6)
+forge.world(smith, {"ev": [{"k": "spawn", "r": record(2, sprite, origin="", x=300.0, y=300.0, rx=1,
+                                                      mh=party)}]}, now + 2.5)
+check("  so is a party of four's at the eighth flood (3.52x, game 0.160.0)", forge.monsters[2].max_hp == party
+      and not kinds(forge.take()[1]))
+forge.world(smith, {"ev": [{"k": "spawn", "r": record(5, sprite, origin="", x=300.0, y=300.0, rx=1,
+                                                      mh=base * combatbook.RUN_RAISED_MOST)}]}, now + 2.7)
+check("  up to RUN_RAISED_MOST (4x) is still the run's", forge.monsters[5].max_hp == base * combatbook.RUN_RAISED_MOST
+      and not kinds(forge.take()[1]))
+forge.world(smith, {"ev": [{"k": "spawn", "r": record(3, sprite, origin="", x=300.0, y=300.0, rx=1,
+                                                      mh=base * combatbook.RUN_RAISED_MOST + 1)}]}, now + 3)
+check("past it, the health is flagged and counted at the catalogue's",
+      kinds(forge.take()[1]) == ["max_hp_differs"] and forge.monsters[3].max_hp == base)
+forge.world(smith, {"ev": [{"k": "spawn", "r": record(4, sprite, origin="", x=300.0, y=300.0, mh=strong)}]},
+            now + 4)
+check("raised without the run's mark, flagged too",
+      "max_hp_differs" in kinds(forge.take()[1]) and forge.monsters[4].max_hp == base)
+
+
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))
 print("=" * 60)

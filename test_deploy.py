@@ -551,6 +551,31 @@ check("  under one name, never half written, and never taken for a backup by pru
       not any(f.endswith(".tmp") for f in os.listdir(cli_out))
       and backup_db.prune(cli_out, "elusion", 1)[1] == 1 and os.path.exists(listed_copy),
       os.listdir(cli_out))
+
+# ITS OWNER'S ALONE (14 Nov): the server's check found its backups
+# -rw-r--r--. A copy, the list and the folder are their owner's alone, and an
+# older copy left open is closed by the next night's run.
+if os.name == "posix":
+    def mode_of(path):
+        return os.stat(path).st_mode & 0o777
+    fresh = backup_db.make_backup(SRC, cli_out)
+    check("a new copy is its owner's alone (0600)", mode_of(fresh) == 0o600, oct(mode_of(fresh)))
+    check("  and so is the list of deleted accounts", mode_of(listed_copy) == 0o600, oct(mode_of(listed_copy)))
+    os.chmod(fresh, 0o644)
+    os.chmod(cli_out, 0o755)
+    stranger = os.path.join(cli_out, "notes.txt")
+    with open(stranger, "w") as handle:
+        handle.write("not a backup")
+    os.chmod(stranger, 0o644)
+    result = subprocess.run([sys.executable, os.path.join(HERE, "backup_db.py"), "--db", SRC,
+                             "--out", cli_out, "--keep", "14"],
+                            capture_output=True, text=True, timeout=60)
+    check("an older copy anybody could read is closed by the next run, the folder too",
+          result.returncode == 0 and mode_of(fresh) == 0o600 and mode_of(cli_out) == 0o700
+          and "made private" in result.stdout, (oct(mode_of(fresh)), oct(mode_of(cli_out)), result.stdout))
+    check("  and a file not named like a backup is left as it was", mode_of(stranger) == 0o644,
+          oct(mode_of(stranger)))
+    os.remove(stranger)
 live.close()
 
 

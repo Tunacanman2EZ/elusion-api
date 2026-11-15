@@ -318,6 +318,23 @@ check("  its own line, worded for the chest",
       killwatch.receipts_line(chest, days=1, endless=True))
 check("  a database with no chest kills table gives no line",
       killwatch.receipts_backing(con, days=1, now=1000700, endless=True) is None)
+# AND THE FORGE'S (game 0.160.0): its chest kills only to the Forge's deaths,
+# never the Endless's, and neither run's deaths back an ordinary kill.
+run.execute("INSERT INTO minigame_kills (user_id, slot, game, enemy_id, at) VALUES (40, 0, 'forge', 'firesprite', 3000400)")
+run.execute("INSERT INTO minigame_kills (user_id, slot, game, enemy_id, at) VALUES (40, 0, 'forge', 'firesprite', 3000450)")
+run.execute("INSERT INTO combat_kills (at, area, enemy_id, user_id, slot, verdict, damage)"
+            " VALUES (3000400, 'forge', 'firesprite', 40, 0, 'agreed', 100)")
+run.execute("INSERT INTO combat_kills (at, area, enemy_id, user_id, slot, verdict, damage)"
+            " VALUES (3000450, 'endless', 'firesprite', 40, 0, 'agreed', 100)")
+kill(run, 40, "firesprite", 3000400)
+forge = killwatch.receipts_backing(run, days=1, now=3000500, game="forge")
+field = killwatch.receipts_backing(run, days=1, now=3000500)
+check("forge receipts: a Forge chest kill is backed by a Forge death only - never the Endless's",
+      (forge["paid"], forge["backed"], forge["never"]) == (2, 1, 1), forge)
+check("  and a Forge death backs no ordinary kill", (field["paid"], field["backed"]) == (2, 0), field)
+check("  its own line", killwatch.receipts_line(forge, days=1, game="forge").startswith(
+          "forge receipts: of 2 chest kills paid"), killwatch.receipts_line(forge, days=1, game="forge"))
+check("  a game that is no run gives no line", killwatch.receipts_backing(run, days=1, game="descent") is None)
 check("receipts: no books, no line; no kills lately, a line that says so",
       killwatch.receipts_backing(plain) is None and killwatch.receipts_line(None) is None
       and killwatch.receipts_line(killwatch.receipts_backing(con, days=1, now=5000000), days=1)

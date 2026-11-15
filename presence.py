@@ -304,6 +304,12 @@ so ("b": 0), and a game then counts its monsters' health itself, as before
 bosses fill a chest, so each arena - a party's or one player's - keeps a book
 like a field's ("b": 1), its run's monsters accounted for by their mark
 (combatbook.RUN_MARK, run_brings()), and a chest kill can be paid against it.
+THE FORGE TOO since game 0.160.0: its fire sprites carry the run's mark now
+(they carried the stress test's, which no server hears of), stronger each
+flood and for a party (combatbook.RUN_RAISED_MOST); the games that say in
+their hello they play a party's Forge as one run ("fp"; "fr" in the welcome)
+share their party's room, the first in running the run as in the Descent,
+and a game from before has a room of its own even in a party (SOLO_PLACES).
 
 PARTY VOICE (game 0.43.0). The owner: "I really really want the option for voice
 chat in game for parties". The voice itself never comes here: each game's
@@ -576,22 +582,33 @@ AREA_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
 # ONE ARENA A PARTY: the areas each party (or each player with none) has a
 # room of its own in - instance_room(). "healerrun" since game 0.105.0: the
 # Healer's Run with a party (THE HEALER'S RUN TOGETHER, below).
-INSTANCED_PLACES = frozenset({"endless", "healerrun", "descent"})
+INSTANCED_PLACES = frozenset({"endless", "healerrun", "descent", "forge"})
+# THE FORGE TOGETHER (game 0.160.0). Its fire sprites are booked now, so its
+# room must hold one run: a party's, for the games that say they play it as
+# one ("fp" in the hello, FORGE_ROOMS) - the first in runs the heat, the
+# floods and the sprites, and the others follow its line - and otherwise a
+# room per account even in a party (instance_room()): a game from before runs
+# its own sprites, and two runs in one room would book only the leader's.
+SOLO_PLACES = frozenset({"forge"})
+# Said in the welcome ("fr"), and by a game in its hello ("fp"): this server
+# seats a party's Forge together for the games that say so.
+FORGE_ROOMS = 1
 # THE ENDLESS IS BOOKED (game 0.159.0). Its elites and bosses roll loot into a
 # chest (/api/minigames/kill), so they are counted as a field's monsters are -
 # every arena its own book, a party's or one player's - and a chest kill can
 # be paid against that count (ELUSION_ENDLESS_RECEIPTS, minigames/). The
 # Healer's Run and the Descent pay nothing per kill and stay unbooked.
-BOOKED_RUNS = frozenset({"endless"})
+BOOKED_RUNS = frozenset({"endless", "forge"})
 
 
 def run_brings(place):
-    """The enemy ids a booked run brings mid-run (its elites and bosses, from
-    gamedata.json's schedule), or none for any other area."""
+    """The enemy ids a booked run brings mid-run (the Endless's elites and
+    bosses, the Forge's fire sprites, from gamedata.json's schedules), or none
+    for any other area."""
     if place not in BOOKED_RUNS or gamedata is None:
         return frozenset()
     schedule = getattr(gamedata, place.upper(), None) or {}
-    return frozenset(str(e) for e in list(schedule.get("elites") or []) + list(schedule.get("bosses") or []))
+    return frozenset(str(e) for key in ("elites", "bosses", "sprites") for e in list(schedule.get(key) or []))
 # Said in the welcome ("hr"): this server seats the Healer's Run a room per
 # party, so a game may say it is there (game 0.105.0). A game against a server
 # without it plays the run alone, as before.
@@ -1267,6 +1284,9 @@ class Player:
         self.server_health = False
         # THE RUN BETWEEN A PARTY (0.93.3): this game speaks "en".
         self.runs = False
+        # THE FORGE TOGETHER (0.160.0): this game plays a party's Forge as one
+        # run ("fp" in its hello), so it may be seated with its party there.
+        self.forge_party = False
         # THE DAMAGE METER (0.81.0): this game has it open. Only an owner's or
         # a co-owner's can (METER_ROLES).
         self.meter = False
@@ -1810,7 +1830,7 @@ class PresenceServer:
         at the guard's "alone" - or None for any other area."""
         if place not in INSTANCED_PLACES:
             return None
-        if player.party and self.crowd_cap != 1:
+        if player.party and self.crowd_cap != 1 and (place not in SOLO_PLACES or player.forge_party):
             return "%s#p%d" % (place, int(player.party))
         return "%s#u%d" % (place, int(player.user_id))
 
@@ -1916,7 +1936,7 @@ class PresenceServer:
         catalogue has a map of, and not a party's own room (THE RUN BETWEEN A
         PARTY) - except a run whose monsters pay (BOOKED_RUNS, game 0.159.0:
         the Endless's elites and bosses fill a chest, so the server counts
-        them as it counts a field's)."""
+        them as it counts a field's; 0.160.0, the Forge's fire sprites)."""
         return bool(BOOKS and place and place in gamedata.AREAS
                     and (place not in INSTANCED_PLACES or place in BOOKED_RUNS))
 
@@ -2618,6 +2638,7 @@ class PresenceServer:
         player.tick_attacks = msg.get("xt") == TICK_ATTACKS and not isinstance(msg.get("xt"), bool)
         player.server_health = msg.get("sh") == SERVER_HEALTH and not isinstance(msg.get("sh"), bool)
         player.runs = msg.get("en") == RUN_VERSION and not isinstance(msg.get("en"), bool)
+        player.forge_party = player.runs and msg.get("fp") == FORGE_ROOMS and not isinstance(msg.get("fp"), bool)
         self.players[user_id] = player
         # Its party, whatever ELUSION_NEAR says: ONE ARENA A PARTY reads it too.
         try:
@@ -2626,7 +2647,7 @@ class PresenceServer:
             print("[PRESENCE] could not read a party: %r" % exc, flush=True)
         await self._send(player, {"t": "welcome", "id": user_id, "v": SHARED_VERSION, "books": BOOKS,
                                   "x": RELAY_VERSION, "sh": SERVER_HEALTH if BOOKS else 0, "en": RUN_VERSION,
-                                  "hr": HEALER_ROOMS, "dr": DESCENT_ROOMS})
+                                  "hr": HEALER_ROOMS, "dr": DESCENT_ROOMS, "fr": FORGE_ROOMS})
 
         try:
             async for raw in ws:

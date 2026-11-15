@@ -366,6 +366,72 @@ check("and off again, a chest kill nobody saw is paid once more", chest_kill(ERI
 os.environ.pop("ELUSION_ENDLESS_RECEIPTS", None)
 
 
+print("\n--- R-10 the Forge's receipts (game 0.160.0) ---")
+# =============================================================================
+# The Forge's fire sprites are numbered and booked since build 9 (they carried
+# the stress test's mark before). Its own switch, ELUSION_FORGE_RECEIPTS: a
+# Forge chest kill paid only against an AGREED death in the Forge's books.
+SPRITE = list(gamedata.FORGE["sprites"])[0]
+FERN = register("fern")
+client.put("/api/save", headers=headers(FERN), json={"slot": 0, "class_id": "tank", "name": "Fern"})
+check("the Go into the Forge", client.post("/api/minigames/enter", headers=headers(FERN),
+                                          json={"game": "forge"}).status_code == 200)
+
+
+def forge_kill(token, build=9):
+    return client.post("/api/minigames/kill", headers=headers(token, build),
+                       json={"game": "forge", "slot": 0, "enemy_id": SPRITE})
+
+
+def died_in(username, area, verdict="agreed"):
+    sql("INSERT INTO combat_kills (at, area, enemy_id, origin, leader_id, user_id, slot, verdict, damage)"
+        " VALUES (?, ?, ?, '', ?, ?, 0, ?, 100)",
+        (int(time.time()), area, SPRITE, uid(username), uid(username), verdict))
+    return int(sql("SELECT MAX(id) AS id FROM combat_kills")[0]["id"])
+
+
+def forge_kills(username):
+    return int(sql("SELECT COUNT(*) AS n FROM minigame_kills WHERE user_id = ? AND game = 'forge'",
+                   (uid(username),))[0]["n"])
+
+
+os.environ.pop("ELUSION_FORGE_RECEIPTS", None)
+os.environ["ELUSION_ENDLESS_RECEIPTS"] = "on"
+before = forge_kills("fern")
+check("the Endless's switch on does not touch the Forge: paid on the game's word, as before",
+      forge_kill(FERN).status_code == 200 and forge_kills("fern") == before + 1)
+os.environ.pop("ELUSION_ENDLESS_RECEIPTS", None)
+os.environ["ELUSION_FORGE_RECEIPTS"] = "on"
+before = forge_kills("fern")
+res = forge_kill(FERN)
+check("on, with nothing in the books: 202 'not yet', and nothing in the chest",
+      res.status_code == 202 and (res.get_json() or {}).get("pending") is True and forge_kills("fern") == before,
+      (res.status_code, res.get_json()))
+died_in("fern", "endless")
+check("  an Endless death of the same monster pays no Forge chest kill",
+      forge_kill(FERN).status_code == 202 and forge_kills("fern") == before)
+here = died_in("fern", "forge")
+res = forge_kill(FERN)
+check("an AGREED death in the Forge's books: paid once, and the death is used",
+      res.status_code == 200 and forge_kills("fern") == before + 1 and here in receipts_of("fern"),
+      (res.status_code, receipts_of("fern")))
+res = forge_kill(FERN, build=8)
+check("a build-8 game (its sprites never booked) is told to update, not paid nothing",
+      res.status_code == 409 and "update" in (res.get_json() or {}).get("message", ""), (res.status_code, res.get_json()))
+switch(BOSS, True)
+sql("INSERT INTO kill_receipts (combat_kill_id, user_id, slot, at) SELECT id, ?, 0, ? FROM combat_kills"
+    " WHERE user_id = ? AND id NOT IN (SELECT combat_kill_id FROM kill_receipts)",
+    (uid("fern"), int(time.time()), uid("fern")))
+died_in("fern", "forge")
+xp_before = xp_of("fern")
+res = kill_claim(FERN, SPRITE)
+check("a Forge death never pays an ordinary kill: /api/combat/kill waits ('not yet') with only that",
+      res.status_code == 202 and xp_of("fern") == xp_before, (res.status_code, res.get_json()))
+switch(BOSS, False)
+os.environ.pop("ELUSION_FORGE_RECEIPTS", None)
+check("and off again, a Forge chest kill nobody saw is paid once more", forge_kill(FERN).status_code == 200)
+
+
 # =============================================================================
 print("\n%d passed, %d failed" % (passed, failed))
 if failures:

@@ -22,6 +22,9 @@ register() is handed app.py's own pieces - it never imports app.py:
     log_staff_action      (actor, action, target_name, target_id, detail)
     db_path               () -> the database's path, for the list of deleted
                           accounts kept beside it (None: no list - a bare app)
+    password_refusal      (db, row, password, reason) -> None, or the answer:
+                          app.py's password check, throttled like login (14
+                          Nov review); None in a bare app, a plain check
 
 It answers with `again(db, now)`: on a database restored from a backup, the
 listed accounts that came back are emptied again (app.py runs it as a
@@ -41,7 +44,7 @@ from . import data, services
 
 def register(app, *, require_auth, get_db, bad_request, protected, find_open_trade, gold_delta,
              bank_gold_delta, lusion_delta, fix_party, drop_guild, log_guild_event, take_down_line,
-             record_login_attempt, client_ip, log_staff_action, db_path=None):
+             record_login_attempt, client_ip, log_staff_action, db_path=None, password_refusal=None):
 
     def erase(db, user_id, username, now, why):
         """Everything after the checks: the money through the ledgers, the
@@ -163,10 +166,16 @@ def register(app, *, require_auth, get_db, bad_request, protected, find_open_tra
                     "message": "The owner's and the co-owners' accounts cannot be deleted."}, 403
 
         db = get_db()
-        row = db.execute("SELECT password_hash FROM users WHERE id = ?", (user_id,)).fetchone()
+        row = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         # THE PASSWORD, as the email route asks it: a stolen session must not be
-        # able to throw an account away. A wrong one counts as a failed login.
-        if row is None or not check_password_hash(row["password_hash"], password):
+        # able to throw an account away. THROTTLED LIKE LOGIN (14 Nov review):
+        # the lockouts first, and a miss counts against both (app.py
+        # _current_password_refusal()) - it was a door to guess at for ever.
+        if row is not None and password_refusal is not None:
+            refused = password_refusal(db, row, password, "bad-password-on-delete")
+            if refused is not None:
+                return refused
+        elif row is None or not check_password_hash(row["password_hash"], password):
             record_login_attempt(db, username, client_ip(), False, "bad-password-on-delete")
             db.commit()
             return {"error": "Unauthorized", "message": "That password is not correct."}, 401

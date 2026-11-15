@@ -524,7 +524,12 @@ def books_summary(con):
         counts.get("agreed", 0), counts.get("short", 0), counts.get("not_due", 0))
 
 
-def receipts_backing(con, days=RECEIPTS_DAYS, now=None, endless=False):
+# The run areas whose deaths pay a chest, not an ordinary kill (kill/services.py
+# RUN_AREAS): the Endless (game 0.159.0) and the Forge (0.160.0).
+RUN_GAMES = ("endless", "forge")
+
+
+def receipts_backing(con, days=RECEIPTS_DAYS, now=None, endless=False, game=None):
     """
     The kills paid in the last `days` days (since the books began, if later),
     each put to the books as the receipts switch would: {"paid", "backed",
@@ -535,11 +540,17 @@ def receipts_backing(con, days=RECEIPTS_DAYS, now=None, endless=False):
     ONE PLACE'S DEATHS FOR ONE PLACE'S KILLS (game 0.159.0), as kill/data.py's
     receipt_for(): an ordinary kill is put only to deaths outside the Endless;
     with `endless`, the Endless's chest kills (minigame_kills) only to the
-    Endless's - what ELUSION_ENDLESS_RECEIPTS would pay.
+    Endless's - what ELUSION_ENDLESS_RECEIPTS would pay. `game` is any run
+    (0.160.0: "forge", what ELUSION_FORGE_RECEIPTS would pay); `endless` is
+    game="endless".
     """
+    if endless:
+        game = "endless"
+    if game is not None and game not in RUN_GAMES:
+        return None
     if not _has_table(con, "combat_kills"):
         return None
-    if endless and not _has_table(con, "minigame_kills"):
+    if game is not None and not _has_table(con, "minigame_kills"):
         return None
     first = con.execute("SELECT MIN(at) FROM combat_kills").fetchone()[0]
     if first is None:
@@ -547,17 +558,22 @@ def receipts_backing(con, days=RECEIPTS_DAYS, now=None, endless=False):
     import time as _time
     since = max(int(first), int((now if now is not None else _time.time()) - days * 86400))
     rows = {}
+    if game is not None:
+        place, places = "area = ?", (game,)
+    else:
+        place, places = "area NOT IN (%s)" % ", ".join("?" * len(RUN_GAMES)), RUN_GAMES
     for at, user_id, slot, enemy_id, verdict in con.execute(
-            "SELECT at, user_id, slot, enemy_id, verdict FROM combat_kills WHERE at >= ? AND area %s 'endless'"
-            " ORDER BY at, id" % ("=" if endless else "!="),
-            (since - RECEIPT_SECONDS,)):
+            "SELECT at, user_id, slot, enemy_id, verdict FROM combat_kills WHERE at >= ? AND %s"
+            " ORDER BY at, id" % place, (since - RECEIPT_SECONDS,) + tuple(places)):
         rows.setdefault((user_id, enemy_id), []).append([at, slot, verdict, False])
     out = {"paid": 0, "backed": 0, "short": 0, "not_due": 0, "never": 0, "since": since,
            "never_by_enemy": {}}
-    paid = ("SELECT user_id, slot, enemy_id, at FROM minigame_kills WHERE game = 'endless' AND at >= ?"
-            " ORDER BY at, id") if endless else \
-        "SELECT user_id, slot, enemy_id, at FROM kill_reports WHERE at >= ? ORDER BY at, id"
-    for user_id, slot, enemy_id, at in con.execute(paid, (since,)):
+    if game is not None:
+        paid, asked = ("SELECT user_id, slot, enemy_id, at FROM minigame_kills WHERE game = ? AND at >= ?"
+                       " ORDER BY at, id"), (game, since)
+    else:
+        paid, asked = "SELECT user_id, slot, enemy_id, at FROM kill_reports WHERE at >= ? ORDER BY at, id", (since,)
+    for user_id, slot, enemy_id, at in con.execute(paid, asked):
         out["paid"] += 1
         near = [r for r in rows.get((user_id, enemy_id), ())
                 if not r[3] and at - RECEIPT_SECONDS <= r[0] <= at + RECEIPT_WAIT_SECONDS and r[1] in (slot, -1)]
@@ -573,12 +589,15 @@ def receipts_backing(con, days=RECEIPTS_DAYS, now=None, endless=False):
     return out
 
 
-def receipts_line(backing, days=RECEIPTS_DAYS, endless=False):
+def receipts_line(backing, days=RECEIPTS_DAYS, endless=False, game=None):
     """The one line killwatch prints about switching the receipts on - or,
-    with `endless`, the Endless's (ELUSION_ENDLESS_RECEIPTS)."""
+    with `endless`, the Endless's (ELUSION_ENDLESS_RECEIPTS), or with `game`
+    that run's ("forge": ELUSION_FORGE_RECEIPTS)."""
     if backing is None:
         return None
-    label, what = ("endless receipts", "chest kills") if endless else ("receipts", "kills")
+    if endless:
+        game = "endless"
+    label, what = ("%s receipts" % game, "chest kills") if game else ("receipts", "kills")
     if backing["paid"] == 0:
         return "%s: no %s paid in the last %d days to measure them by" % (label, what, days)
     worst = sorted(backing["never_by_enemy"].items(), key=lambda kv: (-kv[1], kv[0]))[:3]
@@ -675,8 +694,8 @@ def main():
         dossier = analyze(con, window=args.window, respawn=args.respawn)
         books_line = books_summary(con)
         receipt_line = receipts_line(receipts_backing(con, days=args.days), days=args.days)
-        endless_line = receipts_line(receipts_backing(con, days=args.days, endless=True), days=args.days,
-                                     endless=True)
+        run_lines = [receipts_line(receipts_backing(con, days=args.days, game=game), days=args.days, game=game)
+                     for game in RUN_GAMES]
     except sqlite3.Error as exc:
         print("[KILLWATCH] FAIL: could not read the database: %s" % exc, file=sys.stderr)
         sys.exit(2)
@@ -703,8 +722,9 @@ def main():
         print("  %s" % books_line)
     if receipt_line:
         print("  %s" % receipt_line)
-    if endless_line:
-        print("  %s" % endless_line)
+    for line in run_lines:
+        if line:
+            print("  %s" % line)
     print("=" * 68)
 
     if not dossier:

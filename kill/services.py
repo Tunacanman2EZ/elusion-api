@@ -100,9 +100,10 @@ RECEIPT_SECONDS = 60
 RECEIPT_RETRY_MS = 400
 RECEIPT_BUILD = 7
 # Where the books count monsters whose death pays something else (game
-# 0.159.0): the Endless's elites and bosses fill its chest, through
-# /api/minigames/kill. Their deaths never pay an ordinary kill (receipt_for).
-RUN_AREAS = ("endless",)
+# 0.159.0): the Endless's elites and bosses, and (0.160.0) the Forge's fire
+# sprites, fill a chest, through /api/minigames/kill. Their deaths never pay an
+# ordinary kill (receipt_for).
+RUN_AREAS = ("endless", "forge")
 
 
 def tokens_now(stored, last_kill_ms, now_ms):

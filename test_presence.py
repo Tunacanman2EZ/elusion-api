@@ -158,7 +158,7 @@ def last_lead(messages):
     return leads[-1] if leads else None
 
 
-async def enter(port, headers, area=None, v=None, xt=None, sh=None, en=None, **kw):
+async def enter(port, headers, area=None, v=None, xt=None, sh=None, en=None, fp=None, **kw):
     """A connected game: hello with a fresh ticket, welcome read, optionally
     standing somewhere. v=2 is a game that shares monsters; xt=1 one that
     takes attacks inside the tick (game 0.76.0)."""
@@ -173,6 +173,8 @@ async def enter(port, headers, area=None, v=None, xt=None, sh=None, en=None, **k
         hello["sh"] = sh
     if en is not None:
         hello["en"] = en
+    if fp is not None:
+        hello["fp"] = fp
     await ws.send(json.dumps(hello))
     welcome = json.loads(await asyncio.wait_for(ws.recv(), 2))
     if area:
@@ -228,7 +230,7 @@ async def run(port, server):
                       "books": presence.BOOKS, "x": presence.RELAY_VERSION,
                       "sh": presence.SERVER_HEALTH if presence.BOOKS else 0,
                       "en": presence.RUN_VERSION, "hr": presence.HEALER_ROOMS,
-                      "dr": presence.DESCENT_ROOMS}, welcome)
+                      "dr": presence.DESCENT_ROOMS, "fr": presence.FORGE_ROOMS}, welcome)
     await a.close()
 
     # =========================================================================
@@ -2714,10 +2716,42 @@ async def the_run_between_a_party():
             check("anywhere but a party's arena the run is nobody's business: dropped", not runs(got_g), got_g)
             check("  and there the lead says what the books keep, as before",
                   (last_lead(got_f) or {}).get("b", -1) == booked("field"), [last_lead(got_f), presence.BOOKS])
-            check("  the Healer's Run and the Descent stay unbooked; the Endless alone of the runs is booked",
+            check("  the Healer's Run and the Descent stay unbooked; the Endless and (0.160.0) the Forge are booked",
                   not presence.PresenceServer.keeps_books("healerrun")
                   and not presence.PresenceServer.keeps_books("descent")
-                  and presence.BOOKED_RUNS == frozenset({"endless"}))
+                  and presence.BOOKED_RUNS == frozenset({"endless", "forge"}))
+            # THE FORGE, A ROOM EACH (game 0.160.0): played alone, so a room
+            # per account even in a party - two runs in one room would book
+            # only the leader's sprites.
+            in_party = types.SimpleNamespace(party=7, user_id=41, forge_party=False)
+            check("  the Forge is a room per account, even in a party; the Endless a room per party",
+                  server.instance_room(in_party, "forge") == "forge#u41"
+                  and server.instance_room(in_party, "endless") == "endless#p7",
+                  [server.instance_room(in_party, "forge"), server.instance_room(in_party, "endless")])
+            # THE FORGE TOGETHER (game 0.160.0): a game that says "fp" in its
+            # hello is seated with its party; alone, a Forge of its own.
+            together = types.SimpleNamespace(party=7, user_id=42, forge_party=True)
+            alone = types.SimpleNamespace(party=0, user_id=43, forge_party=True)
+            check("  a game that plays a party's Forge as one run ('fp') shares its party's; alone, its own",
+                  server.instance_room(together, "forge") == "forge#p7"
+                  and server.instance_room(alone, "forge") == "forge#u43",
+                  [server.instance_room(together, "forge"), server.instance_room(alone, "forge")])
+            fa, welcome_fa = await enter(port, C, "forge", v=2, en=1, fp=1, x=1280.0, y=1280.0)
+            fb, _ = await enter(port, D, "forge", v=2, en=1, x=1280.0, y=1280.0)
+            await collect(fa)
+            await collect(fb)
+            check("  the welcome says so ('fr'), and the hello's 'fp' is heard - only with 'en'",
+                  (welcome_fa or {}).get("fr") == presence.FORGE_ROOMS
+                  and server.players[uid("runc")].forge_party is True
+                  and server.players[uid("rund")].forge_party is False,
+                  [welcome_fa, server.players[uid("runc")].forge_party, server.players[uid("rund")].forge_party])
+            await fa.close()
+            await fb.close()
+            check("  and its book knows the fire sprites it sends",
+                  presence.run_brings("forge") == frozenset(presence.gamedata.FORGE["sprites"])
+                  and presence.run_brings("forge") and (not presence.BOOKS
+                                                        or presence.PresenceServer.keeps_books("forge")),
+                  presence.run_brings("forge"))
             await a.send(json.dumps({"t": "w", "d": {"ev": [{"k": "spawn", "r": {"id": 1, "o": "", "s":
                          "res://scene/enemy/lightsprite.tscn", "pp": "", "x": 700, "y": 600, "a": "idledown",
                          "hp": 50, "mh": 50, "p": {}}}]}}))

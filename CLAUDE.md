@@ -2120,6 +2120,46 @@ against the server's own count of the fight.
   deaths. DEPLOY.md, "The Endless's receipts", is switching it on.
 - test_receipts R-9, test_combatbook CB-16, test_presence P-22, test_killwatch.
 
+## The Forge's receipts, and the Forge together (game 0.160.0)
+
+The same for the Forge's fire sprites, which carried the stress test's mark
+until 0.160.0 - never numbered, so no server ever saw one - and the Forge
+became a party game the same day.
+
+- **A party's Forge together** (presence.py THE FORGE TOGETHER): "forge" is in
+  `INSTANCED_PLACES` and `BOOKED_RUNS`. A game that says `"fp"` in its hello
+  (`Player.forge_party`, only with `"en"`) is seated in its party's Forge
+  (`forge#p<party>`; the welcome says `"fr"`, `FORGE_ROOMS`), the first in
+  running the heat, floods and sprites and the others following its line
+  ("en", the Descent's way - `clean_run()` takes it); every player's blows
+  are counted and each fills their own chest. A game from before, which runs
+  its own sprites, is seated `forge#u<account>` even in a party
+  (`SOLO_PLACES`) - two runs in one room would book only the leader's.
+- **Stronger each flood, and for a party** (combatbook.py `RUN_RAISED_MOST` 4,
+  `_raised_run()`): a run's own monster (`rx`, in `run_brings`) is counted at
+  the health it was sent with, up to four times the catalogue's (the eighth
+  flood's 2.2 times a party of four's 1.6 is 3.52); past that, or raised with
+  no mark, `max_hp_differs`. gamedata.json's `"forge"` schedule is for a party
+  of four (125 alive).
+- **Its own switch**: `ELUSION_FORGE_RECEIPTS` (app.py `RECEIPT_SETTINGS`,
+  `endless_receipts_on(game_id)`; minigames/services.py `RECEIPT_GAMES` maps
+  each game to its first build - the Forge's 9, `FORGE_RECEIPT_BUILD`).
+  `kill/services.RUN_AREAS` holds "forge", so a Forge death pays no ordinary
+  kill; killwatch.py prints `forge receipts:` (`receipts_backing(game=)`).
+  `CURRENT_CLIENT_BUILD` is 9.
+- test_receipts R-10, test_combatbook CB-17, test_presence P-22,
+  test_killwatch, test_minigames.
+
+**A password asked from a session is throttled like login** (SECURITY_NOTES
+E-25): the recovery address and deleting the account call app.py
+`_current_password_refusal()` - lockouts first, a miss counted. **A new route
+that takes the current password does the same.** test_recovery,
+test_accountdelete AD-2.
+
+**Backups are their owner's alone** (SECURITY_NOTES E-24): `backup_db.py`
+writes each copy at 0600 from the first byte and `make_private()` closes the
+folder and older copies every run. `test_deploy.py` section D.
+
 ## Levers only from near (game 0.158.0)
 
 A lever pull ("l") was anybody's in its area, from anywhere in it. presence.py

@@ -731,6 +731,11 @@ It only ever touches names it writes, `<db name>-<YYYYMMDD>-<HHMMSS>.db`, so a
 folder shared with anything else is safe. The live database is never touched
 and stays in WAL. `test_deploy.py`.
 
+**Each backup is its owner's alone** (14 Nov, SECURITY_NOTES E-24): written at
+0600 from its first byte, the folder closed to 0700, and any older copy left
+readable by others closed on the next run. Root still reads them, so the
+`scp` below works as before.
+
 **Linux (cron)** — the live server's line is under **The live server**, above.
 The shape, for another box:
 
@@ -956,6 +961,17 @@ update" to 8 first** (a game older than 0.159.0 cannot wait for the count),
 add `ELUSION_ENDLESS_RECEIPTS=on`, and restart the API:
 `sudo systemctl restart elusion-api`. Off again is the same line set to `off`
 and a restart; chest kills are then paid on the game's word, as before.
+
+### The Forge's receipts (0.160.0)
+
+The same for the Forge's fire sprites, under its own switch,
+`ELUSION_FORGE_RECEIPTS`, and its own line under killwatch's: `forge
+receipts:`. Before game 0.160.0 no server ever saw a Forge sprite, so wait
+for a few days of 0.160.0 play. Then **set "Old versions must update" to 9
+first**, add `ELUSION_FORGE_RECEIPTS=on`, and restart the API. Since 0.160.0
+a party's games share one Forge - one run, the first in leading - and a game
+from before keeps a Forge of its own; players outside a party each have
+their own.
 
 ### Holding moves to a walk (0.157.0)
 

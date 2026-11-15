@@ -140,6 +140,25 @@ check("and the address really was not changed",
       res.get_json().get("has_email") is False, str(res.get_json()))
 clear_throttle()
 
+# THROTTLED LIKE LOGIN (14 Nov review): the stolen session may not go on
+# guessing. The misses count toward the account's lockout, and once locked
+# even the right password is refused before it is read.
+reg = client.post("/api/auth/register", json={"username": "guessed", "password": "password123"})
+guessed = reg.get_json()["token"]
+codes = [client.post("/api/account/email", json={"email": "thief@evil.example", "password": "guess%d" % n},
+                     headers=auth(guessed)).status_code for n in range(app_module.LOGIN_MAX_ATTEMPTS)]
+res = client.post("/api/account/email", json={"email": "thief@evil.example", "password": "password123"},
+                  headers=auth(guessed))
+check("a stolen session's guesses lock the account: then even the right password is a 429",
+      codes == [401] * app_module.LOGIN_MAX_ATTEMPTS and res.status_code == 429, (codes, res.status_code))
+check("  and the address was never changed",
+      client.get("/api/account/email", headers=auth(guessed)).get_json().get("has_email") is False)
+check("  and each miss is evidence for the address's own throttle",
+      "bad-password-on-email" in app_module.THROTTLE_EVIDENCE_REASONS
+      and "bad-password-on-delete" in app_module.THROTTLE_EVIDENCE_REASONS)
+raw_sql("UPDATE users SET lockout_until = 0, failed_logins = 0 WHERE username = 'guessed'")
+clear_throttle()
+
 res = client.post("/api/account/email",
                   json={"email": "not-an-email", "password": "password123"},
                   headers=auth(victim))

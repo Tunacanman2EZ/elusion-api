@@ -93,6 +93,12 @@ SWELL_AREA = "bigfield"
 # to it. A run monster anywhere else, or one the run never sends, is
 # unaccounted for, like any monster from nowhere.
 RUN_MARK = "rx"
+# A run's monster may come stronger than the catalogue's (game 0.160.0: the
+# Forge's sprites gain HEALTH_PER_FLOOD 0.15 with each of its 8 floods, 2.2
+# times, and a party's 1.6 for four on top, 3.52 at the most):
+# counted at what it was sent with, up to this many times the catalogue -
+# more health only makes a death harder to agree.
+RUN_RAISED_MOST = 4
 # BOSSES THAT SCALE (game 0.80.0): a boss's health is raised by who fights it
 # (bossenemy.gd, scale_for() - the fighters' levels above its band, how many
 # they are, the Crowned's own 2.5), on the game that runs it, and told in a
@@ -543,7 +549,8 @@ class AreaBook:
             if int(enemy.get("split_count", 0) or 0) > 0 and enemy.get("splits_into"):
                 m.splitter = (int(enemy["split_count"]), str(enemy["splits_into"]))
             if sent_max is not None and sent_max != max_hp:
-                if self._stirred_max(enemy, max_hp, sent_max) or self._scaled_boss(enemy, max_hp, sent_max):
+                if self._stirred_max(enemy, max_hp, sent_max) or self._scaled_boss(enemy, max_hp, sent_max) \
+                        or self._raised_run(enemy, props, max_hp, sent_max):
                     # BORN WHILE ITS LAND STIRS, with the health the stir gave
                     # it: counted at that, so its death agrees where the
                     # game's does.
@@ -559,6 +566,13 @@ class AreaBook:
             self._judge_spawn(m, enemy, props, now, kind)
         self.monsters[monster_id] = m
         self.health_changed.add(monster_id)
+
+    def _raised_run(self, enemy, props, catalogue_max, sent_max):
+        """Whether `sent_max` is a run's own monster made stronger by its run
+        (the Forge's floods): marked, sent by this run, more than the
+        catalogue's and no more than RUN_RAISED_MOST times it."""
+        return props.get(RUN_MARK) == 1 and str(enemy.get("enemy_id", "")) in self.run_brings \
+            and catalogue_max < sent_max <= catalogue_max * RUN_RAISED_MOST
 
     @staticmethod
     def _scaled_boss(enemy, catalogue_max, sent_max):

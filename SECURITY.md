@@ -425,7 +425,7 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     an account in any 24 hours - a run past it paid what is left, a chest
     past it rolling its gear and no coins, the ledger line saying what was
     held back. The owner, who skips the waits, skips it too.
-    → Held by: `test_minigames.py` — "  a 1,750 Cut the Cloth run after it - another minigame, the same day - is paid the 1,000 left", "a chest kill with the day full keeps its sword and none of its coins, and says what was held back", "  a day on, the allowance is whole again: the coins roll into the chest, and count", "a second Go inside the day is refused (409), with how long is left, in words", "the wait is the account's: one row per account and minigame, whichever character", "  loot only: no XP, no level, no kill record, no bag", "70 elites inside the first minute is all a run could have sent: the 71st is a 429, and pays nothing", "another account reads its own chest, never somebody else's, and cannot take from it", "  50 fire sprites at the Go is all there could be: the 51st is a 429 that names them", "  one pet a Go: the first kill's is kept, the second kill is not let roll one", "the fourth inside the day is refused (409) with when the next one is, in words", "a run that says it reached the goal 30 seconds after its Go is believed only as far as the time allows", "  once: a second Leave for the same run is refused (409)", "refused: somebody else's run (404), a bad body (400), not logged in (401)", "a run left too long pays nothing (closed without Leave)", "a run that says it cleared 12 rounds 40 seconds after its Go is believed for 2", "  no run is believed longer than since your Go"
+    → Held by: `test_minigames.py` — "  a 1,750 Cut the Cloth run after it - another minigame, the same day - is paid the 1,000 left", "a chest kill with the day full keeps its sword and none of its coins, and says what was held back", "  a day on, the allowance is whole again: the coins roll into the chest, and count", "a second Go inside the day is refused (409), with how long is left, in words", "the wait is the account's: one row per account and minigame, whichever character", "  loot only: no XP, no level, no kill record, no bag", "70 elites inside the first minute is all a run could have sent: the 71st is a 429, and pays nothing", "another account reads its own chest, never somebody else's, and cannot take from it", "  the most alive at the Go is all there could be: the next is a 429 that names them", "  one pet a Go: the first kill's is kept, the second kill is not let roll one", "the fourth inside the day is refused (409) with when the next one is, in words", "a run that says it reached the goal 30 seconds after its Go is believed only as far as the time allows", "  once: a second Leave for the same run is refused (409)", "refused: somebody else's run (404), a bad body (400), not logged in (401)", "a run left too long pays nothing (closed without Leave)", "a run that says it cleared 12 rounds 40 seconds after its Go is believed for 2", "  no run is believed longer than since your Go"
 42. **Deleting your own account takes everything that was yours and nothing
     that is anybody else's** (game 0.90.0, accountdelete/). It asks three
     times - the name typed, the password (a wrong one counted as a failed
@@ -647,7 +647,11 @@ No comforting lies. These are known, named and open.
   chest kill there is paid only against an AGREED death in those books, in
   the Endless (`test_receipts.py` R-9, `test_combatbook.py` CB-16). A
   field's death never pays a chest, nor the Endless's a field's kill. The
-  Forge's fire sprites are not booked yet.
+  Forge's fire sprites the same since game 0.160.0, under their own switch,
+  `ELUSION_FORGE_RECEIPTS` (R-10, CB-17): a party's Forge one run in one
+  room (a game from before, one of its own), each player's own share of a
+  death backing only their own chest, and each death paying only a Forge
+  chest.
 
 - **A rollback counts items by id, and a sale's gold can stay where it went.**
   Since 0.157.0 it holds back what went to the bank, another character or
@@ -678,7 +682,7 @@ Anything not on this list that later turns out to be true belongs on it.
 
 | For | Read |
 |---|---|
-| Threat model, and every finding E-1…E-22 with what happened to it | [`SECURITY_NOTES.md`](SECURITY_NOTES.md) |
+| Threat model, and every finding E-1…E-25 with what happened to it | [`SECURITY_NOTES.md`](SECURITY_NOTES.md) |
 | Who owns which field, and the exact request/response of every route | [`docs/apicontract.md`](../../Elusion_RPG/docs/apicontract.md) *(game repo)* |
 | TLS, the proxy setting, secrets, backups, monitoring, "before the first stranger connects" | [`DEPLOY.md`](DEPLOY.md) |
 | The pieces, how they talk, who owns which data, the measured limits | [`ARCHITECTURE.md`](ARCHITECTURE.md) |

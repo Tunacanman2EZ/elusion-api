@@ -405,15 +405,16 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
                     "message": "More %s than %s could have sent since you went in."
                                % (services.KIND_WORDS.get(kind, "monsters"), game["name"])}, 429
 
-        # THE SERVER'S RECEIPT (game 0.159.0), with ELUSION_ENDLESS_RECEIPTS on:
-        # an Endless elite or boss is paid only against the books' own count
-        # of it dying for this account in the Endless - as /api/combat/kill
+        # THE SERVER'S RECEIPT (game 0.159.0), with ELUSION_ENDLESS_RECEIPTS on
+        # (or, 0.160.0, ELUSION_FORGE_RECEIPTS for the Forge): a run's monster
+        # is paid only against the books' own count of it dying for this
+        # account in that run's area - as /api/combat/kill
         # pays a field's (services.py, THE ENDLESS'S RECEIPTS). After every
         # cheaper refusal, so a "not yet" spends nothing; the receipt is the
         # first thing written.
-        if game_id in services.RECEIPT_GAMES and receipts_on is not None and receipts_on():
+        if game_id in services.RECEIPT_GAMES and receipts_on is not None and receipts_on(game_id):
             if take_receipt is None or not take_receipt(db, user_id, slot, enemy_id, now, game_id):
-                if client_build is not None and client_build() < services.ENDLESS_RECEIPT_BUILD:
+                if client_build is not None and client_build() < services.RECEIPT_GAMES[game_id]:
                     return {"error": "Conflict",
                             "message": "This copy of the game is too old to fill the chest - update it."}, 409
                 return {"pending": True, "retry_after_ms": services.RECEIPT_RETRY_MS,

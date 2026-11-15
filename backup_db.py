@@ -69,6 +69,14 @@ def make_backup(src_path, out_dir):
     stamp = time.strftime("%Y%m%d-%H%M%S")
     base = os.path.splitext(os.path.basename(src_path))[0] or "elusion"
     dest_path = os.path.join(out_dir, "%s-%s.db" % (base, stamp))
+    # ITS OWNER'S ALONE (14 Nov). A copy holds every account's email and
+    # password hash, and the server's check found them -rw-r--r--: anybody
+    # with a login on the box could read them. Made empty at 0600 before
+    # SQLite opens it (SQLite takes an empty file as an empty database), so
+    # there is no moment it is anybody else's to read. A copy made in the same
+    # second as another is written over it, as it always was.
+    os.close(os.open(dest_path, os.O_WRONLY | os.O_CREAT, PRIVATE))
+    os.chmod(dest_path, PRIVATE)
 
     # Read-only source handle: a backup must never be able to change what it is
     # copying. The online backup API streams pages under a read lock and yields
@@ -104,6 +112,33 @@ def make_backup(src_path, out_dir):
 DELETED_SUFFIX = ".deleted"
 
 
+# Every file this script writes, and the folder it writes them in: its
+# owner's alone.
+PRIVATE = 0o600
+PRIVATE_DIR = 0o700
+
+
+def make_private(out_dir, base):
+    """Close what an older version of this script left open: the folder and
+    every file in it named like this database's backups (and its list of
+    deleted accounts) to their owner alone. A file somebody else owns is
+    left as it is. Returns how many were changed."""
+    changed = 0
+    pattern = backup_name(base)
+    paths = [out_dir] + [os.path.join(out_dir, name) for name in os.listdir(out_dir)
+                         if pattern.match(name) or name == deleted_list_name(base)]
+    for path in paths:
+        want = PRIVATE_DIR if path == out_dir else PRIVATE
+        try:
+            if os.stat(path).st_mode & 0o777 != want:
+                os.chmod(path, want)
+                changed += 1
+        except OSError as exc:
+            print("[BACKUP] warning: could not make %s private: %s" % (path, exc),
+                  file=sys.stderr)
+    return changed
+
+
 def deleted_list_name(base):
     return "%s-deleted-accounts.txt" % base
 
@@ -120,7 +155,7 @@ def copy_deleted_list(src_path, out_dir):
         return None
     base = os.path.splitext(os.path.basename(src_path))[0] or "elusion"
     dest = os.path.join(out_dir, deleted_list_name(base))
-    with open(dest + ".tmp", "wb") as handle:
+    with os.fdopen(os.open(dest + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE), "wb") as handle:
         handle.write(text)
         handle.flush()
         os.fsync(handle.fileno())
@@ -289,12 +324,15 @@ def main():
     listed = copy_deleted_list(args.db, args.out)
     removed, kept = prune(args.out, base, args.keep)
     settled, swept = tidy(args.out, base)
+    opened = make_private(args.out, base)
 
     print("[BACKUP] OK  %s  (%s, %s)  in %.1fs"
           % (dest, human(os.path.getsize(dest)), detail, time.time() - started))
     print("[BACKUP] retention: %d kept, %d pruned (keep=%d)" % (kept, removed, args.keep))
     if listed is not None:
         print("[BACKUP] deleted accounts: the list of %d copied beside the backups" % listed)
+    if opened:
+        print("[BACKUP] made private: %d older files or the folder were readable by others" % opened)
     if settled or swept:
         print("[BACKUP] tidied: older copies made single files: %d, leftover "
               "-wal/-shm files removed: %d" % (settled, swept))

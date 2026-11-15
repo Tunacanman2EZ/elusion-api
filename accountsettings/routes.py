@@ -41,7 +41,7 @@ from . import data, services
 
 def register(app, *, require_auth, no_write_lock, get_db, bad_request, parse_stat, hue_max, clean_email,
              mask_email, row_int, record_login_attempt, client_ip, mail_can_send, send_mail_async, new_code,
-             store_code, consume_code, code_ttl):
+             store_code, consume_code, code_ttl, password_refusal=None):
 
     def get_account_email():
         """
@@ -116,7 +116,16 @@ def register(app, *, require_auth, no_write_lock, get_db, bad_request, parse_sta
         # inbox, reset the password, and lock the real owner out permanently -
         # turning a temporary theft into a permanent one. Knowing the password is
         # the one thing a session thief does not have, so it is what this asks for.
-        if not check_password_hash(row["password_hash"], password):
+        #
+        # THROTTLED LIKE LOGIN (14 Nov review): app.py's password_refusal()
+        # reads the address's and the account's lockouts before the hash, and
+        # a miss counts against both - so a session thief cannot guess at the
+        # password here for ever. A bare app (test_packages) checks it plainly.
+        if password_refusal is not None:
+            refused = password_refusal(db, row, password, "bad-password-on-email")
+            if refused is not None:
+                return refused
+        elif not check_password_hash(row["password_hash"], password):
             record_login_attempt(db, row["username"], client_ip(), False, "bad-password-on-email")
             db.commit()
             return {"error": "Unauthorized", "message": "That password is not correct."}, 401

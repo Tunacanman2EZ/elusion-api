@@ -435,10 +435,13 @@ row = forge_row(gus)
 check("the Forge is a minigame: a day's wait, ready now, no best yet",
       row.get("name") == "The Forge" and row.get("wait_seconds") == services.DAY and row.get("ready_in") == 0
       and row.get("best") == 0 and "best" not in endless(gus), row)
-check("  the catalogue carries its schedule: fire sprites, eight floods, the volcano believed a minute, 50 alive at most",
+# AT A PARTY OF FOUR (game 0.160.0): the most a run sends - 2.5 times a
+# player alone's, so 125 alive and three sprites at once from the start.
+ALIVE = forge_plan.get("alive_most")
+check("  the catalogue carries its schedule, for a party of four: fire sprites, eight floods, the volcano believed a minute, 125 alive at most",
       forge_plan.get("sprites") == ["firesprite"] and len(forge_plan.get("phases", [])) == 8
-      and forge_plan.get("volcano_believed") == 60 and forge_plan.get("alive_most") == 50
-      and forge_plan["phases"][0] == {"count": 1, "gap": 3.0, "seconds": 40.0}, forge_plan)
+      and forge_plan.get("volcano_believed") == 60 and ALIVE == 125
+      and forge_plan["phases"][0] == {"count": 3, "gap": 3.0, "seconds": 40.0}, forge_plan)
 check("before a Go: a kill and a time are both 409, nothing paid",
       forge_kill(gus).status_code == 409 and forge_best(gus, 60).status_code == 409
       and not (client.get("/api/loot/chest?game=forge&slot=0", headers=gus).get_json() or {}).get("contents"))
@@ -468,18 +471,18 @@ def forge_by_hand(seconds):
     return int(total)
 whole = services.forge_run_sprites(forge_plan, services.forge_run_seconds(forge_plan))
 check("its ceiling: every flood at its fastest, the volcano for a minute, the most alive - then back-to-back runs, six a day",
-      services.forge_ceiling(forge_plan, 0) == 50 and services.forge_ceiling(forge_plan, 100) == forge_by_hand(100) + 50
+      services.forge_ceiling(forge_plan, 0) == ALIVE and services.forge_ceiling(forge_plan, 100) == forge_by_hand(100) + ALIVE
       and whole == forge_by_hand(10 ** 6)
-      and services.forge_ceiling(forge_plan, 86000) == whole * services.FORGE_RUNS_BELIEVED + 50
+      and services.forge_ceiling(forge_plan, 86000) == whole * services.FORGE_RUNS_BELIEVED + ALIVE
       and services.forge_ceiling(forge_plan, 2 * 288) > whole,
       (services.forge_ceiling(forge_plan, 100), forge_by_hand(100), whole, services.forge_ceiling(forge_plan, 86000)))
 now = int(time.time())
 conn = sqlite3.connect(DB_PATH)
 conn.executemany("INSERT INTO minigame_kills (user_id, slot, game, enemy_id, boss, at) VALUES (?, 0, 'forge', 'firesprite', 0, ?)",
-                 [(uid("mggus"), now)] * (50 - 1))
+                 [(uid("mggus"), now)] * (ALIVE - 1))
 conn.commit(); conn.close()
 over = forge_kill(gus)
-check("  50 fire sprites at the Go is all there could be: the 51st is a 429 that names them",
+check("  the most alive at the Go is all there could be: the next is a 429 that names them",
       over.status_code == 429 and "fire sprites than The Forge" in (over.get_json() or {}).get("message", ""),
       (over.status_code, over.get_json()))
 raw("UPDATE minigame_entries SET entered_at = entered_at - 400 WHERE user_id = ? AND game = 'forge'", (uid("mggus"),))
