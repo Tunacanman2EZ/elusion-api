@@ -3065,8 +3065,73 @@ async def held_to_a_walk():
             server.stop_clocks()
 
 
+async def levers_only_from_near():
+    """P-28: LEVERS ONLY FROM NEAR (game 0.158.0) - a pull is taken only from a
+    player within LEVER_REACH of that lever (gamedata.json's "levers"); a name
+    the area has no lever by is no lever; staff, and an area the catalogue
+    gives no levers, keep the old rule."""
+    section("P-28 LEVERS ONLY FROM NEAR: A GATE IS OPENED BY SOMEBODY STANDING AT ITS LEVER")
+    OUT, IN = "ysortworld/interactables/levergatesout", "ysortworld/interactables/levergatesin"
+    field_levers = (presence.gamedata.AREAS.get("field") or {}).get("levers") or {}
+    check("the catalogue says where the Field's two levers stand (the exporter's \"levers\")",
+          sorted(field_levers) == sorted([IN, OUT]), field_levers)
+    ox, oy = (float(v) for v in field_levers.get(OUT, [0.0, 0.0]))
+    P, Q, S = account("levp"), account("levq"), account("levs")
+    sql("UPDATE users SET role = 'mod' WHERE username = 'levs'")
+    server = presence.PresenceServer(sweep_seconds=60, tick_seconds=0.05)
+    server.near = False
+    server.hold_moves = False
+    server.start_clocks()
+    async with serve(server.handler, "127.0.0.1", 0, max_size=presence.MAX_SOCKET_BYTES) as ws_server:
+        port = list(ws_server.sockets)[0].getsockname()[1]
+        try:
+            p, _ = await enter(port, P, "field", x=ox + 2000.0, y=oy)
+            q, _ = await enter(port, Q, "field", x=ox + 40.0, y=oy + 30.0)
+            m, _ = await enter(port, S, "field", x=ox + 3000.0, y=oy)
+            for ws in (p, q, m):
+                await collect(ws)
+            hub_p = next(h for h in server.players.values() if h.user_id == uid("levp"))
+            room = hub_p.area
+            await p.send(json.dumps({"t": "l", "n": OUT, "on": True}))
+            got_q = await collect(q)
+            check("a pull from across the Field reaches nobody and is not remembered",
+                  not of(got_q, "l") and OUT not in server.levers.get(room, {}) and hub_p.levers_refused == 1,
+                  (got_q, server.levers.get(room)))
+            await q.send(json.dumps({"t": "l", "n": OUT, "on": True}))
+            got_p = await collect(p)
+            check("a pull from beside the lever is passed on and remembered, as before",
+                  of(got_p, "l") == [{"t": "l", "id": uid("levq"), "n": OUT, "on": True}]
+                  and server.levers.get(room, {}).get(OUT) is True, got_p)
+            await q.send(json.dumps({"t": "l", "n": "ysortworld/interactables/nosuchlever", "on": True}))
+            check("a name the Field has no lever by is no lever: not passed on, not remembered",
+                  not of(await collect(p), "l")
+                  and "ysortworld/interactables/nosuchlever" not in server.levers.get(room, {}))
+            await p.send(state("field", x=ox + presence.LEVER_REACH - 4.0, y=oy))
+            await collect(q)
+            await p.send(json.dumps({"t": "l", "n": OUT, "on": False}))
+            check("just inside LEVER_REACH (%d px) of the lever is near enough" % presence.LEVER_REACH,
+                  of(await collect(q), "l") == [{"t": "l", "id": uid("levp"), "n": OUT, "on": False}])
+            await p.send(state("field", x=ox + presence.LEVER_REACH + 4.0, y=oy))
+            await collect(q)
+            await p.send(json.dumps({"t": "l", "n": OUT, "on": True}))
+            check("  and just outside it is not", not of(await collect(q), "l") and hub_p.levers_refused == 2,
+                  hub_p.levers_refused)
+            await m.send(json.dumps({"t": "l", "n": IN, "on": True}))
+            check("staff pull from anywhere, as they move anywhere",
+                  of(await collect(q), "l") == [{"t": "l", "id": uid("levs"), "n": IN, "on": True}])
+            check("an area the catalogue gives no \"levers\" keeps the old rule (a catalogue from before)",
+                  not presence.PresenceServer.lever_out_of_reach(
+                      types.SimpleNamespace(identity={"role": "player"}, where="nowhere", x=9e5, y=9e5), OUT))
+            check("the hub counts the pulls it refused", server.levers_refused == 3, server.levers_refused)
+            for ws in (p, q, m):
+                await ws.close()
+        finally:
+            server.stop_clocks()
+
+
 async def main():
     await held_to_a_walk()
+    await levers_only_from_near()
     the_loop_never_waits()
     await kills_written_soon()
     await positions_written()

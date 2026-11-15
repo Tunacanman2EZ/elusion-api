@@ -1515,6 +1515,20 @@ player online. A POLL THAT ALWAYS ANSWERS in app.py:
   their savepoint (the rollback check red).
 - **Deploy order: either** - see the game's note.
 
+## A picture meets five readers (E-23, 14 Nov 2026)
+
+`pip-audit -r requirements.txt` found 42 published flaws in Pillow 12.3.0,
+the only C parser here that reads bytes a stranger chose - every chat upload
+and fetched link goes through `chat/services.py decode_relayed_image()`. Two
+fixes: **Pillow==13.0.0** in requirements.txt (the server installs it on its
+next update; the PC's venv needs `pip install -r requirements.txt`), and
+**`Image.open(..., formats=PICTURE_FORMATS)`** - PNG, JPEG, GIF, WebP, BMP,
+the game's `UPLOAD_KINDS` - so no other reader (TIFF, EPS through
+Ghostscript, MSP...) ever sees a player's bytes. **A new picture format the
+game sends goes in that list too**, or the server refuses it.
+test_chatrooms.py "only the five formats a player can send"; SECURITY.md
+invariant 48.
+
 ## Seeing each other: presence.py, a second process
 
 The owner, 5 Oct: "i want to make other players see each other" - over a live
@@ -2077,6 +2091,21 @@ P-27, two sabotages caught):
   by area (DEPLOY.md, "Holding moves to a walk"); a place where honest play
   jumps is many players in one area, and gets its own free rule.
 - `hub.moves_held` and `player.held_moves` count what was held.
+
+## Levers only from near (game 0.158.0)
+
+A lever pull ("l") was anybody's in its area, from anywhere in it. presence.py
+now takes one only from a player within `LEVER_REACH` (160 px) of that lever
+(`lever_out_of_reach()`), by gamedata.json's `"levers"` - name (the lever's
+path in its scene, the name a pull goes by) to spot, written by the game's
+exporter (`_collect_levers()`). A name that is no lever of the area is
+refused; staff pull from anywhere; an area with no `"levers"` key (a catalogue
+from before) keeps the old rule. The position read is `player.x/y`, what is
+passed on, so with HELD TO A WALK on a game has to walk to the lever. A
+refused pull is counted (`levers_refused`) and goes nowhere; the puller's own
+game has already moved its own lever, nobody else's. **Move a lever, rename
+one or add one: re-export and copy gamedata.json here**, or honest pulls are
+refused (the game's suite checks the file against the scenes). P-28.
 
 ## Gear bonuses: a character's maximum includes what it wears
 

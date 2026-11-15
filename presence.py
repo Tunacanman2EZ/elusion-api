@@ -189,6 +189,17 @@ the next game in loads the scene afresh. At most MAX_LEVERS_PER_AREA names per
 area, each a node path in the scene (LEVER_PATTERN) that each game looks up in
 its own copy.
 
+LEVERS ONLY FROM NEAR (game 0.158.0). A pull was anybody's in its area, from
+anywhere in it: a modified game could open or shut the Field's gates for
+everyone from across the map. Now a pull is taken only from a player standing
+within LEVER_REACH of that lever, where gamedata.json's "levers" (written by
+the game's exporter, name -> spot) says it stands - and a name not among them
+is no lever at all. Staff are never refused; an area the catalogue gives no
+"levers" (one exported before 0.158.0) keeps the old rule. The position read
+is the one passed on to everyone else, so with HELD TO A WALK on a game cannot
+claim to stand at a lever it has not walked to. Refused pulls are counted
+(levers_refused), never passed on and never remembered.
+
 HOW ITS MINUTES WENT (game 0.78.0). Everything this process knows about the
 server's load - who is connected and where, the tick and its late beats, what
 it sends - lives in its memory, and gunicorn's workers cannot see it. So once a
@@ -607,6 +618,11 @@ MAX_ATTACK_FLAGS = 255
 # may remember.
 LEVER_PATTERN = re.compile(r"^[A-Za-z0-9_/-]{1,128}$")
 MAX_LEVERS_PER_AREA = 32
+# LEVERS ONLY FROM NEAR (0.158.0): how far from a lever a pull is taken. The
+# game's own reach is a circle of 24 px round it (lever.tscn) touched by the
+# player's body; the rest is the body, a held step and a state a tenth of a
+# second old. The Field's two levers are 250 px apart.
+LEVER_REACH = 160.0
 # Said in the welcome: this server passes attacks and levers on (1), and
 # puts attacks inside the tick for a game that asks (2, game 0.76.0).
 RELAY_VERSION = 2
@@ -1224,6 +1240,7 @@ class Player:
         self.snap_next = False
         self.sync_snap_at = -SYNC_SNAP_SECONDS
         self.held_moves = 0
+        self.levers_refused = 0
         self.tele_asked_at = -TELEPORT_ASK_SECONDS
         self.tele_dest = None
         # ATTACKS RIDE THE TICK: this game takes them inside the moves.
@@ -1659,6 +1676,7 @@ class PresenceServer:
         # HELD TO A WALK: on, and how many steps were held since the start.
         self.hold_moves = HOLD_MOVES
         self.moves_held = 0
+        self.levers_refused = 0
 
     # ---- sending -------------------------------------------------------------
     # EVERYTHING SENT IS COUNTED (game 0.78.0): a frame for each socket a text
@@ -2193,6 +2211,10 @@ class PresenceServer:
         if not area or pulled is None:
             return False
         name, on = pulled
+        if self.lever_out_of_reach(player, name):
+            player.levers_refused += 1
+            self.levers_refused += 1
+            return False
         book = self.levers.setdefault(area, {})
         if name not in book and len(book) >= MAX_LEVERS_PER_AREA:
             return False
@@ -2202,6 +2224,22 @@ class PresenceServer:
         book[name] = on
         self._room_broadcast(area, {"t": "l", "id": player.user_id, "n": name, "on": on}, skip=player)
         return True
+
+    @staticmethod
+    def lever_out_of_reach(player, name):
+        """True when the catalogue says where this area's levers stand and
+        this player is not within LEVER_REACH of the one it pulled - or the
+        name is none of them. Staff, and an area with no "levers", never."""
+        if gamedata is None or str(player.identity.get("role", "player")) in SEES_ALL_ROLES:
+            return False
+        area = (getattr(gamedata, "AREAS", {}) or {}).get(player.where) or {}
+        levers = area.get("levers") if isinstance(area, dict) else None
+        if not isinstance(levers, dict):
+            return False
+        at = levers.get(name)
+        if not isinstance(at, (list, tuple)) or len(at) != 2:
+            return True
+        return math.hypot(player.x - float(at[0]), player.y - float(at[1])) > LEVER_REACH
 
     async def _send_levers(self, player):
         book = self.levers.get(player.area)

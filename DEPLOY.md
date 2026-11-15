@@ -351,6 +351,12 @@ curl -s https://api.elusionrpg.com/api/status
   leave root-owned files the service then cannot replace.
 - **When `requirements.txt` changed**, before the restart:
   `sudo -u elusion /opt/elusion/venv/bin/pip install -r requirements.txt`.
+  On the PC too, or the suites run on the old library:
+  `.\venv\Scripts\pip install -r requirements.txt`.
+- **Ask the libraries before a release** (E-23): `pip install pip-audit`,
+  then `pip-audit -r requirements.txt`. It lists every published flaw in
+  what this server pins. Pillow 12.3.0 had 42, and it is the code that reads
+  every picture a player sends; nothing of ours would ever have said so.
 - **When the game's catalogue changed**, the new `gamedata.json` has to be
   committed here first (the exporter writes into the game repo, not this one);
   the pull then brings it. `/api/status` shows the item and enemy counts.

@@ -706,6 +706,64 @@ else:
 
 
 # ---------------------------------------------------------------------------
+# ONLY THE FIVE FORMATS A PLAYER CAN SEND (E-23)
+#
+# Image.open() with no list tries every reader Pillow has, and most of 12.3.0's
+# 42 known flaws were in readers chat never needed (TIFF, MSP, MIC, FlashPix,
+# EPS through Ghostscript). The game offers PNG, JPEG, GIF, WebP and BMP, so
+# those five decode and nothing else reaches a reader at all.
+# ---------------------------------------------------------------------------
+print("\n--- only the five formats a player can send ---")
+
+if not app_module.PILLOW_AVAILABLE:
+    print("  (Pillow not installed - format list tests skipped)")
+else:
+    from PIL import Image as _FImage, features as _ffeatures
+    import chat.services as _chat_services
+
+    def _made(fmt, mode="RGB"):
+        b = io.BytesIO()
+        _FImage.new(mode, (24, 16), (40, 160, 90)).save(b, format=fmt)
+        return b.getvalue()
+
+    check("the reader's list is the five the game sends",
+          tuple(_chat_services.PICTURE_FORMATS) == ("PNG", "JPEG", "GIF", "WEBP", "BMP"),
+          _chat_services.PICTURE_FORMATS)
+    sent = ["PNG", "JPEG", "GIF", "BMP"] + (["WEBP"] if _ffeatures.check("webp") else [])
+    read_ok = [f for f in sent if _chat_services.decode_relayed_image(_made(f))[0] is not None]
+    check("PNG, JPEG, GIF, BMP and WebP are still read (%s)" % ", ".join(read_ok),
+          read_ok == sent, read_ok)
+    others = {"TIFF": _made("TIFF"), "PCX": _made("PCX"), "TGA": _made("TGA"),
+              "PPM": _made("PPM"), "ICO": _made("ICO", "RGBA"), "SGI": _made("SGI"),
+              "EPS": (b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 24 16\n"
+                      b"newpath 0 0 moveto 24 16 lineto stroke\nshowpage\n%%EOF\n")}
+    read_too = [f for f, raw in others.items() if _chat_services.decode_relayed_image(raw)[0] is not None]
+    check("and nothing else is read: TIFF, PCX, TGA, PPM, ICO, SGI, EPS all refused",
+          read_too == [], read_too)
+    check("  in the words every other unreadable file gets",
+          _chat_services.decode_relayed_image(others["TIFF"])[1]
+          == "that file is not a picture this server can read",
+          _chat_services.decode_relayed_image(others["TIFF"]))
+    refill("amy")
+    res = upload(amy_token, others["TIFF"], "page.tif")
+    check("  and a TIFF sent to the upload route is a 400, nothing stored",
+          res.status_code == 400, (res.status_code, res.get_json()))
+
+    # THE PIN. 13.0.0 is where the 42 were fixed; the server installs what
+    # requirements.txt names on its next update (update_server.sh).
+    import re as _re
+    _pin = _re.search(r"(?im)^pillow==(\d+)\.(\d+)\.(\d+)", open(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")).read())
+    check("requirements.txt pins Pillow at 13.0.0 or later",
+          _pin is not None and tuple(int(x) for x in _pin.groups()) >= (13, 0, 0),
+          _pin.group(0) if _pin else "no pin")
+    import PIL as _PIL
+    if tuple(int(x) for x in _PIL.__version__.split(".")[:3]) < (13, 0, 0):
+        print("  NOTE: this computer's Pillow is %s - run "
+              "venv\\Scripts\\pip install -r requirements.txt" % _PIL.__version__)
+
+
+# ---------------------------------------------------------------------------
 # ONE PICTURE IN WORLD CHAT PER HALF HOUR
 #
 # A DIFFERENT LIMIT FROM THE UPLOAD COOLDOWN, and these tests exist to keep

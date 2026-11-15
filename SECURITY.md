@@ -482,6 +482,13 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     the shop must always pay less than it charges, and the tax's floor is
     at least one gold, the laundering the floor exists to stop.
     → Held by: `test_economyrules.py` — "a player: the four numbers, and the bare 404 from the owner's table and its change", "  and her change is the owner's alone: the bare 404, nothing written", "  a change on a hardened login with a stale confirm asks for the password again, and writes nothing", "  out of bounds, either side, is refused saying them", "the shop must pay less than it charges: sell at or above price is refused, either way round", "  the tax's floor is whole gold, and at least 1 - a floor of 0 is the laundering the floor exists to stop"
+48. **A picture a player sends meets five readers, on a patched Pillow**
+    (E-23, 14 Nov 2026). Chat decodes an upload or a fetched link only as
+    PNG, JPEG, GIF, WebP or BMP - the five the game sends - so no other
+    reader Pillow carries (TIFF, EPS, MSP, FlashPix and dozens more) ever
+    sees a player's bytes; and Pillow is pinned at 13.0.0, where the 42
+    known flaws of 12.3.0 were fixed.
+    → Held by: `test_chatrooms.py` — "the reader's list is the five the game sends", "and nothing else is read: TIFF, PCX, TGA, PPM, ICO, SGI, EPS all refused", "  and a TIFF sent to the upload route is a 400, nothing stored", "requirements.txt pins Pillow at 13.0.0 or later"
 
 ---
 
@@ -572,12 +579,15 @@ No comforting lies. These are known, named and open.
   target within reach - so a modified game can draw an attack that never
   happened, but a picture is never a hit, never reaches the books, and hurts
   nobody.
-- **A lever is anybody's in its area.** Since game 0.19.0 a lever pulled is
-  passed to everyone in the area and remembered for whoever walks in later.
-  The server checks the name's shape, not that the player is standing at the
-  lever, so a modified game can open or shut any gate in its area for
-  everyone there, from anywhere in it. Each game moves only a real lever of
-  its own scene by that name, and a gate moves nobody's health, bag or gold.
+- **A lever is pulled by whoever stands at it, where it stands is the
+  game's word.** Since game 0.19.0 a lever pulled is passed to everyone in the
+  area and remembered for whoever walks in later. Since 0.158.0 the server
+  takes a pull only from a player within `LEVER_REACH` (160 px) of that lever,
+  by the spots the game's exporter writes (gamedata.json's `"levers"`), and a
+  name that is no lever of that area is refused (`test_presence.py` P-28).
+  With the walk check on, a game has to walk there first; with it off, a
+  modified game can still claim to stand at a lever. Staff pull from
+  anywhere. A gate moves nobody's health, bag or gold.
 - **A co-owner is trusted like the owner, while the switch is on**
   (invariant 31). He can create items and gold, set levels and put
   characters back - the owner's powers, so the owner's risks, held by a

@@ -44,8 +44,9 @@ lives.
 | E-20 | **A staff password was the only thing between a guesser and the moderation desk** | **high (moderation)** | **Closed** — with a named limit | Staff names are public (the crown, the MOD and DEV badges), so their passwords are the ones worth guessing; one guessed password gives bans, notes and IP addresses. | **Second factor.** A staff login with a confirmed recovery address answers 202 and emails a six-digit code; only the code gets a token. A computer that proved itself is trusted for 30 days, at the rank it was trusted at. With no address or no mail it stands aside and says so. `test_staffcode.py`. |
 | E-21 | **Session tokens were stored as issued** | **high (accounts)** | **Closed** | A copy of `elusion.db` - a backup, a leaked file - logged its holder in as every player signed in, for up to 30 days, with no password needed. | **Hashing at rest.** `sessions` keeps only each token's SHA-256 (`token_hash`) and every lookup hashes the token it is sent, as `trusted_devices` and `ended_sessions` already did and as passwords always were (scrypt). A boot migration hashed every stored token in place, so nobody was signed out. `test_accounts.py` A-5, `test_api.py` MIGRATION. |
 | E-22 | **A minigame's result is the game's own claim** | medium (economy) | **Mitigated** — held to the day, the time and, since 14 Nov, one gold allowance a day; the chests' gear still the run's word, named in SECURITY.md | A modified game can claim the best run its time allows: up to 60,000 gold a day from the Healer's Run and 72,750 from Cut the Cloth, and every Endless and Forge kill their schedules allow, into its own chest. | **Bound by time and count.** One Go a day or three runs; each kill held to what the run's own schedule could have sent since the Go; each run's gold paid once, for the caller's own run, believed only as far as its time allows (`test_minigames.py`). **Since 14 Nov, capped:** the runs' gold and the chests' coins together, at most `ELUSION_MINIGAME_GOLD_DAY` (100,000) an account a day (`test_minigames.py` MG-16). |
+| E-23 | **The chat's picture reader ran 42 known flaws, and tried every format it knew** | **high** | **Closed** (14 Nov 2026) | Any signed-in player can hand the server 8 MB of bytes or a link to decode. Pillow 12.3.0 carried 42 published flaws - heap overflows in the JPEG, TIFF and FlashPix readers among them - and, given no list, tried every reader it has, EPS through Ghostscript included, on whatever arrived. At best a crash of the process that holds the database; at worst code run inside it. | **Patch + allowlist.** Pillow pinned at 13.0.0, which fixes all 42, installed on the server by `update_server.sh` the update it lands; and `Image.open(..., formats=PICTURE_FORMATS)`: PNG, JPEG, GIF, WebP and BMP, the five the game sends, so no other reader sees a player's bytes. Found by `pip-audit`. `test_chatrooms.py`; SECURITY.md invariant 48. |
 
-Nineteen findings: eighteen closed, one mitigated (E-3, since 25 Oct 2026). Plus E-15, an audit that went
+Twenty-two findings: twenty closed, two mitigated (E-3, since 25 Oct 2026, and E-22, since 13 Nov). Plus E-15, an audit that went
 looking and came back empty — kept, because a search that finds nothing is
 still a result and the reasoning is the point.
 
@@ -1720,6 +1721,43 @@ takes out of the minigames in a day is the owner's number, set with
 materials and pets, held to the schedule's count - the books, as above, are
 what would close those. `test_minigames.py` MG-16; three sabotages caught (the
 day's count left out, Cut the Cloth uncapped, the chest's coins uncapped).
+
+### E-23 — The chat's picture reader ran 42 known flaws · CLOSED (14 Nov 2026)
+
+Found by asking the dependencies rather than the code: `pip-audit -r
+requirements.txt` on 14 Nov listed 42 published vulnerabilities in Pillow
+12.3.0, every one fixed in 13.0.0, and none anywhere else. Pillow is used in
+exactly one place - `chat/services.py`, `decode_relayed_image()`, which reads
+every picture a player uploads (`/api/chat/image/upload`, up to 8 MB of raw
+bytes) or links (`/api/chat/image`, fetched by the server). That makes it the
+most exposed code on the box: the only parser here that handles bytes a
+stranger chose, and it is written in C.
+
+**What made it worse than a stale version.** `Image.open()` was given no list
+of formats, so it tried every reader Pillow carries until one claimed the
+bytes: TIFF, MSP, MIC, FlashPix, PCX, XBM, SGI and dozens more, and EPS,
+which hands the file to Ghostscript wherever Ghostscript is installed (one of
+the 42 is a command injection through exactly that). Most of the 42 were in
+readers chat had no use for. The decompression-bomb ceiling and `verify()`
+already in front of it do not help against a reader that overflows while
+reading the header.
+
+**The fix is two, and either alone would have been enough for most of it.**
+Pillow is pinned at 13.0.0 in `requirements.txt`, which `update_server.sh`
+installs on the server the update it lands. And both opens now pass
+`formats=PICTURE_FORMATS` - PNG, JPEG, GIF, WebP and BMP, exactly the game's
+`UPLOAD_KINDS` (a link has to end in one of them too) - so nothing honest is
+refused, and the next flaw in a reader chat never needed cannot be reached.
+
+**Held by** `test_chatrooms.py`, "only the five formats a player can send":
+the five still read, TIFF, PCX, TGA, PPM, ICO, SGI and an EPS refused in the
+words any unreadable file gets, a TIFF upload a 400 with nothing stored, and
+the pin at 13.0.0 or later. Sabotage-caught: the list taken off both opens
+(three red).
+
+**The habit it leaves.** `pip-audit -r requirements.txt` before a release
+(DEPLOY.md). The code can be right and the library under it wrong, and no
+test of ours would ever say so.
 
 ## The security bot — attacking a running server, not the source
 

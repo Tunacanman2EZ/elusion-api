@@ -175,6 +175,15 @@ IMAGE_MAX_FRAMES = 48
 IMAGE_MAX_FRAME_SIDE = 256
 IMAGE_SHEET_COLUMNS = 8
 
+# ONLY THE FORMATS A PLAYER CAN SEND (E-23, 14 Nov 2026). Image.open() with
+# no list tries every reader Pillow has - TIFF, MSP, MIC, FlashPix, EPS (which
+# runs Ghostscript where it is installed), PCX, XBM and dozens more - and any
+# signed-in player can hand this function 8 MB of bytes or a link. Most of
+# 12.3.0's 42 known flaws were in those readers. The game's file picker
+# offers these five and nothing else (chatpanel.gd UPLOAD_KINDS), and a link
+# has to end in one of them, so nothing honest is refused. Pillow's names.
+PICTURE_FORMATS = ("PNG", "JPEG", "GIF", "WEBP", "BMP")
+
 # A decompression bomb is a 200-byte file that decodes to a billion pixels.
 # Pillow has a ceiling of its own; this one is ours and is far lower.
 IMAGE_MAX_DECODED_PIXELS = 40 * 1024 * 1024
@@ -272,8 +281,8 @@ def decode_relayed_image(raw):
         # verify() is a structural check and it CONSUMES the object, which is
         # why the bytes are opened twice. Cheap, and it rejects a truncated or
         # hand-made file before any pixels are read.
-        Image.open(io.BytesIO(raw)).verify()
-        source = Image.open(io.BytesIO(raw))
+        Image.open(io.BytesIO(raw), formats=PICTURE_FORMATS).verify()
+        source = Image.open(io.BytesIO(raw), formats=PICTURE_FORMATS)
     except Exception:
         return None, "that file is not a picture this server can read"
 

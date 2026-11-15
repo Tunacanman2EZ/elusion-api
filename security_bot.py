@@ -881,9 +881,21 @@ def attack_loot_double_take(p):
             "detail": "six fabricated kills produced no loot bag to attack",
         }
 
+    # ITEMS AS WELL AS GOLD (14 Nov 2026). Since the larder (0.74.0) a bag can
+    # hold a monster's materials and nothing else - a bush mage's carrot - and
+    # a take of one pays no gold at all, so counting gold alone proved nothing
+    # about taking an item twice. The first take is honest; what it gave is
+    # remembered on the player, and the bag check allows exactly that.
+    def carried():
+        return {str(r).rsplit("|", 1)[0]: int(str(r).rsplit("|", 1)[1]) for r in p.srv.all(
+            "SELECT item_id || '|' || SUM(quantity) FROM carry_items"
+            " WHERE user_id = ? AND slot = ? GROUP BY item_id", (p.user_id, p.slot))}
     before = p.db_gold()
+    held_before = carried()
     first, _ = p.call("POST", "/api/loot/take", {"bag_id": bag_id, "position": 0})
     middle = p.db_gold()
+    held_middle = carried()
+    p.looted = {k: v - held_before.get(k, 0) for k, v in held_middle.items() if v > held_before.get(k, 0)}
     # The same position again, four more times, and once concurrently - a
     # guard that is present but not atomic only shows under the overlap.
     for _ in range(4):
@@ -891,14 +903,16 @@ def attack_loot_double_take(p):
     p.srv.concurrent(8, lambda: p.call(
         "POST", "/api/loot/take", {"bag_id": bag_id, "position": 0}))
     after = p.db_gold()
+    held_after = carried()
     gained_once = middle - before
     gained_again = after - middle
+    items_again = sum(max(0, v - held_middle.get(k, 0)) for k, v in held_after.items())
     return {
         "name": "take the same loot twice",
-        "target": "E-1/E-8", "broke": gained_again > 0,
-        "detail": "first take said %s and paid %d; twelve more takes of the same "
-                  "position paid %d more (want 0)"
-                  % (first, gained_once, gained_again),
+        "target": "E-1/E-8", "broke": gained_again > 0 or items_again > 0,
+        "detail": "first take said %s and paid %d gold and %s; twelve more takes of the same "
+                  "position paid %d more gold and %d more items (want 0 and 0)"
+                  % (first, gained_once, p.looted or "no items", gained_again, items_again),
     }
 
 
@@ -1152,21 +1166,48 @@ def check_invariants(srv, players):
         "detail": "skill rows over the cap across bot accounts: %d" % int(over_cap or 0),
     })
 
-    # BOTS HOLD NOTHING. A fresh character starts with an empty backpack and
-    # empty equipment (verified), and bot characters never loot, buy, trade or
-    # earn - so ANY item in a bot's bag, or anything worn, is fabricated. This
-    # is stronger than looking for one known item id: it catches whatever an
+    # BOTS HOLD NOTHING BUT THE STARTER KIT. A fresh character starts with
+    # empty equipment and, since game 0.92.0, a slot's first character with
+    # its starter potions on the first hotbar keys (saves/services.py,
+    # STARTER_POTIONS / STARTER_MANA) - and bot characters never loot, buy,
+    # trade or earn. So any item in a bot's bag that is not a starter potion
+    # at no more than the kit gave, or anything worn, is fabricated. This is
+    # stronger than looking for one known item id: it catches whatever an
     # attacker fabricated, named or not. Covers E-1's backpack and the equip
-    # ownership guard in one sweep.
-    bag_rows = int(srv.one(
-        "SELECT COUNT(*) FROM carry_items JOIN users ON users.id = carry_items.user_id"
-        " WHERE users.username IN (%s)" % placeholders, names) or 0)
+    # ownership guard in one sweep. (It read "empty backpacks" until 14 Nov
+    # 2026, and went red on the kit itself - a stale invariant, not a break.)
+    try:
+        sys.path.insert(0, HERE)
+        from saves import services as _saves_services
+        kit = dict(_saves_services.STARTER_POTIONS + _saves_services.STARTER_MANA)
+    except Exception:
+        kit = {"tinyhealthpotion": 5, "tinymanapotion": 5}
+    rows = [str(r).rsplit("|", 1) for r in srv.all(
+        "SELECT carry_items.item_id || '|' || carry_items.quantity FROM carry_items"
+        " JOIN users ON users.id = carry_items.user_id"
+        " WHERE users.username IN (%s)" % placeholders, names)]
+    # And what each bot honestly took once from a bag (the double-take attack's
+    # first take), item by item, no more than it took.
+    looted = {}
+    for p_ in players:
+        for item_id, quantity in (getattr(p_, "looted", None) or {}).items():
+            looted[item_id] = looted.get(item_id, 0) + int(quantity)
+    extra = []
+    for r in rows:
+        if len(r) == 2 and r[0] in kit and r[1].isdigit() and 0 < int(r[1]) <= int(kit[r[0]]):
+            continue
+        if len(r) == 2 and r[1].isdigit() and looted.get(r[0], 0) >= int(r[1]) > 0:
+            looted[r[0]] -= int(r[1])
+            continue
+        extra.append("%s x%s" % (r[0], r[-1]))
     worn = [p_.name for p_ in players if p_.db_equipment()]
     checks.append({
-        "name": "bots hold nothing: empty backpacks and no equipment",
-        "ok": bag_rows == 0 and not worn,
-        "detail": "%d item rows across bot bags; characters wearing gear: %s"
-                  % (bag_rows, ", ".join(worn) if worn else "none"),
+        "name": "bots hold nothing but the starter kit and one honest take: no other item, no equipment",
+        "ok": not extra and not worn,
+        "detail": "%d item rows across bot bags, %d of them the kit or one honest take; anything else: %s; "
+                  "characters wearing gear: %s"
+                  % (len(rows), len(rows) - len(extra), ", ".join(extra) if extra else "none",
+                     ", ".join(worn) if worn else "none"),
     })
 
     # HP WITHIN MAX for every bot character. The clamp (E-9) must have held for
