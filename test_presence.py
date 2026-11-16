@@ -16,10 +16,22 @@ out - takes the player off everybody's screen within seconds.
 
 It runs the real presence server in this process, on a free port, against a
 throwaway database in the temp folder - never elusion.db.
+
+TWO HALVES, TWO PROCESSES (Nov 2026). This file was 206 s of a 274 s run of
+run_tests.ps1, every other suite long finished and waiting on it. Every check
+and helper is still here, but this file runs only PART 1 - everything played
+on the one shared server (P-1 to P-11, P-19b, P-6, then P-13 over all of it).
+test_presence_2.py runs PART 2 - every section with a server of its own, then
+P-9b and P-9c - in a process and database of its own, so the runner plays the
+two side by side. Run both to run it all. A new section goes in part_one() or
+part_two(); P-31 fails on one that is in neither.
 """
 import ast, asyncio, contextlib, importlib.util, inspect, io, json, math, os, re, sqlite3, sys, time, types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Which half this process runs: 1 when run as itself, 2 when test_presence_2.py
+# runs this file with PRESENCE_PART set (runpy's init_globals).
+PART = globals().get("PRESENCE_PART", 1)
 import testdir  # noqa: E402  (a private folder per run - testdir.py)
 DB_PATH = os.path.join(testdir.PATH, "elusion_presence_test.db")
 os.environ["ELUSION_DB"] = DB_PATH
@@ -37,8 +49,19 @@ client = app_module.app.test_client()
 
 import presence  # noqa: E402  (after ELUSION_DB is set: it reads it on import)
 import combatbook  # noqa: E402
-from websockets.asyncio.client import connect  # noqa: E402
+from websockets.asyncio.client import connect as _connect  # noqa: E402
 from websockets.asyncio.server import serve  # noqa: E402
+
+
+def connect(uri, **options):
+    """websockets' connect(), with no limit on what waits unread. A test game
+    often reads nothing for a while, and by default its socket stops reading
+    after 16 messages wait - so its close() cannot hear the server's reply and
+    waits out the 10-second close timeout: 15 of the crowd's sockets did, 45 s
+    of this suite doing nothing (Nov 2026). Unlimited, every close is at once.
+    The server's sockets are untouched."""
+    options.setdefault("max_queue", None)
+    return _connect(uri, **options)
 from websockets.exceptions import ConnectionClosed  # noqa: E402
 
 passed = failed = 0
@@ -1131,11 +1154,9 @@ async def run(port, server):
     await b.close()
     await asyncio.sleep(0.1)
     check("an empty area is forgotten", not server.rooms, server.rooms)
-
-    # LAST, ON TICKETS OF THEIR OWN: the games above are two minutes old by
-    # here, and a ticket lives two (the sweep signs them out).
-    await attacks_ride_the_tick(port, server)
-    await a_crowd_walks_in(port, server)
+    # P-9b and P-9c used to follow here, last because these games' tickets are
+    # two minutes old by now; they are part 2's, on a server of their own with
+    # these settings (on_a_server()).
 
 
 async def a_crowd_walks_in(port, server):
@@ -3219,6 +3240,15 @@ async def held_to_a_walk():
             check("every area's arrivals are where its pads land: the town has its pad",
                   any(isinstance(p, list) and len(p) == 2 for p in presence.gamedata.AREAS.get("elusion", {}).get("arrivals", [])),
                   presence.gamedata.AREAS.get("elusion", {}).get("arrivals"))
+            # THE WAYSTONES ARE PADS TOO (game 0.161.3): a trip lands in front
+            # of a stone, from inside the Big Field too - 20 of the books'
+            # jumps there in killwatch.py --moves. The Crossroads' landing:
+            # waystones.gd's (4232, 3640) and ARRIVE (0, 30).
+            check("  and the Big Field has its seven waystones' landings, so a trip is a clean jump",
+                  len(presence.gamedata.AREAS.get("bigfield", {}).get("arrivals", [])) >= 7
+                  and presence.PresenceServer.lands_on_a_pad("bigfield", 4232.0, 3670.0)
+                  and not presence.PresenceServer.lands_on_a_pad("bigfield", 4232.0, 3670.0 + 2 * presence.ARRIVAL_REACH),
+                  presence.gamedata.AREAS.get("bigfield", {}).get("arrivals"))
             check("a party's own room is never held (the Endless wakes you by the chest)",
                   presence.PresenceServer.walks_free(types.SimpleNamespace(identity={"role": "player"}, where="endless"))
                   and not presence.PresenceServer.walks_free(types.SimpleNamespace(identity={"role": "player"},
@@ -3300,7 +3330,62 @@ async def levers_only_from_near():
             server.stop_clocks()
 
 
-async def main():
+async def on_a_server(*bodies):
+    """The shared server - a short hello, short holds, quick sweeps and ticks -
+    and each body(port, server) played on it in turn. Answers the server."""
+    presence.HELLO_SECONDS = 0.5
+    combatbook.HOLD_SECONDS = 0.2
+    combatbook.PENDING_SECONDS = 0.3
+    combatbook.EMPTY_KEEP = 0.5
+    server = presence.PresenceServer(sweep_seconds=0.3, tick_seconds=0.05)
+    server.flush_seconds = 0.2
+    server.position_sample_seconds = 0.1
+    server.start_clocks()
+    async with serve(server.handler, "127.0.0.1", 0, max_size=presence.MAX_SOCKET_BYTES) as ws_server:
+        port = list(ws_server.sockets)[0].getsockname()[1]
+        try:
+            for body in bodies:
+                await body(port, server)
+        finally:
+            server.stop_clocks()
+    return server
+
+
+def every_section_runs():
+    """P-31: every function here that opens a section is reached from
+    part_one() or part_two() - so a section added to neither, which no run
+    would ever play, is a red check rather than a silent gap."""
+    section("P-31 EVERY SECTION RUNS IN ONE PART OR THE OTHER")
+    tree = ast.parse(open(os.path.abspath(__file__), encoding="utf-8").read())
+    tops = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+    def calls_section(fn):
+        return any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == "section" for n in ast.walk(fn))
+
+    def names_in(fn):
+        return {n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id in tops}
+    reached, todo = set(), ["part_one", "part_two"]
+    while todo:
+        name = todo.pop()
+        if name not in reached and name in tops:
+            reached.add(name)
+            todo.extend(names_in(tops[name]))
+    sections = sorted(name for name, fn in tops.items() if calls_section(fn) and name != "section")
+    missed = [name for name in sections if name not in reached]
+    check("every one of the %d functions that opens a section is played by part 1 or part 2" % len(sections),
+          len(sections) >= 20 and not missed, missed)
+
+
+async def part_one():
+    """test_presence.py: everything played on the one shared server, then
+    P-13 over all of it, and P-31."""
+    every_section_runs()
+    counted_live(await on_a_server(run))
+
+
+async def part_two():
+    """test_presence_2.py: every section with a server of its own, then P-9b
+    and P-9c on the shared settings, on tickets of their own."""
     await held_to_a_walk()
     await levers_only_from_near()
     the_loop_never_waits()
@@ -3321,25 +3406,12 @@ async def main():
     await the_stand_together()
     await the_cloth_together()
     await clocks_carry_on()
-    presence.HELLO_SECONDS = 0.5
-    combatbook.HOLD_SECONDS = 0.2
-    combatbook.PENDING_SECONDS = 0.3
-    combatbook.EMPTY_KEEP = 0.5
-    server = presence.PresenceServer(sweep_seconds=0.3, tick_seconds=0.05)
-    server.flush_seconds = 0.2
-    server.position_sample_seconds = 0.1
-    server.start_clocks()
-    async with serve(server.handler, "127.0.0.1", 0, max_size=presence.MAX_SOCKET_BYTES) as ws_server:
-        port = list(ws_server.sockets)[0].getsockname()[1]
-        try:
-            await run(port, server)
-        finally:
-            server.stop_clocks()
-    counted_live(server)
+    await on_a_server(attacks_ride_the_tick, a_crowd_walks_in)
 
 
-asyncio.run(main())
+asyncio.run(part_one() if PART == 1 else part_two())
 
+print("\n  (part %d of 2 - %s runs the other)" % (PART, "test_presence_2.py" if PART == 1 else "test_presence.py"))
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))
 print("=" * 60)

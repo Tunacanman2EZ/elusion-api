@@ -15,7 +15,7 @@ it, and it still applies: a change to the server is checked against it.
 
 ```
 pip install waitress            # Windows
-pip install gunicorn            # Linux
+pip install gunicorn            # Linux (requirements.txt pins it there)
 
 # Linux - --preload is not optional, see below
 gunicorn --preload -w 4 -b 127.0.0.1:5000 wsgi:application
@@ -112,7 +112,7 @@ One small droplet holds the API, the proxy and the browser build.
 | Service | systemd unit `elusion-api`, run as the system user `elusion` |
 | Presence | systemd unit `elusion-presence`: `presence.py` on 127.0.0.1:5001, same user, folder and settings |
 | Code | `/opt/elusion/api`, a git clone of this repository, owned by `elusion` |
-| Python | `/opt/elusion/venv`: `requirements.txt` plus gunicorn |
+| Python | `/opt/elusion/venv`: `requirements.txt`, gunicorn in it (pinned since Nov 2026, Linux only) |
 | Settings | `/etc/elusion/elusion.env`, owned by root, `chmod 600` |
 | Database | `/var/lib/elusion/elusion.db`; the folder is `elusion`'s, mode 750 |
 | Backups | `/var/backups/elusion` (mode 700), nightly; log in `/var/log/elusion-backup.log` |
@@ -940,6 +940,15 @@ list with many kills, is the moment. Then **set "Old versions must update" to
 7 first** - a game older than 0.57.0 cannot wait for the server's count - and
 switch it on. Off again is one click, and safe at any time: kills are paid on
 the game's word, as before.
+
+**Once it is on, watch what it refuses** (15 Nov 2026). The `receipts:` line
+counts only kills that were PAID, and a refused kill is never paid - the game
+waits, says the server did not see the fight, and nothing is written. So the
+line under it, `refused by receipts: 186 deaths in the last 7 days the books
+did not back ... - bigfield 181 not due (1 player), elusion 5 not due (1
+player)`, lists every death the books judged SHORT or NOT DUE, by area, with
+how many players. One player is a test or a cheat; many players in one area
+is an honest rule the books do not know yet - send me the line.
 
 `--window` and `--respawn` must match the server's spawn-ceiling constants; the
 defaults already do. This is the standing watch over **E-3** (below): combat is

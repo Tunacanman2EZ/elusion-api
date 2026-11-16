@@ -608,6 +608,37 @@ def receipts_line(backing, days=RECEIPTS_DAYS, endless=False, game=None):
                 (" (%s)" % ", ".join("%s %d" % kv for kv in worst)) if worst else ""))
 
 
+# WHAT THE RECEIPTS REFUSE (15 Nov 2026). The receipts line above counts the
+# kills that were PAID, and a kill the switch refused is never paid - the game
+# waits, then says the server did not see the fight, and nothing is written.
+# So "100% backed" could not show an honest player being turned away. Every
+# death the books did not back (SHORT or NOT DUE) is a kill the switch refuses,
+# so here they are by area: one player's run of them is a test or a cheat, many
+# players' is a rule that needs fixing before more is switched on.
+def refused_by_area(con, days=RECEIPTS_DAYS, now=None):
+    """[(area, verdict, rows, players)] - the books' deaths in the last `days`
+    days that were not AGREED, most first. [] without the books."""
+    if not _has_table(con, "combat_kills"):
+        return []
+    since = int(now if now is not None else time.time()) - int(days) * 86400
+    rows = con.execute(
+        "SELECT area, verdict, COUNT(*), COUNT(DISTINCT user_id) FROM combat_kills"
+        " WHERE at >= ? AND verdict IN ('short', 'not_due') GROUP BY area, verdict", (since,)).fetchall()
+    return sorted(((str(r[0]), str(r[1]), int(r[2]), int(r[3])) for r in rows), key=lambda r: (-r[2], r[0], r[1]))
+
+
+def refused_line(rows, days=RECEIPTS_DAYS):
+    """One line for refused_by_area(), saying "receipts" so a grep for the
+    receipts lines finds it too."""
+    if not rows:
+        return "refused by receipts: none - every death the books judged in the last %d days was agreed" % days
+    parts = ["%s %d %s (%d player%s)" % (area, n, verdict.replace("_", " "), players, "" if players == 1 else "s")
+             for area, verdict, n, players in rows]
+    shown = ", ".join(parts[:6]) + (", ..." if len(parts) > 6 else "")
+    return ("refused by receipts: %d deaths in the last %d days the books did not back, so their kills are"
+            " refused while the switch is on - %s" % (sum(r[2] for r in rows), days, shown))
+
+
 def _rank(dossier):
     """Worst first: any IMPOSSIBLE outranks all SUSPICIOUS, and SUSPICIOUS all
     WATCHED; then more findings before fewer. So the account a defence broke on
@@ -696,6 +727,8 @@ def main():
         receipt_line = receipts_line(receipts_backing(con, days=args.days), days=args.days)
         run_lines = [receipts_line(receipts_backing(con, days=args.days, game=game), days=args.days, game=game)
                      for game in RUN_GAMES]
+        if _has_table(con, "combat_kills"):
+            run_lines.append(refused_line(refused_by_area(con, days=args.days), days=args.days))
     except sqlite3.Error as exc:
         print("[KILLWATCH] FAIL: could not read the database: %s" % exc, file=sys.stderr)
         sys.exit(2)

@@ -346,15 +346,37 @@ try {
             [pscustomobject]@{ Lines = @($lines); Code = $exit; Seconds = $sw.Elapsed.TotalSeconds }
         }
 
+        # THE SLOWEST START FIRST (Nov 2026). In name order test_presence.py
+        # - then 206 s of a 274 s run - started about a minute in, and every
+        # other suite was done long before it. A run can end no sooner than
+        # its slowest suite's start plus its length, so the slow ones start
+        # first and the rest fill the other places in name order. The console
+        # and the transcript are still in name order. This list can only go
+        # stale in speed, never in what runs: every suite runs either way.
+        # The owner's PC, Nov 2026: presence 206 s (now two halves of about 90
+        # and 70), deploy 47, security 33, killwatch 28, gifts 19.
+        $slowFirst = @("test_presence.py", "test_presence_2.py", "test_deploy.py",
+                       "test_security.py", "test_killwatch.py", "test_gifts.py")
+        $order = @()
+        foreach ($name in $slowFirst) {
+            for ($i = 0; $i -lt $suites.Count; $i++) {
+                if ($suites[$i].Name -eq $name) { $order += $i }
+            }
+        }
+        for ($i = 0; $i -lt $suites.Count; $i++) {
+            if ($order -notcontains $i) { $order += $i }
+        }
+
         $running = @{}   # job id -> the suite's place in name order
         $done = @{}      # place -> what its job handed back
-        $started = 0
+        $started = 0     # how many of $order have been started
         $shown = 0
         try {
             while ($shown -lt $suites.Count) {
                 while ($running.Count -lt $Jobs -and $started -lt $suites.Count) {
-                    $job = Start-Job -ScriptBlock $runSuite -ArgumentList $Python, $suites[$started].FullName, $root
-                    $running[$job.Id] = $started
+                    $place = $order[$started]
+                    $job = Start-Job -ScriptBlock $runSuite -ArgumentList $Python, $suites[$place].FullName, $root
+                    $running[$job.Id] = $place
                     $started += 1
                 }
                 if ($running.Count -gt 0) {

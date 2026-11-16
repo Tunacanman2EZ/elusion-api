@@ -38,6 +38,19 @@ on port 0**, or it cannot run beside the others; and a check that waits on
 a clock has to survive a busy machine (test_presence's renewal raced its own
 sweep until the order was fixed).
 
+**The slowest start first, and test_presence is two halves** (Nov 2026: a
+run was 274 s, 206 of them test_presence.py, started a minute in). The
+runner starts `$slowFirst` (presence's two halves, deploy, security,
+killwatch, gifts) before the rest; the console and transcript stay in name
+order. test_presence.py holds every presence check and runs part 1 (the
+shared server: P-1 to P-11, P-19b, P-6, P-13); `test_presence_2.py` runs the
+same file's part 2 (every section with a server of its own, then P-9b and
+P-9c) in a process of its own. Run both to run it all; a new section goes in
+`part_one()` or `part_two()`, and P-31 fails on one in neither. Its test
+sockets read without limit (`connect()` there): a socket nobody reads stopped
+reading after 16 waiting messages, and its close waited out a 10 s timeout -
+the crowd's fifteen were 45 s of nothing.
+
 One suite on its own:
 
 ```
@@ -2081,7 +2094,9 @@ P-27, two sabotages caught):
   `"arrivals"`, which the game's exporter writes from every teleporter.gd's
   `destinationpoint` - the town's pad was 90 of the 115 jumps
   `killwatch.py --moves` found in the two weeks before; re-export and copy
-  gamedata.json when a pad moves).
+  gamedata.json when a pad moves). Since game 0.161.3 the Big Field's seven
+  waystone landings are arrivals too (20 of the books' jumps there were
+  waystone trips); P-27 checks the shipped file has them.
 - **A rebuilt world lands at once.** The game sends its first state from a
   rebuilt world BEFORE its sync, so that state is held; the sync (when
   allowed) puts the player where it last said (`player.claim`) and sends that
@@ -2302,6 +2317,10 @@ pieces.
 - **Off reads off**: no row, or a row that cannot be read - unlike trade's,
   because off is how every kill was paid until now, and a corrupt row must not
   stop everybody being paid. Not announced; the staff log has it.
+- **What it refuses is listed** (15 Nov 2026): the `receipts:` line counts
+  paid kills, and a refused one is never paid, so killwatch.py's
+  `refused by receipts:` line (`refused_by_area()`) lists the books' SHORT
+  and NOT DUE deaths by area, with how many players. test_killwatch.py 11.
 - **What it does not do yet**: hold a player's health (E-9) or run the
   monsters (step 3). A game with its presence link down earns nothing while
   the switch is on, by design - the server cannot count a fight it was not

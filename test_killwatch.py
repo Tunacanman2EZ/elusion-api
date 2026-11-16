@@ -396,6 +396,42 @@ check("moves: --moves prints them and nothing else, read only, exit 0",
       rm.stdout + rm.stderr)
 
 # --------------------------------------------------------------------------- #
+# 11. WHAT THE RECEIPTS REFUSE (15 Nov 2026): a refused kill is never paid, so
+#     the receipts line cannot see it - the books' deaths that were not
+#     AGREED are listed by area instead.
+print("-" * 68)
+con = fresh(); books_tables(con)
+now = 2000000000
+for user_id, area, verdict, at in (
+        (40, "bigfield", "not_due", now - 100), (40, "bigfield", "not_due", now - 90),
+        (41, "bigfield", "not_due", now - 80), (40, "field", "short", now - 70),
+        (42, "field", "agreed", now - 60), (43, "town", "not_due", now - 9 * 86400)):
+    con.execute("INSERT INTO combat_kills (at, area, enemy_id, user_id, verdict) VALUES (?, ?, 'x', ?, ?)",
+                (at, area, user_id, verdict))
+refused = killwatch.refused_by_area(con, days=7, now=now)
+check("refused: the deaths the books did not back, by area and verdict, most first, with how many players",
+      refused == [("bigfield", "not_due", 3, 2), ("field", "short", 1, 1)], refused)
+check("refused: an agreed death, or one older than the days asked for, is left out",
+      all(r[2] != 0 and r[0] != "town" for r in refused) and not [r for r in refused if r[1] == "agreed"])
+line = killwatch.refused_line(refused, days=7)
+check("refused: one line that says receipts, so the receipts grep finds it",
+      line.startswith("refused by receipts: 4 deaths in the last 7 days")
+      and "bigfield 3 not due (2 players)" in line and "field 1 short (1 player)" in line, line)
+check("refused: none says so; no books, nothing",
+      killwatch.refused_line([], days=7).startswith("refused by receipts: none")
+      and killwatch.refused_by_area(fresh(), days=7) == [])
+disk = sqlite3.connect(path)
+for statement in con.iterdump():
+    if statement.startswith(("CREATE TABLE", "INSERT")):
+        disk.execute(statement)
+disk.commit(); disk.close()
+rr = subprocess.run([sys.executable, os.path.join(HERE, "killwatch.py"), "--db", path, "--days", "36500"],
+                    capture_output=True, text=True)
+os.remove(path)
+check("refused: the CLI prints it with the receipts lines, and exits 0",
+      rr.returncode == 0 and "refused by receipts: 5 deaths" in rr.stdout, rr.stdout[:900] + rr.stderr)
+
+# --------------------------------------------------------------------------- #
 # EXIT-CODE CONTRACT (the cron promise), run end-to-end through the CLI.
 print("-" * 68)
 

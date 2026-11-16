@@ -3,3 +3,7 @@ flasgger==0.9.7.1
 Pillow==13.0.0
 websockets==17.2
 google-auth==2.62.0
+# The live server's web server (DEPLOY.md: 26.2.0 there, Nov 2026). Linux only -
+# it does not run on Windows - and named here so pip-audit checks it and an
+# update installs what this file says.
+gunicorn==26.2.0; sys_platform != "win32"
