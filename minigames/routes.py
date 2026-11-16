@@ -98,6 +98,10 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
             # A timed minigame's best (game 0.120.0, the Forge's): seconds, 0 for none.
             if game.get("times"):
                 row["best"] = bests.get(game_id, 0)
+            # How far the account has got (game 0.162.0, Crownfall's maps
+            # cleared in order).
+            if game.get("progress"):
+                row["progress"] = bests.get(game_id, 0)
             games.append(row)
         return {"games": games, "skips_wait": skip}
 
@@ -115,7 +119,7 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
             description: "Bearer <token>"
         responses:
           200:
-            description: "games: id, name, wait_seconds, entered_at (0 never), ready_in (0 now), and a timed one's best (seconds); skips_wait"
+            description: "games: id, name, wait_seconds, entered_at (0 never), ready_in (0 now), a timed one's best (seconds), and Crownfall's progress (maps cleared in order); skips_wait"
           401:
             description: Not logged in
         """
@@ -140,7 +144,7 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
               type: object
               required: [game]
               properties:
-                game: {type: string, description: "a minigame's id: endless, healerrun, forge, cloth"}
+                game: {type: string, description: "a minigame's id: endless, healerrun, forge, cloth, crownfall"}
         responses:
           200:
             description: "in: game, entered_at, ready_in (the next wait)"
@@ -194,14 +198,17 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
         data.enter(db, g.user["id"], game_id, now)
         db.commit()
         plays_left = plays if skip else max(0, plays - len(starts) - 1)
-        return {"ok": True, "game": game_id, "entered_at": now, "run": run_id, "plays_left": plays_left,
-                "ready_in": 0 if skip or plays_left > 0 else services.ready_in_plays(
-                    starts + [now], plays, game["wait"], now),
-                "pays": services.pays_for(game_id)}, 200
+        answer = {"ok": True, "game": game_id, "entered_at": now, "run": run_id, "plays_left": plays_left,
+                  "ready_in": 0 if skip or plays_left > 0 else services.ready_in_plays(
+                      starts + [now], plays, game["wait"], now),
+                  "pays": services.pays_for(game_id)}
+        if game.get("progress"):
+            answer["progress"] = data.bests_of(db, g.user["id"]).get(game_id, 0)
+        return answer, 200
 
     def minigames_finish():
         """
-        The end of a Healer's Run or a Cut the Cloth run - how far it got - and its gold, paid once into the character's purse
+        The end of a Healer's Run, a Cut the Cloth or a Crownfall run - how far it got - and its gold, paid once into the character's purse
         ---
         tags:
           - Minigames
@@ -221,12 +228,14 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
                 run:   {type: integer, description: "the run's id, from its Go"}
                 waves: {type: integer, description: "the Healer's Run: waves passed, 0-24 (0-25 before game 0.100.0)"}
                 rounds: {type: integer, description: "Cut the Cloth (game 0.131.0): rounds cleared"}
+                from:  {type: integer, description: "Crownfall (game 0.162.0): the map the run started on, from 0"}
+                cleared: {type: integer, description: "Crownfall: maps cleared from it"}
                 bosses: {type: integer, description: "bosses beaten, 0-3 (game 0.100.0's tiers)"}
                 boss:  {type: boolean, description: "before game 0.100.0: the gate's boss beaten"}
                 goal:  {type: boolean, description: "the goal marker reached"}
         responses:
           200:
-            description: "gold paid, the waves, boss and goal believed (Cut the Cloth: the rounds believed), and the purse after (gold)"
+            description: "gold paid, the waves, boss and goal believed (Cut the Cloth: the rounds believed; Crownfall: the maps believed and progress), and the purse after (gold)"
           400:
             description: "a bad body"
           404:
@@ -249,6 +258,8 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
             return {"error": "Not Found", "message": "No such run."}, 404
         if str(run["game"]) == "cloth":
             return finish_cloth(db, run, payload, now)
+        if str(run["game"]) == "crownfall":
+            return finish_crownfall(db, run, payload, now)
         waves = payload.get("waves")
         if isinstance(waves, bool) or not isinstance(waves, int) or waves < 0:
             return bad_request("run and waves must be whole numbers")
@@ -320,6 +331,42 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
                 gold = 0
         db.commit()
         return {"ok": True, "gold": gold, "rounds": believed, "bosses": bosses, "held_back": held,
+                "status": {"gold": int(purse)} if purse is not None else {}}, 200
+
+    def finish_crownfall(db, run, payload, now):
+        """A Crownfall run's end (game 0.162.0): the map it started on and the
+        maps it cleared after, held to the time since its Go; their gold paid
+        - once - and the account's progress moved on."""
+        start = payload.get("from")
+        cleared = payload.get("cleared")
+        for said in (start, cleared):
+            if isinstance(said, bool) or not isinstance(said, int) or said < 0:
+                return bad_request("from and cleared must be whole numbers")
+        if int(run["finished_at"]) != 0:
+            return {"error": "Conflict", "message": "That run is already finished."}, 409
+        progress = data.bests_of(db, g.user["id"]).get("crownfall", 0)
+        if not services.crownfall_may_start(start, progress):
+            return bad_request("that map is not open to you yet")
+        seconds = now - int(run["started_at"])
+        believed = services.crownfall_believed(start, cleared, seconds)
+        gold = services.crownfall_gold(start, believed)
+        if seconds > services.CROWNFALL_RUN_KEPT_SECONDS:
+            gold = 0
+        gold, held = services.gold_allowed(gold, day_paid(db, now), cap_now())
+        # A crown taken (the last map of the kingdoms there are) is the boss.
+        crowned = believed > 0 and start + believed >= services.crownfall_maps()
+        if not data.finish_run(db, int(run["id"]), g.user["id"], now, believed, 1 if crowned else 0, crowned, gold):
+            return {"error": "Conflict", "message": "That run is already finished."}, 409
+        progress, _new = data.keep_best(db, g.user["id"], "crownfall", start + believed, now)
+        purse = None
+        if gold > 0 and gold_delta is not None:
+            purse = gold_delta(db, g.user["id"], int(run["slot"]), gold, "minigame",
+                               "crownfall run %d: %d maps from map %d%s" % (int(run["id"]), believed, start + 1,
+                                                                            held_words(held)))
+            if purse is None:
+                gold = 0
+        db.commit()
+        return {"ok": True, "gold": gold, "cleared": believed, "progress": progress, "held_back": held,
                 "status": {"gold": int(purse)} if purse is not None else {}}, 200
 
     def minigames_kill():

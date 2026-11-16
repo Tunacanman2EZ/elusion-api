@@ -1704,10 +1704,12 @@ Endless elite and boss the run's schedule allows inside its Go's day (about
 1,400 elites and 7 bosses) and every Forge fire sprite of six whole runs, each
 paying its loot into that character's chest; claim the Healer's Run's goal no
 sooner than its waves take - 20,000 gold a run, 60,000 a day; claim 30 rounds
-of Cut the Cloth at 15 seconds a round - 24,250 a run, 72,750 a day.
+of Cut the Cloth at 15 seconds a round - 24,250 a run, 72,750 a day; claim
+every Crownfall map from its start at 40 seconds a map - 17,950 a run, 53,850
+a day (game 0.162.0).
 
 **What bounds it.** One Go a day (the Endless, the Forge) or three rolling
-runs (the Healer's Run, the Cloth), per account; a kill only of a monster the
+runs (the Healer's Run, the Cloth, Crownfall), per account; a kill only of a monster the
 run sends, only while its Go's day lasts, never past the schedule's count; a
 run's gold paid once, for the caller's own run, believed as far as its time
 allows, nothing for a run left too long; a pet out of the Forge ten times

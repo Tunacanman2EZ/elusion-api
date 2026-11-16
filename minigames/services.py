@@ -26,6 +26,13 @@ GAMES = {
     # day, as the Healer's Run, and gold for every round cleared (CLOTH
     # below), paid at Leave by POST /api/minigames/finish.
     "cloth": {"name": "Cut the Cloth", "wait": DAY, "plays": 3},
+    # CROWNFALL (game 0.162.0, crownfall/): the owner, 15 Nov - a brick
+    # breaker through seven monster kingdoms, "sounds good" to the plan: three
+    # runs a day, gold for every map cleared (CROWNFALL below), paid at Leave
+    # by POST /api/minigames/finish, and how far the account has got kept
+    # here (`progress`: maps cleared in order, in minigame_bests), so a run
+    # starts from any map up to the next one to clear.
+    "crownfall": {"name": "Crownfall", "wait": DAY, "plays": 3, "progress": True},
 }
 
 
@@ -217,8 +224,71 @@ def cloth_pays():
             "endless_boss": CLOTH_ENDLESS_BOSS_GOLD, "most": cloth_gold(CLOTH_ROUNDS_MOST)}
 
 
+# =============================================================================
+# CROWNFALL'S GOLD (game 0.162.0)
+# =============================================================================
+# Each map cleared pays its own gold (CROWNFALL_MAP_GOLD, in the game's map
+# order - the Light kingdom's 25, every fifth a boss's, its citadel last). A run starts on any map
+# up to the account's next to clear (`progress`, kept in minigame_bests under
+# "crownfall": the maps cleared in order) and goes on map after map until its
+# lives run out or the maps do. At Leave the game says where it started
+# (`from`) and how many it cleared; the server pays those maps, held to
+# CROWNFALL_MIN_MAP_SECONDS a map since the Go and to the maps there are, and
+# moves `progress` on to the furthest reached.
+#
+# THE HONEST LIMIT: a modified game could say it cleared every map from its
+# start. It cannot say so faster than CROWNFALL_MIN_MAP_SECONDS a map, start
+# past the next map to clear, or be paid more than the maps there are (17,950
+# from the first) - three runs a day, inside the day's allowance.
+#
+# A new kingdom's maps go on the end of the table, in the game's order
+# (crownfallmaps.gd MAPS): the game counts the gold on screen from this table
+# (handed it at Go), so a map with no gold here pays nothing and says so.
+
+# 250 a map rising 15 a map, and every fifth - a boss's - more: the Slime
+# King 1,000, the Sprite 1,200, the Sniper 1,500, the Bush Mage 1,800, the
+# ruler and the crown 4,000. 17,950 for the Light kingdom's 25.
+CROWNFALL_BOSS_GOLD = {5: 1000, 10: 1200, 15: 1500, 20: 1800, 25: 4000}
+CROWNFALL_MAP_GOLD = tuple(CROWNFALL_BOSS_GOLD.get(n, 250 + 15 * (n - 1)) for n in range(1, 26))
+CROWNFALL_MIN_MAP_SECONDS = 40
+# A Crownfall run not finished in this long pays nothing (closed without
+# Leave). Longer than a Healer's Run's: 25 maps take a strong player hours.
+CROWNFALL_RUN_KEPT_SECONDS = 8 * 60 * 60
+
+
+def crownfall_maps():
+    """How many maps there are to clear."""
+    return len(CROWNFALL_MAP_GOLD)
+
+
+def crownfall_may_start(start, progress):
+    """Whether a run may start on map `start` (from 0) for an account that
+    has cleared `progress` in order: any map up to the next to clear."""
+    return 0 <= int(start) <= min(int(progress), crownfall_maps() - 1)
+
+
+def crownfall_believed(start, cleared, seconds):
+    """How many maps a run from `start` said it cleared, held to what
+    `seconds` since its Go allow and to the maps after `start`."""
+    return max(0, min(int(cleared), int(seconds) // CROWNFALL_MIN_MAP_SECONDS,
+                      crownfall_maps() - int(start)))
+
+
+def crownfall_gold(start, cleared):
+    """The gold for clearing `cleared` maps from map `start`."""
+    start = max(0, int(start))
+    return sum(CROWNFALL_MAP_GOLD[start:start + max(0, int(cleared))])
+
+
+def crownfall_pays():
+    """The table the game counts gold by on screen (handed it at Go)."""
+    return {"maps": list(CROWNFALL_MAP_GOLD), "most": crownfall_gold(0, crownfall_maps())}
+
+
 def pays_for(game_id):
     """What a run of `game_id` is handed at Go: its own table."""
+    if game_id == "crownfall":
+        return crownfall_pays()
     return cloth_pays() if game_id == "cloth" else healer_pays()
 
 
@@ -402,13 +472,14 @@ def best_believed(seconds_said, since_go):
 # The owner: "lets fix issues in security", choosing a cap of 100,000. A
 # minigame is played on the player's machine and the server believes its
 # result as far as the time since its Go allows (SECURITY_NOTES E-22): a
-# modified game could claim the best run every time - 20,000 a Healer's Run
-# and 24,250 a Cut the Cloth, three of each a day, and every coin the
-# Endless's and the Forge's chests could roll. So one allowance an account
-# across all of them, in any 24 hours: the gold paid at Leave and the coins
-# rolled into a chest, counted together. A run past it is paid what is left;
-# a chest past it rolls its gear and no coins. A good honest day is well under
-# it; a perfect day at both gold games is 132,750 before any chest.
+# modified game could claim the best run every time - 20,000 a Healer's Run,
+# 24,250 a Cut the Cloth and 17,950 a Crownfall (0.162.0), three of each a
+# day, and every coin the Endless's and the Forge's chests could roll. So
+# one allowance an account across all of them, in any 24 hours: the gold
+# paid at Leave and the coins rolled into a chest, counted together. A run
+# past it is paid what is left; a chest past it rolls its gear and no coins.
+# A good honest day is well under it; a perfect day at the three gold games
+# is 186,600 before any chest.
 #
 # ELUSION_MINIGAME_GOLD_DAY sets it on a server (envfile.KNOWN): a whole
 # number, 0 for no cap. Unset or not a number is GOLD_A_DAY - a typo never

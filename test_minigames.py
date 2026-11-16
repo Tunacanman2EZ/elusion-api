@@ -703,6 +703,92 @@ finally:
     app_module.gamedata.roll_kill_rewards = real_roll
     os.environ.pop("ELUSION_MINIGAME_GOLD_DAY", None)
 
+section("MG-17 CROWNFALL (game 0.162.0): THREE RUNS A DAY, GOLD A MAP CLEARED, HOW FAR YOU GOT KEPT")
+fg = services.crownfall_gold
+GOLD = list(services.CROWNFALL_MAP_GOLD)
+check("the maps' gold: 25, 250 rising 15 a map, every fifth a boss's (1,000 ... the crown's 4,000) - 17,950 for the kingdom",
+      len(GOLD) == 25 and GOLD[0] == 250 and GOLD[1] == 265 and GOLD[4] == 1000 and GOLD[23] == 595 and GOLD[24] == 4000
+      and fg(0, 0) == 0 and fg(0, 1) == 250 and fg(0, 25) == 17950 and fg(2, 3) == 280 + 295 + 1000
+      and fg(24, 9) == 4000 and services.crownfall_pays() == {"maps": GOLD, "most": 17950}, [fg(0, 25), fg(2, 3)])
+fb = services.crownfall_believed
+check("  believed only as far as the time allows (%d s a map) and the maps after the start"
+      % services.CROWNFALL_MIN_MAP_SECONDS,
+      fb(0, 5, 9999) == 5 and fb(0, 5, 80) == 2 and fb(0, 1, 39) == 0 and fb(22, 5, 9999) == 3
+      and fb(0, -1, 999) == 0)
+fs = services.crownfall_may_start
+check("  a run starts on any map up to the next to clear - never past it, never past the last",
+      fs(0, 0) and not fs(1, 0) and fs(2, 2) and not fs(3, 2) and fs(24, 25) and not fs(25, 25) and not fs(-1, 3))
+cara = register("mgcara")
+assert client.put("/api/save", headers=cara, json={"slot": 0, "class_id": "tank", "name": "tank"}).status_code in (200, 201)
+def crown_row(headers):
+    games = (client.get("/api/minigames", headers=headers).get_json() or {}).get("games", [])
+    return next((g for g in games if g.get("id") == "crownfall"), {})
+def crown_go(headers, slot=0):
+    return client.post("/api/minigames/enter", headers=headers, json={"game": "crownfall", "slot": slot})
+def crown_finish(headers, run_id, start, cleared):
+    return client.post("/api/minigames/finish", headers=headers, json={"run": run_id, "from": start, "cleared": cleared})
+row = crown_row(cara)
+check("Crownfall is listed: three runs a day, all three left, nothing cleared yet",
+      row.get("name") == "Crownfall" and row.get("plays") == 3 and row.get("plays_left") == 3
+      and row.get("ready_in") == 0 and row.get("progress") == 0 and "best" not in row, row)
+crown_runs = []
+for n in range(3):
+    res = crown_go(cara)
+    body = res.get_json() or {}
+    crown_runs.append(body.get("run"))
+    check("  Go %d is let in with a run of its own, the maps' table and how far you got, %d left" % (n + 1, 2 - n),
+          res.status_code == 200 and isinstance(body.get("run"), int) and body.get("plays_left") == 2 - n
+          and body.get("pays", {}).get("maps") == GOLD and body.get("progress") == 0,
+          (res.status_code, body))
+check("  the fourth inside the day is refused (409)", crown_go(cara).status_code == 409)
+cara_purse = lambda: raw("SELECT gold FROM saves WHERE user_id = ? AND slot = 0", (uid("mgcara"),))[0][0]
+check("refused: a start past the next map to clear (400) - nothing cleared, only the first is open",
+      crown_finish(cara, crown_runs[0], 1, 1).status_code == 400)
+before = cara_purse()
+raw("UPDATE minigame_runs SET started_at = started_at - 600 WHERE id = ?", (crown_runs[0],))
+res = crown_finish(cara, crown_runs[0], 0, 3)
+body = res.get_json() or {}
+check("Leave after three maps from the first pays their 795 gold, in the ledger as minigame, and you have got to map 4",
+      res.status_code == 200 and body.get("gold") == 795 and body.get("cleared") == 3 and body.get("progress") == 3
+      and cara_purse() == before + 795 and body.get("status", {}).get("gold") == cara_purse()
+      and raw("SELECT reason, delta, detail FROM gold_ledger WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+              (uid("mgcara"),))[0] == ("minigame", 795, "crownfall run %d: 3 maps from map 1" % crown_runs[0])
+      and crown_row(cara).get("progress") == 3, (res.status_code, body))
+check("  once: a second Leave for the same run is refused (409)", crown_finish(cara, crown_runs[0], 0, 3).status_code == 409
+      and cara_purse() == before + 795)
+raw("UPDATE minigame_runs SET started_at = started_at - 9999 WHERE id = ?", (crown_runs[1],))
+body = crown_finish(cara, crown_runs[1], 3, 99).get_json() or {}
+check("a run from map 4 that says it cleared 99 is believed for the 22 there are - the crown taken: %d" % fg(3, 22),
+      body.get("cleared") == 22 and body.get("gold") == fg(3, 22) and body.get("progress") == 25
+      and raw("SELECT boss, goal FROM minigame_runs WHERE id = ?", (crown_runs[1],))[0] == (1, 1), body)
+raw("UPDATE minigame_runs SET started_at = started_at - 50 WHERE id = ?", (crown_runs[2],))
+body = crown_finish(cara, crown_runs[2], 0, 5).get_json() or {}
+check("  a run that says five maps 50 seconds after its Go is believed for one; how far you got never goes back",
+      body.get("cleared") == 1 and body.get("gold") == 250 and body.get("progress") == 25
+      and crown_row(cara).get("progress") == 25, body)
+dee = register("mgdee")
+assert client.put("/api/save", headers=dee, json={"slot": 0, "class_id": "mage", "name": "mage"}).status_code in (200, 201)
+dee_run = (crown_go(dee).get_json() or {}).get("run", 0)
+check("refused: from or cleared missing or not a whole number (400), somebody else's run (404), a Cloth body (400)",
+      client.post("/api/minigames/finish", headers=dee, json={"run": dee_run}).status_code == 400
+      and crown_finish(dee, dee_run, 0, True).status_code == 400 and crown_finish(dee, dee_run, -1, 1).status_code == 400
+      and crown_finish(dee, dee_run, 0, 1.5).status_code == 400 and crown_finish(cara, dee_run, 0, 1).status_code == 404
+      and client.post("/api/minigames/finish", headers=dee, json={"run": dee_run, "rounds": 3}).status_code == 400)
+check("  progress is the account's: another account starts from the first",
+      crown_row(dee).get("progress") == 0)
+check("  /best keeps no Crownfall progress - only a timed minigame's time",
+      client.post("/api/minigames/best", headers=dee, json={"game": "crownfall", "seconds": 5}).status_code == 400
+      and crown_row(dee).get("progress") == 0)
+raw("UPDATE minigame_runs SET started_at = started_at - ? WHERE id = ?", (4 * 60 * 60, dee_run))
+long_play = (crown_finish(dee, dee_run, 0, 2).get_json() or {}).get("gold")
+dee_late = (crown_go(dee).get_json() or {}).get("run", 0)
+raw("UPDATE minigame_runs SET started_at = started_at - ? WHERE id = ?", (services.CROWNFALL_RUN_KEPT_SECONDS + 10, dee_late))
+check("  a run four hours long still pays (515); one left past %d hours pays nothing"
+      % (services.CROWNFALL_RUN_KEPT_SECONDS // 3600),
+      long_play == 515 and services.CROWNFALL_RUN_KEPT_SECONDS > services.HEALER_RUN_KEPT_SECONDS
+      and (crown_finish(dee, dee_late, 0, 2).get_json() or {}).get("gold") == 0, long_play)
+check("the owner runs it as often as they like", all(crown_go(owner).status_code in (200, 404) for _ in range(4)))
+
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))
 print("=" * 60)

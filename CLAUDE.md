@@ -2175,6 +2175,36 @@ a pickup taken) and each player's line ("me": ready, lives, out). A game from
 before never says "cloth". test_presence P-30. **Deploy this first**: a
 0.161.0 game against an older server hears no "cc" and cuts alone.
 
+## Crownfall (game 0.162.0)
+
+The owner's brick breaker through seven monster kingdoms, played over the
+screen from town like Cut the Cloth (the game's crownfall/; its CLAUDE.md,
+"Crownfall"). minigames/ CROWNFALL:
+
+- `GAMES["crownfall"]`: three runs a day (`plays`), and `progress` - how far
+  the account has got, its maps cleared in order, kept in minigame_bests
+  under "crownfall" (`keep_best()`, so it only grows). The listing and Go's
+  answer carry it; `/api/minigames/best` keeps no progress (only a `times`
+  game's time).
+- **Gold a map**: `CROWNFALL_MAP_GOLD` - the Light kingdom's 25, 250 rising
+  15 a map, and every fifth a boss's (`CROWNFALL_BOSS_GOLD`: 1,000, 1,200,
+  1,500, 1,800, and the crown's 4,000), 17,950 in all - in the game's map
+  order; a new kingdom's go on the end. Go hands the game `crownfall_pays()`.
+- **Finish** (`finish_crownfall()`): `from` (the map it began on, from 0)
+  and `cleared`. A start past the next map to clear is 400
+  (`crownfall_may_start()`); the maps believed are held to
+  `CROWNFALL_MIN_MAP_SECONDS` (40) each since the Go and to the maps after
+  `from` (`crownfall_believed()`); gold through the day's allowance and
+  `gold_delta()` ("crownfall run N: K maps from map M"); `progress` moved
+  to `from + believed`. A crown taken (the last map reached) is the run's
+  boss and goal. A run left past `CROWNFALL_RUN_KEPT_SECONDS` (8 h, not a
+  Healer's Run's 3: 25 maps take a strong player hours) pays nothing.
+- THE HONEST LIMIT: a modified game could claim every map from its start -
+  17,950 a run from the first - no faster than 40 s a map, three runs a day,
+  inside the day's allowance.
+- test_minigames.py MG-17 (a sabotage caught: the start guard taken out).
+  test_packages.py's bare-app list names it.
+
 ## The Forge's receipts, and the Forge together (game 0.160.0)
 
 The same for the Forge's fire sprites, which carried the stress test's mark
