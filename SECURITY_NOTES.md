@@ -1705,8 +1705,8 @@ Endless elite and boss the run's schedule allows inside its Go's day (about
 paying its loot into that character's chest; claim the Healer's Run's goal no
 sooner than its waves take - 20,000 gold a run, 60,000 a day; claim 30 rounds
 of Cut the Cloth at 15 seconds a round - 24,250 a run, 72,750 a day; claim
-every Crownfall map from its start at 40 seconds a map - 40,425 a run, 121,275
-a day (game 0.163.0, the Light and Wind kingdoms).
+every Crownfall map from its start at 40 seconds a map - 68,485 a run, 205,455
+a day (game 0.164.0, the Light, Wind and Water kingdoms).
 
 **What bounds it.** One Go a day (the Endless, the Forge) or three rolling
 runs (the Healer's Run, the Cloth, Crownfall), per account; a kill only of a monster the

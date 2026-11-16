@@ -238,9 +238,9 @@ def cloth_pays():
 #
 # THE HONEST LIMIT: a modified game could say it cleared every map from its
 # start. It cannot say so faster than CROWNFALL_MIN_MAP_SECONDS a map, start
-# past the next map to clear, or be paid more than the maps there are (40,425
-# from the first, Light's and Wind's) - three runs a day, inside the day's
-# allowance.
+# past the next map to clear, or be paid more than the maps there are (68,485
+# from the first, Light's, Wind's and Water's) - three runs a day, inside the
+# day's allowance.
 #
 # A new kingdom's maps go on the end of the table, in the game's order
 # (crownfallmaps.gd MAPS): the game counts the gold on screen from this table
@@ -255,8 +255,14 @@ CROWNFALL_BOSS_GOLD = {5: 1000, 10: 1200, 15: 1500, 20: 1800, 25: 4000}
 # Gale King 1,250, the Whirlwind 1,500, the Gust Sniper 1,900, the Storm
 # Mage 2,250 and the Tempest's crown 5,000 - 22,475 for its 25.
 CROWNFALL_WIND_BOSS_GOLD = {5: 1250, 10: 1500, 15: 1900, 20: 2250, 25: 5000}
+# THE KINGDOM OF WATER (game 0.164.0) a quarter more again: each map the same
+# place's Light gold times 1.5625 to the nearest 5, its bosses the Tide King
+# 1,550, the Undine 1,900, the Harpooner 2,350, the Tide Mage 2,800 and the
+# Leviathan's crown 6,250 - 28,060 for its 25.
+CROWNFALL_WATER_BOSS_GOLD = {5: 1550, 10: 1900, 15: 2350, 20: 2800, 25: 6250}
 CROWNFALL_MAP_GOLD = tuple(CROWNFALL_BOSS_GOLD.get(n, 250 + 15 * (n - 1)) for n in range(1, 26)) + tuple(
-    CROWNFALL_WIND_BOSS_GOLD.get(n, 5 * int((250 + 15 * (n - 1)) * 1.25 / 5 + 0.5)) for n in range(1, 26))
+    CROWNFALL_WIND_BOSS_GOLD.get(n, 5 * int((250 + 15 * (n - 1)) * 1.25 / 5 + 0.5)) for n in range(1, 26)) + tuple(
+    CROWNFALL_WATER_BOSS_GOLD.get(n, 5 * int((250 + 15 * (n - 1)) * 1.5625 / 5 + 0.5)) for n in range(1, 26))
 CROWNFALL_MIN_MAP_SECONDS = 40
 # A Crownfall run not finished in this long pays nothing (closed without
 # Leave). Longer than a Healer's Run's: a kingdom of maps takes a strong
@@ -481,13 +487,13 @@ def best_believed(seconds_said, since_go):
 # minigame is played on the player's machine and the server believes its
 # result as far as the time since its Go allows (SECURITY_NOTES E-22): a
 # modified game could claim the best run every time - 20,000 a Healer's Run,
-# 24,250 a Cut the Cloth and 40,425 a Crownfall (0.163.0), three of each a
+# 24,250 a Cut the Cloth and 68,485 a Crownfall (0.164.0), three of each a
 # day, and every coin the Endless's and the Forge's chests could roll. So
 # one allowance an account across all of them, in any 24 hours: the gold
 # paid at Leave and the coins rolled into a chest, counted together. A run
 # past it is paid what is left; a chest past it rolls its gear and no coins.
 # A good honest day is well under it; a perfect day at the three gold games
-# is 254,025 before any chest.
+# is 338,205 before any chest.
 #
 # ELUSION_MINIGAME_GOLD_DAY sets it on a server (envfile.KNOWN): a whole
 # number, 0 for no cap. Unset or not a number is GOLD_A_DAY - a typo never

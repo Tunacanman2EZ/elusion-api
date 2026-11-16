@@ -707,21 +707,23 @@ section("MG-17 CROWNFALL (game 0.162.0): THREE RUNS A DAY, GOLD A MAP CLEARED, H
 fg = services.crownfall_gold
 GOLD = list(services.CROWNFALL_MAP_GOLD)
 check("the maps' gold: Light's 25, 250 rising 15 a map, every fifth a boss's (1,000 ... the crown's 4,000) - 17,950;"
-      " Wind's 25 a quarter more (the Gale King 1,250 ... the Tempest's crown 5,000) - 22,475",
-      len(GOLD) == 50 and GOLD[0] == 250 and GOLD[1] == 265 and GOLD[4] == 1000 and GOLD[23] == 595 and GOLD[24] == 4000
+      " Wind's 25 a quarter more (the Gale King 1,250 ... the Tempest's crown 5,000) - 22,475;"
+      " Water's 25 a quarter more again (the Tide King 1,550 ... the Leviathan's crown 6,250) - 28,060",
+      len(GOLD) == 75 and GOLD[0] == 250 and GOLD[1] == 265 and GOLD[4] == 1000 and GOLD[23] == 595 and GOLD[24] == 4000
       and fg(0, 0) == 0 and fg(0, 1) == 250 and fg(0, 25) == 17950 and fg(2, 3) == 280 + 295 + 1000
       and GOLD[25] == 315 and GOLD[29] == 1250 and GOLD[48] == 745 and GOLD[49] == 5000 and fg(25, 25) == 22475
       and fg(24, 9) == 4000 + 315 + 330 + 350 + 370 + 1250 + 405 + 425 + 445
-      and services.crownfall_pays() == {"maps": GOLD, "most": 40425}, [fg(0, 25), fg(25, 25), fg(2, 3)])
+      and GOLD[50] == 390 and GOLD[54] == 1550 and GOLD[73] == 930 and GOLD[74] == 6250 and fg(50, 25) == 28060
+      and services.crownfall_pays() == {"maps": GOLD, "most": 68485}, [fg(0, 25), fg(25, 25), fg(50, 25), fg(2, 3)])
 fb = services.crownfall_believed
 check("  believed only as far as the time allows (%d s a map) and the maps after the start"
       % services.CROWNFALL_MIN_MAP_SECONDS,
-      fb(0, 5, 9999) == 5 and fb(0, 5, 80) == 2 and fb(0, 1, 39) == 0 and fb(47, 5, 9999) == 3
+      fb(0, 5, 9999) == 5 and fb(0, 5, 80) == 2 and fb(0, 1, 39) == 0 and fb(72, 5, 9999) == 3
       and fb(0, -1, 999) == 0)
 fs = services.crownfall_may_start
 check("  a run starts on any map up to the next to clear - never past it, never past the last",
       fs(0, 0) and not fs(1, 0) and fs(2, 2) and not fs(3, 2) and fs(24, 25) and fs(25, 25) and not fs(26, 25)
-      and fs(49, 50) and not fs(50, 50) and not fs(-1, 3))
+      and fs(49, 50) and fs(50, 50) and fs(74, 75) and not fs(75, 75) and not fs(-1, 3))
 cara = register("mgcara")
 assert client.put("/api/save", headers=cara, json={"slot": 0, "class_id": "tank", "name": "tank"}).status_code in (200, 201)
 def crown_row(headers):
@@ -762,14 +764,14 @@ check("  once: a second Leave for the same run is refused (409)", crown_finish(c
       and cara_purse() == before + 795)
 raw("UPDATE minigame_runs SET started_at = started_at - 9999 WHERE id = ?", (crown_runs[1],))
 body = crown_finish(cara, crown_runs[1], 3, 99).get_json() or {}
-check("a run from map 4 that says it cleared 99 is believed for the 47 there are, through Light into Wind - the last crown taken: %d" % fg(3, 47),
-      body.get("cleared") == 47 and body.get("gold") == fg(3, 47) and body.get("progress") == 50
+check("a run from map 4 that says it cleared 99 is believed for the 72 there are, through Light, Wind and Water - the last crown taken: %d" % fg(3, 72),
+      body.get("cleared") == 72 and body.get("gold") == fg(3, 72) and body.get("progress") == 75
       and raw("SELECT boss, goal FROM minigame_runs WHERE id = ?", (crown_runs[1],))[0] == (1, 1), body)
 raw("UPDATE minigame_runs SET started_at = started_at - 50 WHERE id = ?", (crown_runs[2],))
 body = crown_finish(cara, crown_runs[2], 0, 5).get_json() or {}
 check("  a run that says five maps 50 seconds after its Go is believed for one; how far you got never goes back",
-      body.get("cleared") == 1 and body.get("gold") == 250 and body.get("progress") == 50
-      and crown_row(cara).get("progress") == 50, body)
+      body.get("cleared") == 1 and body.get("gold") == 250 and body.get("progress") == 75
+      and crown_row(cara).get("progress") == 75, body)
 dee = register("mgdee")
 assert client.put("/api/save", headers=dee, json={"slot": 0, "class_id": "mage", "name": "mage"}).status_code in (200, 201)
 dee_run = (crown_go(dee).get_json() or {}).get("run", 0)
