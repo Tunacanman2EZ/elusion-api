@@ -650,8 +650,9 @@ No comforting lies. These are known, named and open.
   `ELUSION_MINIGAME_GOLD_DAY` - across every run and every chest's coins, so
   the most a modified game takes is that number, not the 132,750 the two
   gold games' times allow. The chests' gear, materials and pets are still
-  the run's word, held to the schedule's count - except, once the owner
-  switches `ELUSION_ENDLESS_RECEIPTS` on (game 0.159.0), the Endless's: the
+  the run's word, held to the schedule's count - except the Endless's and
+  the Forge's, whose receipts switches are on since 15 Nov 2026
+  (`ELUSION_ENDLESS_RECEIPTS`, game 0.159.0): the
   server books its elites and bosses as it books a field's monsters, and a
   chest kill there is paid only against an AGREED death in those books, in
   the Endless (`test_receipts.py` R-9, `test_combatbook.py` CB-16). A

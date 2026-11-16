@@ -971,13 +971,16 @@ add `ELUSION_ENDLESS_RECEIPTS=on`, and restart the API:
 `sudo systemctl restart elusion-api`. Off again is the same line set to `off`
 and a restart; chest kills are then paid on the game's word, as before.
 
+**On since 15 Nov 2026**: 16 of 16 Endless chest kills backed in the day before.
+
 ### The Forge's receipts (0.160.0)
 
 The same for the Forge's fire sprites, under its own switch,
 `ELUSION_FORGE_RECEIPTS`, and its own line under killwatch's: `forge
 receipts:`. Before game 0.160.0 no server ever saw a Forge sprite, so wait
 for a few days of 0.160.0 play. Then **set "Old versions must update" to 9
-first**, add `ELUSION_FORGE_RECEIPTS=on`, and restart the API. Since 0.160.0
+first**, add `ELUSION_FORGE_RECEIPTS=on`, and restart the API (**on since 15
+Nov 2026**: 167 of 167 Forge chest kills backed in the day before). Since 0.160.0
 a party's games share one Forge - one run, the first in leading - and a game
 from before keeps a Forge of its own; players outside a party each have
 their own.
