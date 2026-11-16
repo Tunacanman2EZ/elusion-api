@@ -434,6 +434,33 @@ BURST = 80.0
 NEED_MESSAGES = 16
 NEED_CREDIT_SECONDS = 10.0
 MAX_NEED_CREDIT = NEED_MESSAGES * 128
+# A FLOOD IS NOT A CROWD (15 Nov 2026). The bucket above counts messages, not
+# their size, and two kinds are big and copied: a leader's world ("w", up to
+# MAX_WORLD_BYTES, to everyone in its room) and a run's messages ("en", up to
+# MAX_RUN_BYTES, to the party). So one modified game leading a room of 16
+# could send 64 KB 40 times a second and have it copied fifteen times - about
+# 38 MB/s out, when 0.4 MB/s held for a month is the droplet's whole
+# allowance: the month gone in hours, and the data guard putting everyone
+# "alone" for the rest of it. Each game now has these BYTES a second of the
+# two kinds, counted as it sends them, before any copy. Measured honest
+# (swarm.py's formats, monstersync.gd's): a Big Field leader's sixty movers
+# ten times a second are about 22 KB/s; a game walking in costs the leader
+# 107 KB (the Big Field's 536 monsters in nine messages), the Endless's
+# 5,000 slimes 180 KB; a follower's fullest "h" 6 KB. So RUN_BYTES_PER_SECOND
+# is about six times a steady leader, RUN_BYTES_BURST several walk-ins at
+# once, and each need this server sends adds NEED_BYTES more (spent once the
+# bucket is empty, until NEED_CREDIT_SECONDS after the last need), at most
+# MAX_NEED_BYTES (128 arrivals, as MAX_NEED_CREDIT). A need buys it once a
+# NEED_CREDIT_SECONDS for each game asked for (asked_for_world()), so a game
+# saying "sync" over and over cannot keep its leader in allowance. Past it a
+# message is not passed on (nor read by the books) and is counted - never a
+# close: this cuts a flood to a crowd's own size.
+RUN_BYTES_PER_SECOND = 131072
+RUN_BYTES_BURST = 1048576
+NEED_BYTES = 262144
+MAX_NEED_BYTES = 128 * NEED_BYTES
+BYTES_HELD_REPORT_SECONDS = 60.0
+BYTE_LIMITED = ("w", "en")
 # PARTY VOICE (0.43.0): a call's description (SDP) is a few kilobytes; its
 # candidates a few hundred bytes each. A call to three others is about twenty
 # messages; this allows several times that at once, and a steady few a second.
@@ -1293,6 +1320,15 @@ class Player:
         # A LEADER ANSWERING: allowance for the needs this server sent it.
         self.need_credit = 0.0
         self.need_credit_until = 0.0
+        # A FLOOD IS NOT A CROWD: the bytes of "w" and "en" it may still
+        # send, the need's share, and what was held back (and when said).
+        self.byte_tokens = float(RUN_BYTES_BURST)
+        self.byte_stamp = self.stamp
+        self.need_bytes = 0.0
+        self.bytes_held = 0
+        self.bytes_said_at = -BYTES_HELD_REPORT_SECONDS
+        # user id -> when its last "need" bought this game allowance.
+        self.credited = {}
         # The shared-monster wire this game speaks (0: none), and when it
         # walked into its current area - the leader is the earliest.
         self.version = 0
@@ -1369,10 +1405,39 @@ class Player:
         self.tokens -= 1.0
         return True
 
-    def asked_for_world(self):
-        """This server just sent this game a "need": allowance to answer it."""
+    def asked_for_world(self, requester=None):
+        """This server just sent this game a "need": allowance to answer it.
+        For the game `requester` (a user id), once a NEED_CREDIT_SECONDS - A
+        FLOOD IS NOT A CROWD: a game saying "sync" over and over is asked for
+        by the server each time, and must not buy its leader allowance without
+        end. None (the books' own ask, already once in a few seconds) always."""
+        now = time.monotonic()
+        if requester is not None:
+            last = self.credited.get(requester)
+            if last is not None and now - last < NEED_CREDIT_SECONDS:
+                return
+            if len(self.credited) >= 256:
+                self.credited = {k: v for k, v in self.credited.items() if now - v < NEED_CREDIT_SECONDS}
+            self.credited[requester] = now
         self.need_credit = min(MAX_NEED_CREDIT, self.need_credit + NEED_MESSAGES)
-        self.need_credit_until = time.monotonic() + NEED_CREDIT_SECONDS
+        self.need_bytes = min(float(MAX_NEED_BYTES), self.need_bytes + NEED_BYTES)
+        self.need_credit_until = now + NEED_CREDIT_SECONDS
+
+    def allow_bytes(self, size):
+        """A FLOOD IS NOT A CROWD: True when `size` more bytes of "w" or "en"
+        fit what this game may send - the bucket, then a need's share."""
+        now = time.monotonic()
+        self.byte_tokens = min(float(RUN_BYTES_BURST),
+                               self.byte_tokens + (now - self.byte_stamp) * RUN_BYTES_PER_SECOND)
+        self.byte_stamp = now
+        if self.byte_tokens >= size:
+            self.byte_tokens -= size
+            return True
+        if self.need_bytes >= size and now < self.need_credit_until:
+            self.need_bytes -= size
+            return True
+        self.bytes_held += size
+        return False
 
     def allow_voice(self):
         """PARTY VOICE's own bucket, beside allow()."""
@@ -1749,6 +1814,8 @@ class PresenceServer:
         self.hold_moves = HOLD_MOVES
         self.moves_held = 0
         self.levers_refused = 0
+        # A FLOOD IS NOT A CROWD: bytes of "w" and "en" not passed on.
+        self.bytes_held = 0
 
     # ---- sending -------------------------------------------------------------
     # EVERYTHING SENT IS COUNTED (game 0.78.0): a frame for each socket a text
@@ -1959,7 +2026,7 @@ class PresenceServer:
         leader = self.leaders.get(area)
         if leader is None or leader is player or not player.shares:
             return
-        leader.asked_for_world()
+        leader.asked_for_world(player.user_id)
         self._out([leader.ws], json.dumps({"t": "need", "id": player.user_id}, separators=(",", ":")))
 
     # ---- the books (combatbook.py) --------------------------------------------
@@ -2158,6 +2225,22 @@ class PresenceServer:
                                "sn": self._source_names(names)},
                               separators=(",", ":"))
             self._out([p.ws for p in watchers if p.area == room], text)
+
+    def allow_bytes(self, player, size, kind):
+        """A FLOOD IS NOT A CROWD: True when this "w" or "en" of `size` bytes
+        fits what `player` may send. Past it the message goes nowhere and is
+        counted (here and on the player), said in the log at most every
+        BYTES_HELD_REPORT_SECONDS a player - never a close."""
+        if player.allow_bytes(size):
+            return True
+        self.bytes_held += size
+        now = time.monotonic()
+        if now - player.bytes_said_at >= BYTES_HELD_REPORT_SECONDS:
+            player.bytes_said_at = now
+            print("[PRESENCE] %s sends more than %d KB a second of world and run messages (%s): %d bytes"
+                  " held back so far" % (player.identity.get("name", player.user_id), RUN_BYTES_PER_SECOND // 1024,
+                                         kind, player.bytes_held), flush=True)
+        return False
 
     def relay_world(self, player, raw, msg):
         """A world message from the area's leader, passed on exactly as sent -
@@ -2704,6 +2787,10 @@ class PresenceServer:
                 most = {"vc": VOICE_MAX_BYTES, "en": MAX_RUN_BYTES}.get(kind, MAX_MESSAGE_BYTES)
                 if kind != "w" and len(raw) > most:
                     await self.drop(player, "too big", 1009)
+                    continue
+                # A FLOOD IS NOT A CROWD: the two big kinds that are copied
+                # are held to bytes a second as well.
+                if kind in BYTE_LIMITED and not self.allow_bytes(player, len(raw), kind):
                     continue
                 if kind == "s":
                     await self.apply_state(player, message)

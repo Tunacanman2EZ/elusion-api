@@ -47,8 +47,9 @@ lives.
 | E-23 | **The chat's picture reader ran 42 known flaws, and tried every format it knew** | **high** | **Closed** (14 Nov 2026) | Any signed-in player can hand the server 8 MB of bytes or a link to decode. Pillow 12.3.0 carried 42 published flaws - heap overflows in the JPEG, TIFF and FlashPix readers among them - and, given no list, tried every reader it has, EPS through Ghostscript included, on whatever arrived. At best a crash of the process that holds the database; at worst code run inside it. | **Patch + allowlist.** Pillow pinned at 13.0.0, which fixes all 42, installed on the server by `update_server.sh` the update it lands; and `Image.open(..., formats=PICTURE_FORMATS)`: PNG, JPEG, GIF, WebP and BMP, the five the game sends, so no other reader sees a player's bytes. Found by `pip-audit`. `test_chatrooms.py`; SECURITY.md invariant 48. |
 | E-24 | **The backups were anybody's to read on the server** | medium (accounts) | **Closed** (14 Nov 2026) | Every copy of `elusion.db` in `/var/backups/elusion` was `-rw-r--r--`: any login on the droplet, or a broken-into service (Caddy faces the internet), could read every email and password hash. | **Its owner's alone.** `backup_db.py` writes each copy at 0600 from the first byte, and every run closes the folder (0700) and any older copy (`make_private()`). `test_deploy.py` section D. |
 | E-25 | **Two doors that ask the password let a session guess at it for ever** | medium (accounts) | **Closed** (14 Nov 2026) | Changing the recovery address and deleting the account ask for the password so a stolen session cannot do either - but neither counted a miss toward the lockout or read it, so a token thief could guess there without end, where the login and the password change stop at eight. | **Throttled like login.** app.py `_current_password_refusal()`: the address's throttle and the account's lockout read before the hash, a miss counted against both. `test_recovery.py`, `test_accountdelete.py` AD-2. |
+| E-26 | **One game could make the server send a flood** | medium (availability + cost) | **Closed** (15 Nov 2026) | The message limit counted messages, not their size, and the two kinds the server copies to a room are big: a leader's monsters (up to 64 KB) and a party's run (32 KB). One modified game leading a room of 16 could have the server send about 38 MB/s - the droplet's month of data in hours, and the data guard putting everyone "alone" for the rest of it. | **Rate limit, by bytes.** presence.py holds those two kinds to 128 KB a second a game with a 1 MB burst, counted as sent, before any copy; each game that walks in buys its leader 256 KB more, once in ten seconds each, so "sync" cannot buy it without end. Past it a message goes nowhere and is counted, never a close. An honest Big Field leader is about 22 KB/s; 64 bots in one area held nothing back. `test_presence.py` P-32; SECURITY.md invariant 49. |
 
-Twenty-four findings: twenty-two closed, two mitigated (E-3, since 25 Oct 2026, and E-22, since 13 Nov). Plus E-15, an audit that went
+Twenty-five findings: twenty-three closed, two mitigated (E-3, since 25 Oct 2026, and E-22, since 13 Nov). Plus E-15, an audit that went
 looking and came back empty — kept, because a search that finds nothing is
 still a result and the reasoning is the point.
 
@@ -1845,6 +1846,36 @@ counted against both (`_register_failed_login()`, and the two reasons added to
 by** `test_recovery.py` ("a stolen session's guesses lock the account") and
 `test_accountdelete.py` AD-2 ("LOGIN_MAX_ATTEMPTS wrong passwords lock it");
 sabotage-caught (the guard not handed over: four red).
+
+### E-26 — One game could make the server send a flood · CLOSED (15 Nov 2026)
+
+Found in the fresh review of the party minigames. presence.py's bucket held
+every game to 40 messages a second, and counted messages, not bytes. Two
+kinds are big and copied to the room: a leader's world (`w`, up to
+`MAX_WORLD_BYTES`, 64 KB, to everyone in its area who shares monsters) and a
+party's run (`en`, up to `MAX_RUN_BYTES`, 32 KB, to the party). The earliest
+game in an area leads it, so one modified game could send 64 KB forty times a
+second and have it copied to fifteen others: about 38 MB/s out of the droplet,
+when 0.4 MB/s held for a month is the plan's whole 1,000 GiB. The data guard
+(invariant 45) would hold the bill and put everyone "alone" - so the cost was
+the game, for everyone, for the rest of the month; and fifteen players'
+connections choking on it.
+
+**The fix** (presence.py, A FLOOD IS NOT A CROWD): the two kinds are also held
+to `RUN_BYTES_PER_SECOND` (128 KB) a game with a `RUN_BYTES_BURST` (1 MB),
+counted as the game sends them, before any copy - so a crowd's own cost is
+unchanged and only the flood is cut. Each need the server sends a leader buys
+it `NEED_BYTES` (256 KB) more, as `NEED_MESSAGES` already bought messages - but
+once in `NEED_CREDIT_SECONDS` for each game asked for, because a second
+account saying "sync" makes the server ask every time, and would otherwise buy
+the flood without end. Past it the message goes nowhere (the books do not read
+it either), `bytes_held` counts it and the log says so once a minute a
+player; nobody is closed. Measured honest: a Big Field leader's sixty movers
+ten times a second are about 22 KB/s, a game walking in costs it 107 KB, the
+Endless's whole swarm 180 KB; `swarm.py` with 64 bots in one area held back
+nothing and dropped nobody. **Held by** `test_presence.py` P-32
+(sabotage-caught twice: the limit switched off, 60 of 60 floods copied on; the
+once-a-game rule taken out, forty syncs bought forty walk-ins).
 
 ## The security bot — attacking a running server, not the source
 

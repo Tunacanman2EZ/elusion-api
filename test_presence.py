@@ -2922,6 +2922,82 @@ async def the_run_between_a_party():
             sql("DELETE FROM party_members WHERE party_id = ?", (party,))
 
 
+async def a_flood_is_not_a_crowd(port, server):
+    """P-32 A FLOOD IS NOT A CROWD (15 Nov 2026): see presence.py. A leader's
+    world and a run's messages are big and copied to the room, and the bucket
+    counted messages only - one game could have the server send 38 MB/s."""
+    section("P-32 A FLOOD IS NOT A CROWD: WORLD AND RUN MESSAGES ARE HELD TO BYTES A SECOND, NOT ONLY MESSAGES")
+    p = presence.Player(None, 1, "hash", {}, time.time() + 60)
+    burst = presence.RUN_BYTES_BURST
+    check("a game may send a burst of world and run bytes at once (%d KB)" % (burst // 1024),
+          p.allow_bytes(burst // 2) and p.allow_bytes(burst // 2))
+    check("  and past it nothing more, counted", not p.allow_bytes(20000) and p.bytes_held == 20000, p.bytes_held)
+    p.asked_for_world()
+    check("  each need the server sends buys more, for a leader answering a walk-in (%d KB)"
+          % (presence.NEED_BYTES // 1024),
+          p.allow_bytes(presence.NEED_BYTES - 10) and not p.allow_bytes(20000))
+    p.byte_stamp -= 1.0
+    check("  and it fills again at %d KB a second" % (presence.RUN_BYTES_PER_SECOND // 1024),
+          p.allow_bytes(presence.RUN_BYTES_PER_SECOND - 2000) and not p.allow_bytes(20000))
+    q = presence.Player(None, 2, "hash", {}, time.time() + 60)
+    q.byte_tokens = 0.0
+    for _ in range(40):
+        q.asked_for_world(77)
+    once = q.need_bytes
+    q.asked_for_world(78)
+    check("a game asked for over and over (a \"sync\" each time) buys its leader the allowance once a while,"
+          " each other game its own", once == presence.NEED_BYTES and q.need_bytes == 2 * presence.NEED_BYTES
+          and q.need_credit == 2 * presence.NEED_MESSAGES, (once, q.need_bytes, q.need_credit))
+    q.credited[77] = q.credited.get(77, time.monotonic()) - (presence.NEED_CREDIT_SECONDS + 1)
+    q.asked_for_world(77)
+    check("  and again once NEED_CREDIT_SECONDS have passed", q.need_bytes == 3 * presence.NEED_BYTES, q.need_bytes)
+    check("the two kinds held are the two big ones that are copied: world and run",
+          presence.BYTE_LIMITED == ("w", "en"), presence.BYTE_LIMITED)
+    check("  and the limit sits well above a steady Big Field leader (22 KB/s) and a walk-in (107 KB)",
+          presence.RUN_BYTES_PER_SECOND >= 5 * 22000 and presence.RUN_BYTES_BURST >= 5 * 107000
+          and presence.NEED_BYTES >= 2 * 107000)
+
+    lead_hdr, fol_hdr = account("presflood"), account("presfloodb")
+    lead, _ = await enter(port, lead_hdr, "field", v=2, x=100.0, y=200.0)
+    fol, _ = await enter(port, fol_hdr, "field", v=2, x=120.0, y=200.0)
+    await collect(lead), await collect(fol)
+    held_before = server.bytes_held
+    honest = json.dumps({"t": "w", "d": {"snap": [], "pad": "x" * 2000}}, separators=(",", ":"))
+    for _ in range(30):
+        await lead.send(honest)
+        await asyncio.sleep(0.1)
+    got = await collect(fol, 0.5)
+    check("a leader's honest world, ten a second, all reaches the room",
+          len(of(got, "w")) == 30 and server.bytes_held == held_before, (len(of(got, "w")), server.bytes_held))
+    flood = json.dumps({"t": "w", "d": {"snap": [], "pad": "x" * 60000}}, separators=(",", ":"))
+    for _ in range(60):
+        await lead.send(flood)
+    got = await collect(fol, 1.5)
+    passed_on = len(of(got, "w"))
+    check("a flood of sixty 60 KB worlds at once: only what the bytes allow is copied on",
+          5 <= passed_on <= (burst + presence.NEED_BYTES) // len(flood) + 2
+          and server.bytes_held - held_before >= 30 * len(flood), (passed_on, server.bytes_held - held_before))
+    said = await collect(lead, 0.3)
+    check("  and the flooding game is not closed for it, only held", not byes(said)
+          and not [m for m in said if m.get("t") == "_closed"], said)
+    await asyncio.sleep(0.5)
+    await lead.send(honest)
+    got = await collect(fol, 0.5)
+    check("  a moment later its honest world goes through again", len(of(got, "w")) == 1, len(of(got, "w")))
+    # The flood's partner: a second game in the room saying "sync" forty
+    # times, each one a need to the leader - which buys allowance once.
+    lead_player = server.players[uid("presflood")]
+    lead_player.need_bytes = 0.0
+    lead_player.credited.clear()
+    for _ in range(40):
+        await fol.send(json.dumps({"t": "sync"}))
+    await collect(lead, 0.5)
+    check("  a second game saying \"sync\" forty times buys the flooder one walk-in's allowance, not forty",
+          lead_player.need_bytes <= presence.NEED_BYTES, lead_player.need_bytes)
+    await lead.close()
+    await fol.close()
+
+
 async def clocks_carry_on():
     """P-23: A CLOCK THAT GOES WRONG CARRIES ON (28 Oct) - an error in one
     turn of the tick, the sweep, the books or the health is counted and said
@@ -3406,7 +3482,7 @@ async def part_two():
     await the_stand_together()
     await the_cloth_together()
     await clocks_carry_on()
-    await on_a_server(attacks_ride_the_tick, a_crowd_walks_in)
+    await on_a_server(attacks_ride_the_tick, a_crowd_walks_in, a_flood_is_not_a_crowd)
 
 
 asyncio.run(part_one() if PART == 1 else part_two())

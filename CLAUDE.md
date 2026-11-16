@@ -1584,6 +1584,14 @@ every rule.
   per area, on the beat (0.76.0). A leader is allowed `NEED_MESSAGES` more for
   every "need" this server sends it (0.76.0: a crowd walking in had it
   dropped "too fast") - "A crowd of 128", below.
+  **And bytes** (15 Nov 2026, A FLOOD IS NOT A CROWD, SECURITY_NOTES E-26):
+  a world (`w`) and a run's messages (`en`) are copied to the room, so they
+  are held to `RUN_BYTES_PER_SECOND` (128 KB) a game, `RUN_BYTES_BURST` (1 MB)
+  at once, and `NEED_BYTES` (256 KB) more for each game walking in - once in
+  `NEED_CREDIT_SECONDS` each, or a second account's "sync" would buy a flood.
+  Past it dropped and counted (`bytes_held`), never closed. An honest Big
+  Field leader is about 22 KB/s. **A new big message that is copied to a
+  room goes in `BYTE_LIMITED`.** test_presence.py P-32.
 - **And, since 0.7.0, the monsters** - next section. PvP stays in "Decided,
   not built".
 - **THE AURA'S HEALS (game 0.40.0).** A healer's aura heals whoever stands in

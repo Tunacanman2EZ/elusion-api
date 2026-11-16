@@ -489,6 +489,15 @@ number is gone, by the same rule CLAUDE.md gives for check counts.)
     sees a player's bytes; and Pillow is pinned at 13.0.0, where the 42
     known flaws of 12.3.0 were fixed.
     → Held by: `test_chatrooms.py` — "the reader's list is the five the game sends", "and nothing else is read: TIFF, PCX, TGA, PPM, ICO, SGI, EPS all refused", "  and a TIFF sent to the upload route is a 400, nothing stored", "requirements.txt pins Pillow at 13.0.0 or later"
+49. **One game cannot make the server send a flood** (E-26, 15 Nov 2026,
+    A FLOOD IS NOT A CROWD). The two big messages the server copies to a
+    room - a leader's monsters and a party's run - are held to bytes a
+    second as well as messages, counted as the game sends them, before any
+    copy, with more allowed only for each game that walks in, once a while
+    each. Past it a message goes nowhere and is counted; nobody is closed.
+    So one modified game leading a room costs what an honest crowd does,
+    not the month's allowance in an evening.
+    → Held by: `test_presence.py` — "a flood of sixty 60 KB worlds at once: only what the bytes allow is copied on", "  and the flooding game is not closed for it, only held", "a leader's honest world, ten a second, all reaches the room", "  a second game saying \"sync\" forty times buys the flooder one walk-in's allowance, not forty"
 
 ---
 
