@@ -210,10 +210,14 @@ check("the canary's connection cannot write", not wrote)
 before = database_rows()
 run(["--db", DB_PATH, "--status-file", STATUS, "--quiet", "--mail"])
 check("  and a whole run, status file and all, changes nothing in the database", database_rows() == before)
-odd_dir = os.path.join(testdir.PATH, "a folder # with ? odd names")
+# Windows allows no ? in a folder's name (the owner's PC: WinError 123, the suite
+# stopped before its summary), so there a % - which a file: URI must escape too -
+# stands in for it.
+ODD_NAME = "a folder # with ? odd names" if os.name != "nt" else "a folder # with % odd names"
+odd_dir = os.path.join(testdir.PATH, ODD_NAME)
 os.makedirs(odd_dir)
 shutil.copy(DB_PATH, os.path.join(odd_dir, "copy.db"))
-check("a path with a space, a # and a ? is the folder it names",
+check("a path with a space, a # and a ? (a % on Windows) is the folder it names",
       canary.run_checks(os.path.join(odd_dir, "copy.db"))["ok"] is True)
 
 # =============================================================================
@@ -228,8 +232,15 @@ check("all well: exit 0, nothing printed, and the status file says so",
       and written["failures"] == [] and len(written["checks"]) == 4, [code, out, err, written])
 check("  beside the database, where the API reads it", os.path.dirname(STATUS) == os.path.dirname(DB_PATH)
       and os.path.basename(STATUS) == canary.STATUS_NAME)
-check("  readable by the service and its group, nobody else", stat.S_IMODE(os.stat(STATUS).st_mode) == 0o640,
-      oct(stat.S_IMODE(os.stat(STATUS).st_mode)))
+# Windows has no group or other bits: os.chmod() there sets only read-only or
+# not, so a file chmodded 0o640 reads back 0o666. The mode is the Linux
+# server's; on Windows the check is that the file was not left read-only.
+if os.name != "nt":
+    check("  readable by the service and its group, nobody else", stat.S_IMODE(os.stat(STATUS).st_mode) == 0o640,
+          oct(stat.S_IMODE(os.stat(STATUS).st_mode)))
+else:
+    check("  writable, not left read-only (Windows has no group bits to check)",
+          os.access(STATUS, os.W_OK), oct(stat.S_IMODE(os.stat(STATUS).st_mode)))
 check("  and nothing half-written left in the folder",
       not [n for n in os.listdir(os.path.dirname(STATUS)) if n.startswith(".canary_status.")])
 sql("UPDATE saves SET gold = gold + 5 WHERE user_id = ?", (PLAYER_ID,))
@@ -492,9 +503,11 @@ section("CA-6  the timer itself")
 SCRIPT = os.path.join(HERE, "deploy", "update_server.sh")
 source = open(SCRIPT, encoding="utf-8").read()
 settings = dict(re.findall(r"^(API|VENV|ENV_FILE|DB)=(\S+)$", source, re.M))
-bash = shutil.which("bash")
+# The cron line is the Linux server's: on Windows a bash found on the PATH (Git's,
+# WSL's) cannot run it as the server would, and os.geteuid() does not exist there.
+bash = shutil.which("bash") if os.name != "nt" else None
 if bash is None:
-    print("  (no bash here: the cron line is read from the script's text instead)")
+    print("  (no bash here, or Windows: the cron line is read from the script's text instead)")
     line_text = ""
 else:
     line_text = subprocess.run([bash, SCRIPT, "--canary-cron"], capture_output=True, text=True, timeout=30).stdout
