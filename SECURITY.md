@@ -646,11 +646,12 @@ No comforting lies. These are known, named and open.
   time - 20,000 gold a run, three runs, 60,000 a day; claim 30 rounds of Cut
   the Cloth no faster than 15 seconds a round - 24,250 a run, 72,750 a day;
   claim every Crownfall map from its start no faster than 40 seconds a map -
-  17,950 a run, 53,850 a day (game 0.162.0); and a Forge best time as long as
+  40,425 a run, 121,275 a day (game 0.163.0, Light and Wind); and a Forge
+  best time as long as
   it has been in. Since 14 Nov the gold is
   held to one allowance an account a day - 100,000 unless the owner sets
   `ELUSION_MINIGAME_GOLD_DAY` - across every run and every chest's coins, so
-  the most a modified game takes is that number, not the 186,600 the three
+  the most a modified game takes is that number, not the 254,025 the three
   gold games' times allow. The chests' gear, materials and pets are still
   the run's word, held to the schedule's count - except the Endless's and
   the Forge's, whose receipts switches are on since 15 Nov 2026

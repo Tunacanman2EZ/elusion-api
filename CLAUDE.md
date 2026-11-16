@@ -2189,7 +2189,12 @@ screen from town like Cut the Cloth (the game's crownfall/; its CLAUDE.md,
 - **Gold a map**: `CROWNFALL_MAP_GOLD` - the Light kingdom's 25, 250 rising
   15 a map, and every fifth a boss's (`CROWNFALL_BOSS_GOLD`: 1,000, 1,200,
   1,500, 1,800, and the crown's 4,000), 17,950 in all - in the game's map
-  order; a new kingdom's go on the end. Go hands the game `crownfall_pays()`.
+  order; a new kingdom's go on the end. **The Kingdom of Wind (game
+  0.163.0)** is maps 26-50, a quarter more: each map the same place's Light
+  gold times 1.25 to the nearest 5, the bosses `CROWNFALL_WIND_BOSS_GOLD`
+  (1,250, 1,500, 1,900, 2,250 and the Tempest's crown 5,000), 22,475 in all.
+  Progress runs on from Light into Wind. Go hands the game
+  `crownfall_pays()`.
 - **Finish** (`finish_crownfall()`): `from` (the map it began on, from 0)
   and `cleared`. A start past the next map to clear is 400
   (`crownfall_may_start()`); the maps believed are held to
@@ -2197,10 +2202,11 @@ screen from town like Cut the Cloth (the game's crownfall/; its CLAUDE.md,
   `from` (`crownfall_believed()`); gold through the day's allowance and
   `gold_delta()` ("crownfall run N: K maps from map M"); `progress` moved
   to `from + believed`. A crown taken (the last map reached) is the run's
-  boss and goal. A run left past `CROWNFALL_RUN_KEPT_SECONDS` (8 h, not a
-  Healer's Run's 3: 25 maps take a strong player hours) pays nothing.
+  boss and goal (the 50th since Wind; Light's crown is no longer the
+  last). A run left past `CROWNFALL_RUN_KEPT_SECONDS` (8 h, not a Healer's
+  Run's 3: a kingdom takes a strong player hours) pays nothing.
 - THE HONEST LIMIT: a modified game could claim every map from its start -
-  17,950 a run from the first - no faster than 40 s a map, three runs a day,
+  40,425 a run from the first - no faster than 40 s a map, three runs a day,
   inside the day's allowance.
 - test_minigames.py MG-17 (a sabotage caught: the start guard taken out).
   test_packages.py's bare-app list names it.
