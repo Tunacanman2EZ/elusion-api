@@ -708,22 +708,32 @@ fg = services.crownfall_gold
 GOLD = list(services.CROWNFALL_MAP_GOLD)
 check("the maps' gold: Light's 25, 250 rising 15 a map, every fifth a boss's (1,000 ... the crown's 4,000) - 17,950;"
       " Wind's 25 a quarter more (the Gale King 1,250 ... the Tempest's crown 5,000) - 22,475;"
-      " Water's 25 a quarter more again (the Tide King 1,550 ... the Leviathan's crown 6,250) - 28,060",
-      len(GOLD) == 75 and GOLD[0] == 250 and GOLD[1] == 265 and GOLD[4] == 1000 and GOLD[23] == 595 and GOLD[24] == 4000
+      " Water's 25 a quarter more again (the Tide King 1,550 ... the Leviathan's crown 6,250) - 28,060;"
+      " Ice's 25 a quarter more again (the Frost King 1,950 ... the Glacier Lord's crown 7,800) - 35,060;"
+      " Earth's 25 a quarter more again (the Stone King 2,450 ... the Mountain Lord's crown 9,750) - 43,885;"
+      " Fire's 25 a quarter more again (the Fire King 3,050 ... the Inferno's crown 12,200) - 54,840;"
+      " Dark's 25 a quarter more again (the Shadow King 3,800 ... the Crowned Beholder's seventh crown 15,250) - 68,540",
+      len(GOLD) == 175 and GOLD[0] == 250 and GOLD[1] == 265 and GOLD[4] == 1000 and GOLD[23] == 595 and GOLD[24] == 4000
       and fg(0, 0) == 0 and fg(0, 1) == 250 and fg(0, 25) == 17950 and fg(2, 3) == 280 + 295 + 1000
       and GOLD[25] == 315 and GOLD[29] == 1250 and GOLD[48] == 745 and GOLD[49] == 5000 and fg(25, 25) == 22475
       and fg(24, 9) == 4000 + 315 + 330 + 350 + 370 + 1250 + 405 + 425 + 445
       and GOLD[50] == 390 and GOLD[54] == 1550 and GOLD[73] == 930 and GOLD[74] == 6250 and fg(50, 25) == 28060
-      and services.crownfall_pays() == {"maps": GOLD, "most": 68485}, [fg(0, 25), fg(25, 25), fg(50, 25), fg(2, 3)])
+      and GOLD[75] == 490 and GOLD[79] == 1950 and GOLD[98] == 1160 and GOLD[99] == 7800 and fg(75, 25) == 35060
+      and GOLD[100] == 610 and GOLD[104] == 2450 and GOLD[123] == 1455 and GOLD[124] == 9750 and fg(100, 25) == 43885
+      and GOLD[125] == 765 and GOLD[129] == 3050 and GOLD[148] == 1815 and GOLD[149] == 12200 and fg(125, 25) == 54840
+      and GOLD[150] == 955 and GOLD[154] == 3800 and GOLD[173] == 2270 and GOLD[174] == 15250 and fg(150, 25) == 68540
+      and services.crownfall_pays() == {"maps": GOLD, "most": 270810},
+      [fg(0, 25), fg(25, 25), fg(50, 25), fg(75, 25), fg(100, 25), fg(125, 25), fg(150, 25), fg(2, 3)])
 fb = services.crownfall_believed
 check("  believed only as far as the time allows (%d s a map) and the maps after the start"
       % services.CROWNFALL_MIN_MAP_SECONDS,
-      fb(0, 5, 9999) == 5 and fb(0, 5, 80) == 2 and fb(0, 1, 39) == 0 and fb(72, 5, 9999) == 3
+      fb(0, 5, 9999) == 5 and fb(0, 5, 80) == 2 and fb(0, 1, 39) == 0 and fb(172, 5, 9999) == 3
       and fb(0, -1, 999) == 0)
 fs = services.crownfall_may_start
 check("  a run starts on any map up to the next to clear - never past it, never past the last",
       fs(0, 0) and not fs(1, 0) and fs(2, 2) and not fs(3, 2) and fs(24, 25) and fs(25, 25) and not fs(26, 25)
-      and fs(49, 50) and fs(50, 50) and fs(74, 75) and not fs(75, 75) and not fs(-1, 3))
+      and fs(49, 50) and fs(50, 50) and fs(74, 75) and fs(75, 75) and fs(99, 100) and fs(100, 100) and fs(124, 125)
+      and fs(125, 125) and fs(149, 150) and fs(150, 150) and fs(174, 175) and not fs(175, 175) and not fs(-1, 3))
 cara = register("mgcara")
 assert client.put("/api/save", headers=cara, json={"slot": 0, "class_id": "tank", "name": "tank"}).status_code in (200, 201)
 def crown_row(headers):
@@ -763,15 +773,19 @@ check("Leave after three maps from the first pays their 795 gold, in the ledger 
 check("  once: a second Leave for the same run is refused (409)", crown_finish(cara, crown_runs[0], 0, 3).status_code == 409
       and cara_purse() == before + 795)
 raw("UPDATE minigame_runs SET started_at = started_at - 9999 WHERE id = ?", (crown_runs[1],))
-body = crown_finish(cara, crown_runs[1], 3, 99).get_json() or {}
-check("a run from map 4 that says it cleared 99 is believed for the 72 there are, through Light, Wind and Water - the last crown taken: %d" % fg(3, 72),
-      body.get("cleared") == 72 and body.get("gold") == fg(3, 72) and body.get("progress") == 75
+# all seven kingdoms from map 4 are past the day's allowance: with no cap, all of it
+os.environ["ELUSION_MINIGAME_GOLD_DAY"] = "0"
+body = crown_finish(cara, crown_runs[1], 3, 190).get_json() or {}
+os.environ.pop("ELUSION_MINIGAME_GOLD_DAY", None)
+check("a run from map 4 that says it cleared 190 is believed for the 172 there are, through all seven kingdoms - the seventh crown taken: %d" % fg(3, 172),
+      body.get("cleared") == 172 and body.get("gold") == fg(3, 172) and body.get("progress") == 175
       and raw("SELECT boss, goal FROM minigame_runs WHERE id = ?", (crown_runs[1],))[0] == (1, 1), body)
 raw("UPDATE minigame_runs SET started_at = started_at - 50 WHERE id = ?", (crown_runs[2],))
 body = crown_finish(cara, crown_runs[2], 0, 5).get_json() or {}
-check("  a run that says five maps 50 seconds after its Go is believed for one; how far you got never goes back",
-      body.get("cleared") == 1 and body.get("gold") == 250 and body.get("progress") == 75
-      and crown_row(cara).get("progress") == 75, body)
+check("  a run that says five maps 50 seconds after its Go is believed for one (its 250 held back: the run before filled the"
+      " day); how far you got never goes back",
+      body.get("cleared") == 1 and body.get("gold", 0) + body.get("held_back", 0) == 250 and body.get("progress") == 175
+      and crown_row(cara).get("progress") == 175, body)
 dee = register("mgdee")
 assert client.put("/api/save", headers=dee, json={"slot": 0, "class_id": "mage", "name": "mage"}).status_code in (200, 201)
 dee_run = (crown_go(dee).get_json() or {}).get("run", 0)

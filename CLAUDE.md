@@ -2196,8 +2196,24 @@ screen from town like Cut the Cloth (the game's crownfall/; its CLAUDE.md,
   **The Kingdom of Water (game 0.164.0)** is maps 51-75, a quarter more
   again: each map the Light gold times 1.5625 to the nearest 5, the bosses
   `CROWNFALL_WATER_BOSS_GOLD` (1,550, 1,900, 2,350, 2,800 and the
-  Leviathan's crown 6,250), 28,060 in all.
-  Progress runs on from Light into Wind and Water. Go hands the game
+  Leviathan's crown 6,250), 28,060 in all. **The Kingdom of Ice (game
+  0.165.0)** is maps 76-100, a quarter more again: each map the Light gold
+  times 1.953125 to the nearest 5, the bosses `CROWNFALL_ICE_BOSS_GOLD`
+  (1,950, 2,350, 2,950, 3,500 and the Glacier Lord's crown 7,800), 35,060 in
+  all - a run from the first is past the day's allowance now, which holds it.
+  **The Kingdom of Earth (the same game 0.165.0)** is maps 101-125, a
+  quarter more again: each map the Light gold times 2.44140625 to the nearest
+  5, the bosses `CROWNFALL_EARTH_BOSS_GOLD` (2,450, 2,950, 3,700, 4,400 and
+  the Mountain Lord's crown 9,750), 43,885 in all. **The Kingdom of Fire
+  (the same game 0.165.0)** is maps 126-150, a quarter more again: each map
+  the Light gold times 3.0517578125 to the nearest 5, the bosses
+  `CROWNFALL_FIRE_BOSS_GOLD` (3,050, 3,700, 4,600, 5,500 and the Inferno's
+  crown 12,200), 54,840 in all. **The Kingdom of Dark (the same game
+  0.165.0)**, the last, is maps 151-175, a quarter more again: each map the
+  Light gold times 3.814697265625 to the nearest 5, the bosses
+  `CROWNFALL_DARK_BOSS_GOLD` (3,800, 4,600, 5,750, 6,900 and the Crowned
+  Beholder's seventh crown 15,250), 68,540 in all.
+  Progress runs on from Light through all seven kingdoms. Go hands the game
   `crownfall_pays()`.
 - **Finish** (`finish_crownfall()`): `from` (the map it began on, from 0)
   and `cleared`. A start past the next map to clear is 400
@@ -2206,11 +2222,11 @@ screen from town like Cut the Cloth (the game's crownfall/; its CLAUDE.md,
   `from` (`crownfall_believed()`); gold through the day's allowance and
   `gold_delta()` ("crownfall run N: K maps from map M"); `progress` moved
   to `from + believed`. A crown taken (the last map reached) is the run's
-  boss and goal (the 75th since Water; the earlier crowns are no longer
+  boss and goal (the 175th since Dark, the seventh crown; the earlier crowns are no longer
   the last). A run left past `CROWNFALL_RUN_KEPT_SECONDS` (8 h, not a Healer's
   Run's 3: a kingdom takes a strong player hours) pays nothing.
 - THE HONEST LIMIT: a modified game could claim every map from its start -
-  68,485 a run from the first - no faster than 40 s a map, three runs a day,
+  270,810 a run from the first - no faster than 40 s a map, three runs a day,
   inside the day's allowance.
 - test_minigames.py MG-17 (a sabotage caught: the start guard taken out).
   test_packages.py's bare-app list names it.

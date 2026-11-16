@@ -238,9 +238,9 @@ def cloth_pays():
 #
 # THE HONEST LIMIT: a modified game could say it cleared every map from its
 # start. It cannot say so faster than CROWNFALL_MIN_MAP_SECONDS a map, start
-# past the next map to clear, or be paid more than the maps there are (68,485
-# from the first, Light's, Wind's and Water's) - three runs a day, inside the
-# day's allowance.
+# past the next map to clear, or be paid more than the maps there are (270,810
+# from the first, all seven kingdoms') - and never past the day's allowance,
+# which is the tighter bound now.
 #
 # A new kingdom's maps go on the end of the table, in the game's order
 # (crownfallmaps.gd MAPS): the game counts the gold on screen from this table
@@ -260,9 +260,33 @@ CROWNFALL_WIND_BOSS_GOLD = {5: 1250, 10: 1500, 15: 1900, 20: 2250, 25: 5000}
 # 1,550, the Undine 1,900, the Harpooner 2,350, the Tide Mage 2,800 and the
 # Leviathan's crown 6,250 - 28,060 for its 25.
 CROWNFALL_WATER_BOSS_GOLD = {5: 1550, 10: 1900, 15: 2350, 20: 2800, 25: 6250}
+# THE KINGDOM OF ICE (game 0.165.0) a quarter more again: each map the Light
+# gold times 1.953125 to the nearest 5, its bosses the Frost King 1,950, the
+# Snow Sprite 2,350, the Ice Sniper 2,950, the Frost Mage 3,500 and the
+# Glacier Lord's crown 7,800 - 35,060 for its 25.
+CROWNFALL_ICE_BOSS_GOLD = {5: 1950, 10: 2350, 15: 2950, 20: 3500, 25: 7800}
+# THE KINGDOM OF EARTH (the same game 0.165.0) a quarter more again: each map
+# the Light gold times 2.44140625 to the nearest 5, its bosses the Stone King
+# 2,450, the Dust Sprite 2,950, the Rock Sniper 3,700, the Earth Mage 4,400 and
+# the Mountain Lord's crown 9,750 - 43,885 for its 25.
+CROWNFALL_EARTH_BOSS_GOLD = {5: 2450, 10: 2950, 15: 3700, 20: 4400, 25: 9750}
+# THE KINGDOM OF FIRE (the same game 0.165.0) a quarter more again: each map
+# the Light gold times 3.0517578125 to the nearest 5, its bosses the Fire King
+# 3,050, the Flame Sprite 3,700, the Fire Sniper 4,600, the Fire Mage 5,500 and
+# the Inferno's crown 12,200 - 54,840 for its 25.
+CROWNFALL_FIRE_BOSS_GOLD = {5: 3050, 10: 3700, 15: 4600, 20: 5500, 25: 12200}
+# THE KINGDOM OF DARK (the same game 0.165.0), the last, a quarter more again:
+# each map the Light gold times 3.814697265625 to the nearest 5, its bosses the
+# Shadow King 3,800, the Wisp 4,600, the Shade Sniper 5,750, the Void Mage
+# 6,900 and the Crowned Beholder's seventh crown 15,250 - 68,540 for its 25.
+CROWNFALL_DARK_BOSS_GOLD = {5: 3800, 10: 4600, 15: 5750, 20: 6900, 25: 15250}
 CROWNFALL_MAP_GOLD = tuple(CROWNFALL_BOSS_GOLD.get(n, 250 + 15 * (n - 1)) for n in range(1, 26)) + tuple(
     CROWNFALL_WIND_BOSS_GOLD.get(n, 5 * int((250 + 15 * (n - 1)) * 1.25 / 5 + 0.5)) for n in range(1, 26)) + tuple(
-    CROWNFALL_WATER_BOSS_GOLD.get(n, 5 * int((250 + 15 * (n - 1)) * 1.5625 / 5 + 0.5)) for n in range(1, 26))
+    CROWNFALL_WATER_BOSS_GOLD.get(n, 5 * int((250 + 15 * (n - 1)) * 1.5625 / 5 + 0.5)) for n in range(1, 26)) + tuple(
+    CROWNFALL_ICE_BOSS_GOLD.get(n, 5 * int((250 + 15 * (n - 1)) * 1.953125 / 5 + 0.5)) for n in range(1, 26)) + tuple(
+    CROWNFALL_EARTH_BOSS_GOLD.get(n, 5 * int((250 + 15 * (n - 1)) * 2.44140625 / 5 + 0.5)) for n in range(1, 26)) + tuple(
+    CROWNFALL_FIRE_BOSS_GOLD.get(n, 5 * int((250 + 15 * (n - 1)) * 3.0517578125 / 5 + 0.5)) for n in range(1, 26)) + tuple(
+    CROWNFALL_DARK_BOSS_GOLD.get(n, 5 * int((250 + 15 * (n - 1)) * 3.814697265625 / 5 + 0.5)) for n in range(1, 26))
 CROWNFALL_MIN_MAP_SECONDS = 40
 # A Crownfall run not finished in this long pays nothing (closed without
 # Leave). Longer than a Healer's Run's: a kingdom of maps takes a strong
@@ -487,13 +511,13 @@ def best_believed(seconds_said, since_go):
 # minigame is played on the player's machine and the server believes its
 # result as far as the time since its Go allows (SECURITY_NOTES E-22): a
 # modified game could claim the best run every time - 20,000 a Healer's Run,
-# 24,250 a Cut the Cloth and 68,485 a Crownfall (0.164.0), three of each a
+# 24,250 a Cut the Cloth and 270,810 a Crownfall (0.165.0), three of each a
 # day, and every coin the Endless's and the Forge's chests could roll. So
 # one allowance an account across all of them, in any 24 hours: the gold
 # paid at Leave and the coins rolled into a chest, counted together. A run
 # past it is paid what is left; a chest past it rolls its gear and no coins.
 # A good honest day is well under it; a perfect day at the three gold games
-# is 338,205 before any chest.
+# is 945,180 before any chest.
 #
 # ELUSION_MINIGAME_GOLD_DAY sets it on a server (envfile.KNOWN): a whole
 # number, 0 for no cap. Unset or not a number is GOLD_A_DAY - a typo never
