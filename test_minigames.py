@@ -41,6 +41,9 @@ own loot - no XP, the owner's "Loot only" - into the character's chest
         the second boss; each
         boss believed only with its tier's waves and the time; a game that
         sends `boss` is paid as before (1000 at most).
+  MG-18 THE BEHOLDER'S TABLE (game 0.168.0): three games a day, a gold every
+        2,000 points up to 3,000 a game, held to the time since the Go, paid
+        once; the account's best score kept.
 """
 import importlib.util, math, os, sqlite3, sys, time
 
@@ -808,6 +811,89 @@ check("  a run four hours long still pays (515); one left past %d hours pays not
       long_play == 515 and services.CROWNFALL_RUN_KEPT_SECONDS > services.HEALER_RUN_KEPT_SECONDS
       and (crown_finish(dee, dee_late, 0, 2).get_json() or {}).get("gold") == 0, long_play)
 check("the owner runs it as often as they like", all(crown_go(owner).status_code in (200, 404) for _ in range(4)))
+
+section("MG-18 THE BEHOLDER'S TABLE (game 0.168.0): THREE GAMES A DAY, GOLD FROM THE SCORE, THE BEST KEPT")
+pg = services.pinball_gold
+check("the gold: one for every %d points, at most %d a game"
+      % (services.PINBALL_POINTS_PER_GOLD, services.PINBALL_GAME_MOST),
+      pg(0) == 0 and pg(1999) == 0 and pg(2000) == 1 and pg(1234567) == 617 and pg(6000000) == 3000
+      and pg(10 ** 9) == 3000 and pg(-5) == 0
+      and services.pinball_pays() == {"points_per_gold": 2000, "most": 3000})
+pb = services.pinball_believed
+check("  a score believed only as far as the time since the Go allows (%d points a second)"
+      % services.PINBALL_MOST_PER_SECOND,
+      pb(100, 0) == 0 and pb(5000000, 60) == 5000000 and pb(10 ** 9, 2) == 2 * services.PINBALL_MOST_PER_SECOND
+      and pb(-3, 50) == 0 and pb(7, -10) == 0)
+fay = register("mgpia")
+assert client.put("/api/save", headers=fay, json={"slot": 0, "class_id": "healer", "name": "healer"}).status_code in (200, 201)
+def pin_row(headers):
+    games = (client.get("/api/minigames", headers=headers).get_json() or {}).get("games", [])
+    return next((g for g in games if g.get("id") == "pinball"), {})
+def pin_go(headers, slot=0):
+    return client.post("/api/minigames/enter", headers=headers, json={"game": "pinball", "slot": slot})
+def pin_finish(headers, run_id, score):
+    return client.post("/api/minigames/finish", headers=headers, json={"run": run_id, "score": score})
+row = pin_row(fay)
+check("the Beholder's Table is listed: three games a day, all three left, no best yet",
+      row.get("name") == "The Beholder's Table" and row.get("plays") == 3 and row.get("plays_left") == 3
+      and row.get("ready_in") == 0 and row.get("best_score") == 0 and "best" not in row and "progress" not in row, row)
+pin_runs = []
+for n in range(3):
+    res = pin_go(fay)
+    body = res.get_json() or {}
+    pin_runs.append(body.get("run"))
+    check("  Go %d is let in with a run of its own, the gold's table and the best, %d left" % (n + 1, 2 - n),
+          res.status_code == 200 and isinstance(body.get("run"), int) and body.get("plays_left") == 2 - n
+          and body.get("pays") == {"points_per_gold": 2000, "most": 3000} and body.get("best_score") == 0,
+          (res.status_code, body))
+check("  the fourth inside the day is refused (409)", pin_go(fay).status_code == 409)
+fay_purse = lambda: raw("SELECT gold FROM saves WHERE user_id = ? AND slot = 0", (uid("mgpia"),))[0][0]
+before = fay_purse()
+raw("UPDATE minigame_runs SET started_at = started_at - 300 WHERE id = ?", (pin_runs[0],))
+res = pin_finish(fay, pin_runs[0], 1234567)
+body = res.get_json() or {}
+check("Game Over on 1,234,567 after five minutes pays 617 gold, in the ledger as minigame, and is the best",
+      res.status_code == 200 and body.get("gold") == 617 and body.get("score") == 1234567 and body.get("best") == 1234567
+      and body.get("new_best") is True and fay_purse() == before + 617 and body.get("status", {}).get("gold") == fay_purse()
+      and raw("SELECT reason, delta, detail FROM gold_ledger WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+              (uid("mgpia"),))[0] == ("minigame", 617, "pinball run %d: 1,234,567 points" % pin_runs[0])
+      and pin_row(fay).get("best_score") == 1234567, (res.status_code, body))
+check("  once: a second finish for the same game is refused (409)",
+      pin_finish(fay, pin_runs[0], 1234567).status_code == 409 and fay_purse() == before + 617)
+raw("UPDATE minigame_runs SET started_at = started_at - 600 WHERE id = ?", (pin_runs[1],))
+body = pin_finish(fay, pin_runs[1], 500000).get_json() or {}
+check("  a lower score pays its own (250) and leaves the best as it was",
+      body.get("gold") == 250 and body.get("best") == 1234567 and body.get("new_best") is False
+      and pin_row(fay).get("best_score") == 1234567, body)
+raw("UPDATE minigame_runs SET started_at = started_at - 4 WHERE id = ?", (pin_runs[2],))
+os.environ["ELUSION_MINIGAME_GOLD_DAY"] = "0"
+body = pin_finish(fay, pin_runs[2], 900000000).get_json() or {}
+os.environ.pop("ELUSION_MINIGAME_GOLD_DAY", None)
+said = body.get("score", 0)
+check("a game that says 900,000,000 a few seconds after its Go is believed only for what the time allows, and pays"
+      " at most %d" % services.PINBALL_GAME_MOST,
+      4 * services.PINBALL_MOST_PER_SECOND <= said <= 6 * services.PINBALL_MOST_PER_SECOND
+      and body.get("gold") == pg(said) and body.get("best") == said, body)
+gus = register("mgpete")
+assert client.put("/api/save", headers=gus, json={"slot": 0, "class_id": "mage", "name": "mage"}).status_code in (200, 201)
+gus_run = (pin_go(gus).get_json() or {}).get("run", 0)
+check("refused: no score, or not a whole number, or below nought (400); somebody else's game (404); a Crownfall body (400)",
+      client.post("/api/minigames/finish", headers=gus, json={"run": gus_run}).status_code == 400
+      and pin_finish(gus, gus_run, True).status_code == 400 and pin_finish(gus, gus_run, -1).status_code == 400
+      and pin_finish(gus, gus_run, 12.5).status_code == 400 and pin_finish(fay, gus_run, 10).status_code == 404
+      and client.post("/api/minigames/finish", headers=gus, json={"run": gus_run, "from": 0, "cleared": 1}).status_code == 400)
+check("  the best is the account's: another account has none",
+      pin_row(gus).get("best_score") == 0)
+check("  /best keeps no score - only a timed minigame's time",
+      client.post("/api/minigames/best", headers=gus, json={"game": "pinball", "seconds": 5}).status_code == 400
+      and pin_row(gus).get("best_score") == 0)
+gus_late = (pin_go(gus).get_json() or {}).get("run", 0)
+raw("UPDATE minigame_runs SET started_at = started_at - ? WHERE id = ?", (services.PINBALL_RUN_KEPT_SECONDS + 10, gus_late))
+late = pin_finish(gus, gus_late, 40000).get_json() or {}
+check("  a game left past %d hours pays nothing, though its score is kept"
+      % (services.PINBALL_RUN_KEPT_SECONDS // 3600),
+      late.get("gold") == 0 and late.get("best") == 40000, late)
+check("the owner plays it as often as they like", all(pin_go(owner).status_code in (200, 404) for _ in range(4)))
 
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))

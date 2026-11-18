@@ -102,6 +102,9 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
             # cleared in order).
             if game.get("progress"):
                 row["progress"] = bests.get(game_id, 0)
+            # The best score (game 0.168.0, the Beholder's Table's).
+            if game.get("score"):
+                row["best_score"] = bests.get(game_id, 0)
             games.append(row)
         return {"games": games, "skips_wait": skip}
 
@@ -119,7 +122,7 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
             description: "Bearer <token>"
         responses:
           200:
-            description: "games: id, name, wait_seconds, entered_at (0 never), ready_in (0 now), a timed one's best (seconds), and Crownfall's progress (maps cleared in order); skips_wait"
+            description: "games: id, name, wait_seconds, entered_at (0 never), ready_in (0 now), a timed one's best (seconds), Crownfall's progress (maps cleared in order) and the Beholder's Table's best_score; skips_wait"
           401:
             description: Not logged in
         """
@@ -144,7 +147,7 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
               type: object
               required: [game]
               properties:
-                game: {type: string, description: "a minigame's id: endless, healerrun, forge, cloth, crownfall"}
+                game: {type: string, description: "a minigame's id: endless, healerrun, forge, cloth, crownfall, pinball"}
         responses:
           200:
             description: "in: game, entered_at, ready_in (the next wait)"
@@ -204,11 +207,13 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
                   "pays": services.pays_for(game_id)}
         if game.get("progress"):
             answer["progress"] = data.bests_of(db, g.user["id"]).get(game_id, 0)
+        if game.get("score"):
+            answer["best_score"] = data.bests_of(db, g.user["id"]).get(game_id, 0)
         return answer, 200
 
     def minigames_finish():
         """
-        The end of a Healer's Run, a Cut the Cloth or a Crownfall run - how far it got - and its gold, paid once into the character's purse
+        The end of a Healer's Run, a Cut the Cloth, a Crownfall run or a game on the Beholder's Table - how far it got - and its gold, paid once into the character's purse
         ---
         tags:
           - Minigames
@@ -230,12 +235,13 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
                 rounds: {type: integer, description: "Cut the Cloth (game 0.131.0): rounds cleared"}
                 from:  {type: integer, description: "Crownfall (game 0.162.0): the map the run started on, from 0"}
                 cleared: {type: integer, description: "Crownfall: maps cleared from it"}
+                score: {type: integer, description: "the Beholder's Table (game 0.168.0): the game's score"}
                 bosses: {type: integer, description: "bosses beaten, 0-3 (game 0.100.0's tiers)"}
                 boss:  {type: boolean, description: "before game 0.100.0: the gate's boss beaten"}
                 goal:  {type: boolean, description: "the goal marker reached"}
         responses:
           200:
-            description: "gold paid, the waves, boss and goal believed (Cut the Cloth: the rounds believed; Crownfall: the maps believed and progress), and the purse after (gold)"
+            description: "gold paid, the waves, boss and goal believed (Cut the Cloth: the rounds believed; Crownfall: the maps believed and progress; the Beholder's Table: the score believed, best and new_best), and the purse after (gold)"
           400:
             description: "a bad body"
           404:
@@ -260,6 +266,8 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
             return finish_cloth(db, run, payload, now)
         if str(run["game"]) == "crownfall":
             return finish_crownfall(db, run, payload, now)
+        if str(run["game"]) == "pinball":
+            return finish_pinball(db, run, payload, now)
         waves = payload.get("waves")
         if isinstance(waves, bool) or not isinstance(waves, int) or waves < 0:
             return bad_request("run and waves must be whole numbers")
@@ -368,6 +376,35 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
         db.commit()
         return {"ok": True, "gold": gold, "cleared": believed, "progress": progress, "held_back": held,
                 "status": {"gold": int(purse)} if purse is not None else {}}, 200
+
+    def finish_pinball(db, run, payload, now):
+        """A game on the Beholder's Table's end (game 0.168.0): its score, held
+        to the time since its Go; its gold paid - once - and the account's
+        best score kept."""
+        score = payload.get("score")
+        if isinstance(score, bool) or not isinstance(score, int) or score < 0:
+            return bad_request("score must be a whole number")
+        if int(run["finished_at"]) != 0:
+            return {"error": "Conflict", "message": "That run is already finished."}, 409
+        seconds = now - int(run["started_at"])
+        believed = services.pinball_believed(score, seconds)
+        gold = services.pinball_gold(believed)
+        if seconds > services.PINBALL_RUN_KEPT_SECONDS:
+            gold = 0
+        gold, held = services.gold_allowed(gold, day_paid(db, now), cap_now())
+        if not data.finish_run(db, int(run["id"]), g.user["id"], now, 0, 0, False, gold):
+            return {"error": "Conflict", "message": "That run is already finished."}, 409
+        best, new_best = data.keep_best(db, g.user["id"], "pinball", believed, now)
+        purse = None
+        if gold > 0 and gold_delta is not None:
+            purse = gold_delta(db, g.user["id"], int(run["slot"]), gold, "minigame",
+                               "pinball run %d: %s points%s" % (int(run["id"]), "{:,}".format(believed),
+                                                                 held_words(held)))
+            if purse is None:
+                gold = 0
+        db.commit()
+        return {"ok": True, "gold": gold, "score": believed, "best": best, "new_best": new_best,
+                "held_back": held, "status": {"gold": int(purse)} if purse is not None else {}}, 200
 
     def minigames_kill():
         """

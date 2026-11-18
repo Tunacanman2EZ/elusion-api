@@ -2231,6 +2231,37 @@ screen from town like Cut the Cloth (the game's crownfall/; its CLAUDE.md,
 - test_minigames.py MG-17 (a sabotage caught: the start guard taken out).
   test_packages.py's bare-app list names it.
 
+## The Beholder's Table (game 0.168.0)
+
+The owner's pinball table in three floors, played over the screen from
+town (the game's pinball/; its CLAUDE.md, "The Beholder's Table"). The
+owner, 17 Nov: three games a day, gold from the score. minigames/ THE
+BEHOLDER'S TABLE'S GOLD; MG-18 in test_minigames.py.
+
+- `GAMES["pinball"]`: three games a day (`plays`), and `score` - the
+  account's best score, kept in minigame_bests under "pinball" (its
+  `seconds` column holds points here; `keep_best()`, so it only grows).
+  The listing and Go's answer carry it as `best_score`;
+  `/api/minigames/best` keeps none (only a `times` game's time).
+- **Go** (`{"game": "pinball", "slot": n}`) answers the run and `pays`:
+  `pinball_pays()`, `{"points_per_gold": 2000, "most": 3000}` - the game
+  counts the gold on screen from it.
+- **POST /api/minigames/finish `{"run": id, "score": n}`** at Game Over or
+  Leave (`finish_pinball()`): the score believed only as far as
+  PINBALL_MOST_PER_SECOND (1,500,000) a second since the Go allows
+  (`pinball_believed()`), a gold for every PINBALL_POINTS_PER_GOLD (2,000)
+  points up to PINBALL_GAME_MOST (3,000) a game (`pinball_gold()`), held to
+  the day's allowance, paid once as "minigame" ("pinball run N: S
+  points"). A game older than PINBALL_RUN_KEPT_SECONDS (3 hours) pays
+  nothing; its score is still kept. The answer: `gold`, `score` (believed),
+  `best`, `new_best`, `held_back`, `status`.
+- **The honest limit**: a modified game can say any score, but no more
+  than 1,500,000 a second since its Go (the table's own bot, which aims
+  every shot, made at most 1,141,820 a second over 60 ten-minute games), at
+  most 3,000 gold a game, three games a day - and the day's allowance holds
+  it first. The time holds the best score more than the gold: 3,000 gold is
+  6,000,000 points, four seconds' worth.
+
 ## The Forge's receipts, and the Forge together (game 0.160.0)
 
 The same for the Forge's fire sprites, which carried the stress test's mark

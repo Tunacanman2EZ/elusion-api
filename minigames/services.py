@@ -33,6 +33,12 @@ GAMES = {
     # here (`progress`: maps cleared in order, in minigame_bests), so a run
     # starts from any map up to the next one to clear.
     "crownfall": {"name": "Crownfall", "wait": DAY, "plays": 3, "progress": True},
+    # THE BEHOLDER'S TABLE (game 0.168.0, pinball/): the owner, 17 Nov - a
+    # pinball table in three floors; three games a day, gold from the score
+    # (PINBALL below), paid at Game Over or Leave by POST
+    # /api/minigames/finish, and the account's best score kept (`score`:
+    # the list's best_score, in minigame_bests).
+    "pinball": {"name": "The Beholder's Table", "wait": DAY, "plays": 3, "score": True},
 }
 
 
@@ -323,10 +329,49 @@ def crownfall_pays():
     return {"maps": list(CROWNFALL_MAP_GOLD), "most": crownfall_gold(0, crownfall_maps())}
 
 
+# =============================================================================
+# THE BEHOLDER'S TABLE'S GOLD (game 0.168.0)
+# =============================================================================
+# The owner, 17 Nov: three games a day, a gold for every PINBALL_POINTS_PER_GOLD
+# points, at most PINBALL_GAME_MOST a game. The game counts the gold on screen
+# from pinball_pays() (handed it at Go) and says its score at Game Over or
+# Leave; the server pays from that - held to what the time since the Go
+# allows - once a game, in the ledger as "minigame", and keeps the best.
+#
+# THE HONEST LIMIT: a modified game could say any score. It cannot say more
+# than PINBALL_MOST_PER_SECOND for every second since its Go - above the
+# table's own bot (it aims every shot) at its fastest over 60 games of ten
+# minutes (the game's zz/pinstall.gd: 1,141,820 points a second, from the
+# Go) - nor be paid more than PINBALL_GAME_MOST a game, three games a day,
+# and never past the day's allowance, which is the tighter bound.
+PINBALL_POINTS_PER_GOLD = 2000
+PINBALL_GAME_MOST = 3000
+PINBALL_MOST_PER_SECOND = 1500000
+# A game not finished in this long pays nothing (closed without Leave).
+PINBALL_RUN_KEPT_SECONDS = 3 * 60 * 60
+
+
+def pinball_believed(score, seconds):
+    """A game's score as said, held to what `seconds` since its Go allow."""
+    return max(0, min(int(score), max(0, int(seconds)) * PINBALL_MOST_PER_SECOND))
+
+
+def pinball_gold(score):
+    """The gold for a game that scored `score`."""
+    return min(PINBALL_GAME_MOST, max(0, int(score)) // PINBALL_POINTS_PER_GOLD)
+
+
+def pinball_pays():
+    """What the game counts gold by on screen (handed it at Go)."""
+    return {"points_per_gold": PINBALL_POINTS_PER_GOLD, "most": PINBALL_GAME_MOST}
+
+
 def pays_for(game_id):
     """What a run of `game_id` is handed at Go: its own table."""
     if game_id == "crownfall":
         return crownfall_pays()
+    if game_id == "pinball":
+        return pinball_pays()
     return cloth_pays() if game_id == "cloth" else healer_pays()
 
 
