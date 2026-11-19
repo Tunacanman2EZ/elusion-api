@@ -1,11 +1,32 @@
 # How Elusion is built
 
-13 Nov 2026, game 0.156.0. The owner: "security and architecture need a
-full update". This replaces the 16 Oct page, which was the plan for taking
-app.py apart - that plan is done (19 Oct), and since then the server grew a
-second process, rooms per party, its own books on every monster, a guard on
-the month's data, Google sign-in and a gate for old games. This is the
-whole system as it stands, measured where it can be.
+Elusion is an online action RPG I build alone: a Godot 4.7 game, a Flask
+API and a live WebSocket server. Everything behind it runs on **one
+droplet: 1 vCPU, 1 GB of memory, $6 a month.**
+
+- **256 players fighting in one area** took about a quarter of a core for
+  the live server and a quarter for the API (`swarm.py`, on one container
+  core - "Limits, measured" below).
+- **The core is not the limit; the network and the bill are.** What goes
+  out grows with the square of a crowd in one place, so each game is sent
+  only the players near it, and a data guard holds the month under the
+  plan's 1,000 GiB.
+- **The game is assumed hostile.** The server owns level, XP, gold (a
+  double-entry ledger) and every loot roll. A kill pays what the server
+  decides it was worth - and with the receipts on, only for a death the
+  server's own books saw.
+- **Two processes that share only the database** - the API (about 175
+  routes in 39 packages) and presence.py - so either can move to a machine
+  of its own.
+- **Checked, not hoped:** 77 test suites, a lock on every route, a fixture
+  for the schema, a nightly backup and a restore drill.
+
+**How I work:** solo - the design, the server, the trade-offs and the
+measuring are mine. I use AI tools as coding partners: Claude, Google's
+and my school's. Every number on this page was measured, and the tool
+that measured it is named beside it.
+
+The whole system as it stands, 18 Nov 2026 (game 0.168.7).
 
 Where the rest lives: **DEPLOY.md** runs it (the machine, the settings, the
 updates, the backups), **SECURITY.md** says what it trusts and why,
@@ -36,22 +57,47 @@ domain stays on Netlify.
 
 ## How they talk
 
-```
-  the game (PC / phone / browser)
-     |                         |
-     | HTTPS, JSON             | WSS, JSON text frames
-     v                         v
-  Caddy :443  -- /api/* -->  gunicorn: 2 workers x 4 threads --> app.py + packages
-     |                                                              |    ^
-     +------- /ws/* ------>  presence.py (one asyncio loop)         |    |
-                                |   reads tickets, writes books,    v    |
-                                +-- health, samples -------------> SQLite (WAL)
+```mermaid
+flowchart LR
+    subgraph players["Players"]
+        direction TB
+        pc["Windows build<br>Godot 4.7, Mobile renderer"]
+        web["Browser build, PC or phone<br>WebGL 2, Compatibility renderer"]
+        site["elusionrpg.com<br>static site, Netlify"]
+    end
+    subgraph box["elusion-1: one droplet, 1 vCPU, 1 GB, $6 a month"]
+        caddy["Caddy, port 443<br>TLS, compression, routing"]
+        files["browser build files<br>play.elusionrpg.com"]
+        api["API: Flask under gunicorn<br>2 workers x 4 threads<br>app.py + 39 packages<br>about 175 routes"]
+        presence["presence.py<br>one asyncio loop<br>every WebSocket"]
+        db[("SQLite, WAL<br>one file")]
+        watch["watchers<br>nightly backup, restore drill,<br>killwatch, canary, security bot"]
+    end
+    subgraph outside["Outside services"]
+        direction TB
+        google["Google sign-in"]
+        turn["Cloudflare TURN<br>voice relay"]
+        smtp["mail provider<br>recovery codes"]
+    end
 
-  play.elusionrpg.com: Caddy serves the build's files, and /api and /ws on
-  the same origin - a browser game then needs no cross-site rules.
-  elusionrpg.com: Netlify, static; it never talks to the droplet but to say
-  "Play".
+    pc -->|"HTTPS + WSS"| caddy
+    web -->|"HTTPS + WSS"| caddy
+    site -.->|"Play"| web
+    caddy --> files
+    caddy -->|"/api/*"| api
+    caddy -->|"/ws/*"| presence
+    api <--> db
+    presence <-->|"tickets in,<br>books and health out"| db
+    watch -->|"read"| db
+    api -->|"checks the token"| google
+    api -->|"short-lived credentials"| turn
+    api --> smtp
 ```
+
+play.elusionrpg.com: Caddy serves the build's files, and /api and /ws on
+the same origin - a browser game then needs no cross-site rules.
+elusionrpg.com: Netlify, static; it never talks to the droplet but to say
+"Play".
 
 **Signing in.** The game posts a password (or finishes a Google sign-in)
 to `/api/auth/*` and gets a session token, which every later request
@@ -75,6 +121,33 @@ minutes and the game renews it every minute; every five seconds the server
 drops any connection whose ticket ran out or whose login no longer exists,
 so a ban or a logout reaches the socket within seconds without the API
 knowing presence.py exists.
+
+```mermaid
+sequenceDiagram
+    participant G as The game
+    participant A as API (Flask)
+    participant D as SQLite
+    participant P as presence.py
+    G->>A: sign in (a password, or Google)
+    A->>D: the session token, as a row
+    A-->>G: token, sent with every request after
+    G->>A: POST /api/presence/ticket
+    A->>D: a ticket row that lives 2 minutes
+    A-->>G: ticket
+    G->>P: open wss /ws/presence, hello with the ticket
+    P->>D: read the ticket row
+    loop every 0.1 s, the tick
+        P-->>G: the steps and attacks of the players near you
+    end
+    loop every 10 s
+        G->>A: /api/server/broadcasts, the heartbeat and the news
+    end
+    loop every minute
+        G->>A: renew the ticket
+    end
+    Note over A,P: every 5 s presence drops a socket whose ticket ran out<br>or whose login is gone: a ban reaches it within seconds
+    Note over A,P: the API and presence.py share only the database
+```
 
 **The two processes share only the database.** gunicorn's workers share no
 memory with each other or with presence.py. What the API needs to know of
@@ -105,6 +178,37 @@ Whatever a player could gain by lying about is the server's.
 | Where a player stands, what they swing | relayed by presence.py, never stored but for the 15-second sample |
 | The monsters of a shared area | run by one game, the area's leader (below); the server keeps books but does not simulate them |
 | The Endless's swarm of thousands | each game's own arrays, made the same from a seed; worth nothing to the server |
+
+**A kill in a shared room, end to end** - the games run the fight; the
+server keeps the books and decides the pay (kill/'s `__init__.py` has the
+whole story):
+
+```mermaid
+sequenceDiagram
+    participant Y as Your game
+    participant L as The leader's game
+    participant P as presence.py<br>and its books
+    participant A as API<br>POST /api/combat/kill
+    participant D as SQLite
+    Note over Y,P: the game in the room longest leads: it runs the monsters
+    L->>P: what the monsters do
+    P-->>Y: draw them there
+    Y->>P: your hit
+    Note over P: the books hold it to<br>what your character can do
+    P-->>L: your hit
+    L->>P: the monster died
+    P->>D: the books judge the death: AGREED, SHORT or NOT DUE
+    Y->>A: this monster died (which one, and nothing else)
+    alt receipts on, and no unpaid AGREED death for you and that monster
+        A-->>Y: 202, not yet: ask again (SHORT and NOT DUE never pay)
+    else faster than the rate allows, or more than could have respawned
+        A-->>Y: 429, not now
+    else paid
+        A->>D: one transaction: XP, level and the kill's record
+        A->>D: loot rolled with SystemRandom into a bag row
+        A-->>Y: the bag, which the game only draws
+    end
+```
 
 ## Inside the API
 
@@ -252,6 +356,29 @@ the samples, the health rows and the books, each on its own clock.
   connections, the biggest crowds, late ticks, bytes sent, the machine's
   network out, its share of the core, memory - for the GM panel's Health
   tab.
+
+**The data guard's levels** - the bill comes before the core:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "Full: everyone near you, every step" as full
+    state "Half: other players' steps at half rate" as half
+    state "Crowd: at most 16 see each other in an area" as crowd
+    state "Alone: everyone alone, each game runs its own monsters" as alone
+    [*] --> full
+    full --> half: over what the month can afford
+    half --> crowd: still over
+    crowd --> alone: still over
+    alone --> crowd: the month allows
+    crowd --> half: the month allows
+    half --> full: the month allows
+    note right of alone
+        Checked every minute:
+        this month's data so far,
+        against the plan's 1,000 GiB
+    end note
+```
 
 ## Inside the game
 
