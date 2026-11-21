@@ -10,7 +10,10 @@
     POST /api/minigames/finish  a Healer's Run's end (0.99.0): its gold, by
                                 how far it got, into the character's purse
     POST /api/minigames/best    a Forge run's time (0.120.0), kept when it is
-                                your best; the list carries it
+                                your best; the list carries it. The Endless's
+                                too (0.169.0)
+    GET  /api/minigames/top     every minigame's top ten, how many play it,
+                                and where you are (0.169.0)
 
 THE FORGE (0.120.0): the owner, "Rewards + daily wait" - once a day as the
 Endless, every fire sprite slain paying its own loot into the character's

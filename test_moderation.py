@@ -407,9 +407,26 @@ check("exactly at the ceiling is fine",
 section("M-4 the record on the list")
 # =============================================================================
 
+ROWDY_BEFORE = {"Authorization": "Bearer " + client.post(
+    "/api/auth/login", json={"username": "rowdy", "password": "password123"}).get_json()["token"]}
 client.post("/api/staff/kick", headers=MOD, json={"username": "rowdy", "reason": "cool off"})
+kicked = client.get("/api/auth/session", headers=ROWDY_BEFORE)
+check("a kicked game's next request says staff signed it out (game 0.169.0), not just \"signed out\"",
+      kicked.status_code == 401 and (kicked.get_json() or {}).get("kicked") is True
+      and (kicked.get_json() or {}).get("message") == app_module.KICKED_MESSAGE, kicked.get_json())
+ROWDY_BEFORE = {"Authorization": "Bearer " + client.post(
+    "/api/auth/login", json={"username": "rowdy", "password": "password123"}).get_json()["token"]}
 client.post("/api/staff/ban", headers=MOD, json={"username": "rowdy", "reason": "again", "days": 1})
+banned_told = client.get("/api/auth/session", headers=ROWDY_BEFORE).get_json() or {}
+check("  and a banned one's says it was a ban, for how long and why, as the sign-in's 403 does",
+      banned_told.get("banned") is True and banned_told.get("message") == app_module.BANNED_MESSAGE
+      and (banned_told.get("ban") or {}).get("permanent") is False
+      and (banned_told.get("ban") or {}).get("reason") == "again"
+      and abs(int((banned_told.get("ban") or {}).get("expires_at") or 0) - int(time.time()) - 86400) < 10, banned_told)
 client.post("/api/staff/unban", headers=MOD, json={"username": "rowdy"})
+lifted = client.get("/api/auth/session", headers=ROWDY_BEFORE).get_json() or {}
+check("  lifted since: it says staff signed it out, not that it is banned",
+      lifted.get("kicked") is True and "banned" not in lifted, lifted)
 # The kick and the ban both ended rowdy's sessions, and an unban does not hand
 # one back - log in again, like anybody lifted from a ban.
 PLAYER = {"Authorization": "Bearer " + client.post(

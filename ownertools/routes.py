@@ -82,7 +82,8 @@ def register(app, *, require_auth, require_owner, require_role, require_fresh_pa
              levelup_grant_id, log_staff_action, valid_skills, max_skill_level, stack_limit, add_to_backpack,
              bag_cells, inventory_of, mark_gift, online_window, gifts_since_key, snapshots_kept, snapshot_every,
              find_open_trade, carry_cells, owns_item, has_owner_powers, queue_teleport, teleport_spacing,
-             post_broadcast, moderation_target, note_refill, held_elsewhere=None, held_by=None):
+             post_broadcast, moderation_target, note_refill, held_elsewhere=None, held_by=None,
+             remember_ended=None):
 
     def staff_gold():
         """
@@ -924,7 +925,11 @@ def register(app, *, require_auth, require_owner, require_role, require_fresh_pa
             data.bring_pools_down(db, user_id, slot, derived, now)
 
         # THEIR GAME RELOADS - see the section header. Counted first, like a kick,
-        # because "were they playing" is the useful number.
+        # because "were they playing" is the useful number. And told why (game
+        # 0.169.0): its next request hears it was a rollback, and the game says
+        # so on screen before the sign-in (app.py _remember_ended()).
+        if remember_ended is not None:
+            remember_ended(db, user_id, "rollback")
         ended = data.end_sessions(db, user_id, now)
 
         after = character_state(db, user_id, slot)

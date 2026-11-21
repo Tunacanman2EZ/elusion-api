@@ -52,7 +52,7 @@ from .services import (MAX_MOD_BAN_DAYS, MUTE_MAX_MINUTES, REPORT_KEEP_SECONDS, 
 def register(app, *, require_auth, require_role, require_fresh_password, get_db, bad_request, parse_stat,
              moderation_target, find_user, can_act_on, role_for, role_at_least, roles, settable_roles,
              log_staff_action, can_read_row, wait_words, default_channel, reports_per_hour,
-             report_lines_per_player, mute_max_minutes_mod):
+             report_lines_per_player, mute_max_minutes_mod, remember_ended=None):
 
     def close_reports_about(db, user_id, outcome, now):
         """Close every open report about one account, as the caller. Returns
@@ -242,7 +242,10 @@ def register(app, *, require_auth, require_role, require_fresh_password, get_db,
         # IN THE SAME TRANSACTION. Crossing the name off the list does nothing
         # about the person already inside - a banned player holding a live
         # token keeps playing until it expires, which on this server is thirty
-        # days.
+        # days. And their game is told it was a ban, how long and why (game
+        # 0.169.0, app.py _remember_ended()).
+        if remember_ended is not None:
+            remember_ended(db, target["id"], "ban")
         data.end_sessions(db, target["id"])
 
         closed = close_reports_about(db, target["id"], "actioned", now)
@@ -330,6 +333,10 @@ def register(app, *, require_auth, require_role, require_fresh_password, get_db,
         # account holds no live session and the kick changed nothing.
         live = data.live_sessions(db, target["id"], int(time.time()))
 
+        # SAID TO THEIR GAME (game 0.169.0): its next request is told a staff
+        # kick ended it, and it says so on screen (app.py _remember_ended()).
+        if remember_ended is not None:
+            remember_ended(db, target["id"], "kick")
         data.end_sessions(db, target["id"])
 
         closed = close_reports_about(db, target["id"], "actioned", int(time.time()))

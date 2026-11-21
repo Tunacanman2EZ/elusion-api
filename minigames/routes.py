@@ -63,7 +63,7 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
              class_of, material_scale, store_in_chest, clear_chests, post_broadcast, mythic_text,
              mythic_kind, gold_delta=None, gold_a_day=None, money_worth=None,
              receipts_on=None, take_receipt=None, client_build=None):
-    """Add the five routes."""
+    """Add the six routes."""
 
     def cap_now():
         """The day's allowance for the caller: none for the owner and a co-owner
@@ -536,7 +536,7 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
 
     def minigames_best():
         """
-        How long a run of a timed minigame held - the Forge's - kept when it is your best
+        How long a run of a timed minigame held - the Forge's, the Endless's - kept when it is your best
         ---
         tags:
           - Minigames
@@ -553,7 +553,7 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
               type: object
               required: [game, seconds]
               properties:
-                game:    {type: string,  description: "forge"}
+                game:    {type: string,  description: "forge, or endless (game 0.169.0)"}
                 seconds: {type: integer, description: "how long the run held"}
         responses:
           200:
@@ -586,11 +586,62 @@ def register(app, *, require_auth, get_db, bad_request, skips_wait, parse_slot, 
         if not entered or now - entered >= int(game["wait"]):
             return {"error": "Conflict",
                     "message": "You have not gone into %s today." % game["name"]}, 409
-        believed = services.best_believed(seconds, now - entered)
+        believed = services.best_believed(seconds, now - entered, services.best_most(game_id))
         best, new = data.keep_best(db, g.user["id"], game_id, believed, now)
         db.commit()
         return {"ok": True, "game": game_id, "seconds": believed, "best": best, "new_best": new}, 200
 
+    def minigames_top():
+        """
+        Every minigame's top ten, and where you are on each
+        ---
+        tags:
+          - Minigames
+        parameters:
+          - in: header
+            name: Authorization
+            type: string
+            required: true
+            description: "Bearer <token>"
+        responses:
+          200:
+            description: "boards, in the minigames' order: id, name, counts (seconds, waves, rounds, maps or score), players (how many accounts have one), top (up to ten: place, name, value, bosses for the runs' boards, at) and you (place and value, or null); now"
+          401:
+            description: Not logged in
+        """
+        # THE OWNER: "i want a global highscore option here for all
+        # minigames top 10 on each" (game 0.169.0), and "this will help me
+        # see if anyone plays my minigames" - so each board says how many
+        # accounts are on it. Read when the window opens and on Refresh.
+        db = get_db()
+        now = int(time.time())
+        me = int(g.user["id"])
+        boards = []
+        for game_id, board in services.BOARDS.items():
+            game = services.GAMES.get(game_id, {})
+            runs = board["from"] == "runs"
+            top = data.top_runs(db, game_id, now, services.TOP_SIZE) if runs \
+                else data.top_bests(db, game_id, now, services.TOP_SIZE)
+            rows = []
+            for place, row in enumerate(top, start=1):
+                shown = {"place": place, "name": row["username"], "value": row["value"], "at": row["at"],
+                         "you": row["user_id"] == me}
+                if runs:
+                    shown["bosses"] = row["bosses"]
+                rows.append(shown)
+            mine = data.place_in_runs(db, game_id, me, now) if runs else data.place_in_bests(db, game_id, me, now)
+            you = None
+            if mine is not None:
+                you = {"place": mine[0], "value": mine[1]}
+                if runs:
+                    you["bosses"] = mine[2]
+            players = data.players_in_runs(db, game_id, now) if runs else data.players_in_bests(db, game_id, now)
+            boards.append({"id": game_id, "name": game.get("name", game_id), "counts": board["counts"],
+                           "players": players, "top": rows, "you": you})
+        return {"boards": boards, "now": now}, 200
+
+    app.add_url_rule("/api/minigames/top", endpoint="minigames_top",
+                     view_func=require_auth(minigames_top), methods=["GET"])
     app.add_url_rule("/api/minigames", endpoint="minigames_list",
                      view_func=require_auth(minigames_list), methods=["GET"])
     app.add_url_rule("/api/minigames/enter", endpoint="minigames_enter",

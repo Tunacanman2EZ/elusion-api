@@ -3768,6 +3768,60 @@ MINIGAME GOLD.
 - test_minigames.py MG-16; three sabotages caught. `test_schema.json`
   rewritten for the new column (its diff is that column alone).
 
+## Every minigame's top ten (game 0.169.0)
+
+The owner: "i want a global highscore option here for all minigames top 10
+on each", and "this will help me see if anyone plays my minigames".
+
+- **`GET /api/minigames/top`** (logged in): `boards` in GAMES' order, each
+  `id`, `name`, `counts` (`seconds`, `waves`, `rounds`, `maps`, `score`),
+  `players` (how many accounts are on it), `top` (up to `TOP_SIZE`, 10:
+  `place`, `name` - the account's username, since a best is an account's -
+  `value`, `at`, `you`, and `bosses` on a runs board) and `you` (`place`,
+  `value`, or null); `now`. Read when the game's window opens and on
+  Refresh, never polled.
+- **Where each comes from** (`services.BOARDS`): the bests table for the
+  Endless and the Forge (time), Crownfall (maps, its progress) and the
+  Beholder's Table (score) - `data.top_bests()`; each account's best
+  FINISHED run for the Healer's Run (waves, then bosses) and Cut the Cloth
+  (rounds, in the waves column) - `data.top_runs()`, a ROW_NUMBER() window
+  (SQLite 3.25+). A run with 0 waves is on no board. Ties go to whoever got
+  there first, then the lower account id. `place_in_*()`: 1 + how many are
+  ahead.
+- **An account banned now is on no board** (`data.NOT_BANNED`); a ban run
+  out or lifted counts again. The owner's and co-owners' own runs count.
+- **The Endless keeps a time now** (`times` in GAMES): the game posts it to
+  `/api/minigames/best` when a run ends, believed no longer than since the
+  Go nor `ENDLESS_BEST_MOST` (two hours; `best_most()`, `best_believed()`'s
+  new `most`). The list's Endless row carries `best`. Before this its board
+  is empty; nothing older was kept.
+- **Deploy the server first**: the game's Highscores window against an
+  older server reads a 404 and says to update.
+
+`test_minigames.py` MG-20; MG-14's refusal is Cut the Cloth's now (the
+Endless keeps a time); test_packages.py's route list; routes.lock.
+
+## A kick, a ban and a rollback say so (game 0.169.0)
+
+The owner: "when rolling back a account i want it to let the player know",
+"same with being kicked", "add one for ban and perm ban". A kick, a ban
+and a rollback deleted the account's sessions and nothing more, so the game
+heard only a bare 401 and said "signed out by the server".
+
+- **`_remember_ended(db, user_id, why)`** (app.py), handed to moderation/
+  and ownertools/ as `remember_ended` (None in a bare app, which then
+  remembers nothing): before the sessions go, each one's hash is kept a day
+  in `ended_sessions` with `why` - "kick", "ban", "rollback" - as a sign-in
+  elsewhere keeps "elsewhere".
+- **`_ended_refusal()`** answers that token's next request: "kick" is
+  `KICKED_MESSAGE` with `kicked`; "rollback" `ROLLED_BACK_MESSAGE` with
+  `rolled_back`; "ban" `BANNED_MESSAGE` with `banned` and `ban` (the live
+  `ban_state()`, as the sign-in's 403 carries it) - and a ban lifted since
+  reads as a kick. Setting a player's level (which also ends sessions) is
+  unchanged.
+
+test_moderation.py (M-4: kicked, banned, lifted), test_rollback.py (RB-6).
+
 ## Signing in with Google (game 0.101.0)
 
 A player: "Google account to play or I am not registering". The owner: "lets

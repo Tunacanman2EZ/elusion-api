@@ -9,7 +9,9 @@ DAY = 24 * 60 * 60
 # Every minigame: its id (the area it is played in), its name and the wait
 # after going in. The order is the order the game lists them in.
 GAMES = {
-    "endless": {"name": "The Endless", "wait": DAY},
+    # The Endless keeps a time too since game 0.169.0 (`times`, the top
+    # ten's): how long a run held before its player fell.
+    "endless": {"name": "The Endless", "wait": DAY, "times": True},
     # THE HEALER'S RUN (game 0.99.0, healerrun.gd): the owner, 31 Oct, "this
     # minigame can be played 3 times a day". Three Go's in any day (a rolling
     # one - the oldest of the three frees a run 24 hours after it), and its
@@ -543,10 +545,40 @@ def forge_ceiling(schedule, seconds):
     return min(worth, whole * FORGE_RUNS_BELIEVED) + alive
 
 
-def best_believed(seconds_said, since_go):
+def best_believed(seconds_said, since_go, most=FORGE_BEST_MOST):
     """How long a run is believed to have held: what it says, no longer than
-    the time since the Go, nor FORGE_BEST_MOST."""
-    return max(0, min(int(seconds_said), int(since_go), FORGE_BEST_MOST))
+    the time since the Go, nor `most` (FORGE_BEST_MOST; the Endless's
+    ENDLESS_BEST_MOST)."""
+    return max(0, min(int(seconds_said), int(since_go), int(most)))
+
+
+# THE ENDLESS'S TIME (game 0.169.0): kept as the Forge's is, for the top
+# ten - how long a run held before its player fell. Its horde grows until
+# nobody stands, so two hours is past any run; a modified game could claim
+# that long, inside its one Go a day.
+ENDLESS_BEST_MOST = 2 * 60 * 60
+
+
+def best_most(game_id):
+    """The longest a timed minigame's run is believed to have held."""
+    return ENDLESS_BEST_MOST if game_id == "endless" else FORGE_BEST_MOST
+
+
+# =============================================================================
+# THE TOP TEN (game 0.169.0)
+# =============================================================================
+# The owner: "i want a global highscore option ... for all minigames top 10
+# on each", and "this will help me see if anyone plays my minigames". Each
+# board: where its number is kept, and what it counts. In GAMES' order.
+TOP_SIZE = 10
+BOARDS = {
+    "endless": {"from": "bests", "counts": "seconds"},
+    "healerrun": {"from": "runs", "counts": "waves"},
+    "forge": {"from": "bests", "counts": "seconds"},
+    "cloth": {"from": "runs", "counts": "rounds"},
+    "crownfall": {"from": "bests", "counts": "maps"},
+    "pinball": {"from": "bests", "counts": "score"},
+}
 
 
 # =============================================================================

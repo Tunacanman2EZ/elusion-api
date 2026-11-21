@@ -1817,6 +1817,8 @@ check("a bare app has the packages' routes and nothing else",
                        "/api/client/errors", "/api/server/client-errors",
                        # minigames/ (0.93.3)
                        "/api/minigames", "/api/minigames/best", "/api/minigames/enter", "/api/minigames/finish", "/api/minigames/kill",
+                       # the top ten (game 0.169.0)
+                       "/api/minigames/top",
                        # loot/'s chest (0.93.4)
                        "/api/loot/chest",
                        # accountdelete/ (0.90.0)

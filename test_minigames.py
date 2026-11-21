@@ -437,7 +437,7 @@ def forge_best(headers, seconds):
 row = forge_row(gus)
 check("the Forge is a minigame: a day's wait, ready now, no best yet",
       row.get("name") == "The Forge" and row.get("wait_seconds") == services.DAY and row.get("ready_in") == 0
-      and row.get("best") == 0 and "best" not in endless(gus), row)
+      and row.get("best") == 0 and endless(gus).get("best") == 0, row)
 # AT A PARTY OF FOUR (game 0.160.0): the most a run sends - 2.5 times a
 # player alone's, so 125 alive and three sprites at once from the start.
 ALIVE = forge_plan.get("alive_most")
@@ -499,8 +499,8 @@ check("a run's time is kept when it is your best: 4:30, then a 3:20 changes noth
 long = forge_best(gus, 5000).get_json() or {}
 check("  no run is believed longer than since your Go", 400 <= long.get("seconds", 0) <= 410
       and long.get("best") == long.get("seconds"), long)
-check("  refused: the Endless keeps no time (400), seconds not a whole number (400), no login (401)",
-      client.post("/api/minigames/best", headers=gus, json={"game": "endless", "seconds": 60}).status_code == 400
+check("  refused: Cut the Cloth keeps no time (400), seconds not a whole number (400), no login (401)",
+      client.post("/api/minigames/best", headers=gus, json={"game": "cloth", "seconds": 60}).status_code == 400
       and forge_best(gus, "60").status_code == 400 and forge_best(gus, -1).status_code == 400
       and forge_best(gus, True).status_code == 400
       and client.post("/api/minigames/best", json={"game": "forge", "seconds": 60}).status_code == 401)
@@ -917,6 +917,74 @@ finally:
 kept = sorted(r[0] for r in raw("SELECT enemy_id FROM minigame_kills WHERE user_id = ?", (pru_id,)))
 check("a kill recorded takes out every kill older than %d days, and keeps the rest"
       % (mgdata.KILLS_KEPT_SECONDS // 86400), kept == ["new", "recent"], kept)
+
+section("MG-20 THE TOP TEN (game 0.169.0)")
+# The owner: "i want a global highscore option here for all minigames top 10
+# on each", and "this will help me see if anyone plays my minigames".
+def top(headers):
+    return client.get("/api/minigames/top", headers=headers)
+before = {b["id"]: b for b in (top(ann).get_json() or {}).get("boards", [])}
+check("every minigame has a board, in the minigames' order, saying what it counts",
+      [b for b in before] == list(services.GAMES) and [before[k]["counts"] for k in before]
+      == ["seconds", "waves", "seconds", "rounds", "maps", "score"]
+      and all(before[k]["name"] == services.GAMES[k]["name"] for k in before), list(before))
+check("  read only when logged in (401)", top({}).status_code == 401)
+tops = [register("mgtop%02d" % i) for i in range(12)]
+t_now = int(time.time())
+for i in range(12):
+    raw("INSERT INTO minigame_bests (user_id, game, seconds, at) VALUES (?, 'pinball', ?, ?)",
+        (uid("mgtop%02d" % i), 9000000 + i * 10, t_now - 1000 + i))
+# A TIE: mgtop03 equals mgtop04's score and got there first, so is ahead.
+raw("UPDATE minigame_bests SET seconds = 9000040, at = ? WHERE user_id = ? AND game = 'pinball'",
+    (t_now - 5000, uid("mgtop03")))
+# BANNED NOW: off the board, though the best of all; a ban run out counts.
+banned = register("mgtopban")
+raw("INSERT INTO minigame_bests (user_id, game, seconds, at) VALUES (?, 'pinball', 99999999, ?)", (uid("mgtopban"), t_now))
+raw("UPDATE users SET is_banned = 1, ban_expires_at = NULL WHERE username = 'mgtopban'")
+board = next(b for b in top(tops[0]).get_json()["boards"] if b["id"] == "pinball")
+names = [row["name"] for row in board["top"]]
+check("the Beholder's Table: the ten best scores, highest first; a tie to whoever got there first",
+      names == ["mgtop11", "mgtop10", "mgtop09", "mgtop08", "mgtop07", "mgtop06", "mgtop05", "mgtop03", "mgtop04",
+                "mgtop02"] and [row["place"] for row in board["top"]] == list(range(1, 11))
+      and board["top"][0]["value"] == 9000110, names)
+check("  someone banned now is left off; how many play it counts each account once",
+      "mgtopban" not in names and board["players"] == before["pinball"]["players"] + 12, board["players"])
+check("  you, off the ten: your place and your score; on it, your row says so",
+      board["you"] == {"place": 12, "value": 9000000}
+      and next(b for b in top(tops[11]).get_json()["boards"] if b["id"] == "pinball")["top"][0]["you"] is True
+      and next(b for b in top(tops[11]).get_json()["boards"] if b["id"] == "pinball")["you"]["place"] == 1,
+      board["you"])
+raw("UPDATE users SET ban_expires_at = ? WHERE username = 'mgtopban'", (t_now - 1,))
+check("  a ban run out counts again", next(b for b in top(ann).get_json()["boards"]
+                                          if b["id"] == "pinball")["top"][0]["name"] == "mgtopban")
+# THE RUNS: each account's best finished run - waves, then bosses.
+for name, runs in [("mgtop00", [(300, 0), (310, 1)]), ("mgtop01", [(310, 3)]), ("mgtop02", [(305, 3), (0, 0)])]:
+    for waves, bosses in runs:
+        raw("INSERT INTO minigame_runs (user_id, slot, game, started_at, finished_at, waves, boss, goal, gold)"
+            " VALUES (?, 0, 'healerrun', ?, ?, ?, ?, 0, 0)", (uid(name), t_now - 600, t_now - 300, waves, bosses))
+raw("INSERT INTO minigame_runs (user_id, slot, game, started_at, finished_at, waves, boss, goal, gold)"
+    " VALUES (?, 0, 'healerrun', ?, 0, 999, 3, 0, 0)", (uid("mgtop03"), t_now - 60))
+healer = next(b for b in top(tops[2]).get_json()["boards"] if b["id"] == "healerrun")
+check("the Healer's Run: each account's best run once - most waves, then most bosses; a run never finished counts nothing",
+      [(r["name"], r["value"], r["bosses"]) for r in healer["top"][:3]]
+      == [("mgtop01", 310, 3), ("mgtop00", 310, 1), ("mgtop02", 305, 3)]
+      and healer["you"] == {"place": 3, "value": 305, "bosses": 3}
+      and "mgtop03" not in [r["name"] for r in healer["top"]]
+      and healer["players"] == before["healerrun"]["players"] + 3, healer["top"][:3])
+# THE ENDLESS KEEPS A TIME NOW: Go, then the run's time.
+endless_go = go(tops[5])
+raw("UPDATE minigame_entries SET entered_at = ? WHERE user_id = ? AND game = 'endless'", (t_now - 600, uid("mgtop05")))
+kept = client.post("/api/minigames/best", headers=tops[5], json={"game": "endless", "seconds": 300}).get_json() or {}
+endless_board = next(b for b in top(tops[5]).get_json()["boards"] if b["id"] == "endless")
+check("the Endless keeps a run's time, as the Forge does, and it is on its board",
+      endless_go.status_code == 200 and kept.get("best") == 300 and kept.get("new_best") is True
+      and (endless_board["you"] or {}).get("value") == 300 and endless(tops[5]).get("best") == 300
+      and any(r["name"] == "mgtop05" and r["value"] == 300 for r in endless_board["top"]), (kept, endless_board["you"]))
+check("  believed no longer than ENDLESS_BEST_MOST (two hours), nor since the Go",
+      services.best_believed(99999, 99999, services.best_most("endless")) == services.ENDLESS_BEST_MOST == 7200
+      and services.best_most("forge") == services.FORGE_BEST_MOST)
+nobody = register("mgtopnone")
+check("someone on no board: every \"you\" is null", all(b["you"] is None for b in top(nobody).get_json()["boards"]))
 
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))

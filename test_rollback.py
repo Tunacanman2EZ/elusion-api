@@ -394,6 +394,9 @@ r = rollback(boss, "erin", erin_snap)
 check("the answer counts the sessions it ended", (r.get_json() or {}).get("sessions_ended") == 1, r.get_json())
 check("  and her game's next poll is the 401 that sends it to the login screen",
       poll(erin).status_code == 401, poll(erin).status_code)
+told = poll(erin).get_json() or {}
+check("  saying why, so her game can say so on screen (game 0.169.0): rolled back by staff",
+      told.get("rolled_back") is True and told.get("message") == app_module.ROLLED_BACK_MESSAGE, told)
 check("the owner, rolling back somebody else, is still signed in", poll(boss).status_code == 200)
 r = client.post("/api/auth/login", json={"username": "erin", "password": PW},
                 environ_base={"REMOTE_ADDR": "198.51.100.200"})

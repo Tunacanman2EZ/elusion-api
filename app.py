@@ -2824,6 +2824,31 @@ def _ended_elsewhere(token):
 SIGNED_IN_ELSEWHERE_MESSAGE = ("This account signed in somewhere else, so this game "
                                "was signed out.")
 
+# A KICK AND A ROLLBACK SAY SO (game 0.169.0). The owner: "when rolling back a
+# account i want it to let the player know ... a loading screen that says your
+# account was rolled back", and "same with being kicked staff kicked you".
+# Both used to delete the sessions and nothing more, so the game was told only
+# "signed out by the server". The route asks _remember_ended() first, which
+# keeps each session's hash a day with the reason (ended_sessions, as an
+# ending "elsewhere" is), and _ended_refusal() says it.
+KICKED_MESSAGE = "Staff signed you out. You can sign straight back in."
+# And a ban (the owner: "add one for ban and perm ban"): the 401 carries the
+# ban as the sign-in's 403 does (ban_state()), so the game's card says how
+# long and why.
+BANNED_MESSAGE = "Staff banned this account."
+ROLLED_BACK_MESSAGE = ("Staff rolled your character back to an earlier save. Anything since then "
+                       "is undone - sign in to play it as it is now.")
+
+
+def _remember_ended(db, user_id, why):
+    """Every session `user_id` holds, kept a day as ended for `why` ("kick",
+    "ban", "rollback"), so the game's next request is told why. Before the
+    sessions are deleted; the caller commits."""
+    now = int(time.time())
+    db.execute("INSERT OR REPLACE INTO ended_sessions (token_hash, user_id, ended_at, why, install_hash)"
+               " SELECT token_hash, user_id, ?, ?, install_hash FROM sessions WHERE user_id = ?",
+               (now, str(why), int(user_id)))
+
 
 # =============================================================================
 # TOKEN LIFECYCLE (game 0.44.0)
@@ -2967,6 +2992,17 @@ def _ended_refusal(token):
         return {"error": "Unauthorized", "message": STAFF_SESSION_ENDED_MESSAGE, "staff_session_ended": True}, 401
     if why == "old":
         return {"error": "Unauthorized", "message": OLD_LOGIN_MESSAGE, "old_login": True}, 401
+    if why == "ban":
+        user = db.execute("SELECT * FROM users WHERE id = ?", (int(row["user_id"]),)).fetchone()
+        ban = ban_state(user) if user is not None else None
+        if ban is not None:
+            return {"error": "Unauthorized", "message": BANNED_MESSAGE, "banned": True, "ban": ban}, 401
+        # Lifted since: what is left to say is that staff signed it out.
+        why = "kick"
+    if why == "kick":
+        return {"error": "Unauthorized", "message": KICKED_MESSAGE, "kicked": True}, 401
+    if why == "rollback":
+        return {"error": "Unauthorized", "message": ROLLED_BACK_MESSAGE, "rolled_back": True}, 401
     return {"error": "Unauthorized", "message": SIGNED_IN_ELSEWHERE_MESSAGE, "signed_in_elsewhere": True}, 401
 
 
@@ -6570,6 +6606,7 @@ _MODERATION = moderation_package.register(
     reports_per_hour=lambda: REPORTS_PER_HOUR,
     report_lines_per_player=lambda: REPORT_LINES_PER_PLAYER,
     mute_max_minutes_mod=lambda: MUTE_MAX_MINUTES_MOD,
+    remember_ended=_remember_ended,
 )
 # The staff numbers on the broadcast poll, and the limits the powers page
 # quotes, by the names this file always used.
@@ -8204,6 +8241,7 @@ ownertools_package.register(
     post_broadcast=post_broadcast,
     moderation_target=_moderation_target,
     note_refill=_note_refill,
+    remember_ended=_remember_ended,
 )
 
 # Named here as well, for the suites that read them off this module;

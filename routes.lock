@@ -24,6 +24,7 @@ GET /api/loot/bag  read_loot_bag  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/loot/chest  read_loot_chest  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/metrics  metrics  auth  rank=coowner  fresh=-  lock=yes  doc=yes
 GET /api/minigames  minigames_list  auth  rank=-  fresh=-  lock=yes  doc=yes
+GET /api/minigames/top  minigames_top  auth  rank=-  fresh=-  lock=yes  doc=yes
 GET /api/owner/economy/canary  owner_canary_status  auth  rank=coowner  fresh=-  lock=yes  doc=yes
 GET /api/owner/economy/flow  owner_economy_flow  auth  rank=coowner  fresh=-  lock=yes  doc=yes
 GET /api/owner/economy/rules  owner_economy_rules  auth  rank=coowner  fresh=-  lock=yes  doc=yes
