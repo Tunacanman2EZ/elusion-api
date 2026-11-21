@@ -39,6 +39,11 @@ def record_kill(db, user_id, slot, game, enemy_id, boss, now, pet=False, gold=0)
         (int(user_id), int(slot), str(game), str(enemy_id), 1 if boss else 0, int(now), 1 if pet else 0,
          int(gold)),
     )
+    # THE PRUNE BELONGS HERE (20 Nov 2026). When pets_since() was added
+    # (game 0.121.0) it went in between the INSERT above and this line, which
+    # then sat after pets_since()'s return: never run, and `now` undefined
+    # there (the CI's import check, F821). Kills were not pruned from then on.
+    db.execute("DELETE FROM minigame_kills WHERE at < ?", (int(now) - KILLS_KEPT_SECONDS,))
 
 
 def gold_since(db, user_id, since):
@@ -59,7 +64,6 @@ def pets_since(db, user_id, game, since):
         "SELECT COUNT(*) FROM minigame_kills WHERE user_id = ? AND game = ? AND at >= ? AND pet = 1",
         (int(user_id), str(game), int(since)),
     ).fetchone()[0]
-    db.execute("DELETE FROM minigame_kills WHERE at < ?", (int(now) - KILLS_KEPT_SECONDS,))
 
 
 # THE HEALER'S RUN'S RUNS (game 0.99.0): one row a Go, finished once.

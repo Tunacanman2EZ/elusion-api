@@ -895,6 +895,29 @@ check("  a game left past %d hours pays nothing, though its score is kept"
       late.get("gold") == 0 and late.get("best") == 40000, late)
 check("the owner plays it as often as they like", all(pin_go(owner).status_code in (200, 404) for _ in range(4)))
 
+section("MG-19 A KILL PRUNES THE OLD ONES (20 Nov 2026)")
+# record_kill() keeps KILLS_KEPT_SECONDS of kills: each new one takes out every
+# one older. From 0.121.0 the DELETE sat after pets_since()'s return and never
+# ran; test_ownership's retention check reads the source and was fooled by the
+# dead line, so this one runs it.
+import minigames.data as mgdata  # noqa: E402
+register("mgpru")
+pru_id = uid("mgpru")
+t_now = int(time.time())
+raw("INSERT INTO minigame_kills (user_id, slot, game, enemy_id, boss, at) VALUES (?, 0, 'endless', 'old', 0, ?)",
+    (pru_id, t_now - mgdata.KILLS_KEPT_SECONDS - 60))
+raw("INSERT INTO minigame_kills (user_id, slot, game, enemy_id, boss, at) VALUES (?, 0, 'endless', 'recent', 0, ?)",
+    (pru_id, t_now - 60))
+conn = sqlite3.connect(DB_PATH)
+try:
+    mgdata.record_kill(conn, pru_id, 0, "endless", "new", False, t_now)
+    conn.commit()
+finally:
+    conn.close()
+kept = sorted(r[0] for r in raw("SELECT enemy_id FROM minigame_kills WHERE user_id = ?", (pru_id,)))
+check("a kill recorded takes out every kill older than %d days, and keeps the rest"
+      % (mgdata.KILLS_KEPT_SECONDS // 86400), kept == ["new", "recent"], kept)
+
 print("\n" + "=" * 60)
 print("  %d passed, %d failed" % (passed, failed))
 print("=" * 60)
