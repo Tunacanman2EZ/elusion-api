@@ -97,6 +97,8 @@ its own throwaway database in your temp folder, so none of them touches
 - `SECURITY.md` - the security model, each promise with the test that holds it.
 - `ARCHITECTURE.md` and `CODEMAP.md` - how the parts fit, and where each lives.
 - `DEPLOY.md` - the live server: setup, settings and how it is updated.
+- `RUNBOOK.md` - running it: shipping, health, what to do when it breaks,
+  backups, load tests, and the incidents behind each habit.
 
 ## Licence
 
